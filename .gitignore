@@ -1,0 +1,11 @@
+.idea
+.env
+__pycache__/
+.venv/
+node_modules/
+*.pyc
+.venv/
+vault-service/.lint-env.hash
+vault-service/.lint-npm.hash
+
+.DS_Store

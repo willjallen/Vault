@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{{ doc.path.split('/')[-1] }} - Family Vault</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Family Vault</h1>
+      <p class="muted small">Signed in as {{ user.name }}</p>
+    </div>
+    <div class="header-actions">
+      <a class="btn ghost" href="/{% if folder_path %}?folder={{ folder_path | urlencode }}{% endif %}">Back to folder</a>
+      <a class="btn ghost" href="https://{{ base_domain }}">Home</a>
+      <a
+        class="btn logout"
+        href="https://auth.{{ base_domain }}/logout?rd={{ request.url | urlencode }}"
+      >
+        Log out
+      </a>
+    </div>
+  </header>
+
+  {% set redirect_to = request.url.path %}
+  {% if request.url.query %}
+    {% set redirect_to = redirect_to + '?' + request.url.query %}
+  {% endif %}
+
+  <main class="page">
+    <section class="card">
+      <div class="card-header">
+        <div>
+          <p class="eyebrow">File</p>
+          <h2>{{ doc.path.split('/')[-1] }}</h2>
+          <p class="muted tiny{% if archived %} archived-text{% endif %}">{{ doc.path }}</p>
+        </div>
+        <div>
+          {% if lock %}
+            <span class="status busy">Being edited by {{ lock.locked_by_name or lock.locked_by }}</span>
+          {% else %}
+            <span class="status available">Available</span>
+          {% endif %}
+        </div>
+      </div>
+
+      {% set archived = doc.path.startswith('Archive/') %}
+      <div class="actions row">
+        <a class="btn secondary" href="/documents/{{ doc.id }}/download">Download to view</a>
+        {% if archived %}
+          <span class="status pill archived">Archived</span>
+        {% elif not lock %}
+          <a class="btn primary" href="/documents/{{ doc.id }}/checkout">Start editing</a>
+        {% elif lock.locked_by == user.id %}
+          <span class="status yours">You are editing this document</span>
+        {% endif %}
+      </div>
+
+      {% if lock and lock.locked_by == user.id and not archived %}
+        <div class="checkin-box" style="margin-top:16px;">
+          <h3>Save your changes back to the vault</h3>
+          <form action="/documents/{{ doc.id }}/checkin" method="post" enctype="multipart/form-data">
+            <input type="hidden" name="redirect_to" value="{{ redirect_to }}" />
+            <label>
+              Choose the edited file
+              <input type="file" name="file" required />
+            </label>
+            <label>
+              What changed? (optional)
+              <input type="text" name="note" placeholder="Short note about the update" />
+            </label>
+            <button class="btn primary" type="submit">Save changes</button>
+          </form>
+          <form class="inline-form" action="/documents/{{ doc.id }}/release" method="post">
+            <input type="hidden" name="redirect_to" value="{{ redirect_to }}" />
+            <button class="btn secondary" type="submit">Stop editing without saving</button>
+          </form>
+        </div>
+      {% endif %}
+    </section>
+
+    <section class="card">
+      <div class="card-header">
+        <div>
+          <p class="eyebrow">History</p>
+          <h3>Saved versions</h3>
+        </div>
+      </div>
+      {% if history %}
+        <ul class="version-list">
+          {% for item in history %}
+            <li>
+              <div>
+                <div class="title">
+                  {{ item.display or item.timestamp }}
+                  {% if item.type and item.type != "version" %}
+                    <span class="status pill">{{ item.type }}</span>
+                  {% endif %}
+                </div>
+                <div class="muted tiny">by {{ item.by }}</div>
+                {% if item.note %}
+                  <div class="muted tiny">{{ item.note }}</div>
+                {% endif %}
+              </div>
+              {% if item.download_url %}
+                <div class="version-actions">
+                  <a class="btn ghost" href="{{ item.download_url }}">Download this version</a>
+                </div>
+              {% endif %}
+            </li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <p class="muted">No previous versions yet.</p>
+      {% endif %}
+    </section>
+  </main>
+</body>
+</html>

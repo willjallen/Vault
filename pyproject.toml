@@ -1,0 +1,64 @@
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["app"]
+extend-exclude = ["app/static"]
+force-exclude = true
+fix = false
+show-fixes = true
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+docstring-code-format = true
+
+[tool.ruff.lint]
+# Focus on correctness, security, and modernization; exclude style-only noise.
+select = ["E", "F", "I", "UP", "B", "S", "DTZ"]
+ignore = [
+    # Relax docstring formatting to prioritize runtime safety and typing checks.
+    "D100",
+    "D101",
+    "D102",
+    "D103",
+    "D104",
+    "D107",
+    "D203",
+    "D204",
+    "D205",
+    "D212",
+    "D213",
+    "D401",
+    "DOC201",
+    "DOC501",
+    "B008",
+]
+preview = true
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]
+combine-as-imports = true
+
+[tool.ruff.lint.per-file-ignores]
+"app/__init__.py" = ["F401", "D104"]
+
+[tool.mypy]
+python_version = "3.11"
+plugins = ["sqlalchemy.ext.mypy.plugin"]
+warn_unused_configs = true
+warn_unreachable = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+show_error_codes = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+disallow_untyped_calls = true
+disallow_any_generics = true
+no_implicit_optional = true
+check_untyped_defs = true
+strict_equality = true
+pretty = true
+exclude = ["venv", ".venv", "node_modules", "app/static"]
+
+[tool.bandit]
+skips = []

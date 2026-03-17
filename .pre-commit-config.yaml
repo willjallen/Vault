@@ -1,0 +1,78 @@
+minimum_pre_commit_version: "3.8.0"
+default_stages: [commit, push]
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-merge-conflict
+      - id: check-yaml
+      - id: check-json
+      - id: check-added-large-files
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.7.0
+    hooks:
+      - id: ruff-format
+        args: ["--config", "vault-service/pyproject.toml", "--check"]
+      - id: ruff
+        args: ["--config", "vault-service/pyproject.toml", "--exit-non-zero-on-fix"]
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.13.0
+    hooks:
+      - id: mypy
+        files: ^vault-service/app/
+        args: ["--config-file", "vault-service/pyproject.toml"]
+        additional_dependencies:
+          - fastapi==0.115.5
+          - uvicorn[standard]==0.32.0
+          - SQLAlchemy==2.0.36
+          - sqlalchemy[mypy]==2.0.36
+          - python-multipart==0.0.9
+          - jinja2==3.1.4
+
+  - repo: https://github.com/PyCQA/bandit
+    rev: 1.7.10
+    hooks:
+      - id: bandit
+        args:
+          [
+            "-r",
+            "vault-service/app",
+            "-x",
+            "vault-service/app/static",
+            "--severity-level",
+            "low",
+            "--confidence-level",
+            "low",
+          ]
+        pass_filenames: false
+
+  - repo: https://github.com/pypa/pip-audit
+    rev: v2.7.2
+    hooks:
+      - id: pip-audit
+        args:
+          [
+            "-r",
+            "vault-service/requirements.txt",
+            "-r",
+            "vault-service/requirements-dev.txt",
+            "--strict",
+            "--progress-spinner=off",
+          ]
+
+  - repo: local
+    hooks:
+      - id: npm-lint
+        name: npm run lint (JS/CSS format + ESLint + Stylelint)
+        entry: bash
+        language: system
+        pass_filenames: false
+        files: ^vault-service/app/static/
+        args:
+          - "-c"
+          - "cd vault-service && npm run lint"

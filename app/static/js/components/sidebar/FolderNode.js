@@ -14,7 +14,7 @@ export function FolderNode({
   onFolderDragEnd,
   draggingFolderPath,
 }) {
-  const offset = 16 + depth * 14;
+  const offset = Math.min(12 + depth * 10, 78);
   const isActive = activePath === node.path;
   const isArchived = isArchivePath(node.path);
   return h(
@@ -31,6 +31,7 @@ export function FolderNode({
           draggingFolderPath === node.path ? "dragging" : ""
         ),
         style: { paddingLeft: `${offset}px` },
+        title: node.path || node.name || "Folder",
         onClick: () => onSelect(node.path),
         onContextMenu: (e) => onContextMenu && onContextMenu(e, node),
         draggable: true,

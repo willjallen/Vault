@@ -24,6 +24,10 @@ export function VaultFileList({
   onFolderDragEnd,
   onFileContextMenu,
   onFolderContextMenu,
+  inlineFolderDraft,
+  onInlineFolderNameChange,
+  onCommitInlineFolder,
+  onCancelInlineFolder,
   onDropOnFolder,
   onClearDropHint,
   onCanvasDrop,
@@ -32,7 +36,9 @@ export function VaultFileList({
   onUploadClick,
 }) {
   const inArchive = isArchivePath(folder);
-  const emptyState = files.length === 0 && subfolders.length === 0;
+  const draftInFolder = inlineFolderDraft && inlineFolderDraft.parent === (folder || "");
+  const createDraft = draftInFolder && inlineFolderDraft.mode === "create";
+  const emptyState = files.length === 0 && subfolders.length === 0 && !createDraft;
   return h(
     "section",
     {
@@ -72,10 +78,37 @@ export function VaultFileList({
           : h("div", { className: "muted tiny quiet-text" }, "Select an item to see details."),
       ]),
       h("div", { className: "file-list" }, [
+        createDraft
+          ? h(FolderRow, {
+              key: "inline-new-folder",
+              folder: {
+                path: "",
+                name: inlineFolderDraft.value,
+              },
+              editing: true,
+              editValue: inlineFolderDraft.value,
+              isDraft: true,
+              onOpen: () => {},
+              onDropEnter: () => {},
+              onDrop: () => {},
+              onDropLeave: () => {},
+              onDragStart: () => {},
+              onDragEnd: () => {},
+              onContextMenu: () => {},
+              onEditChange: onInlineFolderNameChange,
+              onEditCommit: onCommitInlineFolder,
+              onEditCancel: onCancelInlineFolder,
+            })
+          : null,
         ...subfolders.map((folderItem) =>
           h(FolderRow, {
             key: folderItem.path || "root",
             folder: folderItem,
+            editing:
+              draftInFolder &&
+              inlineFolderDraft.mode === "rename" &&
+              inlineFolderDraft.path === folderItem.path,
+            editValue: inlineFolderDraft?.value || "",
             isDropTarget: dropHint === folderItem.path,
             isDragging: draggingFolderPath === folderItem.path,
             onOpen: () => onSelectFolder(folderItem.path),
@@ -85,6 +118,9 @@ export function VaultFileList({
             onDragStart: (e) => onFolderDragStart && onFolderDragStart(e, folderItem.path),
             onDragEnd: onFolderDragEnd,
             onContextMenu: (e) => onFolderContextMenu && onFolderContextMenu(e, folderItem),
+            onEditChange: onInlineFolderNameChange,
+            onEditCommit: onCommitInlineFolder,
+            onEditCancel: onCancelInlineFolder,
           })
         ),
         ...files.map((doc) =>

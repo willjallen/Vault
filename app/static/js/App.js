@@ -1,151 +1,31 @@
 import { FinderShell } from "./components/FinderShell.js";
 import { ContextMenu } from "./components/browser/ContextMenu.js";
 import { MoveDialog } from "./components/browser/MoveDialog.js";
+import {
+  buildFileMenuItems,
+  buildFolderMenuItems,
+  buildPageMenuItems,
+} from "./lib/contextMenus.js";
 import { createDropHandlers } from "./lib/dropHandlers.js";
-import { isArchivePath, toBreadcrumbs, triggerDownload } from "./lib/utils.js";
+import {
+  folderBaseName,
+  folderParent,
+  folderPathForName,
+  isArchivePath,
+  normalizeFolderName,
+  toBreadcrumbs,
+  triggerDownload,
+} from "./lib/utils.js";
+import { useMouseNavigation } from "./lib/useMouseNavigation.js";
 import { useMoveDialog } from "./lib/useMoveDialog.js";
 
 const { useEffect, useMemo, useState, useCallback, useRef } = React;
 const h = React.createElement;
 
-function compactMenuItems(items) {
-  const compacted = items.filter(Boolean).reduce((acc, item) => {
-    const previous = acc[acc.length - 1];
-    if (item.type === "separator" && (!previous || previous.type === "separator")) {
-      return acc;
-    }
-    acc.push(item);
-    return acc;
-  }, []);
-  if (compacted[compacted.length - 1]?.type === "separator") {
-    compacted.pop();
-  }
-  return compacted;
-}
-
-function buildFileMenuItems(actions) {
-  const { doc, currentUser, busy, isAdmin } = actions;
-  const lock = doc.lock || {};
-  const lockedByMe = lock && lock.by === currentUser.id;
-  const lockedByOther = lock && lock.by && lock.by !== currentUser.id;
-  return compactMenuItems([
-    { label: "Open", action: () => actions.handleView(doc) },
-    { label: "Rename", action: () => actions.handleRenameFile(doc), disabled: busy },
-    {
-      label: "Move...",
-      action: () => actions.openMoveDialogForDoc(doc),
-      disabled: busy || lockedByOther,
-    },
-    doc.archived
-      ? { label: "Restore to Vault", action: () => actions.handleUnarchive(doc.id), disabled: busy }
-      : { label: "Move to Archive", action: () => actions.handleArchive(doc.id), disabled: busy },
-    !doc.archived && !lockedByOther
-      ? {
-          label: lockedByMe ? "Re-download (locked)" : "Lock for editing",
-          action: () => actions.handleStartEdit(doc),
-        }
-      : null,
-    lockedByMe && !doc.archived
-      ? { label: "Unlock file", action: () => actions.handleRelease(doc.id), disabled: busy }
-      : null,
-    isAdmin && doc.archived
-      ? {
-          label: "Delete forever",
-          action: () => {
-            const confirmed = window.confirm(
-              `This will permanently delete "${doc.name}" from the archive. You cannot undo this.`
-            );
-            if (confirmed) {
-              actions.handlePermanentDelete(doc.id);
-            }
-          },
-          danger: true,
-          disabled: busy,
-        }
-      : null,
-  ]);
-}
-
-function buildFolderMenuItems(actions) {
-  const { folderItem, busy, isAdmin } = actions;
-  const folderPath = folderItem.path || "";
-  const isArchivedFolder = folderPath.startsWith("Archive");
-  const hasPath = Boolean(folderPath);
-  const canPermanentDeleteFolder = isAdmin && isArchivedFolder && folderPath !== "Archive";
-  return compactMenuItems([
-    { label: "Open", action: () => actions.setFolder(folderPath) },
-    hasPath
-      ? { label: "Rename", action: () => actions.beginRenameFolder(folderPath), disabled: busy }
-      : null,
-    hasPath
-      ? {
-          label: "Move...",
-          action: () => actions.openMoveDialogForFolder(folderItem),
-          disabled: busy,
-        }
-      : null,
-    hasPath
-      ? isArchivedFolder
-        ? {
-            label: "Restore to Vault",
-            action: () => actions.handleUnarchiveFolder(folderPath, { navigate: false }),
-            disabled: busy,
-          }
-        : {
-            label: "Move to Archive",
-            action: () => actions.handleArchiveFolder(folderPath, { navigate: false }),
-            disabled: busy,
-          }
-      : null,
-    canPermanentDeleteFolder
-      ? {
-          label: "Delete forever",
-          action: () => actions.handlePermanentDeleteFolder(folderPath),
-          danger: true,
-          disabled: busy,
-        }
-      : null,
-  ]);
-}
-
-function buildPageMenuItems(actions) {
-  const currentFolder = actions.folder || "";
-  return [
-    {
-      label: "Upload file",
-      action: actions.handleUploadClick,
-      disabled: actions.busy || actions.uploading,
-    },
-    {
-      label: "New folder",
-      action: () => actions.beginCreateFolder(currentFolder),
-      disabled: actions.busy || actions.creatingFolder,
-    },
-  ];
-}
-
-function folderParts(path) {
-  return (path || "").split("/").filter(Boolean);
-}
-
-function folderParent(path) {
-  return folderParts(path).slice(0, -1).join("/");
-}
-
-function folderBaseName(path, fallback = "New Folder") {
-  return folderParts(path).slice(-1)[0] || fallback;
-}
-
-function normalizeFolderName(value) {
-  return (value || "").trim().replace(/^\/+|\/+$/g, "");
-}
-
-function folderPathForName(parentPath, folderName) {
-  return parentPath ? `${parentPath}/${folderName}` : folderName;
-}
-
 export function App({ initial }) {
   const [folder, setFolder] = useState(initial.current_folder || "");
+  const [folderBackStack, setFolderBackStack] = useState([]);
+  const [folderForwardStack, setFolderForwardStack] = useState([]);
   const [state, setState] = useState(initial);
   const [selectedId, setSelectedId] = useState(null);
   const [uploading, setUploading] = useState(false);
@@ -253,6 +133,64 @@ export function App({ initial }) {
   const breadcrumbs = useMemo(() => toBreadcrumbs(folder || ""), [folder]);
   const selectedDoc = docs.find((d) => d.id === selectedId) || null;
   const myEdits = docs.filter((d) => d.lock && d.lock.by === currentUser.id);
+  const canGoBack = folderBackStack.length > 0;
+  const canGoForward = folderForwardStack.length > 0;
+  const canGoUp = Boolean(folder);
+
+  function navigateToFolder(nextFolder) {
+    const normalized = nextFolder || "";
+    if (normalized === folder) {
+      return;
+    }
+    setFolderBackStack((prev) => [...prev, folder || ""]);
+    setFolderForwardStack([]);
+    setSelectedId(null);
+    setFolder(normalized);
+    closeContextMenu();
+  }
+
+  function replaceFolder(nextFolder) {
+    const normalized = nextFolder || "";
+    if (normalized === folder) {
+      return;
+    }
+    setSelectedId(null);
+    setFolder(normalized);
+    closeContextMenu();
+  }
+
+  function navigateBack() {
+    if (!folderBackStack.length) {
+      return;
+    }
+    const nextFolder = folderBackStack[folderBackStack.length - 1] || "";
+    setFolderBackStack(folderBackStack.slice(0, -1));
+    setFolderForwardStack([folder || "", ...folderForwardStack]);
+    setSelectedId(null);
+    setFolder(nextFolder);
+    closeContextMenu();
+  }
+
+  function navigateForward() {
+    if (!folderForwardStack.length) {
+      return;
+    }
+    const nextFolder = folderForwardStack[0] || "";
+    setFolderForwardStack(folderForwardStack.slice(1));
+    setFolderBackStack([...folderBackStack, folder || ""]);
+    setSelectedId(null);
+    setFolder(nextFolder);
+    closeContextMenu();
+  }
+
+  function navigateUp() {
+    if (!folder) {
+      return;
+    }
+    navigateToFolder(folderParent(folder));
+  }
+
+  useMouseNavigation({ onBack: navigateBack, onForward: navigateForward });
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -466,7 +404,7 @@ export function App({ initial }) {
       const data = await res.json();
       const destFolder = data.path ? data.path.split("/").slice(0, -1).join("/") : "";
       await refresh(destFolder);
-      setFolder(destFolder);
+      replaceFolder(destFolder);
       setSelectedId(null);
     } catch (err) {
       setError(err.message || "Unarchive failed.");
@@ -532,7 +470,7 @@ export function App({ initial }) {
       const refreshTarget = shouldNavigate ? parentFolder : folder;
       await refresh(refreshTarget);
       if (shouldNavigate) {
-        setFolder(parentFolder);
+        replaceFolder(parentFolder);
       }
       setSelectedId(null);
     } catch (err) {
@@ -568,7 +506,7 @@ export function App({ initial }) {
       const refreshTarget = shouldNavigate ? dest : folder;
       await refresh(refreshTarget);
       if (shouldNavigate) {
-        setFolder(dest);
+        replaceFolder(dest);
       }
     } catch (err) {
       setError(err.message || "Archive failed.");
@@ -603,7 +541,7 @@ export function App({ initial }) {
       const refreshTarget = shouldNavigate ? dest : folder;
       await refresh(refreshTarget);
       if (shouldNavigate) {
-        setFolder(dest);
+        replaceFolder(dest);
       }
     } catch (err) {
       setError(err.message || "Unarchive failed.");
@@ -694,7 +632,7 @@ export function App({ initial }) {
     }
     const parentPath = folderParent(folderPath);
     if ((folder || "") !== parentPath) {
-      setFolder(parentPath);
+      replaceFolder(parentPath);
     }
     setSelectedId(null);
     setInlineFolderDraft({
@@ -812,7 +750,7 @@ export function App({ initial }) {
       const refreshTarget = shouldNavigate ? dest : folder;
       await refresh(refreshTarget);
       if (shouldNavigate) {
-        setFolder(dest);
+        replaceFolder(dest);
       }
       success = true;
     } catch (err) {
@@ -869,7 +807,7 @@ export function App({ initial }) {
       openMoveDialogForDoc,
       openMoveDialogForFolder,
       selectedDoc,
-      setFolder,
+      navigateToFolder,
       uploading,
       ...extra,
     };
@@ -940,13 +878,17 @@ export function App({ initial }) {
       draggingFolderPath,
       currentUser,
       isAdmin,
-      creatingFolder,
+      canGoBack,
+      canGoForward,
+      canGoUp,
       inlineFolderDraft,
       onInlineFolderNameChange: handleInlineFolderNameChange,
       onCommitInlineFolder: handleCommitInlineFolder,
       onCancelInlineFolder: handleCancelInlineFolder,
-      onStartAddingFolder: () => beginCreateFolder(folder),
-      onSelectFolder: setFolder,
+      onNavigateBack: navigateBack,
+      onNavigateForward: navigateForward,
+      onNavigateUp: navigateUp,
+      onSelectFolder: navigateToFolder,
       onSelectDoc: setSelectedId,
       onClearSelection: () => setSelectedId(null),
       onOpenDoc: handleView,
@@ -974,7 +916,7 @@ export function App({ initial }) {
       onArchive: handleArchive,
       onUnarchive: handleUnarchive,
       onPermanentDelete: handlePermanentDelete,
-      onOpenFolder: setFolder,
+      onOpenFolder: navigateToFolder,
       busy,
       uploading,
     }),

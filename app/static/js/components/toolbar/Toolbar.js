@@ -5,7 +5,12 @@ const h = React.createElement;
 export function Toolbar({
   folder,
   breadcrumbs,
-  onStartAddingFolder,
+  canGoBack,
+  canGoForward,
+  canGoUp,
+  onNavigateBack,
+  onNavigateForward,
+  onNavigateUp,
   _busy,
   uploading,
   uploadInputRef,
@@ -18,21 +23,54 @@ export function Toolbar({
   return h(
     "div",
     { className: "finder-toolbar" },
-    h(Breadcrumbs, {
-      breadcrumbs,
-      activePath: folder,
-      onSelect: onSelectFolder,
-      onDropOnFolder,
-      onClearDrop,
-    }),
+    h("div", { className: "toolbar-navigation" }, [
+      h(
+        "button",
+        {
+          "aria-label": "Back",
+          className: "btn ghost nav-button",
+          disabled: !canGoBack,
+          onClick: onNavigateBack,
+          title: "Back",
+          type: "button",
+        },
+        "‹"
+      ),
+      h(
+        "button",
+        {
+          "aria-label": "Forward",
+          className: "btn ghost nav-button",
+          disabled: !canGoForward,
+          onClick: onNavigateForward,
+          title: "Forward",
+          type: "button",
+        },
+        "›"
+      ),
+      h(
+        "button",
+        {
+          "aria-label": "Up",
+          className: "btn ghost nav-button",
+          disabled: !canGoUp,
+          onClick: onNavigateUp,
+          title: "Up",
+          type: "button",
+        },
+        "↑"
+      ),
+      h(Breadcrumbs, {
+        breadcrumbs,
+        activePath: folder,
+        onSelect: onSelectFolder,
+        onDropOnFolder,
+        onClearDrop,
+      }),
+    ]),
     h(
       "div",
       { className: "toolbar-actions" },
-      h(
-        "button",
-        { className: "btn secondary", type: "button", onClick: onStartAddingFolder },
-        "New folder"
-      ),
       h(
         "div",
         { className: "upload-control" },

@@ -1,0 +1,20 @@
+services:
+  vault-service:
+    build:
+      context: .
+    image: vault-service:local
+    container_name: vault-service
+    ports:
+      - "0.0.0.0:8000:8000"
+    environment:
+      BASE_DOMAIN: localhost
+      VAULT_FILES_PATH: /vault-files
+      VAULT_DB_PATH: /vault-metadata/vault-metadata.db
+      VAULT_DEFAULT_USER_EMAIL: admin@example.com
+      VAULT_DEV_AUTH: "1"
+      VAULT_DEV_USER: local-admin
+      VAULT_DEV_NAME: Local Admin
+      VAULT_DEV_GROUPS: admin,vault-admin
+    volumes:
+      - ./.docker-data/files:/vault-files
+      - ./.docker-data/metadata:/vault-metadata

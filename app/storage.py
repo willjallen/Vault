@@ -2,7 +2,6 @@
 """Filesystem helpers for the vault repository."""
 
 import datetime
-import fcntl
 import threading
 import uuid
 from collections.abc import Callable, Iterator
@@ -17,10 +16,36 @@ from .models import Document
 storage_lock = threading.Lock()
 FILES_LOCK_PATH = FILES_PATH / ".vault-files.lock"
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - exercised on Windows only
+    fcntl = None
+    import msvcrt
+
 
 def ensure_storage() -> None:
     """Ensure the repository root exists on disk."""
     FILES_PATH.mkdir(parents=True, exist_ok=True)
+
+
+def _acquire_process_lock(lock_file: object) -> None:
+    if fcntl is not None:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        return
+
+    lock_file.truncate(1)
+    lock_file.flush()
+    lock_file.seek(0)
+    msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+
+
+def _release_process_lock(lock_file: object) -> None:
+    if fcntl is not None:
+        fcntl.flock(lock_file, fcntl.LOCK_UN)
+        return
+
+    lock_file.seek(0)
+    msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
 
 
 @contextmanager
@@ -29,12 +54,12 @@ def storage_write_lock() -> Iterator[None]:
     ensure_storage()
     FILES_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
     with storage_lock:
-        lock_file = FILES_LOCK_PATH.open("w")
+        lock_file = FILES_LOCK_PATH.open("a+b")
         try:
-            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            _acquire_process_lock(lock_file)
             yield
         finally:
-            fcntl.flock(lock_file, fcntl.LOCK_UN)
+            _release_process_lock(lock_file)
             lock_file.close()
 
 

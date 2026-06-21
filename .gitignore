@@ -1,11 +1,41 @@
-.idea
+# Environment and local config
 .env
+.env.*
+!.env.example
+
+# Editors and OS metadata
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Python
 __pycache__/
+*.py[cod]
+*$py.class
+.python-version
 .venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Node and frontend tooling
 node_modules/
-*.pyc
-.venv/
+.npm/
+
+# Runtime data, logs, and local debug artifacts
+.docker-data/
+.local/
+.runtime/
+logs/
+*.log
+*.log.*
+*.out
+*.err
+
+# Local lint cache files
 vault-service/.lint-env.hash
 vault-service/.lint-npm.hash
-
-.DS_Store

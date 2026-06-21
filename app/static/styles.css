@@ -198,10 +198,31 @@ header {
   flex-wrap: wrap;
 }
 
+.toolbar-navigation {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.nav-button {
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.1rem;
+  line-height: 1;
+}
+
 .crumbs-list {
   display: flex;
   align-items: center;
   gap: 6px;
+  min-width: 0;
   flex-wrap: wrap;
 }
 

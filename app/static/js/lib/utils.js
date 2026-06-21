@@ -66,3 +66,23 @@ export function isArchivePath(path) {
 export function folderNameFromPath(path) {
   return (path || "").split("/").filter(Boolean).slice(-1)[0] || "";
 }
+
+export function folderParts(path) {
+  return (path || "").split("/").filter(Boolean);
+}
+
+export function folderParent(path) {
+  return folderParts(path).slice(0, -1).join("/");
+}
+
+export function folderBaseName(path, fallback = "New Folder") {
+  return folderParts(path).slice(-1)[0] || fallback;
+}
+
+export function normalizeFolderName(value) {
+  return (value || "").trim().replace(/^\/+|\/+$/g, "");
+}
+
+export function folderPathForName(parentPath, folderName) {
+  return parentPath ? `${parentPath}/${folderName}` : folderName;
+}

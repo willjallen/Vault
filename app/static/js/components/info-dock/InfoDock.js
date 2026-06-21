@@ -118,7 +118,6 @@ function filterHistoryItems(historyItems) {
 export function InfoDock({
   doc,
   currentUserId,
-  onClose,
   onDownload,
   onRename,
   onStartEdit,
@@ -280,11 +279,6 @@ export function InfoDock({
             doc.latest_by ? ` · ${doc.latest_by}` : "",
           ]),
         ]),
-        h(
-          "button",
-          { className: "btn ghost compact", type: "button", onClick: () => onClose() },
-          "Hide"
-        ),
       ])
     ),
     h("div", { className: "info-block editing-block" }, [

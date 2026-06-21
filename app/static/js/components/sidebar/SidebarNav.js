@@ -13,7 +13,11 @@ function directChildren(folderChildren, parentPath, predicate) {
     : [];
   return children
     .filter(predicate)
-    .map((path) => ({ name: folderName(path, parentPath ? "Archive" : "Vault"), path }))
+    .map((path) => ({
+      child: true,
+      name: folderName(path, parentPath ? "Archive" : "Vault"),
+      path,
+    }))
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
@@ -44,6 +48,7 @@ function SidebarFolderShortcut({
     {
       className: classNames(
         "folder-node",
+        item.child ? "child-shortcut" : "",
         isActive ? "active" : "",
         isDropTarget ? "drop-target" : "",
         isArchived ? "archived" : ""

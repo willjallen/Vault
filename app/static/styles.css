@@ -350,6 +350,7 @@ header {
 }
 
 .folder-node {
+  position: relative;
   width: 100%;
   max-width: 100%;
   min-width: 0;
@@ -403,6 +404,22 @@ header {
   border-color: var(--accent);
   background: #e0ecff;
   box-shadow: 0 0 0 2px rgba(43, 124, 255, 0.18);
+}
+
+.folder-node.child-shortcut {
+  margin-left: 16px;
+  width: calc(100% - 16px);
+}
+
+.folder-node.child-shortcut::before {
+  content: "";
+  position: absolute;
+  left: -8px;
+  top: -6px;
+  bottom: 50%;
+  width: 8px;
+  border-bottom: 1px solid #d7dde8;
+  border-left: 1px solid #d7dde8;
 }
 
 .folder-node.dragging {
@@ -531,7 +548,7 @@ header {
 
 .file-row {
   display: grid;
-  grid-template-columns: 46px 1fr 220px 170px;
+  grid-template-columns: 46px minmax(0, 1fr) 170px 90px 160px;
   gap: 8px;
   align-items: center;
   padding: 10px 12px;
@@ -700,6 +717,13 @@ header {
   font-size: 0.82rem;
   overflow-wrap: anywhere;
   word-break: break-word;
+}
+
+.file-cell.size {
+  color: var(--muted);
+  font-size: 0.82rem;
+  text-align: right;
+  white-space: nowrap;
 }
 
 .file-cell.status-col {
@@ -1486,8 +1510,13 @@ input[type="text"]:focus {
   }
 
   .file-cell.meta,
+  .file-cell.size,
   .file-cell.status-col {
     grid-column: 2;
+  }
+
+  .file-cell.size {
+    text-align: left;
   }
 
   .modal {

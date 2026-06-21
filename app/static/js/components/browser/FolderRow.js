@@ -74,6 +74,7 @@ export function FolderRow({
           return;
         }
         e.preventDefault();
+        e.stopPropagation();
         if (onContextMenu) {
           onContextMenu(e);
         }
@@ -130,7 +131,16 @@ export function FolderRow({
           parentLabel
         ),
       ]),
-      h("div", { className: "file-cell meta" }, h("span", { className: "muted tiny" }, "Folder")),
+      h(
+        "div",
+        { className: "file-cell meta" },
+        h("span", { className: "muted tiny" }, folder.latest_updated_display || "Not updated yet")
+      ),
+      h(
+        "div",
+        { className: "file-cell size" },
+        h("span", { className: "muted tiny" }, folder.size_display || "0 B")
+      ),
       h("div", { className: "file-cell status-col" }, h("span", { className: "row-chevron" }, "›")),
     ]
   );

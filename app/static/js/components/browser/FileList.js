@@ -17,6 +17,7 @@ export function VaultFileList({
   uploadHover,
   onSelectFolder,
   onSelectFile,
+  onBackgroundClick,
   onOpenFile,
   onFileDragStart,
   onFileDragEnd,
@@ -39,6 +40,16 @@ export function VaultFileList({
   const draftInFolder = inlineFolderDraft && inlineFolderDraft.parent === (folder || "");
   const createDraft = draftInFolder && inlineFolderDraft.mode === "create";
   const emptyState = files.length === 0 && subfolders.length === 0 && !createDraft;
+
+  function handleBackgroundClick(e) {
+    if (e.target.closest && e.target.closest(".file-row")) {
+      return;
+    }
+    if (onBackgroundClick) {
+      onBackgroundClick();
+    }
+  }
+
   return h(
     "section",
     {
@@ -51,6 +62,7 @@ export function VaultFileList({
       onDragOver: onCanvasDragOver,
       onDragLeave: onCanvasDragLeave,
       onDrop: onCanvasDrop,
+      onClick: handleBackgroundClick,
     },
     [
       h("div", { className: "browser-head" }, [

@@ -170,6 +170,7 @@ export function App({ initial }) {
   const redirectingRef = useRef(false);
   const docs = useMemo(() => state.doc_payloads || [], [state.doc_payloads]);
   const folderChildren = useMemo(() => state.folder_children || {}, [state.folder_children]);
+  const folderPayloads = useMemo(() => state.folder_payloads || {}, [state.folder_payloads]);
 
   const redirectToLogin = useCallback(() => {
     if (redirectingRef.current) {
@@ -231,12 +232,23 @@ export function App({ initial }) {
       inArchiveView ? isArchivePath(path) : !isArchivePath(path)
     );
     return raw
-      .map((path) => ({
-        path,
-        name: path.split("/").filter(Boolean).slice(-1)[0] || (inArchiveView ? "Archive" : "Vault"),
-      }))
+      .map((path) => {
+        // eslint-disable-next-line security/detect-object-injection
+        const payload = folderPayloads[path] || {};
+        return {
+          path,
+          name:
+            payload.name ||
+            path.split("/").filter(Boolean).slice(-1)[0] ||
+            (inArchiveView ? "Archive" : "Vault"),
+          latest_updated_display: payload.latest_updated_display || "Not updated yet",
+          latest_updated_at: payload.latest_updated_at || null,
+          size_bytes: payload.size_bytes || 0,
+          size_display: payload.size_display || "0 B",
+        };
+      })
       .sort((a, b) => a.name.localeCompare(b.name));
-  }, [folderChildren, folder, inArchiveView]);
+  }, [folderChildren, folder, folderPayloads, inArchiveView]);
 
   const breadcrumbs = useMemo(() => toBreadcrumbs(folder || ""), [folder]);
   const selectedDoc = docs.find((d) => d.id === selectedId) || null;
@@ -936,6 +948,7 @@ export function App({ initial }) {
       onStartAddingFolder: () => beginCreateFolder(folder),
       onSelectFolder: setFolder,
       onSelectDoc: setSelectedId,
+      onClearSelection: () => setSelectedId(null),
       onOpenDoc: handleView,
       onDropOnFolder: handleDropOnFolder,
       onClearDropHint: clearDropState,

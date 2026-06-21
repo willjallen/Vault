@@ -186,6 +186,7 @@ header {
   border: 1px solid #dfe4ed;
   border-radius: 16px;
   box-shadow: var(--shadow);
+  min-width: 0;
 }
 
 .finder-toolbar {
@@ -248,6 +249,7 @@ header {
   grid-template-columns: 240px minmax(0, 1fr) 340px;
   gap: 12px;
   align-items: stretch;
+  min-width: 0;
 }
 
 .finder-sidebar {
@@ -257,6 +259,8 @@ header {
   padding: 12px;
   box-shadow: 0 10px 26px rgba(15, 23, 42, 0.06);
   min-height: 560px;
+  min-width: 0;
+  overflow: hidden;
 }
 
 .sidebar-section {
@@ -326,6 +330,8 @@ header {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  max-width: 100%;
+  overflow: hidden auto;
 }
 
 .tree-node {
@@ -345,11 +351,14 @@ header {
 
 .folder-node {
   width: 100%;
+  max-width: 100%;
+  min-width: 0;
   border: 1px solid transparent;
   background: #f8fafc;
   border-radius: 10px;
   padding: 9px 10px;
-  display: flex;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
   align-items: center;
   gap: 8px;
   color: var(--text);
@@ -426,10 +435,16 @@ header {
 
 .folder-glyph {
   font-size: 1.1rem;
+  line-height: 1.25;
 }
 
 .folder-name {
   font-weight: 600;
+  line-height: 1.25;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .my-edit-chip {
@@ -480,6 +495,7 @@ header {
   padding: 10px;
   box-shadow: 0 12px 30px rgba(15, 23, 42, 0.08);
   min-height: 560px;
+  min-width: 0;
   position: relative;
 }
 
@@ -523,12 +539,18 @@ header {
   border: 1px solid transparent;
   background: #f8fafc;
   cursor: pointer;
+  min-width: 0;
   transition: all 0.12s ease;
 }
 
 .file-row.folder {
   font-weight: 600;
   background: #fdfdfd;
+}
+
+.file-row.editing {
+  border-color: #cbd5ff;
+  background: #eef2ff;
 }
 
 .file-row:hover {
@@ -639,7 +661,13 @@ header {
 }
 
 .context-label {
+  min-width: 0;
+  overflow-wrap: anywhere;
   pointer-events: none;
+}
+
+.file-cell {
+  min-width: 0;
 }
 
 .file-cell.icon {
@@ -650,11 +678,28 @@ header {
 .file-cell.main .name {
   font-weight: 700;
   color: var(--text);
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.inline-name-editor {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid #cbd5ff;
+  border-radius: 8px;
+  background: #fff;
+  color: var(--text);
+  font: inherit;
+  font-weight: 700;
+  padding: 4px 8px;
 }
 
 .file-cell.meta {
   color: var(--muted);
   font-size: 0.82rem;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .file-cell.status-col {
@@ -694,6 +739,18 @@ header {
   display: flex;
   flex-direction: column;
   gap: 10px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.info-dock * {
+  min-width: 0;
+}
+
+.info-dock :where(h3, p, span, button, a, label, input) {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .info-dock.archived-scope {
@@ -711,6 +768,7 @@ header {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  width: 100%;
 }
 
 .summary-top {
@@ -724,13 +782,20 @@ header {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  width: 100%;
 }
 
 .summary-heading {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 10px;
   flex-wrap: wrap;
+}
+
+.summary-heading h3 {
+  flex: 1 1 160px;
+  line-height: 1.25;
+  margin-bottom: 0;
 }
 
 .location-line {
@@ -746,6 +811,7 @@ header {
   padding: 0;
   color: inherit;
   font: inherit;
+  text-align: left;
 }
 
 .info-block {
@@ -755,12 +821,15 @@ header {
   display: flex;
   flex-direction: column;
   gap: 8px;
+  width: 100%;
 }
 
 .block-heading {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 .editing-block {
@@ -830,6 +899,7 @@ input[type="text"]:focus {
   display: flex;
   align-items: baseline;
   gap: 6px;
+  flex-wrap: wrap;
 }
 
 .history-toggle .chevron {
@@ -856,7 +926,7 @@ input[type="text"]:focus {
 
 .history-row.timeline {
   display: grid;
-  grid-template-columns: 16px 1fr;
+  grid-template-columns: 16px minmax(0, 1fr);
   gap: 12px;
   padding: 10px 0;
 }
@@ -892,13 +962,15 @@ input[type="text"]:focus {
   display: flex;
   flex-direction: column;
   gap: 4px;
+  min-width: 0;
 }
 
 .history-top-line {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
   gap: 10px;
+  flex-wrap: wrap;
 }
 
 .history-action {
@@ -911,6 +983,7 @@ input[type="text"]:focus {
   font-weight: 600;
   font-size: 0.85rem;
   text-decoration: none;
+  max-width: 100%;
 }
 
 .history-download:hover {
@@ -970,6 +1043,8 @@ input[type="text"]:focus {
   border-radius: 999px;
   font-weight: 700;
   font-size: 0.85rem;
+  max-width: 100%;
+  white-space: normal;
 }
 
 .pill {

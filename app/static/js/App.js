@@ -8,6 +8,142 @@ import { useMoveDialog } from "./lib/useMoveDialog.js";
 const { useEffect, useMemo, useState, useCallback, useRef } = React;
 const h = React.createElement;
 
+function compactMenuItems(items) {
+  const compacted = items.filter(Boolean).reduce((acc, item) => {
+    const previous = acc[acc.length - 1];
+    if (item.type === "separator" && (!previous || previous.type === "separator")) {
+      return acc;
+    }
+    acc.push(item);
+    return acc;
+  }, []);
+  if (compacted[compacted.length - 1]?.type === "separator") {
+    compacted.pop();
+  }
+  return compacted;
+}
+
+function buildFileMenuItems(actions) {
+  const { doc, currentUser, busy, isAdmin } = actions;
+  const lock = doc.lock || {};
+  const lockedByMe = lock && lock.by === currentUser.id;
+  const lockedByOther = lock && lock.by && lock.by !== currentUser.id;
+  return compactMenuItems([
+    { label: "Open", action: () => actions.handleView(doc) },
+    { label: "Rename", action: () => actions.handleRenameFile(doc), disabled: busy },
+    {
+      label: "Move...",
+      action: () => actions.openMoveDialogForDoc(doc),
+      disabled: busy || lockedByOther,
+    },
+    doc.archived
+      ? { label: "Restore to Vault", action: () => actions.handleUnarchive(doc.id), disabled: busy }
+      : { label: "Move to Archive", action: () => actions.handleArchive(doc.id), disabled: busy },
+    !doc.archived && !lockedByOther
+      ? {
+          label: lockedByMe ? "Re-download (locked)" : "Lock for editing",
+          action: () => actions.handleStartEdit(doc),
+        }
+      : null,
+    lockedByMe && !doc.archived
+      ? { label: "Unlock file", action: () => actions.handleRelease(doc.id), disabled: busy }
+      : null,
+    isAdmin && doc.archived
+      ? {
+          label: "Delete forever",
+          action: () => {
+            const confirmed = window.confirm(
+              `This will permanently delete "${doc.name}" from the archive. You cannot undo this.`
+            );
+            if (confirmed) {
+              actions.handlePermanentDelete(doc.id);
+            }
+          },
+          danger: true,
+          disabled: busy,
+        }
+      : null,
+  ]);
+}
+
+function buildFolderMenuItems(actions) {
+  const { folderItem, busy, isAdmin } = actions;
+  const folderPath = folderItem.path || "";
+  const isArchivedFolder = folderPath.startsWith("Archive");
+  const hasPath = Boolean(folderPath);
+  const canPermanentDeleteFolder = isAdmin && isArchivedFolder && folderPath !== "Archive";
+  return compactMenuItems([
+    { label: "Open", action: () => actions.setFolder(folderPath) },
+    hasPath
+      ? { label: "Rename", action: () => actions.beginRenameFolder(folderPath), disabled: busy }
+      : null,
+    hasPath
+      ? {
+          label: "Move...",
+          action: () => actions.openMoveDialogForFolder(folderItem),
+          disabled: busy,
+        }
+      : null,
+    hasPath
+      ? isArchivedFolder
+        ? {
+            label: "Restore to Vault",
+            action: () => actions.handleUnarchiveFolder(folderPath, { navigate: false }),
+            disabled: busy,
+          }
+        : {
+            label: "Move to Archive",
+            action: () => actions.handleArchiveFolder(folderPath, { navigate: false }),
+            disabled: busy,
+          }
+      : null,
+    canPermanentDeleteFolder
+      ? {
+          label: "Delete forever",
+          action: () => actions.handlePermanentDeleteFolder(folderPath),
+          danger: true,
+          disabled: busy,
+        }
+      : null,
+  ]);
+}
+
+function buildPageMenuItems(actions) {
+  const currentFolder = actions.folder || "";
+  return [
+    {
+      label: "Upload file",
+      action: actions.handleUploadClick,
+      disabled: actions.busy || actions.uploading,
+    },
+    {
+      label: "New folder",
+      action: () => actions.beginCreateFolder(currentFolder),
+      disabled: actions.busy || actions.creatingFolder,
+    },
+  ];
+}
+
+function folderParts(path) {
+  return (path || "").split("/").filter(Boolean);
+}
+
+function folderParent(path) {
+  return folderParts(path).slice(0, -1).join("/");
+}
+
+function folderBaseName(path, fallback = "New Folder") {
+  return folderParts(path).slice(-1)[0] || fallback;
+}
+
+function normalizeFolderName(value) {
+  return (value || "").trim().replace(/^\/+|\/+$/g, "");
+}
+
+function folderPathForName(parentPath, folderName) {
+  return parentPath ? `${parentPath}/${folderName}` : folderName;
+}
+
 export function App({ initial }) {
   const [folder, setFolder] = useState(initial.current_folder || "");
   const [state, setState] = useState(initial);
@@ -18,9 +154,8 @@ export function App({ initial }) {
   const [draggingId, setDraggingId] = useState(null);
   const [dropHint, setDropHint] = useState(null);
   const [uploadHover, setUploadHover] = useState(false);
-  const [addingFolder, setAddingFolder] = useState(false);
-  const [newFolderName, setNewFolderName] = useState("");
   const [creatingFolder, setCreatingFolder] = useState(false);
+  const [inlineFolderDraft, setInlineFolderDraft] = useState(null);
   const [contextMenu, setContextMenu] = useState(null);
   const [draggingFolderPath, setDraggingFolderPath] = useState(null);
   const [toast, setToast] = useState("");
@@ -492,13 +627,17 @@ export function App({ initial }) {
     setDraggingFolderPath,
   });
 
-  async function handleCreateFolder() {
-    const trimmed = (newFolderName || "").trim().replace(/^\/+|\/+$/g, "");
+  async function handleCreateFolder(folderName, parentFolder = folder) {
+    const trimmed = normalizeFolderName(folderName);
     if (!trimmed) {
       setError("Folder name is required.");
-      return;
+      return false;
     }
-    const targetPath = folder ? `${folder}/${trimmed}` : trimmed;
+    if (trimmed.includes("/")) {
+      setError("Folder name cannot contain slashes.");
+      return false;
+    }
+    const targetPath = folderPathForName(parentFolder || "", trimmed);
     setCreatingFolder(true);
     setError("");
     const form = new FormData();
@@ -509,12 +648,11 @@ export function App({ initial }) {
         const detail = await res.json().catch(() => ({}));
         throw new Error(detail.detail || "Could not create folder");
       }
-      await refresh(targetPath);
-      setFolder(targetPath);
-      setNewFolderName("");
-      setAddingFolder(false);
+      await refresh(parentFolder || "");
+      return true;
     } catch (err) {
       setError(err.message || "Could not create folder");
+      return false;
     } finally {
       setCreatingFolder(false);
     }
@@ -523,6 +661,68 @@ export function App({ initial }) {
   function handleUploadClick() {
     if (uploadInput.current) {
       uploadInput.current.click();
+    }
+  }
+
+  function beginCreateFolder(parentFolder = folder) {
+    setSelectedId(null);
+    setInlineFolderDraft({
+      mode: "create",
+      parent: parentFolder || "",
+      path: "",
+      value: "New Folder",
+    });
+  }
+
+  function beginRenameFolder(targetFolder = folder) {
+    const folderPath = typeof targetFolder === "string" ? targetFolder : "";
+    if (!folderPath || folderPath === "Archive") {
+      setError("Choose a folder to rename.");
+      return;
+    }
+    const parentPath = folderParent(folderPath);
+    if ((folder || "") !== parentPath) {
+      setFolder(parentPath);
+    }
+    setSelectedId(null);
+    setInlineFolderDraft({
+      mode: "rename",
+      parent: parentPath,
+      path: folderPath,
+      value: folderBaseName(folderPath, "Folder"),
+    });
+  }
+
+  function handleInlineFolderNameChange(value) {
+    setInlineFolderDraft((draft) => (draft ? { ...draft, value } : draft));
+  }
+
+  function handleCancelInlineFolder() {
+    setInlineFolderDraft(null);
+  }
+
+  async function handleCommitInlineFolder(value) {
+    const draft = inlineFolderDraft;
+    if (!draft) {
+      return;
+    }
+    const trimmed = normalizeFolderName(value);
+    if (!trimmed) {
+      setError("Folder name is required.");
+      return;
+    }
+    if (trimmed.includes("/")) {
+      setError("Folder name cannot contain slashes.");
+      return;
+    }
+    const success =
+      draft.mode === "create"
+        ? await handleCreateFolder(trimmed, draft.parent)
+        : await handleRenameFolder(draft.path, folderPathForName(draft.parent, trimmed), {
+            navigate: false,
+          });
+    if (success || folderPathForName(draft.parent, trimmed) === draft.path) {
+      setInlineFolderDraft(null);
     }
   }
 
@@ -633,6 +833,36 @@ export function App({ initial }) {
     setSelectedId,
   });
 
+  function contextActions(extra = {}) {
+    return {
+      beginCreateFolder,
+      beginRenameFolder,
+      busy,
+      creatingFolder,
+      currentUser,
+      folder,
+      handleArchive,
+      handleArchiveFolder,
+      handlePermanentDelete,
+      handlePermanentDeleteFolder,
+      handleRelease,
+      handleRenameFile,
+      handleRenameFolder,
+      handleStartEdit,
+      handleUnarchive,
+      handleUnarchiveFolder,
+      handleUploadClick,
+      handleView,
+      isAdmin,
+      openMoveDialogForDoc,
+      openMoveDialogForFolder,
+      selectedDoc,
+      setFolder,
+      uploading,
+      ...extra,
+    };
+  }
+
   function handleFileContextMenu(evt, doc) {
     evt.preventDefault();
     evt.stopPropagation();
@@ -640,49 +870,7 @@ export function App({ initial }) {
       return;
     }
     setSelectedId(doc.id);
-    const lock = doc.lock || {};
-    const lockedByMe = lock && lock.by === currentUser.id;
-    const lockedByOther = lock && lock.by && lock.by !== currentUser.id;
-    const items = [
-      { label: "Open", action: () => handleView(doc) },
-      {
-        label: "Rename",
-        action: () => handleRenameFile(doc),
-        disabled: busy,
-      },
-      {
-        label: "Move…",
-        action: () => openMoveDialogForDoc(doc),
-        disabled: busy || lockedByOther,
-      },
-      doc.archived
-        ? { label: "Restore to Vault", action: () => handleUnarchive(doc.id), disabled: busy }
-        : { label: "Move to Archive", action: () => handleArchive(doc.id), disabled: busy },
-      !doc.archived && !lockedByOther
-        ? {
-            label: lockedByMe ? "Re-download (locked)" : "Lock for editing",
-            action: () => handleStartEdit(doc),
-          }
-        : null,
-      lockedByMe && !doc.archived
-        ? { label: "Unlock file", action: () => handleRelease(doc.id), disabled: busy }
-        : null,
-      isAdmin && doc.archived
-        ? {
-            label: "Delete forever",
-            action: () => {
-              const confirmed = window.confirm(
-                `This will permanently delete "${doc.name}" from the archive. You cannot undo this.`
-              );
-              if (confirmed) {
-                handlePermanentDelete(doc.id);
-              }
-            },
-            danger: true,
-            disabled: busy,
-          }
-        : null,
-    ].filter(Boolean);
+    const items = buildFileMenuItems(contextActions({ doc }));
     setContextMenu({ x: evt.clientX, y: evt.clientY, items });
   }
 
@@ -692,48 +880,13 @@ export function App({ initial }) {
     if (!folderItem) {
       return;
     }
-    const isArchivedFolder = (folderItem.path || "").startsWith("Archive");
-    const hasPath = Boolean(folderItem.path);
-    const canPermanentDeleteFolder =
-      isAdmin && isArchivedFolder && folderItem.path && folderItem.path !== "Archive";
-    const items = [
-      { label: "Open", action: () => setFolder(folderItem.path || "") },
-      hasPath
-        ? {
-            label: "Rename",
-            action: () => handleRenameFolder(folderItem.path),
-            disabled: busy,
-          }
-        : null,
-      hasPath
-        ? {
-            label: "Move…",
-            action: () => openMoveDialogForFolder(folderItem),
-            disabled: busy,
-          }
-        : null,
-      hasPath
-        ? isArchivedFolder
-          ? {
-              label: "Restore to Vault",
-              action: () => handleUnarchiveFolder(folderItem.path, { navigate: false }),
-              disabled: busy,
-            }
-          : {
-              label: "Move to Archive",
-              action: () => handleArchiveFolder(folderItem.path, { navigate: false }),
-              disabled: busy,
-            }
-        : null,
-      canPermanentDeleteFolder
-        ? {
-            label: "Delete forever",
-            action: () => handlePermanentDeleteFolder(folderItem.path),
-            danger: true,
-            disabled: busy,
-          }
-        : null,
-    ].filter(Boolean);
+    const items = buildFolderMenuItems(contextActions({ folderItem }));
+    setContextMenu({ x: evt.clientX, y: evt.clientY, items });
+  }
+
+  function handlePageContextMenu(evt) {
+    evt.preventDefault();
+    const items = buildPageMenuItems(contextActions());
     setContextMenu({ x: evt.clientX, y: evt.clientY, items });
   }
 
@@ -775,16 +928,12 @@ export function App({ initial }) {
       draggingFolderPath,
       currentUser,
       isAdmin,
-      addingFolder,
       creatingFolder,
-      newFolderName,
-      onNewFolderNameChange: setNewFolderName,
-      onStartAddingFolder: () => setAddingFolder(true),
-      onCancelCreateFolder: () => {
-        setAddingFolder(false);
-        setNewFolderName("");
-      },
-      onCreateFolder: handleCreateFolder,
+      inlineFolderDraft,
+      onInlineFolderNameChange: handleInlineFolderNameChange,
+      onCommitInlineFolder: handleCommitInlineFolder,
+      onCancelInlineFolder: handleCancelInlineFolder,
+      onStartAddingFolder: () => beginCreateFolder(folder),
       onSelectFolder: setFolder,
       onSelectDoc: setSelectedId,
       onOpenDoc: handleView,
@@ -799,6 +948,7 @@ export function App({ initial }) {
       onFolderDragEnd: handleFolderDragEnd,
       onFileContextMenu: handleFileContextMenu,
       onFolderContextMenu: handleFolderContextMenu,
+      onPageContextMenu: handlePageContextMenu,
       onUploadFile: (file) => handleUpload(file),
       onTriggerUpload: handleUploadClick,
       uploadInputRef: uploadInput,

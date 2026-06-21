@@ -47,8 +47,11 @@ export function FileRow({
       onDragStart: (e) => onDragStart(e, doc.id),
       onDragEnd: onDragEnd,
       onContextMenu: (e) => {
+        if (selectedId !== doc.id) {
+          return;
+        }
         e.preventDefault();
-        onSelect(doc.id);
+        e.stopPropagation();
         if (onContextMenu) {
           onContextMenu(e);
         }

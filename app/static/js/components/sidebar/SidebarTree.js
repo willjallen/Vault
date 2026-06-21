@@ -31,6 +31,7 @@ export function SidebarTree({
           ),
           onClick: () => onSelect(""),
           onContextMenu: (e) => onContextMenu && onContextMenu(e, { path: "", name: "Vault" }),
+          title: "Vault",
           draggable: false,
           onDragEnter: (e) => {
             e.preventDefault();

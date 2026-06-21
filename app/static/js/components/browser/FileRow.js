@@ -47,11 +47,9 @@ export function FileRow({
       onDragStart: (e) => onDragStart(e, doc.id),
       onDragEnd: onDragEnd,
       onContextMenu: (e) => {
-        if (selectedId !== doc.id) {
-          return;
-        }
         e.preventDefault();
         e.stopPropagation();
+        onSelect(doc.id);
         if (onContextMenu) {
           onContextMenu(e);
         }
@@ -78,6 +76,11 @@ export function FileRow({
             )
           : h("div", { className: "muted tiny" }, "No updates yet"),
       ]),
+      h(
+        "div",
+        { className: "file-cell size" },
+        h("span", { className: "muted tiny" }, doc.size_display || "-")
+      ),
       h("div", { className: "file-cell status-col" }, [
         h(StatusBadge, { doc, currentUserId: currentUser.id, showReady: false }),
         h(

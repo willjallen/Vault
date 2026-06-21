@@ -542,6 +542,42 @@ def breadcrumbs_for(folder: str) -> list[dict[str, str]]:
     return crumbs
 
 
+def format_size(size_bytes: int | None) -> str:
+    if size_bytes is None:
+        return "-"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    size = float(size_bytes)
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            return f"{int(size)} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size_bytes} B"
+
+
+def normalize_timestamp(timestamp: dt.datetime | None) -> dt.datetime | None:
+    if not timestamp:
+        return None
+    if timestamp.tzinfo is None:
+        return timestamp.replace(tzinfo=dt.UTC)
+    return timestamp.astimezone(dt.UTC)
+
+
+def format_mtime(timestamp: dt.datetime | None) -> str:
+    normalized = normalize_timestamp(timestamp)
+    if not normalized:
+        return "Not updated yet"
+    return normalized.strftime("%b %d, %Y")
+
+
+def folder_stat_mtime(folder: str) -> dt.datetime | None:
+    target = FILES_PATH if not folder else FILES_PATH / folder
+    try:
+        stat = target.stat()
+    except OSError:
+        return None
+    return dt.datetime.fromtimestamp(stat.st_mtime, tz=dt.UTC)
+
+
 def get_document_or_404(doc_id: int, db: Session) -> Document:
     try:
         return db.execute(select(Document).where(Document.id == doc_id)).scalar_one()
@@ -585,11 +621,19 @@ def build_state(user: UserContext, current_folder: str, db: Session) -> dict[str
         events_by_document[event.document_id].append(event)
 
     doc_payloads = []
+    doc_stats = []
     for doc in docs:
         doc_versions = versions_by_document.get(doc.id, [])
         filtered_versions = dedupe_versions_by_checksum(doc_versions)
         version_signatures = {version_signature(v) for v in filtered_versions}
         latest_version = filtered_versions[0] if filtered_versions else None
+        latest_size_bytes = latest_version.size_bytes if latest_version else None
+        if latest_size_bytes is None:
+            try:
+                latest_size_bytes = safe_path(doc.path).stat().st_size
+            except (OSError, HTTPException):
+                latest_size_bytes = None
+        latest_updated_at = normalize_timestamp(doc.latest_modified_at)
         lock = locks.get(doc.id)
         archived = is_archived_path(doc.path)
         history_items = []
@@ -638,12 +682,8 @@ def build_state(user: UserContext, current_folder: str, db: Session) -> dict[str
                 "name": Path(doc.path).name,
                 "path": doc.path,
                 "folder": "/".join(Path(doc.path).parent.parts),
-                "latest_updated_at": doc.latest_modified_at.isoformat()
-                if doc.latest_modified_at
-                else None,
-                "latest_updated_display": doc.latest_modified_at.strftime("%b %d, %Y")
-                if doc.latest_modified_at
-                else None,
+                "latest_updated_at": latest_updated_at.isoformat() if latest_updated_at else None,
+                "latest_updated_display": format_mtime(latest_updated_at),
                 "latest_by": (latest_version.committed_by_name or latest_version.committed_by)
                 if latest_version
                 else None,
@@ -655,6 +695,8 @@ def build_state(user: UserContext, current_folder: str, db: Session) -> dict[str
                 "created_by": doc.created_by,
                 "created_by_name": doc.created_by_name,
                 "created_at": doc.created_at.isoformat() if doc.created_at else None,
+                "size_bytes": latest_size_bytes,
+                "size_display": format_size(latest_size_bytes),
                 "lock": {
                     "by": lock.locked_by if lock else None,
                     "name": lock.locked_by_name if lock else None,
@@ -667,11 +709,44 @@ def build_state(user: UserContext, current_folder: str, db: Session) -> dict[str
                 "versions": history_items,
             },
         )
+        doc_stats.append(
+            {
+                "path": doc.path,
+                "size_bytes": latest_size_bytes or 0,
+                "mtime": latest_updated_at,
+            },
+        )
 
     _folder_docs, folder_children = build_folder_maps(docs, existing_dirs)
     folder_children_serialized = {
         folder: sorted(children) for folder, children in folder_children.items()
     }
+    all_folders = set(folder_children)
+    for children in folder_children.values():
+        all_folders.update(children)
+    folder_payloads = {}
+    for folder_path in all_folders:
+        folder_size = 0
+        latest_folder_mtime = folder_stat_mtime(folder_path)
+        for doc_stat in doc_stats:
+            if not doc_in_folder(str(doc_stat["path"]), folder_path):
+                continue
+            folder_size += int(doc_stat["size_bytes"])
+            doc_mtime = doc_stat["mtime"]
+            if doc_mtime and (
+                not latest_folder_mtime or doc_mtime > latest_folder_mtime
+            ):
+                latest_folder_mtime = doc_mtime
+        folder_payloads[folder_path] = {
+            "name": folder_path.split("/")[-1] if folder_path else "Vault",
+            "path": folder_path,
+            "latest_updated_at": latest_folder_mtime.isoformat()
+            if latest_folder_mtime
+            else None,
+            "latest_updated_display": format_mtime(latest_folder_mtime),
+            "size_bytes": folder_size,
+            "size_display": format_size(folder_size),
+        }
     breadcrumbs = breadcrumbs_for(current_folder)
     subfolders = sorted(folder_children.get(current_folder, []))
 
@@ -683,6 +758,7 @@ def build_state(user: UserContext, current_folder: str, db: Session) -> dict[str
         "base_domain": BASE_DOMAIN,
         "doc_payloads": doc_payloads,
         "folder_children": folder_children_serialized,
+        "folder_payloads": folder_payloads,
     }
 
 

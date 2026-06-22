@@ -158,16 +158,20 @@ def normalize_folder(folder: str | None) -> str:
     if not cleaned:
         return ""
     parts = [part.strip() for part in cleaned.split("/") if part.strip()]
-    if any(part in {".", ".."} for part in parts):
+    if any(part in {".", ".."} or has_control_char(part) for part in parts):
         raise HTTPException(status_code=400, detail="Invalid folder path")
     return "/".join(parts)
+
+
+def has_control_char(value: str) -> bool:
+    return any(ord(char) < 32 or ord(char) == 127 for char in value)
 
 
 def normalize_item_name(name: str | None, label: str = "Name") -> str:
     cleaned = (name or "").replace("\\", "/").split("/")[-1].strip()
     if not cleaned:
         raise HTTPException(status_code=400, detail=f"{label} is required")
-    if cleaned in {".", ".."} or "/" in cleaned or "\\" in cleaned:
+    if cleaned in {".", ".."} or "/" in cleaned or "\\" in cleaned or has_control_char(cleaned):
         raise HTTPException(status_code=400, detail=f"Invalid {label.lower()}")
     return cleaned
 
@@ -747,7 +751,10 @@ def read_version_bytes(version: DocumentVersion) -> bytes:
 
 
 def download_response(data: bytes, filename: str, mime_type: str | None = None) -> Response:
-    safe_name = filename.replace('"', "").strip() or "download"
+    safe_name = "".join(
+        "_" if ord(char) < 32 or ord(char) == 127 else char
+        for char in filename.replace('"', "")
+    ).strip() or "download"
     content_type = mime_type or mimetypes.guess_type(safe_name)[0] or "application/octet-stream"
     disposition = f'attachment; filename="{safe_name}"; filename*=UTF-8\'\'{quote(safe_name)}'
     return Response(

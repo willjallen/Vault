@@ -7,8 +7,6 @@ const { useCallback, useEffect, useMemo, useRef, useState } = React;
 const personalSections = [
   { id: "personalization", label: "Personalization", detail: "Appearance, density, and focus" },
   { id: "files", label: "Files", detail: "Defaults for browsing and edits" },
-  { id: "transfers", label: "Transfers", detail: "Uploads, downloads, and progress" },
-  { id: "notifications", label: "Notifications", detail: "Activity and alerts" },
 ];
 
 const adminSection = { id: "admin", label: "Admin", detail: "Users, roles, and permissions" };
@@ -634,64 +632,6 @@ function SectionPanel({
           title: "Archive reminders",
           copy: "Surface extra confirmation before permanent deletion.",
           control: ToggleMock({ active: true }),
-        }),
-      ]),
-    ]);
-  }
-
-  if (activeSection === "transfers") {
-    return h("div", { className: "settings-panel" }, [
-      h("div", { className: "settings-panel-head", key: "head" }, [
-        h("p", { className: "eyebrow tiny", key: "eyebrow" }, "Transfers"),
-        h("h2", { key: "title" }, "Progress"),
-        h("p", { className: "muted tiny", key: "copy" }, "Upload and download presentation."),
-      ]),
-      h("div", { className: "settings-card", key: "card" }, [
-        SettingsRow({
-          title: "Show transfer dock",
-          copy: "Progress, speed, and ETA stay visible while files move.",
-          control: ToggleMock({ active: true }),
-        }),
-        SettingsRow({
-          title: "Completion hold",
-          copy: "Keep finished transfers visible long enough to read.",
-          control: SliderMock({ value: 64 }),
-        }),
-        SettingsRow({
-          title: "Animation feel",
-          copy: "Use quick spring motion for transfer status changes.",
-          control: SegmentedMock({ options: ["Calm", "Spring", "Fast"], active: "Spring" }),
-        }),
-      ]),
-    ]);
-  }
-
-  if (activeSection === "notifications") {
-    return h("div", { className: "settings-panel" }, [
-      h("div", { className: "settings-panel-head", key: "head" }, [
-        h("p", { className: "eyebrow tiny", key: "eyebrow" }, "Notifications"),
-        h("h2", { key: "title" }, "Activity"),
-        h(
-          "p",
-          { className: "muted tiny", key: "copy" },
-          "How vault activity should announce itself."
-        ),
-      ]),
-      h("div", { className: "settings-card", key: "card" }, [
-        SettingsRow({
-          title: "Lock changes",
-          copy: "Show a small notice when a file is locked or released.",
-          control: ToggleMock({ active: true }),
-        }),
-        SettingsRow({
-          title: "Archive changes",
-          copy: "Show movement into and out of Archive.",
-          control: ToggleMock({ active: true }),
-        }),
-        SettingsRow({
-          title: "Sound",
-          copy: "Keep vault notifications silent.",
-          control: ToggleMock({ active: false }),
         }),
       ]),
     ]);

@@ -1,50 +1,10 @@
 import { classNames, isArchivePath } from "../../lib/utils.js";
+import { Icon } from "../common/Icon.js";
 import { FolderRow } from "./FolderRow.js";
 import { FileRow } from "./FileRow.js";
 import { EmptyState } from "./EmptyState.js";
 
 const h = React.createElement;
-
-function SearchIcon() {
-  return h(
-    "svg",
-    {
-      "aria-hidden": "true",
-      viewBox: "0 0 20 20",
-      width: 16,
-      height: 16,
-      fill: "none",
-      stroke: "currentColor",
-      strokeWidth: 1.8,
-      strokeLinecap: "round",
-      strokeLinejoin: "round",
-    },
-    [h("circle", { cx: 9, cy: 9, r: 5 }), h("path", { d: "m13 13 4 4" })]
-  );
-}
-
-function RecursiveSearchIcon() {
-  return h(
-    "svg",
-    {
-      "aria-hidden": "true",
-      viewBox: "0 0 20 20",
-      width: 16,
-      height: 16,
-      fill: "none",
-      stroke: "currentColor",
-      strokeWidth: 1.8,
-      strokeLinecap: "round",
-      strokeLinejoin: "round",
-    },
-    [
-      h("path", { d: "M4 5h4a4 4 0 0 1 4 4v6" }),
-      h("path", { d: "M4 15h4a4 4 0 0 0 4-4V5" }),
-      h("path", { d: "m9 12 3 3 3-3" }),
-      h("path", { d: "m9 8 3-3 3 3" }),
-    ]
-  );
-}
 
 export function VaultFileList({
   folder,
@@ -243,7 +203,7 @@ export function VaultFileList({
           onMouseDown: (e) => e.stopPropagation(),
         },
         [
-          h("span", { className: "contents-search-icon" }, h(SearchIcon)),
+          h("span", { className: "contents-search-icon" }, h(Icon, { icon: "search", size: 15 })),
           h("input", {
             type: "search",
             value: searchQuery,
@@ -263,7 +223,7 @@ export function VaultFileList({
               "aria-pressed": recursiveSearch,
               onClick: () => onRecursiveSearchChange && onRecursiveSearchChange(!recursiveSearch),
             },
-            h(RecursiveSearchIcon)
+            h(Icon, { icon: "circle-nodes", size: 15 })
           ),
         ]
       ),

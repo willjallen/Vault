@@ -1,4 +1,5 @@
 import { classNames, isArchivePath } from "../../lib/utils.js";
+import { Icon } from "../common/Icon.js";
 
 const h = React.createElement;
 
@@ -17,6 +18,7 @@ export function FolderNode({
   const offset = Math.min(12 + depth * 10, 78);
   const isActive = activePath === node.path;
   const isArchived = isArchivePath(node.path);
+  const icon = node.icon || (isArchived ? "box-archive" : "folder");
   return h(
     React.Fragment,
     null,
@@ -52,7 +54,17 @@ export function FolderNode({
         },
         onDrop: (e) => onDrop(node.path, e, false),
       },
-      h("span", { className: classNames("folder-glyph", isArchived ? "archived-text" : "") }, "📁"),
+      h(
+        "span",
+        {
+          className: classNames(
+            "folder-glyph",
+            node.color ? `folder-color-${node.color}` : "",
+            isArchived ? "archived-text" : ""
+          ),
+        },
+        h(Icon, { icon, size: 15 })
+      ),
       h(
         "span",
         { className: classNames("folder-name", isArchived ? "archived-text" : "") },

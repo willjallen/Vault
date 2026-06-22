@@ -244,6 +244,7 @@ export function App({ initial }) {
   const {
     docs,
     folderChildren,
+    folderMetadata,
     myEdits,
     recursiveSearch,
     refresh,
@@ -275,20 +276,36 @@ export function App({ initial }) {
       // eslint-disable-next-line security/detect-object-injection
       (folderChildren[parentPath] || [])
         .filter(predicate)
-        .map((path) =>
-          folderToItem({
+        .map((path) => {
+          // eslint-disable-next-line security/detect-object-injection
+          const metadata = folderMetadata[path] || {};
+          return folderToItem({
+            color: metadata.color,
+            icon: metadata.icon,
             name: folderBaseName(path, path === "Archive" ? "Archive" : "Folder"),
             path,
-          })
-        )
+          });
+        })
         .sort((a, b) => a.name.localeCompare(b.name));
+    const vaultMetadata = folderMetadata[""] || {};
+    const archiveMetadata = folderMetadata.Archive || {};
     return [
-      folderToItem({ name: "Vault", path: "" }),
+      folderToItem({
+        color: vaultMetadata.color,
+        icon: vaultMetadata.icon || "house",
+        name: "Vault",
+        path: "",
+      }),
       ...childrenFor("", (path) => !isArchivePath(path)),
-      folderToItem({ name: "Archive", path: "Archive" }),
+      folderToItem({
+        color: archiveMetadata.color,
+        icon: archiveMetadata.icon || "box-archive",
+        name: "Archive",
+        path: "Archive",
+      }),
       ...childrenFor("Archive", (path) => isArchivePath(path)),
     ];
-  }, [folderChildren]);
+  }, [folderChildren, folderMetadata]);
   const folderByKey = useMemo(
     () => new Map(folderPaneItems.map((item) => [keyForItem(item), item])),
     [folderPaneItems]

@@ -1,5 +1,6 @@
 import { classNames, isArchivePath } from "../../lib/utils.js";
 import { FileIcon } from "../common/FileIcon.js";
+import { Icon } from "../common/Icon.js";
 
 const { useEffect, useRef } = React;
 const h = React.createElement;
@@ -163,7 +164,11 @@ export function FolderRow({
         { className: "file-cell size" },
         h("span", { className: "muted tiny" }, folder.size_display || "0 B")
       ),
-      h("div", { className: "file-cell status-col" }, h("span", { className: "row-chevron" }, "›")),
+      h(
+        "div",
+        { className: "file-cell status-col" },
+        h("span", { className: "row-chevron" }, h(Icon, { icon: "chevron-right", size: 12 }))
+      ),
     ]
   );
 }

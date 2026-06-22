@@ -1,4 +1,5 @@
 import { classNames } from "../lib/utils.js";
+import { Icon } from "./common/Icon.js";
 
 const h = React.createElement;
 
@@ -78,7 +79,7 @@ function TransferIcon({ kind }) {
   return h(
     "span",
     { className: classNames("transfer-icon", kind === "upload" ? "uploading" : "downloading") },
-    kind === "upload" ? "↑" : "↓"
+    h(Icon, { icon: kind === "upload" ? "upload" : "download", size: 15 })
   );
 }
 

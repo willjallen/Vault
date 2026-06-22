@@ -1,4 +1,5 @@
 import { classNames, isArchivePath, toBreadcrumbs } from "../../lib/utils.js";
+import { Icon } from "../common/Icon.js";
 
 const { useMemo, useState } = React;
 const h = React.createElement;
@@ -44,7 +45,7 @@ function DestinationList({ items, onSelect }) {
           onClick: () => !folderItem.blocked && onSelect(folderItem.path),
         },
         [
-          h("span", { className: "folder-glyph" }, "📁"),
+          h("span", { className: "folder-glyph" }, h(Icon, { icon: "folder", size: 15 })),
           h("span", { className: "folder-name" }, folderItem.name),
           h(
             "span",

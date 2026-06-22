@@ -1,25 +1,7 @@
 import { classNames } from "../../lib/utils.js";
+import { Icon } from "./Icon.js";
 
 const h = React.createElement;
-
-function LockIcon() {
-  return h(
-    "svg",
-    {
-      className: "status-icon",
-      viewBox: "0 0 20 20",
-      width: 14,
-      height: 14,
-      fill: "none",
-      stroke: "currentColor",
-      strokeWidth: 1.6,
-    },
-    [
-      h("rect", { x: 4, y: 8, width: 12, height: 9, rx: 2 }),
-      h("path", { d: "M7 8V6a3 3 0 1 1 6 0v2" }),
-    ]
-  );
-}
 
 export function StatusBadge({ doc, currentUserId, showReady = true, labelOverride = null }) {
   if (!doc) {
@@ -47,7 +29,10 @@ export function StatusBadge({ doc, currentUserId, showReady = true, labelOverrid
         : statusClass === "locked"
           ? `Checked out by ${lock.name || lock.by}`
           : "Ready to edit");
-  const icon = statusClass === "locked" || statusClass === "locked-self" ? h(LockIcon) : null;
+  const icon =
+    statusClass === "locked" || statusClass === "locked-self"
+      ? h(Icon, { className: "status-icon", icon: "lock", size: 14 })
+      : null;
   return h(
     "span",
     {

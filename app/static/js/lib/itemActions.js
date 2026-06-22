@@ -23,9 +23,14 @@ export function docToItem(doc) {
 export function folderToItem(folderItem) {
   return {
     archived: isArchivePath(folderItem.path || ""),
+    color: folderItem.color || "",
+    icon: folderItem.icon || "",
+    latest_updated_at: folderItem.latest_updated_at || null,
+    latest_updated_display: folderItem.latest_updated_display || "",
     name: folderItem.name || folderBaseName(folderItem.path || "", "Folder"),
     path: folderItem.path || "",
     size_bytes: folderItem.size_bytes || 0,
+    size_display: folderItem.size_display || "",
     type: "folder",
   };
 }

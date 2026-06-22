@@ -99,6 +99,68 @@ class StorageReconciliationTests(unittest.TestCase):
 
             self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
 
+    def test_apply_preserves_remote_orphan_metadata_without_supported_delete(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="vault-reconcile-remote-") as temp_dir:
+            script = textwrap.dedent(
+                """
+                from app.db import SessionLocal, init_db
+                from app.models import Blob, BlobLocation
+                from app.routers import storage_reconciliation_report
+                from app.storage import ensure_storage
+
+
+                init_db()
+                ensure_storage()
+                with SessionLocal() as db:
+                    blob = Blob(hash_algo="sha256", hash="remote-only", size_bytes=12)
+                    db.add(blob)
+                    db.flush()
+                    db.add(
+                        BlobLocation(
+                            blob_id=blob.id,
+                            backend="s3",
+                            bucket="vault-prod",
+                            object_key="objects/sha256/remote-only",
+                        ),
+                    )
+                    db.commit()
+                    blob_id = blob.id
+
+                    before = storage_reconciliation_report(db, apply=False)
+                    assert before["orphan_blob_ids"] == [blob_id]
+                    assert before["unreferenced_local_keys"] == []
+
+                    applied = storage_reconciliation_report(db, apply=True)
+                    assert applied["orphan_blob_ids"] == [blob_id]
+                    assert applied["deleted_local_keys"] == []
+                    db.commit()
+
+                    after = storage_reconciliation_report(db, apply=False)
+                    assert after["orphan_blob_ids"] == [blob_id]
+                    assert after["unreferenced_local_keys"] == []
+                    assert db.query(Blob).count() == 1
+                    location = db.query(BlobLocation).one()
+                    assert location.blob_id == blob_id
+                    assert location.backend == "s3"
+                    assert location.object_key == "objects/sha256/remote-only"
+                """,
+            )
+            env = os.environ.copy()
+            env["VAULT_DB_PATH"] = str(Path(temp_dir) / "vault.db")
+            env["VAULT_OBJECTS_PATH"] = str(Path(temp_dir) / "objects")
+
+            completed = subprocess.run(
+                [sys.executable, "-c", script],
+                check=False,
+                cwd=Path(__file__).resolve().parents[1],
+                env=env,
+                stderr=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                text=True,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

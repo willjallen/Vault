@@ -1,4 +1,4 @@
-import { docToItem, folderToItem } from "./itemActions.js";
+import { folderToItem } from "./itemActions.js";
 import {
   folderBaseName,
   folderParent,
@@ -151,6 +151,10 @@ export function createFolderActionHandlers({
     if (!draft) {
       return;
     }
+    if (draft.mode === "renameFile") {
+      await handleCommitInlineFile(draft, value);
+      return;
+    }
     const trimmed = normalizeFolderName(value);
     if (!trimmed) {
       setError("Folder name is required.");
@@ -175,34 +179,53 @@ export function createFolderActionHandlers({
       setError("Document not found.");
       return;
     }
-    const next = window.prompt("Rename file", doc.name || "");
-    if (next === null) {
-      return;
+    const parentPath = doc.folder || "";
+    if ((folder || "") !== parentPath) {
+      replaceFolder(parentPath);
     }
-    const trimmed = (next || "").trim();
+    setSelectedId(doc.id);
+    setInlineFolderDraft({
+      docId: doc.id,
+      mode: "renameFile",
+      parent: parentPath,
+      path: doc.path || (parentPath ? `${parentPath}/${doc.name}` : doc.name),
+      value: doc.name || "",
+    });
+  }
+
+  async function handleCommitInlineFile(draft, value) {
+    const trimmed = (value || "").trim();
     if (!trimmed) {
       setError("File name is required.");
-      return;
+      return false;
     }
     if (trimmed.includes("/")) {
       setError("File name cannot contain slashes.");
-      return;
+      return false;
     }
-    const targetPath = doc.folder ? `${doc.folder}/${trimmed}` : trimmed;
-    if (targetPath === doc.path) {
-      return;
+    const targetPath = draft.parent ? `${draft.parent}/${trimmed}` : trimmed;
+    if (targetPath === draft.path) {
+      setInlineFolderDraft(null);
+      return true;
     }
     setBusy(true);
     setError("");
-    postAction("rename", [docToItem(doc)], { name: trimmed })
-      .then(async (payload) => {
-        if (payload.failed?.length) {
-          throw new Error(payload.failed[0].detail || "Rename failed");
-        }
-        await refreshAfterAction();
-      })
-      .catch((err) => setError(err.message || "Rename failed."))
-      .finally(() => setBusy(false));
+    try {
+      const payload = await postAction("rename", [{ type: "document", id: draft.docId }], {
+        name: trimmed,
+      });
+      if (payload.failed?.length) {
+        throw new Error(payload.failed[0].detail || "Rename failed");
+      }
+      await refreshAfterAction(draft.parent);
+      setInlineFolderDraft(null);
+      return true;
+    } catch (err) {
+      setError(err.message || "Rename failed.");
+      return false;
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function handleRenameFolder(targetFolder = folder, newPathOverride = null, options = {}) {

@@ -422,6 +422,18 @@ def ensure_unique_folder_name(
         raise HTTPException(status_code=400, detail="A folder already exists at that path")
 
 
+def remove_empty_folder_conflict(
+    db: Session,
+    parent_id: int,
+    name: str,
+    exclude_folder_id: int | None = None,
+) -> None:
+    existing = find_child_folder(db, parent_id, name)
+    if existing and existing.id != exclude_folder_id and not folder_has_items(db, existing):
+        db.delete(existing)
+        db.flush()
+
+
 def document_in_folder(
     db: Session,
     folder_id: int,
@@ -926,14 +938,7 @@ def archive_folder_item(source: Folder, request: Request, user: UserContext, db:
     target_path = public_folder_path(ARCHIVE_ROOT_KEY, folder_relative_path(source))
     target_parent = get_or_create_folder_path(db, "/".join(target_path.split("/")[:-1]))
     target_name = normalize_item_name(target_path.split("/")[-1], "Folder name")
-    existing_target = find_child_folder(db, target_parent.id, target_name)
-    if (
-        existing_target
-        and existing_target.id != source.id
-        and not folder_has_items(db, existing_target)
-    ):
-        db.delete(existing_target)
-        db.flush()
+    remove_empty_folder_conflict(db, target_parent.id, target_name, source.id)
     ensure_unique_folder_name(db, target_parent.id, target_name, source.id)
     meta = client_meta(request)
     for doc in docs_in_folder_subtree(db, source):
@@ -963,6 +968,7 @@ def restore_folder_item(source: Folder, request: Request, user: UserContext, db:
     target_path = folder_relative_path(source)
     target_parent = get_or_create_folder_path(db, "/".join(target_path.split("/")[:-1]))
     target_name = normalize_item_name(target_path.split("/")[-1], "Folder name")
+    remove_empty_folder_conflict(db, target_parent.id, target_name, source.id)
     ensure_unique_folder_name(db, target_parent.id, target_name, source.id)
     archive_parent = source.parent
     meta = client_meta(request)

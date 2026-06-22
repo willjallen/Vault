@@ -2254,6 +2254,7 @@ def delete_items_forever(
             try:
                 if item.type == "document":
                     doc = get_document_or_404(item.id or 0, db)
+                    refresh_document_location(doc, db)
                     if not document_is_archive(doc):
                         raise HTTPException(
                             status_code=400,

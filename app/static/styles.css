@@ -227,6 +227,20 @@ header {
   border-color: #fecdd3;
 }
 
+.btn.icon-button {
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+}
+
+.logout-icon {
+  display: block;
+}
+
 .btn.danger {
   color: #b91c1c;
   border-color: #fecdd3;
@@ -1389,10 +1403,6 @@ input[type="text"]:focus {
 
 .table-wrapper {
   overflow-x: auto;
-}
-
-.upload-control {
-  position: relative;
 }
 
 .new-folder-inline {

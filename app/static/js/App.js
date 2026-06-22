@@ -52,6 +52,10 @@ export function App({ initial }) {
     (window.location.hostname.includes(".")
       ? window.location.hostname.split(".").slice(1).join(".")
       : "");
+  const logoutUrl = useMemo(() => {
+    const rd = encodeURIComponent(window.location.href);
+    return baseDomain ? `https://auth.${baseDomain}/logout?rd=${rd}` : `/logout?rd=${rd}`;
+  }, [baseDomain]);
   const redirectingRef = useRef(false);
   const docs = useMemo(() => state.doc_payloads || [], [state.doc_payloads]);
   const folderChildren = useMemo(() => state.folder_children || {}, [state.folder_children]);
@@ -894,9 +898,8 @@ export function App({ initial }) {
       onFolderContextMenu: handleFolderContextMenu,
       onMyEditContextMenu: handleMyEditContextMenu,
       onPageContextMenu: handlePageContextMenu,
-      onUploadFile: (file) => handleUpload(file),
       onTriggerUpload: handleUploadClick,
-      uploadInputRef: uploadInput,
+      logoutUrl,
       onDownload: handleView,
       onLock: handleLock,
       onRename: handleRenameFile,
@@ -909,7 +912,6 @@ export function App({ initial }) {
       onPermanentDelete: handlePermanentDelete,
       onOpenFolder: navigateToFolder,
       busy,
-      uploading,
     }),
     moveTarget
       ? h(MoveDialog, {
@@ -925,6 +927,12 @@ export function App({ initial }) {
           onNewFolderNameChange: setMoveNewFolderName,
         })
       : null,
+    h("input", {
+      type: "file",
+      ref: uploadInput,
+      className: "hidden-input",
+      onChange: (e) => handleUpload(e.target.files[0]),
+    }),
     h("input", {
       type: "file",
       ref: versionUploadInput,

@@ -2,6 +2,29 @@ import { Breadcrumbs } from "../common/Breadcrumbs.js";
 
 const h = React.createElement;
 
+function LogoutIcon() {
+  return h(
+    "svg",
+    {
+      "aria-hidden": "true",
+      className: "logout-icon",
+      fill: "none",
+      height: "18",
+      stroke: "currentColor",
+      strokeLinecap: "round",
+      strokeLinejoin: "round",
+      strokeWidth: "2",
+      viewBox: "0 0 24 24",
+      width: "18",
+    },
+    [
+      h("path", { d: "M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4", key: "door" }),
+      h("path", { d: "M16 17l5-5-5-5", key: "arrow" }),
+      h("path", { d: "M21 12H9", key: "line" }),
+    ]
+  );
+}
+
 export function Toolbar({
   folder,
   breadcrumbs,
@@ -11,11 +34,7 @@ export function Toolbar({
   onNavigateBack,
   onNavigateForward,
   onNavigateUp,
-  _busy,
-  uploading,
-  uploadInputRef,
-  onUploadFile,
-  onTriggerUpload,
+  logoutUrl,
   onSelectFolder,
   onDropOnFolder,
   onClearDrop,
@@ -72,24 +91,14 @@ export function Toolbar({
       "div",
       { className: "toolbar-actions" },
       h(
-        "div",
-        { className: "upload-control" },
-        h("input", {
-          type: "file",
-          ref: uploadInputRef,
-          className: "hidden-input",
-          onChange: (e) => onUploadFile(e.target.files[0]),
-        }),
-        h(
-          "button",
-          {
-            className: "btn primary",
-            type: "button",
-            disabled: uploading,
-            onClick: onTriggerUpload,
-          },
-          uploading ? "Uploading..." : "Upload"
-        )
+        "a",
+        {
+          "aria-label": "Log out",
+          className: "btn logout icon-button",
+          href: logoutUrl,
+          title: "Log out",
+        },
+        h(LogoutIcon)
       )
     )
   );

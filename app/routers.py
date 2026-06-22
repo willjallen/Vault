@@ -1703,8 +1703,29 @@ def storage_reconciliation_report(db: Session, apply: bool = False) -> dict[str,
         local_backend = get_storage_backend("local")
         for object_key in orphan_local_keys:
             local_backend.delete_object(object_key)
+        orphan_blob_id_set = set(orphan_blob_ids)
+        remote_location_blob_ids = {
+            location.blob_id
+            for location in db.execute(
+                select(BlobLocation).where(
+                    BlobLocation.blob_id.in_(orphan_blob_id_set),
+                    BlobLocation.backend != "local",
+                ),
+            ).scalars()
+        }
+        local_orphan_locations = list(
+            db.execute(
+                select(BlobLocation).where(
+                    BlobLocation.blob_id.in_(orphan_blob_id_set),
+                    BlobLocation.backend == "local",
+                ),
+            ).scalars(),
+        )
+        for location in local_orphan_locations:
+            db.delete(location)
         for blob in orphan_blobs:
-            db.delete(blob)
+            if blob.id not in remote_location_blob_ids:
+                db.delete(blob)
         for object_key in unreferenced_local_keys:
             local_backend.delete_object(object_key)
         db.flush()

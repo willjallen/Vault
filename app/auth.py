@@ -49,6 +49,8 @@ from .config import (
 from .db import get_db
 from .models import VaultGroup, VaultGroupMembership, VaultUser
 
+LOCAL_DEV_DOMAINS = {"localhost", "127.0.0.1", "::1", "family.localhost"}
+
 
 class UserContext(TypedDict):
     """Canonical Vault user attributes."""
@@ -73,6 +75,15 @@ def _env_flag(name: str) -> bool:
 
 def _split_groups(value: str | None) -> set[str]:
     return {group.strip().lower() for group in (value or "").split(",") if group.strip()}
+
+
+def _clean_header(value: str | None) -> str:
+    return (value or "").strip()
+
+
+def _dev_auth_allowed_for_domain() -> bool:
+    base_domain = _clean_header(os.getenv("BASE_DOMAIN", "family.localhost")).lower()
+    return base_domain in LOCAL_DEV_DOMAINS or base_domain.endswith(".localhost")
 
 
 def _now_utc() -> dt.datetime:
@@ -209,7 +220,9 @@ def _upsert_vault_user(
 
 
 def _dev_identity(db: Session) -> UserContext | None:
-    if AUTH_MODE != "dev" and not _env_flag("VAULT_DEV_AUTH"):
+    if not _env_flag("VAULT_DEV_AUTH"):
+        return None
+    if not _dev_auth_allowed_for_domain():
         return None
 
     subject = (os.getenv("VAULT_DEV_USER", "local-admin") or "local-admin").strip()
@@ -231,7 +244,7 @@ def _dev_identity(db: Session) -> UserContext | None:
 
 
 def _header_identity(request: Request, db: Session) -> UserContext:
-    remote_user = request.headers.get("Remote-User")
+    remote_user = _clean_header(request.headers.get("Remote-User"))
     if not remote_user:
         local_user = _dev_identity(db)
         if local_user:
@@ -240,16 +253,17 @@ def _header_identity(request: Request, db: Session) -> UserContext:
 
     groups = _split_groups(request.headers.get("Remote-Groups"))
     email = (
-        request.headers.get("Remote-Email")
+        _clean_header(request.headers.get("Remote-Email"))
         or os.getenv("VAULT_DEFAULT_USER_EMAIL", "admin@example.com")
         or "admin@example.com"
     )
+    remote_name = _clean_header(request.headers.get("Remote-Name")) or remote_user
     user = _upsert_vault_user(
         db,
         HEADER_AUTH_ISSUER,
         remote_user,
         email,
-        request.headers.get("Remote-Name") or remote_user,
+        remote_name,
         admin_hint=_admin_hint(email, groups),
     )
     return _context_for_user(user, db)

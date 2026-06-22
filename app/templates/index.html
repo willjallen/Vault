@@ -7,21 +7,31 @@
     <script>
       (() => {
         const key = "vault.themePreference";
+        const paletteKey = "vault.palettePreference";
         const allowed = new Set(["system", "light", "dark"]);
+        const allowedPalettes = new Set(["cozy", "winui"]);
         let preference = "system";
+        let palette = "cozy";
         try {
           preference = window.localStorage.getItem(key) || "system";
+          palette = window.localStorage.getItem(paletteKey) || "cozy";
         } catch (_err) {
           preference = "system";
+          palette = "cozy";
         }
         if (!allowed.has(preference)) {
           preference = "system";
+        }
+        if (!allowedPalettes.has(palette)) {
+          palette = "cozy";
         }
         const prefersDark =
           window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
         const resolved = preference === "system" ? (prefersDark ? "dark" : "light") : preference;
         document.documentElement.dataset.themePreference = preference;
         document.documentElement.dataset.theme = resolved;
+        document.documentElement.dataset.palettePreference = palette;
+        document.documentElement.dataset.palette = palette;
         document.documentElement.style.colorScheme = resolved;
       })();
     </script>

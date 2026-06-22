@@ -1,24 +1,24 @@
 import { FinderShell } from "./components/FinderShell.js";
+import { BulkDragPreview } from "./components/BulkDragPreview.js";
 import { ConfirmToast } from "./components/ConfirmToast.js";
 import { TransferDock } from "./components/TransferDock.js";
 import { ContextMenu } from "./components/browser/ContextMenu.js";
 import { MoveDialog } from "./components/browser/MoveDialog.js";
 import {
-  buildFileMenuItems,
-  buildFolderMenuItems,
   buildMyEditMenuItems,
   buildPageMenuItems,
+  buildSelectionMenuItems,
 } from "./lib/contextMenus.js";
 import { createDropHandlers } from "./lib/dropHandlers.js";
 import { createFileLockActions } from "./lib/fileLockActions.js";
+import { createFolderActionHandlers } from "./lib/folderActions.js";
 import {
-  folderBaseName,
-  folderParent,
-  folderPathForName,
-  isArchivePath,
-  normalizeFolderName,
-  toBreadcrumbs,
-} from "./lib/utils.js";
+  createBulkActionHandlers,
+  docToItem,
+  folderToItem,
+  keyForItem,
+} from "./lib/itemActions.js";
+import { folderBaseName, folderParent, isArchivePath, toBreadcrumbs } from "./lib/utils.js";
 import { useMouseNavigation } from "./lib/useMouseNavigation.js";
 import { useMoveDialog } from "./lib/useMoveDialog.js";
 import { useTransfers } from "./lib/useTransfers.js";
@@ -33,10 +33,15 @@ export function App({ initial }) {
   const [folderBackStack, setFolderBackStack] = useState([]);
   const [folderForwardStack, setFolderForwardStack] = useState([]);
   const [selectedId, setSelectedId] = useState(null);
+  const [contentsSelection, setContentsSelection] = useState([]);
+  const [contentsAnchor, setContentsAnchor] = useState(null);
+  const [folderSelection, setFolderSelection] = useState([]);
+  const [folderAnchor, setFolderAnchor] = useState(null);
   const [uploading, setUploading] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [draggingId, setDraggingId] = useState(null);
+  const [dragBundle, setDragBundle] = useState(null);
   const [dropHint, setDropHint] = useState(null);
   const [uploadHover, setUploadHover] = useState(false);
   const [creatingFolder, setCreatingFolder] = useState(false);
@@ -132,6 +137,8 @@ export function App({ initial }) {
     setFolderBackStack((prev) => [...prev, folder || ""]);
     setFolderForwardStack([]);
     setSelectedId(null);
+    setContentsSelection([]);
+    setContentsAnchor(null);
     setFolder(normalized);
     closeContextMenu();
   }
@@ -142,6 +149,8 @@ export function App({ initial }) {
       return;
     }
     setSelectedId(null);
+    setContentsSelection([]);
+    setContentsAnchor(null);
     setFolder(normalized);
     closeContextMenu();
   }
@@ -154,6 +163,8 @@ export function App({ initial }) {
     setFolderBackStack(folderBackStack.slice(0, -1));
     setFolderForwardStack([folder || "", ...folderForwardStack]);
     setSelectedId(null);
+    setContentsSelection([]);
+    setContentsAnchor(null);
     setFolder(nextFolder);
     closeContextMenu();
   }
@@ -166,6 +177,8 @@ export function App({ initial }) {
     setFolderForwardStack(folderForwardStack.slice(1));
     setFolderBackStack([...folderBackStack, folder || ""]);
     setSelectedId(null);
+    setContentsSelection([]);
+    setContentsAnchor(null);
     setFolder(nextFolder);
     closeContextMenu();
   }
@@ -214,6 +227,136 @@ export function App({ initial }) {
     setError,
     setSelectedId,
   });
+
+  const contentsItems = useMemo(
+    () => [...subfolders.map(folderToItem), ...docs.map(docToItem)],
+    [docs, subfolders]
+  );
+  const contentsByKey = useMemo(
+    () => new Map(contentsItems.map((item) => [keyForItem(item), item])),
+    [contentsItems]
+  );
+  const folderPaneItems = useMemo(() => {
+    const childrenFor = (parentPath, predicate) =>
+      // eslint-disable-next-line security/detect-object-injection
+      (folderChildren[parentPath] || [])
+        .filter(predicate)
+        .map((path) =>
+          folderToItem({
+            name: folderBaseName(path, path === "Archive" ? "Archive" : "Folder"),
+            path,
+          })
+        )
+        .sort((a, b) => a.name.localeCompare(b.name));
+    return [
+      folderToItem({ name: "Vault", path: "" }),
+      ...childrenFor("", (path) => !isArchivePath(path)),
+      folderToItem({ name: "Archive", path: "Archive" }),
+      ...childrenFor("Archive", (path) => isArchivePath(path)),
+    ];
+  }, [folderChildren]);
+  const folderByKey = useMemo(
+    () => new Map(folderPaneItems.map((item) => [keyForItem(item), item])),
+    [folderPaneItems]
+  );
+  const selectedContentsItems = useMemo(
+    () => contentsSelection.map((key) => contentsByKey.get(key)).filter(Boolean),
+    [contentsByKey, contentsSelection]
+  );
+  const selectedFolderItems = useMemo(
+    () => folderSelection.map((key) => folderByKey.get(key)).filter(Boolean),
+    [folderByKey, folderSelection]
+  );
+
+  const applyPaneSelection = useCallback(
+    (pane, item, pointerEvent, orderedItems) => {
+      const key = keyForItem(item);
+      const setSelection = pane === "contents" ? setContentsSelection : setFolderSelection;
+      const anchor = pane === "contents" ? contentsAnchor : folderAnchor;
+      const setAnchor = pane === "contents" ? setContentsAnchor : setFolderAnchor;
+      const orderedKeys = orderedItems.map(keyForItem);
+      const isToggle = pointerEvent?.ctrlKey || pointerEvent?.metaKey;
+      const isRange = pointerEvent?.shiftKey && anchor && orderedKeys.includes(anchor);
+      setSelection((current) => {
+        if (isRange) {
+          const start = orderedKeys.indexOf(anchor);
+          const end = orderedKeys.indexOf(key);
+          const [from, to] = start < end ? [start, end] : [end, start];
+          return orderedKeys.slice(from, to + 1);
+        }
+        if (isToggle) {
+          return current.includes(key)
+            ? current.filter((itemKey) => itemKey !== key)
+            : [...current, key];
+        }
+        return [key];
+      });
+      if (!isRange) {
+        setAnchor(key);
+      }
+    },
+    [contentsAnchor, folderAnchor]
+  );
+
+  function clearAllSelections() {
+    setContentsSelection([]);
+    setContentsAnchor(null);
+    setFolderSelection([]);
+    setFolderAnchor(null);
+  }
+
+  function isSelectionClick(pointerEvent) {
+    return Boolean(pointerEvent?.ctrlKey || pointerEvent?.metaKey || pointerEvent?.shiftKey);
+  }
+
+  useEffect(() => {
+    const docItems = selectedContentsItems.filter((item) => item.type === "document");
+    setSelectedId(
+      selectedContentsItems.length === 1 && docItems.length === 1 ? docItems[0].id : null
+    );
+  }, [selectedContentsItems]);
+
+  function handleSelectContentItem(rawItem, type, pointerEvent, orderedItems) {
+    const item = type === "document" ? docToItem(rawItem) : folderToItem(rawItem);
+    if (!item) {
+      return;
+    }
+    const key = keyForItem(item);
+    if (isSelectionClick(pointerEvent)) {
+      setFolderSelection([]);
+      setFolderAnchor(null);
+      applyPaneSelection("contents", item, pointerEvent, orderedItems);
+      return;
+    }
+    if (contentsSelection.includes(key)) {
+      clearAllSelections();
+      return;
+    }
+    if (item.type === "folder") {
+      clearAllSelections();
+      navigateToFolder(item.path || "");
+      return;
+    }
+    setFolderSelection([]);
+    setFolderAnchor(null);
+    applyPaneSelection("contents", item, pointerEvent, orderedItems);
+  }
+
+  function handleSelectFolderItem(item, pointerEvent, orderedItems) {
+    const key = keyForItem(item);
+    if (isSelectionClick(pointerEvent)) {
+      setContentsSelection([]);
+      setContentsAnchor(null);
+      applyPaneSelection("folders", item, pointerEvent, orderedItems);
+      return;
+    }
+    if (folderSelection.includes(key)) {
+      clearAllSelections();
+      return;
+    }
+    clearAllSelections();
+    navigateToFolder(item.path || "");
+  }
 
   const { handleLock, handleRelease, handleSave, handleStartEdit, handleVersionUpload } =
     createFileLockActions({
@@ -277,15 +420,40 @@ export function App({ initial }) {
     }
   }
 
-  function handleView(doc) {
-    downloadWithProgress({
-      name: doc.name,
-      size: doc.size_bytes,
-      url: `/documents/${doc.id}/download`,
-    }).catch((err) => {
-      setError(err.message || "Download failed.");
-    });
-  }
+  const {
+    handleArchive,
+    handleArchiveItems,
+    handleDeleteForeverItems,
+    handleDownloadSelection,
+    handleLockItems,
+    handleMove,
+    handleMoveSelection,
+    handlePermanentDelete,
+    handleRestoreItems,
+    handleUnarchive,
+    handleUnlockItems,
+    handleView,
+    postAction,
+    refreshAfterAction,
+  } = createBulkActionHandlers({
+    apiFetch,
+    clearAllSelections: () => {
+      setContentsSelection([]);
+      setContentsAnchor(null);
+      setFolderSelection([]);
+      setFolderAnchor(null);
+    },
+    docs,
+    downloadWithProgress,
+    refresh,
+    requestConfirm,
+    selectedDoc,
+    setBusy,
+    setDraggingFolderPath,
+    setDraggingId,
+    setDropHint,
+    setError,
+  });
 
   function handleVersionDownload(item) {
     if (!item.download_url) {
@@ -300,264 +468,44 @@ export function App({ initial }) {
     });
   }
 
-  async function handleMove(docId, newPath) {
-    if (!newPath) {
-      return false;
-    }
-    const doc = docs.find((d) => d.id === docId);
-    const pathLower = (newPath || "").trim();
-    const targetInArchive = isArchivePath(pathLower);
-    const docArchived = doc && doc.archived;
-    if (docArchived && !targetInArchive) {
-      setError("Restore this file before moving it out of Archive.");
-      return false;
-    }
-    if (!docArchived && targetInArchive) {
-      setError("Use Move to Archive instead of dragging items into Archive.");
-      return false;
-    }
-    setBusy(true);
-    setError("");
-    const form = new FormData();
-    form.append("new_path", newPath);
-    let success = false;
-    try {
-      const res = await apiFetch(`/documents/${docId}/move`, { method: "POST", body: form });
-      if (!res.ok) {
-        const detail = await res.json().catch(() => ({}));
-        throw new Error(detail.detail || "Move failed");
-      }
-      await refresh(undefined, { invalidateContents: true });
-      success = true;
-    } catch (err) {
-      setError(err.message || "Move failed.");
-    } finally {
-      setBusy(false);
-      setDraggingId(null);
-      setDropHint(null);
-    }
-    return success;
-  }
-
-  async function handleArchive(docId) {
-    const doc = docs.find((item) => item.id === docId) || selectedDoc;
-    const confirmed = await requestConfirm({
-      title: "Move to Archive",
-      message: `Move "${doc?.name || "this file"}" to Archive?`,
-      confirmLabel: "Move",
-    });
-    if (!confirmed) {
-      return false;
-    }
-    setBusy(true);
-    setError("");
-    try {
-      const res = await apiFetch(`/documents/${docId}/archive`, { method: "POST" });
-      if (!res.ok) {
-        const detail = await res.json().catch(() => ({}));
-        throw new Error(detail.detail || "Archive failed");
-      }
-      await refresh(undefined, { invalidateContents: true, sidebar: true });
-      setSelectedId(null);
-      return true;
-    } catch (err) {
-      setError(err.message || "Archive failed.");
-      return false;
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function handleUnarchive(docId) {
-    setBusy(true);
-    setError("");
-    try {
-      const res = await apiFetch(`/documents/${docId}/unarchive`, { method: "POST" });
-      if (!res.ok) {
-        const detail = await res.json().catch(() => ({}));
-        throw new Error(detail.detail || "Unarchive failed");
-      }
-      const data = await res.json();
-      const destFolder = data.path ? data.path.split("/").slice(0, -1).join("/") : "";
-      await refresh(destFolder, { invalidateContents: true, sidebar: true });
-      replaceFolder(destFolder);
-      setSelectedId(null);
-    } catch (err) {
-      setError(err.message || "Unarchive failed.");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function handlePermanentDelete(docId) {
-    const doc = docs.find((item) => item.id === docId) || selectedDoc;
-    const confirmed = await requestConfirm({
-      title: "Delete forever",
-      message: `Permanently delete "${doc?.name || "this file"}" from Archive? This cannot be undone.`,
-      confirmLabel: "Delete forever",
-      tone: "danger",
-    });
-    if (!confirmed) {
-      return false;
-    }
-    setBusy(true);
-    setError("");
-    try {
-      const res = await apiFetch(`/documents/${docId}/permanent_delete`, { method: "POST" });
-      if (!res.ok) {
-        const detail = await res.json().catch(() => ({}));
-        throw new Error(detail.detail || "Delete failed");
-      }
-      await refresh(undefined, { invalidateContents: true, sidebar: true });
-      setSelectedId(null);
-      return true;
-    } catch (err) {
-      setError(err.message || "Delete failed.");
-      return false;
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function handlePermanentDeleteFolder(targetFolder = folder, options = {}) {
-    const selectedFolder = typeof targetFolder === "string" ? targetFolder : folder || "";
-    const currentFolder = folder || "";
-    const withinSelected =
-      selectedFolder &&
-      (currentFolder === selectedFolder || currentFolder.startsWith(`${selectedFolder}/`));
-    const shouldNavigate = options.navigate ?? withinSelected;
-    if (!selectedFolder) {
-      setError("Choose a folder to delete.");
-      return;
-    }
-    if (selectedFolder === "Archive") {
-      setError("Cannot delete the Archive root.");
-      return;
-    }
-    if (!isArchivePath(selectedFolder)) {
-      setError("Delete forever is only available in Archive.");
-      return;
-    }
-    const confirmed = await requestConfirm({
-      title: "Delete forever",
-      message: `Permanently delete "${selectedFolder}" and everything inside? This cannot be undone.`,
-      confirmLabel: "Delete forever",
-      tone: "danger",
-    });
-    if (!confirmed) {
-      return;
-    }
-    setBusy(true);
-    setError("");
-    const form = new FormData();
-    form.append("folder", selectedFolder);
-    try {
-      const res = await apiFetch("/folders/permanent_delete", { method: "POST", body: form });
-      if (!res.ok) {
-        const detail = await res.json().catch(() => ({}));
-        throw new Error(detail.detail || "Delete failed");
-      }
-      const parentFolder = selectedFolder.split("/").slice(0, -1).join("/");
-      const refreshTarget = shouldNavigate ? parentFolder : folder;
-      await refresh(refreshTarget, { invalidateContents: true, sidebar: true });
-      if (shouldNavigate) {
-        replaceFolder(parentFolder);
-      }
-      setSelectedId(null);
-    } catch (err) {
-      setError(err.message || "Delete failed.");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function handleArchiveFolder(targetFolder = folder, options = {}) {
-    const selectedFolder = typeof targetFolder === "string" ? targetFolder : folder || "";
-    const shouldNavigate = options.navigate ?? selectedFolder === folder;
-    if (!selectedFolder || isArchivePath(selectedFolder)) {
-      setError("Pick a Vault folder to move into Archive.");
-      return;
-    }
-    const confirmed = await requestConfirm({
-      title: "Move to Archive",
-      message: `Move "${selectedFolder}" and everything inside to Archive?`,
-      confirmLabel: "Move",
-    });
-    if (!confirmed) {
-      return;
-    }
-    setBusy(true);
-    setError("");
-    const form = new FormData();
-    form.append("folder", selectedFolder);
-    try {
-      const res = await apiFetch("/folders/archive", { method: "POST", body: form });
-      if (!res.ok) {
-        const detail = await res.json().catch(() => ({}));
-        throw new Error(detail.detail || "Archive failed");
-      }
-      const payload = await res.json();
-      const dest = payload.archive_folder || `Archive/${selectedFolder}`;
-      const refreshTarget = shouldNavigate ? dest : folder;
-      await refresh(refreshTarget, { invalidateContents: true, sidebar: true });
-      if (shouldNavigate) {
-        replaceFolder(dest);
-      }
-    } catch (err) {
-      setError(err.message || "Archive failed.");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function handleUnarchiveFolder(targetFolder = folder, options = {}) {
-    const selectedFolder = typeof targetFolder === "string" ? targetFolder : folder || "";
-    const shouldNavigate = options.navigate ?? selectedFolder === folder;
-    if (!selectedFolder || !isArchivePath(selectedFolder)) {
-      setError("Choose an archived folder to restore.");
-      return;
-    }
-    const confirmed = await requestConfirm({
-      title: "Restore to Vault",
-      message: `Restore "${selectedFolder}" back to Vault?`,
-      confirmLabel: "Restore",
-    });
-    if (!confirmed) {
-      return;
-    }
-    setBusy(true);
-    setError("");
-    const form = new FormData();
-    form.append("folder", selectedFolder);
-    try {
-      const res = await apiFetch("/folders/unarchive", { method: "POST", body: form });
-      if (!res.ok) {
-        const detail = await res.json().catch(() => ({}));
-        throw new Error(detail.detail || "Unarchive failed");
-      }
-      const payload = await res.json();
-      const dest = payload.folder || "";
-      const refreshTarget = shouldNavigate ? dest : folder;
-      await refresh(refreshTarget, { invalidateContents: true, sidebar: true });
-      if (shouldNavigate) {
-        replaceFolder(dest);
-      }
-    } catch (err) {
-      setError(err.message || "Unarchive failed.");
-    } finally {
-      setBusy(false);
-    }
-  }
+  const {
+    beginCreateFolder,
+    beginRenameFolder,
+    handleArchiveFolder,
+    handleCancelInlineFolder,
+    handleCommitInlineFolder,
+    handleInlineFolderNameChange,
+    handlePermanentDeleteFolder,
+    handleRenameFile,
+    handleRenameFolder,
+    handleUnarchiveFolder,
+  } = createFolderActionHandlers({
+    apiFetch,
+    folder,
+    handleArchiveItems,
+    handleDeleteForeverItems,
+    handleRestoreItems,
+    inlineFolderDraft,
+    postAction,
+    refresh,
+    refreshAfterAction,
+    replaceFolder,
+    setBusy,
+    setCreatingFolder,
+    setError,
+    setInlineFolderDraft,
+    setSelectedId,
+  });
 
   const {
     handleDropOnFolder,
     handleCanvasDrop,
     handleCanvasDragOver,
     handleCanvasDragLeave,
-    handleFileDragStart,
-    handleFileDragEnd,
-    handleFolderDragStart,
-    handleFolderDragEnd,
+    handleFileDragStart: startFileDrag,
+    handleFileDragEnd: endFileDrag,
+    handleFolderDragStart: startFolderDrag,
+    handleFolderDragEnd: endFolderDrag,
     clearDropState,
   } = createDropHandlers({
     folder,
@@ -567,7 +515,9 @@ export function App({ initial }) {
     setDropHint,
     setUploadHover,
     setError,
+    handleArchiveItems,
     handleArchiveFolder,
+    handleMoveSelection,
     handleRenameFolder,
     handleUpload,
     handleMove,
@@ -576,188 +526,58 @@ export function App({ initial }) {
     setDraggingFolderPath,
   });
 
-  async function handleCreateFolder(folderName, parentFolder = folder) {
-    const trimmed = normalizeFolderName(folderName);
-    if (!trimmed) {
-      setError("Folder name is required.");
-      return false;
+  function beginDragPreview(evt, items) {
+    if (!items || items.length <= 1) {
+      setDragBundle(null);
+      return;
     }
-    if (trimmed.includes("/")) {
-      setError("Folder name cannot contain slashes.");
-      return false;
-    }
-    const targetPath = folderPathForName(parentFolder || "", trimmed);
-    setCreatingFolder(true);
-    setError("");
-    const form = new FormData();
-    form.append("folder", targetPath);
-    try {
-      const res = await apiFetch("/folders", { method: "POST", body: form });
-      if (!res.ok) {
-        const detail = await res.json().catch(() => ({}));
-        throw new Error(detail.detail || "Could not create folder");
-      }
-      await refresh(parentFolder || "", { invalidateContents: true, sidebar: true });
-      return true;
-    } catch (err) {
-      setError(err.message || "Could not create folder");
-      return false;
-    } finally {
-      setCreatingFolder(false);
-    }
+    const transparent = document.createElement("canvas");
+    transparent.width = 1;
+    transparent.height = 1;
+    evt.dataTransfer.setDragImage(transparent, 0, 0);
+    setDragBundle({ items, phase: "entering", x: evt.clientX, y: evt.clientY });
+    window.requestAnimationFrame(() =>
+      setDragBundle((current) => (current ? { ...current, phase: "visible" } : current))
+    );
   }
+
+  function handleFileDragStart(evt, docId, items = []) {
+    beginDragPreview(evt, items);
+    startFileDrag(evt, docId, items);
+  }
+
+  function handleFolderDragStart(evt, path, items = []) {
+    beginDragPreview(evt, items);
+    startFolderDrag(evt, path, items);
+  }
+
+  function handleFileDragEnd() {
+    endFileDrag();
+    setDragBundle(null);
+  }
+
+  function handleFolderDragEnd() {
+    endFolderDrag();
+    setDragBundle(null);
+  }
+
+  useEffect(() => {
+    if (!dragBundle) {
+      return undefined;
+    }
+    function updateDragPosition(evt) {
+      setDragBundle((current) =>
+        current ? { ...current, x: evt.clientX, y: evt.clientY } : current
+      );
+    }
+    window.addEventListener("dragover", updateDragPosition);
+    return () => window.removeEventListener("dragover", updateDragPosition);
+  }, [dragBundle]);
 
   function handleUploadClick() {
     if (uploadInput.current) {
       uploadInput.current.click();
     }
-  }
-
-  function beginCreateFolder(parentFolder = folder) {
-    setSelectedId(null);
-    setInlineFolderDraft({
-      mode: "create",
-      parent: parentFolder || "",
-      path: "",
-      value: "New Folder",
-    });
-  }
-
-  function beginRenameFolder(targetFolder = folder) {
-    const folderPath = typeof targetFolder === "string" ? targetFolder : "";
-    if (!folderPath || folderPath === "Archive") {
-      setError("Choose a folder to rename.");
-      return;
-    }
-    const parentPath = folderParent(folderPath);
-    if ((folder || "") !== parentPath) {
-      replaceFolder(parentPath);
-    }
-    setSelectedId(null);
-    setInlineFolderDraft({
-      mode: "rename",
-      parent: parentPath,
-      path: folderPath,
-      value: folderBaseName(folderPath, "Folder"),
-    });
-  }
-
-  function handleInlineFolderNameChange(value) {
-    setInlineFolderDraft((draft) => (draft ? { ...draft, value } : draft));
-  }
-
-  function handleCancelInlineFolder() {
-    setInlineFolderDraft(null);
-  }
-
-  async function handleCommitInlineFolder(value) {
-    const draft = inlineFolderDraft;
-    if (!draft) {
-      return;
-    }
-    const trimmed = normalizeFolderName(value);
-    if (!trimmed) {
-      setError("Folder name is required.");
-      return;
-    }
-    if (trimmed.includes("/")) {
-      setError("Folder name cannot contain slashes.");
-      return;
-    }
-    const success =
-      draft.mode === "create"
-        ? await handleCreateFolder(trimmed, draft.parent)
-        : await handleRenameFolder(draft.path, folderPathForName(draft.parent, trimmed), {
-            navigate: false,
-          });
-    if (success || folderPathForName(draft.parent, trimmed) === draft.path) {
-      setInlineFolderDraft(null);
-    }
-  }
-
-  function handleRenameFile(doc) {
-    const currentName = doc?.name || "";
-    const next = window.prompt("Rename file", currentName);
-    if (next === null) {
-      return;
-    }
-    const trimmed = (next || "").trim();
-    if (!trimmed) {
-      setError("File name is required.");
-      return;
-    }
-    if (trimmed.includes("/")) {
-      setError("File name cannot contain slashes.");
-      return;
-    }
-    const targetPath = doc.folder ? `${doc.folder}/${trimmed}` : trimmed;
-    if (targetPath === doc.path) {
-      return;
-    }
-    handleMove(doc.id, targetPath);
-  }
-
-  async function handleRenameFolder(targetFolder = folder, newPathOverride = null, options = {}) {
-    const folderPath = typeof targetFolder === "string" ? targetFolder : "";
-    if (!folderPath) {
-      setError("Cannot rename the root Vault folder.");
-      return false;
-    }
-    const parts = folderPath.split("/").filter(Boolean);
-    const currentName = parts.slice(-1)[0] || folderPath;
-    const parentFolder = parts.slice(0, -1).join("/");
-    let newPath = newPathOverride || "";
-    if (!newPath) {
-      const next = window.prompt("Rename folder", currentName);
-      if (next === null) {
-        return;
-      }
-      const trimmed = (next || "").trim().replace(/^\/+|\/+$/g, "");
-      if (!trimmed) {
-        setError("Folder name is required.");
-        return;
-      }
-      if (trimmed.includes("/")) {
-        setError("Folder name cannot contain slashes.");
-        return;
-      }
-      newPath = parentFolder ? `${parentFolder}/${trimmed}` : trimmed;
-    }
-    const normalizedNewPath = (newPath || "").trim().replace(/^\/+|\/+$/g, "");
-    if (!normalizedNewPath) {
-      setError("New folder path is required.");
-      return false;
-    }
-    if (normalizedNewPath === folderPath) {
-      return false;
-    }
-    const shouldNavigate = options.navigate ?? folder === folderPath;
-    setBusy(true);
-    setError("");
-    const form = new FormData();
-    form.append("folder", folderPath);
-    form.append("new_path", normalizedNewPath);
-    let success = false;
-    try {
-      const res = await apiFetch("/folders/rename", { method: "POST", body: form });
-      if (!res.ok) {
-        const detail = await res.json().catch(() => ({}));
-        throw new Error(detail.detail || "Rename failed");
-      }
-      const payload = await res.json();
-      const dest = payload.folder || normalizedNewPath;
-      const refreshTarget = shouldNavigate ? dest : folder;
-      await refresh(refreshTarget, { invalidateContents: true, sidebar: true });
-      if (shouldNavigate) {
-        replaceFolder(dest);
-      }
-      success = true;
-    } catch (err) {
-      setError(err.message || "Rename failed.");
-    } finally {
-      setBusy(false);
-    }
-    return success;
   }
 
   const {
@@ -767,6 +587,7 @@ export function App({ initial }) {
     creatingMoveFolder,
     openMoveDialogForDoc,
     openMoveDialogForFolder,
+    openMoveDialogForSelection,
     closeMoveDialog,
     setMoveDestinationSafe,
     handleCreateMoveFolder,
@@ -775,6 +596,7 @@ export function App({ initial }) {
   } = useMoveDialog({
     folder,
     handleMove,
+    handleMoveSelection,
     handleRenameFolder,
     apiFetch,
     refresh,
@@ -791,22 +613,29 @@ export function App({ initial }) {
       currentUser,
       folder,
       handleArchive,
+      handleArchiveItems,
       handleArchiveFolder,
+      handleDeleteForeverItems,
+      handleDownloadSelection,
+      handleLockItems,
       handleLock,
       handlePermanentDelete,
       handlePermanentDeleteFolder,
       handleRelease,
+      handleRestoreItems,
       handleRenameFile,
       handleRenameFolder,
       handleStartEdit,
       handleUnarchive,
       handleUnarchiveFolder,
+      handleUnlockItems,
       handleUploadClick,
       handleView,
       handleVersionUploadClick,
       isAdmin,
       openMoveDialogForDoc,
       openMoveDialogForFolder,
+      openMoveDialogForSelection,
       selectedDoc,
       navigateToFolder,
       uploading,
@@ -820,8 +649,14 @@ export function App({ initial }) {
     if (!doc) {
       return;
     }
-    setSelectedId(doc.id);
-    const items = buildFileMenuItems(contextActions({ doc }));
+    const item = docToItem(doc);
+    const key = keyForItem(item);
+    const selectedItems = contentsSelection.includes(key) ? selectedContentsItems : [item];
+    if (!contentsSelection.includes(key)) {
+      setContentsSelection([key]);
+      setContentsAnchor(key);
+    }
+    const items = buildSelectionMenuItems(contextActions({ selectedItems }));
     setContextMenu({ x: evt.clientX, y: evt.clientY, items });
   }
 
@@ -842,7 +677,22 @@ export function App({ initial }) {
     if (!folderItem) {
       return;
     }
-    const items = buildFolderMenuItems(contextActions({ folderItem }));
+    const item = folderToItem(folderItem);
+    const key = keyForItem(item);
+    const useFolderPane = folderItem.sourcePane === "folders" || !contentsByKey.has(key);
+    const paneSelection = useFolderPane ? folderSelection : contentsSelection;
+    const paneItems = useFolderPane ? selectedFolderItems : selectedContentsItems;
+    const selectedItems = paneSelection.includes(key) ? paneItems : [item];
+    if (!paneSelection.includes(key)) {
+      if (useFolderPane) {
+        setFolderSelection([key]);
+        setFolderAnchor(key);
+      } else {
+        setContentsSelection([key]);
+        setContentsAnchor(key);
+      }
+    }
+    const items = buildSelectionMenuItems(contextActions({ selectedItems }));
     setContextMenu({ x: evt.clientX, y: evt.clientY, items });
   }
 
@@ -851,6 +701,10 @@ export function App({ initial }) {
     const items = buildPageMenuItems(contextActions());
     setContextMenu({ x: evt.clientX, y: evt.clientY, items });
   }
+
+  const infoSelectionItems = selectedContentsItems.length
+    ? selectedContentsItems
+    : selectedFolderItems;
 
   return h(
     React.Fragment,
@@ -883,6 +737,10 @@ export function App({ initial }) {
       subfolders,
       files: docs,
       selectedId,
+      contentsItems,
+      contentsSelection,
+      folderItems: folderPaneItems,
+      folderSelection,
       selectedDoc,
       searchQuery,
       recursiveSearch,
@@ -904,9 +762,16 @@ export function App({ initial }) {
       onNavigateUp: navigateUp,
       onSelectFolder: navigateToFolder,
       onSelectDoc: setSelectedId,
+      onSelectContentItem: handleSelectContentItem,
+      onSelectFolderItem: handleSelectFolderItem,
       onSearchQueryChange: setSearchQuery,
       onRecursiveSearchChange: setRecursiveSearch,
-      onClearSelection: () => setSelectedId(null),
+      onClearSelection: () => {
+        setContentsSelection([]);
+        setContentsAnchor(null);
+        setFolderSelection([]);
+        setFolderAnchor(null);
+      },
       onOpenDoc: handleView,
       onDropOnFolder: handleDropOnFolder,
       onClearDropHint: clearDropState,
@@ -924,16 +789,24 @@ export function App({ initial }) {
       onTriggerUpload: handleUploadClick,
       logoutUrl,
       onDownload: handleView,
+      selectionItems: infoSelectionItems,
+      onDownloadSelection: handleDownloadSelection,
       onDownloadVersion: handleVersionDownload,
       onLock: handleLock,
+      onLockSelection: handleLockItems,
       onRename: handleRenameFile,
       onMove: openMoveDialogForDoc,
+      onMoveSelection: openMoveDialogForSelection,
       onStartEdit: handleStartEdit,
       onRelease: handleRelease,
+      onReleaseSelection: handleUnlockItems,
       onSave: handleSave,
       onArchive: handleArchive,
+      onArchiveSelection: handleArchiveItems,
       onUnarchive: handleUnarchive,
+      onRestoreSelection: handleRestoreItems,
       onPermanentDelete: handlePermanentDelete,
+      onDeleteSelection: handleDeleteForeverItems,
       onOpenFolder: navigateToFolder,
       busy,
     }),
@@ -964,6 +837,7 @@ export function App({ initial }) {
       onChange: (e) => handleVersionUploadInput(e.target.files[0]),
     }),
     h(TransferDock, { transfers }),
+    h(BulkDragPreview, { drag: dragBundle }),
     h(ConfirmToast, { request: confirmRequest, onResolve: resolveConfirm }),
     contextMenu ? h(ContextMenu, { menu: contextMenu, onClose: closeContextMenu }) : null,
     error ? h("div", { className: "toast error" }, error) : null,

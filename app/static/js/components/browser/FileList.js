@@ -51,7 +51,8 @@ export function VaultFileList({
   subfolders,
   files,
   currentUser,
-  selectedId,
+  selectedKeys = [],
+  orderedItems = [],
   searchQuery = "",
   recursiveSearch = false,
   draggingId,
@@ -59,7 +60,7 @@ export function VaultFileList({
   dropHint,
   uploadHover,
   onSelectFolder,
-  onSelectFile,
+  onSelectItem,
   onSearchQueryChange,
   onRecursiveSearchChange,
   onBackgroundClick,
@@ -86,6 +87,39 @@ export function VaultFileList({
   const createDraft = draftInFolder && inlineFolderDraft.mode === "create";
   const hasRows = files.length > 0 || subfolders.length > 0 || createDraft;
   const emptyState = !hasRows;
+  const selectedSet = new Set(selectedKeys);
+  function dragItemsFor(item, type) {
+    const key = type === "document" ? `document:${item.id}` : `folder:${item.path || ""}`;
+    if (selectedSet.has(key)) {
+      return orderedItems.filter((orderedItem) =>
+        selectedSet.has(
+          orderedItem.type === "document"
+            ? `document:${orderedItem.id}`
+            : `folder:${orderedItem.path || ""}`
+        )
+      );
+    }
+    return [
+      type === "document"
+        ? {
+            archived: Boolean(item.archived),
+            folder: item.folder || "",
+            id: item.id,
+            lock: item.lock || {},
+            name: item.name,
+            path: item.path || (item.folder ? `${item.folder}/${item.name}` : item.name),
+            size_bytes: item.size_bytes || 0,
+            type: "document",
+          }
+        : {
+            archived: isArchivePath(item.path || ""),
+            name: item.name,
+            path: item.path || "",
+            size_bytes: item.size_bytes || 0,
+            type: "folder",
+          },
+    ];
+  }
 
   function handleBackgroundClick(e) {
     if (e.target.closest && e.target.closest(".file-row")) {
@@ -169,11 +203,15 @@ export function VaultFileList({
             editValue: inlineFolderDraft?.value || "",
             isDropTarget: dropHint === folderItem.path,
             isDragging: draggingFolderPath === folderItem.path,
+            selected: selectedSet.has(`folder:${folderItem.path || ""}`),
+            onSelect: (e) => onSelectItem && onSelectItem(folderItem, "folder", e, orderedItems),
             onOpen: () => onSelectFolder(folderItem.path),
             onDropEnter: (e) => onDropOnFolder(folderItem.path, e, true),
             onDrop: (e) => onDropOnFolder(folderItem.path, e, false),
             onDropLeave: onClearDropHint,
-            onDragStart: (e) => onFolderDragStart && onFolderDragStart(e, folderItem.path),
+            onDragStart: (e) =>
+              onFolderDragStart &&
+              onFolderDragStart(e, folderItem.path, dragItemsFor(folderItem, "folder")),
             onDragEnd: onFolderDragEnd,
             onContextMenu: (e) => onFolderContextMenu && onFolderContextMenu(e, folderItem),
             onEditChange: onInlineFolderNameChange,
@@ -186,11 +224,11 @@ export function VaultFileList({
             key: doc.id,
             doc,
             currentUser,
-            selectedId,
+            selected: selectedSet.has(`document:${doc.id}`),
             draggingId,
-            onSelect: onSelectFile,
+            onSelect: (e) => onSelectItem && onSelectItem(doc, "document", e, orderedItems),
             onOpen: onOpenFile,
-            onDragStart: (e) => onFileDragStart(e, doc.id),
+            onDragStart: (e) => onFileDragStart(e, doc.id, dragItemsFor(doc, "document")),
             onDragEnd: onFileDragEnd,
             onContextMenu: (e) => onFileContextMenu && onFileContextMenu(e, doc),
           })

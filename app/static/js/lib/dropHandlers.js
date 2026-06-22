@@ -20,6 +20,73 @@ function getFolderFromDrag(dragEvent) {
   return (path || "").trim();
 }
 
+function getSelectionFromDrag(dragEvent) {
+  const raw = dragEvent.dataTransfer.getData("application/x-vault-selection");
+  if (!raw) {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed.items) ? parsed.items : [];
+  } catch {
+    return [];
+  }
+}
+
+function itemInArchive(item) {
+  return item.archived || isArchivePath(item.path || item.folder || "");
+}
+
+function handleSelectionDrop({
+  target,
+  targetFolder,
+  items,
+  dropEvent,
+  isPreview,
+  setDropHint,
+  setUploadHover,
+  setError,
+  handleArchiveItems,
+  handleMoveSelection,
+}) {
+  if (!items.length) {
+    return false;
+  }
+  dropEvent.preventDefault();
+  if (isPreview) {
+    setDropHint(targetFolder);
+    setUploadHover(false);
+    return true;
+  }
+  const targetArchived = isArchivePath(target);
+  const allVault = items.every((item) => !itemInArchive(item));
+  if (target === "Archive" && allVault) {
+    setDropHint(null);
+    setUploadHover(false);
+    handleArchiveItems(items);
+    return true;
+  }
+  if (items.some((item) => itemInArchive(item) !== targetArchived)) {
+    setError("Use Move to Archive/Restore to Vault for switching locations.");
+    setDropHint(null);
+    setUploadHover(false);
+    return true;
+  }
+  const invalidFolder = items.some(
+    (item) => item.type === "folder" && (target === item.path || target.startsWith(`${item.path}/`))
+  );
+  if (invalidFolder) {
+    setError("Cannot move a folder into itself.");
+    setDropHint(null);
+    setUploadHover(false);
+    return true;
+  }
+  setDropHint(null);
+  setUploadHover(false);
+  handleMoveSelection(items, targetFolder || "");
+  return true;
+}
+
 function handleFolderDrop({
   target,
   targetFolder,
@@ -144,6 +211,8 @@ export function createDropHandlers({
   setError,
   handleArchiveFolder,
   handleRenameFolder,
+  handleArchiveItems,
+  handleMoveSelection,
   handleUpload,
   handleMove,
   handleArchive,
@@ -157,6 +226,23 @@ export function createDropHandlers({
       return;
     }
     const target = targetFolder || "";
+    const selectedItems = getSelectionFromDrag(dropEvent);
+    if (
+      handleSelectionDrop({
+        target,
+        targetFolder,
+        items: selectedItems,
+        dropEvent,
+        isPreview,
+        setDropHint,
+        setUploadHover,
+        setError,
+        handleArchiveItems,
+        handleMoveSelection,
+      })
+    ) {
+      return;
+    }
     const draggedFolder = getFolderFromDrag(dropEvent);
     if (draggedFolder) {
       handleFolderDrop({
@@ -209,6 +295,23 @@ export function createDropHandlers({
     canvasEvent.preventDefault();
     const draggedFolder = getFolderFromDrag(canvasEvent);
     const target = folder || "";
+    const selectedItems = getSelectionFromDrag(canvasEvent);
+    if (
+      handleSelectionDrop({
+        target,
+        targetFolder: target,
+        items: selectedItems,
+        dropEvent: canvasEvent,
+        isPreview: false,
+        setDropHint,
+        setUploadHover,
+        setError,
+        handleArchiveItems,
+        handleMoveSelection,
+      })
+    ) {
+      return;
+    }
     if (draggedFolder) {
       handleFolderDrop({
         target,
@@ -246,8 +349,11 @@ export function createDropHandlers({
 
   function handleCanvasDragOver(e) {
     const hasFiles = e.dataTransfer.types && Array.from(e.dataTransfer.types).includes("Files");
+    const hasSelection =
+      e.dataTransfer.types &&
+      Array.from(e.dataTransfer.types).includes("application/x-vault-selection");
     const draggingFolder = Boolean(draggingFolderPath);
-    if (hasFiles || draggingId || draggingFolder) {
+    if (hasFiles || draggingId || draggingFolder || hasSelection) {
       e.preventDefault();
       if (hasFiles) {
         setUploadHover(true);
@@ -265,7 +371,10 @@ export function createDropHandlers({
     }
   }
 
-  function handleFileDragStart(e, docId) {
+  function handleFileDragStart(e, docId, items = []) {
+    if (items.length) {
+      e.dataTransfer.setData("application/x-vault-selection", JSON.stringify({ items }));
+    }
     e.dataTransfer.setData("application/x-doc-id", String(docId));
     e.dataTransfer.effectAllowed = "move";
     setDraggingId(docId);
@@ -276,9 +385,12 @@ export function createDropHandlers({
     setDropHint(null);
   }
 
-  function handleFolderDragStart(e, path) {
+  function handleFolderDragStart(e, path, items = []) {
     if (!path) {
       return;
+    }
+    if (items.length) {
+      e.dataTransfer.setData("application/x-vault-selection", JSON.stringify({ items }));
     }
     e.dataTransfer.setData("application/x-folder-path", path);
     e.dataTransfer.effectAllowed = "move";

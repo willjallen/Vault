@@ -19,6 +19,10 @@ export function createFileLockActions({
   uploadWithProgress,
   downloadWithProgress,
 }) {
+  function documentItem(docId) {
+    return { type: "document", id: docId };
+  }
+
   async function handleSave(docId, file, note, options = {}) {
     setBusy(true);
     setError("");
@@ -50,20 +54,24 @@ export function createFileLockActions({
   async function handleRelease(docId) {
     setBusy(true);
     setError("");
-    const form = new FormData();
     try {
-      const res = await apiFetch(`/documents/${docId}/release?mode=json`, {
+      const res = await apiFetch("/api/unlock", {
         method: "POST",
-        body: form,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ items: [documentItem(docId)] }),
       });
       if (!res.ok) {
         throw new Error("Release failed");
       }
+      const payload = await res.json();
+      if (payload.failed?.length) {
+        throw new Error(payload.failed[0].detail || "Release failed");
+      }
       if (updateDocument) {
         updateDocument(docId, (item) => ({ ...item, lock: { by: null, name: null } }));
       }
-    } catch {
-      setError("Could not release the file.");
+    } catch (err) {
+      setError(err.message || "Could not release the file.");
     } finally {
       setBusy(false);
     }
@@ -77,10 +85,18 @@ export function createFileLockActions({
     setBusy(true);
     setError("");
     try {
-      const res = await apiFetch(`/documents/${doc.id}/lock`, { method: "POST" });
+      const res = await apiFetch("/api/lock", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ items: [documentItem(doc.id)] }),
+      });
       if (!res.ok) {
         const detail = await res.json().catch(() => ({}));
         throw new Error(detail.detail || "Lock failed");
+      }
+      const payload = await res.json();
+      if (payload.failed?.length) {
+        throw new Error(payload.failed[0].detail || "Lock failed");
       }
       if (updateDocument) {
         updateDocument(doc.id, (item) => ({ ...item, lock: optimisticLockFor(item, currentUser) }));

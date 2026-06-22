@@ -503,6 +503,12 @@ header {
   color: #1d4ed8;
 }
 
+.folder-node.selected {
+  border-color: #cbd5ff;
+  background: #eef2ff;
+  box-shadow: 0 8px 18px rgba(37, 99, 235, 0.12);
+}
+
 .folder-node.drop-target {
   border-color: var(--accent);
   background: #e0ecff;
@@ -869,6 +875,90 @@ header {
   min-width: 0;
   overflow-wrap: anywhere;
   pointer-events: none;
+}
+
+.bulk-drag-preview {
+  position: fixed;
+  z-index: 2500;
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr);
+  gap: 10px;
+  align-items: center;
+  width: min(260px, calc(100vw - 24px));
+  padding: 10px 12px;
+  border: 1px solid rgba(203, 213, 225, 0.92);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.96);
+  color: var(--text);
+  box-shadow: 0 18px 44px rgba(15, 23, 42, 0.2);
+  pointer-events: none;
+  transform: translate3d(0, 10px, 0) scale(0.88);
+  opacity: 0;
+  transition:
+    opacity 0.14s ease,
+    transform 0.24s cubic-bezier(0.18, 1.32, 0.28, 1);
+}
+
+.bulk-drag-preview.visible {
+  opacity: 1;
+  transform: translate3d(0, 0, 0) scale(1);
+}
+
+.bulk-drag-stack {
+  position: relative;
+  width: 38px;
+  height: 34px;
+}
+
+.bulk-drag-card {
+  position: absolute;
+  inset: 5px 4px 3px 4px;
+  border: 1px solid #cbd5ff;
+  border-radius: 8px;
+  background: #eef2ff;
+  transition: transform 0.24s cubic-bezier(0.18, 1.32, 0.28, 1);
+}
+
+.bulk-drag-card.two {
+  transform: translate(-5px, -4px) rotate(-8deg);
+}
+
+.bulk-drag-card.three {
+  transform: translate(5px, 4px) rotate(7deg);
+}
+
+.bulk-drag-preview.visible .bulk-drag-card.two {
+  transform: translate(-3px, -3px) rotate(-4deg);
+}
+
+.bulk-drag-preview.visible .bulk-drag-card.three {
+  transform: translate(3px, 3px) rotate(4deg);
+}
+
+.bulk-drag-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.bulk-drag-copy strong,
+.bulk-drag-copy span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.bulk-drag-copy strong {
+  font-size: 0.88rem;
+  line-height: 1.2;
+}
+
+.bulk-drag-copy span {
+  color: var(--muted);
+  font-size: 0.76rem;
+  line-height: 1.2;
 }
 
 .file-cell {

@@ -91,14 +91,23 @@ export function uploadForm({ url, formData, onProgress, method = "POST", fallbac
   });
 }
 
-export function downloadBlob({ url, fallbackName, fallbackTotal = null, onProgress }) {
+export function downloadBlob({
+  url,
+  fallbackName,
+  fallbackTotal = null,
+  headers = {},
+  method = "GET",
+  body = null,
+  onProgress,
+}) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     const startedAt = performance.now();
 
-    xhr.open("GET", url, true);
+    xhr.open(method, url, true);
     xhr.withCredentials = true;
     xhr.responseType = "blob";
+    Object.entries(headers || {}).forEach(([key, value]) => xhr.setRequestHeader(key, value));
     xhr.onprogress = (evt) => {
       onProgress(progressFromEvent(evt, startedAt, fallbackTotal));
     };
@@ -123,6 +132,6 @@ export function downloadBlob({ url, fallbackName, fallbackTotal = null, onProgre
     };
     xhr.onerror = () => reject(errorFromText("", "Network error during download", xhr.status));
     xhr.onabort = () => reject(errorFromText("", "Download cancelled", xhr.status));
-    xhr.send();
+    xhr.send(body);
   });
 }

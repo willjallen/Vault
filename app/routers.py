@@ -3,16 +3,19 @@
 
 import asyncio
 import datetime as dt
+import io
 import json
 import mimetypes
+import zipfile
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Response, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -58,6 +61,18 @@ class DocStat:
 class PublicFolderPath:
     root_key: str
     relative_path: str
+
+
+class ActionItem(BaseModel):
+    type: str
+    id: int | None = None
+    path: str | None = None
+
+
+class ActionPayload(BaseModel):
+    items: list[ActionItem] = Field(default_factory=list)
+    destination_folder: str | None = None
+    name: str | None = None
 
 
 DOCUMENT_EVENT_RESOURCES: dict[str, tuple[str, ...]] = {
@@ -131,14 +146,6 @@ def public_folder_path(root_key: str, relative_path: str) -> str:
 
 def is_archived_path(path: str | None) -> bool:
     return parse_public_folder_path(path).root_key == ARCHIVE_ROOT_KEY
-
-
-def split_document_path(path: str) -> tuple[str, str]:
-    cleaned = normalize_folder(path)
-    if not cleaned:
-        raise HTTPException(status_code=400, detail="Document path is required")
-    parts = cleaned.split("/")
-    return "/".join(parts[:-1]), normalize_item_name(parts[-1], "File name")
 
 
 def format_size(size_bytes: int | None) -> str:
@@ -666,6 +673,256 @@ def download_response(data: bytes, filename: str, mime_type: str | None = None) 
     )
 
 
+def action_item_payload(item: ActionItem) -> dict[str, object]:
+    payload: dict[str, object] = {"type": item.type}
+    if item.id is not None:
+        payload["id"] = item.id
+    if item.path is not None:
+        payload["path"] = normalize_folder(item.path)
+    return payload
+
+
+def item_label(item: ActionItem) -> str:
+    if item.type == "document":
+        return f"document:{item.id}"
+    return f"folder:{normalize_folder(item.path)}"
+
+
+def action_result(item: ActionItem, detail: str | None = None) -> dict[str, object]:
+    result = {"item": action_item_payload(item)}
+    if detail:
+        result["detail"] = detail
+    return result
+
+
+def bulk_result() -> dict[str, list[dict[str, object]]]:
+    return {"ok": [], "failed": [], "skipped": []}
+
+
+def require_action_items(payload: ActionPayload) -> list[ActionItem]:
+    if not payload.items:
+        raise HTTPException(status_code=400, detail="Select at least one item")
+    return payload.items
+
+
+def normalize_action_items(items: list[ActionItem], db: Session) -> list[ActionItem]:
+    folders: list[tuple[ActionItem, Folder]] = []
+    documents: list[tuple[ActionItem, Document]] = []
+    seen: set[str] = set()
+    normalized: list[ActionItem] = []
+    for item in items:
+        item_type = item.type.strip().lower()
+        if item_type == "document":
+            if item.id is None:
+                raise HTTPException(status_code=400, detail="Document id is required")
+            doc = get_document_or_404(item.id, db)
+            normalized_item = ActionItem(type="document", id=doc.id)
+            key = item_label(normalized_item)
+            if key not in seen:
+                seen.add(key)
+                normalized.append(normalized_item)
+                documents.append((normalized_item, doc))
+            continue
+        if item_type == "folder":
+            path = normalize_folder(item.path)
+            if not path:
+                raise HTTPException(status_code=400, detail="Folder path is required")
+            folder = get_folder_by_path(db, path)
+            if not folder:
+                raise HTTPException(status_code=404, detail=f"Folder not found: {path}")
+            normalized_item = ActionItem(type="folder", path=folder_path(folder))
+            key = item_label(normalized_item)
+            if key not in seen:
+                seen.add(key)
+                normalized.append(normalized_item)
+                folders.append((normalized_item, folder))
+            continue
+        raise HTTPException(status_code=400, detail="Invalid item type")
+
+    folder_paths = [folder_path(folder) for _, folder in folders]
+    pruned: list[ActionItem] = []
+    for item in normalized:
+        if item.type == "folder":
+            path = normalize_folder(item.path)
+            if any(path != parent and path.startswith(f"{parent}/") for parent in folder_paths):
+                continue
+        if item.type == "document":
+            doc = get_document_or_404(item.id or 0, db)
+            doc_path = document_folder_path(doc)
+            if any(doc_path == parent or doc_path.startswith(f"{parent}/") for parent in folder_paths):
+                continue
+        pruned.append(item)
+    return pruned
+
+
+def batch_state_changed(db: Session, event_type: str) -> None:
+    record_state_change(
+        db,
+        f"batch.{event_type}",
+        ("contents", "sidebar", "document_detail", "my_edits"),
+    )
+
+
+def archive_doc_item(doc: Document, request: Request, user: UserContext, db: Session) -> str:
+    if document_is_archive(doc):
+        raise HTTPException(status_code=400, detail="Document is already archived")
+    source_path = document_path(doc)
+    lock = ensure_not_locked_by_other(doc, user, db)
+    target_folder_path = public_folder_path(ARCHIVE_ROOT_KEY, folder_relative_path(doc.folder))
+    target_folder = get_or_create_folder_path(db, target_folder_path)
+    release_lock(lock, user)
+    mutate_doc_location(
+        doc,
+        target_folder,
+        doc.name,
+        user,
+        db,
+        client_meta(request),
+        "archive",
+        f"Archived from {source_path}",
+        publish_state=False,
+    )
+    return document_path(doc)
+
+
+def restore_doc_item(doc: Document, request: Request, user: UserContext, db: Session) -> str:
+    if not document_is_archive(doc):
+        raise HTTPException(status_code=400, detail="Document is not archived")
+    source_path = document_path(doc)
+    ensure_not_locked_by_other(doc, user, db)
+    archive_folder = doc.folder
+    target_folder_path = folder_relative_path(doc.folder)
+    target_folder = get_or_create_folder_path(db, target_folder_path)
+    mutate_doc_location(
+        doc,
+        target_folder,
+        doc.name,
+        user,
+        db,
+        client_meta(request),
+        "unarchive",
+        f"Restored to Vault from {source_path}",
+        publish_state=False,
+    )
+    prune_empty_archive_folders(db, archive_folder)
+    return document_path(doc)
+
+
+def archive_folder_item(source: Folder, request: Request, user: UserContext, db: Session) -> str:
+    if source.is_root:
+        raise HTTPException(status_code=400, detail="Cannot archive a root folder")
+    if folder_is_archive(source):
+        raise HTTPException(status_code=400, detail="Folder is already archived")
+    target_path = public_folder_path(ARCHIVE_ROOT_KEY, folder_relative_path(source))
+    target_parent = get_or_create_folder_path(db, "/".join(target_path.split("/")[:-1]))
+    target_name = normalize_item_name(target_path.split("/")[-1], "Folder name")
+    ensure_unique_folder_name(db, target_parent.id, target_name, source.id)
+    meta = client_meta(request)
+    for doc in docs_in_folder_subtree(db, source):
+        release_lock(get_active_lock(doc, db), user)
+        record_event(
+            doc,
+            user,
+            "archive",
+            f"Archived from {document_path(doc)}",
+            db,
+            meta=meta,
+            publish_state=False,
+        )
+        doc.latest_modified_at = now_utc()
+    source.parent = target_parent
+    source.parent_id = target_parent.id
+    source.name = target_name
+    set_subtree_root_key(db, source, ARCHIVE_ROOT_KEY)
+    return target_path
+
+
+def restore_folder_item(source: Folder, request: Request, user: UserContext, db: Session) -> str:
+    if source.is_root or not folder_is_archive(source):
+        raise HTTPException(status_code=400, detail="Choose an archived folder to restore")
+    target_path = folder_relative_path(source)
+    target_parent = get_or_create_folder_path(db, "/".join(target_path.split("/")[:-1]))
+    target_name = normalize_item_name(target_path.split("/")[-1], "Folder name")
+    ensure_unique_folder_name(db, target_parent.id, target_name, source.id)
+    archive_parent = source.parent
+    meta = client_meta(request)
+    for doc in docs_in_folder_subtree(db, source):
+        record_event(
+            doc,
+            user,
+            "unarchive",
+            f"Restored to Vault from {document_path(doc)}",
+            db,
+            meta=meta,
+            publish_state=False,
+        )
+        doc.latest_modified_at = now_utc()
+    source.parent = target_parent
+    source.parent_id = target_parent.id
+    source.name = target_name
+    set_subtree_root_key(db, source, VAULT_ROOT_KEY)
+    prune_empty_archive_folders(db, archive_parent)
+    return target_path
+
+
+def move_doc_item(
+    doc: Document,
+    destination_folder: str,
+    request: Request,
+    user: UserContext,
+    db: Session,
+    name: str | None = None,
+) -> str:
+    ensure_not_locked_by_other(doc, user, db)
+    target_folder = get_or_create_folder_path(db, destination_folder)
+    target_name = normalize_item_name(name or doc.name, "File name")
+    if doc.folder.root_key != target_folder.root_key:
+        raise HTTPException(status_code=400, detail="Use archive or restore for Archive moves")
+    old_path = document_path(doc)
+    mutate_doc_location(
+        doc,
+        target_folder,
+        target_name,
+        user,
+        db,
+        client_meta(request),
+        "move",
+        f"Moved from {old_path} to {join_path(folder_path(target_folder), target_name)}",
+        publish_state=False,
+    )
+    return document_path(doc)
+
+
+def move_folder_item(
+    source: Folder,
+    destination_folder: str,
+    db: Session,
+    name: str | None = None,
+) -> str:
+    if source.is_root:
+        raise HTTPException(status_code=400, detail="Cannot move a root folder")
+    target_parent = get_or_create_folder_path(db, destination_folder)
+    if source.root_key != target_parent.root_key:
+        raise HTTPException(status_code=400, detail="Use archive or restore for Archive moves")
+    source_path = folder_path(source)
+    target_name = normalize_item_name(name or source.name, "Folder name")
+    target_path = join_path(folder_path(target_parent), target_name)
+    if target_path == source_path:
+        return source_path
+    if target_path.startswith(f"{source_path}/"):
+        raise HTTPException(status_code=400, detail="Cannot move a folder into itself")
+    ensure_unique_folder_name(db, target_parent.id, target_name, source.id)
+    source.parent = target_parent
+    source.parent_id = target_parent.id
+    source.name = target_name
+    return target_path
+
+
+def response_detail(exc: HTTPException) -> str:
+    detail = exc.detail
+    return detail if isinstance(detail, str) else "Action failed"
+
+
 def version_signature(
     version: DocumentVersion,
 ) -> tuple[str | None, str | None, str | None, int | None]:
@@ -1047,12 +1304,6 @@ def commit_state(db: Session) -> None:
     db.commit()
 
 
-def folder_for_new_path(db: Session, path: str) -> tuple[Folder, str]:
-    folder_path_value, name = split_document_path(path)
-    folder = get_or_create_folder_path(db, folder_path_value)
-    return folder, name
-
-
 def mutate_doc_location(
     doc: Document,
     target_folder: Folder,
@@ -1062,13 +1313,14 @@ def mutate_doc_location(
     meta: dict[str, str | None],
     event_type: str,
     message: str,
+    publish_state: bool = True,
 ) -> None:
     ensure_unique_document_path(db, target_folder.id, target_name, doc.id)
     doc.folder = target_folder
     doc.folder_id = target_folder.id
     doc.name = target_name
     doc.latest_modified_at = now_utc()
-    record_event(doc, user, event_type, message, db, meta=meta)
+    record_event(doc, user, event_type, message, db, meta=meta, publish_state=publish_state)
 
 
 def storage_reconciliation_report(db: Session, apply: bool = False) -> dict[str, object]:
@@ -1236,143 +1488,348 @@ def create_folder(
     return {"folder": normalized}
 
 
-@router.post("/folders/rename")
-def rename_folder(
-    folder: str = Form(...),
-    new_path: str = Form(...),
-    user: UserContext = Depends(current_user),
-    db: Session = Depends(get_db),
-) -> dict[str, str]:
-    del user
-    source_path = normalize_folder(folder)
-    target_path = normalize_folder(new_path)
-    source = get_folder_by_path(db, source_path)
-    if not source:
-        raise HTTPException(status_code=404, detail="Folder not found")
-    if source.is_root:
-        raise HTTPException(status_code=400, detail="Cannot rename that folder")
-    target_ref = parse_public_folder_path(target_path)
-    if not target_ref.relative_path:
-        raise HTTPException(status_code=400, detail="Invalid target folder")
-    if target_path == source_path:
-        return {"folder": source_path}
-    if target_ref.root_key != source.root_key:
-        raise HTTPException(status_code=400, detail="Use archive or restore for Archive moves")
-    if target_path.startswith(f"{source_path}/"):
-        raise HTTPException(status_code=400, detail="Cannot move a folder into itself")
-
-    target_parent_path = "/".join(target_path.split("/")[:-1])
-    target_name = normalize_item_name(target_path.split("/")[-1], "Folder name")
-    target_parent = get_or_create_folder_path(db, target_parent_path)
-    ensure_unique_folder_name(db, target_parent.id, target_name, source.id)
-    source.parent = target_parent
-    source.parent_id = target_parent.id
-    source.name = target_name
-    record_folder_change(db, "renamed")
-    db.commit()
-    return {"folder": target_path}
-
-
-@router.post("/folders/archive")
-def archive_folder(
+@router.post("/api/move")
+def move_items(
+    payload: ActionPayload,
     request: Request,
-    folder: str = Form(...),
     user: UserContext = Depends(current_user),
     db: Session = Depends(get_db),
-) -> dict[str, str]:
-    source_path = normalize_folder(folder)
-    source = get_folder_by_path(db, source_path)
-    if not source or source.is_root:
-        raise HTTPException(status_code=404, detail="Folder not found")
-    if folder_is_archive(source):
-        raise HTTPException(status_code=400, detail="Pick a Vault folder to archive")
-    target_path = public_folder_path(ARCHIVE_ROOT_KEY, folder_relative_path(source))
-    target_parent = get_or_create_folder_path(db, "/".join(target_path.split("/")[:-1]))
-    target_name = normalize_item_name(target_path.split("/")[-1], "Folder name")
-    ensure_unique_folder_name(db, target_parent.id, target_name, source.id)
-    meta = client_meta(request)
-    affected_docs = docs_in_folder_subtree(db, source)
-    for doc in affected_docs:
-        release_lock(get_active_lock(doc, db), user)
-        record_event(
-            doc,
-            user,
-            "archive",
-            f"Archived from {document_path(doc)}",
-            db,
-            meta=meta,
-            publish_state=False,
-        )
-        doc.latest_modified_at = now_utc()
-    source.parent = target_parent
-    source.parent_id = target_parent.id
-    source.name = target_name
-    set_subtree_root_key(db, source, ARCHIVE_ROOT_KEY)
-    record_folder_change(db, "archived", include_document_updates=bool(affected_docs))
-    db.commit()
-    return {"archive_folder": target_path}
+) -> dict[str, list[dict[str, object]]]:
+    destination = normalize_folder(payload.destination_folder)
+    items = normalize_action_items(require_action_items(payload), db)
+    result = bulk_result()
+    changed = False
+    with storage_write_lock():
+        for item in items:
+            try:
+                if item.type == "document":
+                    doc = get_document_or_404(item.id or 0, db)
+                    moved = move_doc_item(doc, destination, request, user, db)
+                    result["ok"].append(action_result(item, moved))
+                else:
+                    folder_item = get_folder_by_path(db, item.path)
+                    if not folder_item:
+                        raise HTTPException(status_code=404, detail="Folder not found")
+                    moved = move_folder_item(folder_item, destination, db)
+                    result["ok"].append(action_result(item, moved))
+                changed = True
+            except HTTPException as exc:
+                result["failed"].append(action_result(item, response_detail(exc)))
+        if changed:
+            batch_state_changed(db, "move")
+        db.commit()
+    return result
 
 
-@router.post("/folders/unarchive")
-def unarchive_folder(
+@router.post("/api/rename")
+def rename_item(
+    payload: ActionPayload,
     request: Request,
-    folder: str = Form(...),
     user: UserContext = Depends(current_user),
     db: Session = Depends(get_db),
-) -> dict[str, str]:
-    source_path = normalize_folder(folder)
-    source = get_folder_by_path(db, source_path)
-    if not source or source.is_root or not folder_is_archive(source):
-        raise HTTPException(status_code=400, detail="Choose an archived folder to restore")
-    target_path = folder_relative_path(source)
-    target_parent = get_or_create_folder_path(db, "/".join(target_path.split("/")[:-1]))
-    target_name = normalize_item_name(target_path.split("/")[-1], "Folder name")
-    ensure_unique_folder_name(db, target_parent.id, target_name, source.id)
-    archive_parent = source.parent
-    meta = client_meta(request)
-    affected_docs = docs_in_folder_subtree(db, source)
-    for doc in affected_docs:
-        record_event(
-            doc,
-            user,
-            "unarchive",
-            f"Restored to Vault from {document_path(doc)}",
-            db,
-            meta=meta,
-            publish_state=False,
-        )
-        doc.latest_modified_at = now_utc()
-    source.parent = target_parent
-    source.parent_id = target_parent.id
-    source.name = target_name
-    set_subtree_root_key(db, source, VAULT_ROOT_KEY)
-    prune_empty_archive_folders(db, archive_parent)
-    record_folder_change(db, "unarchived", include_document_updates=bool(affected_docs))
-    db.commit()
-    return {"folder": target_path}
+) -> dict[str, list[dict[str, object]]]:
+    items = normalize_action_items(require_action_items(payload), db)
+    if len(items) != 1:
+        raise HTTPException(status_code=400, detail="Rename exactly one item")
+    if not payload.name:
+        raise HTTPException(status_code=400, detail="Name is required")
+    result = bulk_result()
+    item = items[0]
+    with storage_write_lock():
+        try:
+            if item.type == "document":
+                doc = get_document_or_404(item.id or 0, db)
+                destination_folder = (
+                    normalize_folder(payload.destination_folder)
+                    if payload.destination_folder is not None
+                    else document_folder_path(doc)
+                )
+                renamed = move_doc_item(
+                    doc,
+                    destination_folder,
+                    request,
+                    user,
+                    db,
+                    name=payload.name,
+                )
+                result["ok"].append(action_result(item, renamed))
+            else:
+                folder_item = get_folder_by_path(db, item.path)
+                if not folder_item:
+                    raise HTTPException(status_code=404, detail="Folder not found")
+                destination_folder = (
+                    normalize_folder(payload.destination_folder)
+                    if payload.destination_folder is not None
+                    else (folder_path(folder_item.parent) if folder_item.parent else "")
+                )
+                renamed = move_folder_item(
+                    folder_item,
+                    destination_folder,
+                    db,
+                    name=payload.name,
+                )
+                result["ok"].append(action_result(item, renamed))
+            batch_state_changed(db, "rename")
+        except HTTPException as exc:
+            result["failed"].append(action_result(item, response_detail(exc)))
+        db.commit()
+    return result
 
 
-@router.post("/folders/permanent_delete")
-def permanent_delete_folder(
-    folder: str = Form(...),
+@router.post("/api/archive")
+def archive_items(
+    payload: ActionPayload,
+    request: Request,
     user: UserContext = Depends(current_user),
     db: Session = Depends(get_db),
-) -> dict[str, str]:
+) -> dict[str, list[dict[str, object]]]:
+    items = normalize_action_items(require_action_items(payload), db)
+    result = bulk_result()
+    changed = False
+    with storage_write_lock():
+        for item in items:
+            try:
+                if item.type == "document":
+                    doc = get_document_or_404(item.id or 0, db)
+                    archived = archive_doc_item(doc, request, user, db)
+                else:
+                    folder_item = get_folder_by_path(db, item.path)
+                    if not folder_item:
+                        raise HTTPException(status_code=404, detail="Folder not found")
+                    archived = archive_folder_item(folder_item, request, user, db)
+                result["ok"].append(action_result(item, archived))
+                changed = True
+            except HTTPException as exc:
+                result["failed"].append(action_result(item, response_detail(exc)))
+        if changed:
+            batch_state_changed(db, "archive")
+        db.commit()
+    return result
+
+
+@router.post("/api/restore")
+def restore_items(
+    payload: ActionPayload,
+    request: Request,
+    user: UserContext = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, list[dict[str, object]]]:
+    items = normalize_action_items(require_action_items(payload), db)
+    result = bulk_result()
+    changed = False
+    with storage_write_lock():
+        for item in items:
+            try:
+                if item.type == "document":
+                    doc = get_document_or_404(item.id or 0, db)
+                    restored = restore_doc_item(doc, request, user, db)
+                else:
+                    folder_item = get_folder_by_path(db, item.path)
+                    if not folder_item:
+                        raise HTTPException(status_code=404, detail="Folder not found")
+                    restored = restore_folder_item(folder_item, request, user, db)
+                result["ok"].append(action_result(item, restored))
+                changed = True
+            except HTTPException as exc:
+                result["failed"].append(action_result(item, response_detail(exc)))
+        if changed:
+            batch_state_changed(db, "restore")
+        db.commit()
+    return result
+
+
+@router.post("/api/delete-forever")
+def delete_items_forever(
+    payload: ActionPayload,
+    user: UserContext = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, list[dict[str, object]]]:
     if not user["is_admin"]:
         raise HTTPException(status_code=403, detail="Admin access required")
-    normalized = normalize_folder(folder)
-    target = get_folder_by_path(db, normalized)
-    if not target or target.is_root or not folder_is_archive(target):
-        raise HTTPException(status_code=400, detail="Delete forever is only available in Archive")
-    archive_parent = target.parent
-    affected_docs = docs_in_folder_subtree(db, target)
-    for doc in affected_docs:
-        db.delete(doc)
-    db.delete(target)
-    prune_empty_archive_folders(db, archive_parent)
-    record_folder_change(db, "deleted", include_document_updates=bool(affected_docs))
+    items = normalize_action_items(require_action_items(payload), db)
+    result = bulk_result()
+    changed = False
+    with storage_write_lock():
+        for item in items:
+            try:
+                if item.type == "document":
+                    doc = get_document_or_404(item.id or 0, db)
+                    if not document_is_archive(doc):
+                        raise HTTPException(
+                            status_code=400,
+                            detail="Move the document to Archive before deleting",
+                        )
+                    deleted = document_path(doc)
+                    archive_folder = doc.folder
+                    db.delete(doc)
+                    prune_empty_archive_folders(db, archive_folder)
+                else:
+                    folder_item = get_folder_by_path(db, item.path)
+                    if not folder_item or folder_item.is_root or not folder_is_archive(folder_item):
+                        raise HTTPException(
+                            status_code=400,
+                            detail="Delete forever is only available in Archive",
+                        )
+                    deleted = folder_path(folder_item)
+                    archive_parent = folder_item.parent
+                    db.delete(folder_item)
+                    prune_empty_archive_folders(db, archive_parent)
+                result["ok"].append(action_result(item, deleted))
+                changed = True
+            except HTTPException as exc:
+                result["failed"].append(action_result(item, response_detail(exc)))
+        if changed:
+            record_document_deleted(db)
+        db.commit()
+    return result
+
+
+@router.post("/api/lock")
+def lock_items(
+    payload: ActionPayload,
+    request: Request,
+    user: UserContext = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, list[dict[str, object]]]:
+    items = normalize_action_items(require_action_items(payload), db)
+    result = bulk_result()
+    changed = False
+    with storage_write_lock():
+        for item in items:
+            try:
+                if item.type != "document":
+                    raise HTTPException(status_code=400, detail="Only files can be locked")
+                doc = get_document_or_404(item.id or 0, db)
+                if document_is_archive(doc):
+                    raise HTTPException(status_code=400, detail="Restore this file before editing")
+                lock, created = acquire_document_lock(doc, user, client_meta(request), db)
+                if created:
+                    record_event(
+                        doc,
+                        user,
+                        "lock",
+                        f"Locked {document_path(doc)}",
+                        db,
+                        meta=client_meta(request),
+                        publish_state=False,
+                    )
+                result["ok"].append(action_result(item, lock.locked_by_name or lock.locked_by))
+                changed = True
+            except HTTPException as exc:
+                result["failed"].append(action_result(item, response_detail(exc)))
+        if changed:
+            batch_state_changed(db, "lock")
+        db.commit()
+    return result
+
+
+@router.post("/api/unlock")
+def unlock_items(
+    payload: ActionPayload,
+    request: Request,
+    user: UserContext = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, list[dict[str, object]]]:
+    items = normalize_action_items(require_action_items(payload), db)
+    result = bulk_result()
+    changed = False
+    with storage_write_lock():
+        for item in items:
+            try:
+                if item.type != "document":
+                    raise HTTPException(status_code=400, detail="Only files can be unlocked")
+                doc = get_document_or_404(item.id or 0, db)
+                lock = get_active_lock(doc, db)
+                if lock and lock.locked_by != user["id"] and not user["is_admin"]:
+                    raise HTTPException(status_code=403, detail="Document is locked by another user")
+                release_lock(lock, user)
+                record_event(
+                    doc,
+                    user,
+                    "release",
+                    f"Released lock for {document_path(doc)}",
+                    db,
+                    meta=client_meta(request),
+                    publish_state=False,
+                )
+                result["ok"].append(action_result(item, "Unlocked"))
+                changed = True
+            except HTTPException as exc:
+                result["failed"].append(action_result(item, response_detail(exc)))
+        if changed:
+            batch_state_changed(db, "unlock")
+        db.commit()
+    return result
+
+
+@router.post("/api/download")
+def download_items(
+    payload: ActionPayload,
+    request: Request,
+    user: UserContext = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> Response:
+    items = normalize_action_items(require_action_items(payload), db)
+    docs_to_download: list[Document] = []
+    for item in items:
+        if item.type == "document":
+            docs_to_download.append(get_document_or_404(item.id or 0, db))
+        else:
+            folder_item = get_folder_by_path(db, item.path)
+            if not folder_item:
+                raise HTTPException(status_code=404, detail="Folder not found")
+            docs_to_download.extend(docs_in_folder_subtree(db, folder_item))
+    unique_docs = list({doc.id: doc for doc in docs_to_download}.values())
+    if len(unique_docs) == 1 and len(items) == 1 and items[0].type == "document":
+        doc = unique_docs[0]
+        version = current_version(doc, db)
+        if not version:
+            raise HTTPException(status_code=404, detail="Document has no versions")
+        data = read_version_bytes(version)
+        record_event(
+            doc,
+            user,
+            "download",
+            f"Downloaded {document_path(doc)}",
+            db,
+            meta=client_meta(request),
+            publish_state=False,
+        )
+        record_state_change(db, "document.download", ("document_detail",))
+        db.commit()
+        return download_response(data, doc.name, version.mime_type)
+
+    buffer = io.BytesIO()
+    errors: list[str] = []
+    written: set[str] = set()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for doc in unique_docs:
+            archive_name = document_path(doc) or doc.name
+            if archive_name in written:
+                archive_name = f"{doc.id}-{archive_name}"
+            try:
+                version = current_version(doc, db)
+                if not version:
+                    raise HTTPException(status_code=404, detail="Document has no versions")
+                archive.writestr(archive_name, read_version_bytes(version))
+                written.add(archive_name)
+                record_event(
+                    doc,
+                    user,
+                    "download",
+                    f"Downloaded {document_path(doc)}",
+                    db,
+                    meta=client_meta(request),
+                    publish_state=False,
+                )
+            except HTTPException as exc:
+                errors.append(f"{archive_name}: {response_detail(exc)}")
+        if errors:
+            archive.writestr("vault-download-errors.txt", "\n".join(errors))
+    if written:
+        record_state_change(db, "document.download", ("document_detail",))
     db.commit()
-    return {"folder": normalized}
+    return download_response(buffer.getvalue(), "vault-download.zip", "application/zip")
 
 
 @router.post("/documents")
@@ -1424,30 +1881,6 @@ def document_detail(doc_id: int, db: Session = Depends(get_db)) -> RedirectRespo
     return RedirectResponse(url=f"/?folder={quote(folder_value)}", status_code=303)
 
 
-@router.get("/documents/{doc_id}/download")
-def download_document(
-    doc_id: int,
-    request: Request,
-    user: UserContext = Depends(current_user),
-    db: Session = Depends(get_db),
-) -> Response:
-    doc = get_document_or_404(doc_id, db)
-    version = current_version(doc, db)
-    if not version:
-        raise HTTPException(status_code=404, detail="Document has no versions")
-    data = read_version_bytes(version)
-    record_event(
-        doc,
-        user,
-        "download",
-        f"Downloaded {document_path(doc)}",
-        db,
-        meta=client_meta(request),
-    )
-    db.commit()
-    return download_response(data, doc.name, version.mime_type)
-
-
 @router.get("/documents/{doc_id}/checkout")
 def checkout_document(
     doc_id: int,
@@ -1468,59 +1901,6 @@ def checkout_document(
         data = read_version_bytes(version)
         db.commit()
     return download_response(data, doc.name, version.mime_type)
-
-
-@router.post("/documents/{doc_id}/lock")
-def lock_document(
-    doc_id: int,
-    request: Request,
-    user: UserContext = Depends(current_user),
-    db: Session = Depends(get_db),
-) -> dict[str, object]:
-    doc = get_document_or_404(doc_id, db)
-    if document_is_archive(doc):
-        raise HTTPException(status_code=400, detail="Restore this file before editing")
-    meta = client_meta(request)
-    with storage_write_lock():
-        lock, created = acquire_document_lock(doc, user, meta, db)
-        if created:
-            record_event(doc, user, "lock", f"Locked {document_path(doc)}", db, meta=meta)
-        db.commit()
-    return {
-        "locked": True,
-        "lock": {
-            "by": lock.locked_by,
-            "name": lock.locked_by_name,
-            "at": lock.locked_at.isoformat() if lock.locked_at else None,
-        },
-    }
-
-
-@router.post("/documents/{doc_id}/release")
-def release_document(
-    doc_id: int,
-    request: Request,
-    mode: str = "redirect",
-    user: UserContext = Depends(current_user),
-    db: Session = Depends(get_db),
-) -> Response:
-    doc = get_document_or_404(doc_id, db)
-    lock = get_active_lock(doc, db)
-    if lock and lock.locked_by != user["id"] and not user["is_admin"]:
-        raise HTTPException(status_code=403, detail="Document is locked by another user")
-    release_lock(lock, user)
-    record_event(
-        doc,
-        user,
-        "release",
-        f"Released lock for {document_path(doc)}",
-        db,
-        meta=client_meta(request),
-    )
-    db.commit()
-    if mode == "json":
-        return JSONResponse({"released": True})
-    return RedirectResponse(url=f"/?folder={quote(document_folder_path(doc))}", status_code=303)
 
 
 @router.post("/documents/{doc_id}/checkin")
@@ -1599,126 +1979,3 @@ def download_version(
     )
     db.commit()
     return download_response(data, filename, version.mime_type)
-
-
-@router.post("/documents/{doc_id}/move")
-def move_document(
-    doc_id: int,
-    request: Request,
-    new_path: str = Form(...),
-    user: UserContext = Depends(current_user),
-    db: Session = Depends(get_db),
-) -> dict[str, str]:
-    doc = get_document_or_404(doc_id, db)
-    ensure_not_locked_by_other(doc, user, db)
-    old_path = document_path(doc)
-    target_folder, target_name = folder_for_new_path(db, new_path)
-    if doc.folder.root_key != target_folder.root_key:
-        raise HTTPException(status_code=400, detail="Use archive or restore for Archive moves")
-    with storage_write_lock():
-        mutate_doc_location(
-            doc,
-            target_folder,
-            target_name,
-            user,
-            db,
-            client_meta(request),
-            "move",
-            f"Moved from {old_path} to {join_path(folder_path(target_folder), target_name)}",
-        )
-        db.commit()
-    return {"path": document_path(doc)}
-
-
-@router.post("/documents/{doc_id}/archive")
-def archive_document(
-    doc_id: int,
-    request: Request,
-    user: UserContext = Depends(current_user),
-    db: Session = Depends(get_db),
-) -> dict[str, str]:
-    doc = get_document_or_404(doc_id, db)
-    source_path = document_path(doc)
-    if document_is_archive(doc):
-        raise HTTPException(status_code=400, detail="Document is already archived")
-    lock = ensure_not_locked_by_other(doc, user, db)
-    target_folder_path = public_folder_path(ARCHIVE_ROOT_KEY, folder_relative_path(doc.folder))
-    target_folder = get_or_create_folder_path(db, target_folder_path)
-    with storage_write_lock():
-        release_lock(lock, user)
-        mutate_doc_location(
-            doc,
-            target_folder,
-            doc.name,
-            user,
-            db,
-            client_meta(request),
-            "archive",
-            f"Archived from {source_path}",
-        )
-        db.commit()
-    return {"path": document_path(doc)}
-
-
-@router.post("/documents/{doc_id}/unarchive")
-def unarchive_document(
-    doc_id: int,
-    request: Request,
-    user: UserContext = Depends(current_user),
-    db: Session = Depends(get_db),
-) -> dict[str, str]:
-    doc = get_document_or_404(doc_id, db)
-    source_path = document_path(doc)
-    if not document_is_archive(doc):
-        raise HTTPException(status_code=400, detail="Document is not archived")
-    ensure_not_locked_by_other(doc, user, db)
-    archive_folder = doc.folder
-    target_folder_path = folder_relative_path(doc.folder)
-    target_folder = get_or_create_folder_path(db, target_folder_path)
-    with storage_write_lock():
-        mutate_doc_location(
-            doc,
-            target_folder,
-            doc.name,
-            user,
-            db,
-            client_meta(request),
-            "unarchive",
-            f"Restored to Vault from {source_path}",
-        )
-        prune_empty_archive_folders(db, archive_folder)
-        db.commit()
-    return {"path": document_path(doc)}
-
-
-@router.post("/documents/{doc_id}/delete")
-def delete_document(
-    doc_id: int,
-    request: Request,
-    user: UserContext = Depends(current_user),
-    db: Session = Depends(get_db),
-) -> dict[str, str]:
-    doc = get_document_or_404(doc_id, db)
-    if not document_is_archive(doc):
-        return archive_document(doc_id, request, user, db)
-    return permanent_delete_document(doc_id, user, db)
-
-
-@router.post("/documents/{doc_id}/permanent_delete")
-def permanent_delete_document(
-    doc_id: int,
-    user: UserContext = Depends(current_user),
-    db: Session = Depends(get_db),
-) -> dict[str, str]:
-    if not user["is_admin"]:
-        raise HTTPException(status_code=403, detail="Admin access required")
-    doc = get_document_or_404(doc_id, db)
-    if not document_is_archive(doc):
-        raise HTTPException(status_code=400, detail="Move the document to Archive before deleting")
-    deleted_path = document_path(doc)
-    archive_folder = doc.folder
-    db.delete(doc)
-    prune_empty_archive_folders(db, archive_folder)
-    record_document_deleted(db)
-    db.commit()
-    return {"deleted": deleted_path}

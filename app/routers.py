@@ -796,8 +796,10 @@ def download_response(data: bytes, filename: str, mime_type: str | None = None) 
         "_" if ord(char) < 32 or ord(char) == 127 else char
         for char in filename.replace('"', "")
     ).strip() or "download"
+    ascii_name = "".join(char if 32 <= ord(char) < 127 else "_" for char in safe_name).strip()
+    ascii_name = ascii_name or "download"
     content_type = mime_type or mimetypes.guess_type(safe_name)[0] or "application/octet-stream"
-    disposition = f'attachment; filename="{safe_name}"; filename*=UTF-8\'\'{quote(safe_name)}'
+    disposition = f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{quote(safe_name)}'
     return Response(
         content=data,
         media_type=content_type,

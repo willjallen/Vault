@@ -38,8 +38,14 @@ def init_db() -> None:
     # Import models so SQLAlchemy is aware of them before creating tables
     from . import models
 
-    if RESET_DB_ON_START or _schema_needs_reset():
+    if RESET_DB_ON_START:
         _drop_existing_schema()
+    elif _schema_needs_reset():
+        raise RuntimeError(
+            "Database schema is incompatible with this app version. "
+            "Refusing to reset metadata automatically; migrate or back up the database before "
+            "setting VAULT_RESET_DB_ON_START=1."
+        )
     Base.metadata.create_all(bind=engine)
     _bootstrap_root_folders(models.Folder)
 

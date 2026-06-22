@@ -205,6 +205,11 @@ def ensure_document_upload_folder(folder: str) -> None:
         raise HTTPException(status_code=400, detail="Upload new documents to Vault")
 
 
+def ensure_folder_creation_path(folder: str) -> None:
+    if is_archived_path(folder):
+        raise HTTPException(status_code=400, detail="Create folders in Vault")
+
+
 def split_document_path(path: str) -> tuple[str, str]:
     cleaned = normalize_folder(path)
     if not cleaned:
@@ -2014,6 +2019,7 @@ def create_folder(
     normalized = normalize_folder(folder)
     if not normalized:
         raise HTTPException(status_code=400, detail="Folder path is required")
+    ensure_folder_creation_path(normalized)
     if get_folder_by_path(db, normalized):
         raise HTTPException(status_code=400, detail="Folder already exists")
     parent_path = "/".join(normalized.split("/")[:-1])

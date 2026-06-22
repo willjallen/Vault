@@ -14,3 +14,6 @@
 - Changed incompatible schema startup behavior to fail closed with a clear error unless explicit reset is enabled, and added a subprocess-backed DB init test proving pre-existing rows survive the failed startup.
 - Reproduced direct upload into `Archive/...` as a normal user: the server created an archived document with no archive event, checkout rejected it as archived, and non-admin delete hit the permanent-delete admin gate.
 - Added an upload-folder guard so new documents can only be created in Vault paths before any Archive folder rows are created.
+- User clarified locks are advisory only and users may unlock each other's files; do not treat cross-user unlock/archive behavior as a permissions bug by itself.
+- Reproduced direct `/folders` creation under `Archive/...`: creating `Archive/Project` succeeded, then archiving Vault `Project` failed with `A folder already exists at that path`.
+- Added a folder creation guard so user-created folders must start in Vault; archive transitions can still create Archive folders internally.

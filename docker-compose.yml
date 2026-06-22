@@ -8,13 +8,30 @@ services:
       - "0.0.0.0:8000:8000"
     environment:
       BASE_DOMAIN: localhost
-      VAULT_FILES_PATH: /vault-files
       VAULT_DB_PATH: /vault-metadata/vault-metadata.db
+      VAULT_STORAGE_BACKEND: ${VAULT_STORAGE_BACKEND:-local}
+      VAULT_STORAGE_PREFIX: ${VAULT_STORAGE_PREFIX:-objects}
+      VAULT_OBJECTS_PATH: /vault-objects
+      VAULT_RESET_DB_ON_START: ${VAULT_RESET_DB_ON_START:-0}
+      VAULT_S3_BUCKET: ${VAULT_S3_BUCKET:-}
+      VAULT_S3_REGION: ${VAULT_S3_REGION:-us-east-1}
+      VAULT_S3_ENDPOINT_URL: ${VAULT_S3_ENDPOINT_URL:-}
+      VAULT_S3_ACCESS_KEY_ID: ${VAULT_S3_ACCESS_KEY_ID:-}
+      VAULT_S3_SECRET_ACCESS_KEY: ${VAULT_S3_SECRET_ACCESS_KEY:-}
+      VAULT_S3_SESSION_TOKEN: ${VAULT_S3_SESSION_TOKEN:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      VAULT_R2_BUCKET: ${VAULT_R2_BUCKET:-}
+      VAULT_R2_ACCOUNT_ID: ${VAULT_R2_ACCOUNT_ID:-}
+      VAULT_R2_ACCESS_KEY_ID: ${VAULT_R2_ACCESS_KEY_ID:-}
+      VAULT_R2_SECRET_ACCESS_KEY: ${VAULT_R2_SECRET_ACCESS_KEY:-}
+      VAULT_R2_ENDPOINT_URL: ${VAULT_R2_ENDPOINT_URL:-}
       VAULT_DEFAULT_USER_EMAIL: admin@example.com
       VAULT_DEV_AUTH: "1"
       VAULT_DEV_USER: local-admin
       VAULT_DEV_NAME: Local Admin
       VAULT_DEV_GROUPS: admin,vault-admin
     volumes:
-      - ./.docker-data/files:/vault-files
+      - ./.docker-data/objects:/vault-objects
       - ./.docker-data/metadata:/vault-metadata

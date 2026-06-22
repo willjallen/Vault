@@ -2497,6 +2497,16 @@ async def checkin_document(
     meta = client_meta(request)
     message = note.strip() or f"Uploaded {upload_name}"
     with storage_write_lock():
+        db.refresh(doc)
+        db.expire(doc, ["folder"])
+        if document_is_archive(doc):
+            raise HTTPException(status_code=400, detail="Restore this file before editing")
+        lock = get_active_lock(doc, db)
+        if not lock or lock.locked_by != user["id"]:
+            raise HTTPException(
+                status_code=403,
+                detail="Check out the file before uploading a new version",
+            )
         if rename_to_upload and upload_name != doc.name:
             ensure_unique_document_path(db, doc.folder_id, upload_name, doc.id)
             record_event(

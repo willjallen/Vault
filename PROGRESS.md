@@ -19,3 +19,4 @@
 - Added a folder creation guard so user-created folders must start in Vault; archive transitions can still create Archive folders internally.
 - Added compatibility handling for legacy empty Archive placeholders so `Archive/Project` can be replaced by a real archived `Project` folder, while non-empty Archive targets still conflict.
 - Reproduced the symmetric restore issue: an empty Vault `Project` placeholder blocked restoring `Archive/Project`; added the same empty-placeholder cleanup to folder unarchive while preserving non-empty target conflicts.
+- Reproduced stale check-in race: a request validated a checked-out Vault document, the upload read archived it in another session, and check-in still wrote version 2 to the archived document. Added in-lock state refresh/recheck before version creation.

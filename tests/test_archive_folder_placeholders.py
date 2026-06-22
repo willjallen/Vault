@@ -114,6 +114,100 @@ class ArchiveFolderPlaceholderTests(unittest.TestCase):
             """,
         )
 
+    def test_unarchive_folder_reuses_empty_vault_placeholder(self) -> None:
+        self.run_archive_script(
+            """
+            from app.db import SessionLocal, init_db
+            from app.models import Folder
+            from app.routers import archive_folder, get_or_create_folder_path, unarchive_folder
+
+
+            class FakeClient:
+                host = "testclient"
+
+
+            class FakeRequest:
+                headers = {}
+                client = FakeClient()
+
+
+            init_db()
+            user = {
+                "id": "user",
+                "name": "User",
+                "email": "user@example.com",
+                "groups": ["vault-users"],
+                "is_admin": False,
+            }
+
+            with SessionLocal() as db:
+                get_or_create_folder_path(db, "Project")
+                db.commit()
+
+                archive_folder(FakeRequest(), "Project", user, db)
+                get_or_create_folder_path(db, "Project")
+                db.commit()
+
+                result = unarchive_folder(FakeRequest(), "Archive/Project", user, db)
+                assert result == {"folder": "Project"}
+
+                rows = db.query(Folder).filter_by(name="Project").all()
+                assert len(rows) == 1
+                assert rows[0].root_key == "vault"
+                assert rows[0].parent is not None
+                assert rows[0].parent.is_root
+            """,
+        )
+
+    def test_unarchive_folder_keeps_nonempty_vault_target_as_conflict(self) -> None:
+        self.run_archive_script(
+            """
+            from fastapi import HTTPException
+
+            from app.db import SessionLocal, init_db
+            from app.models import Folder
+            from app.routers import archive_folder, get_or_create_folder_path, unarchive_folder
+
+
+            class FakeClient:
+                host = "testclient"
+
+
+            class FakeRequest:
+                headers = {}
+                client = FakeClient()
+
+
+            init_db()
+            user = {
+                "id": "user",
+                "name": "User",
+                "email": "user@example.com",
+                "groups": ["vault-users"],
+                "is_admin": False,
+            }
+
+            with SessionLocal() as db:
+                get_or_create_folder_path(db, "Project")
+                db.commit()
+
+                archive_folder(FakeRequest(), "Project", user, db)
+                get_or_create_folder_path(db, "Project/Existing")
+                db.commit()
+
+                try:
+                    unarchive_folder(FakeRequest(), "Archive/Project", user, db)
+                except HTTPException as exc:
+                    assert exc.status_code == 400
+                    assert exc.detail == "A folder already exists at that path"
+                else:
+                    raise AssertionError("restore unexpectedly replaced a non-empty target")
+
+                rows = db.query(Folder).filter_by(name="Project").all()
+                assert sorted(row.root_key for row in rows) == ["archive", "vault"]
+            """,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -35,6 +35,7 @@ logs/
 *.log.*
 *.out
 *.err
+FINDINGS.md
 
 # Local lint cache files
 vault-service/.lint-env.hash

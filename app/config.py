@@ -2,10 +2,59 @@
 """Configuration helpers for the vault service."""
 
 import os
+import secrets
 from pathlib import Path
 
 BASE_DOMAIN = os.getenv("BASE_DOMAIN", "family.localhost")
 DB_PATH = Path(os.getenv("VAULT_DB_PATH", "/vault-metadata/vault-metadata.db")).resolve()
+PUBLIC_URL = os.getenv("VAULT_PUBLIC_URL", "").strip().rstrip("/")
+
+AUTH_MODE = os.getenv(
+    "VAULT_AUTH_MODE",
+    "dev" if os.getenv("VAULT_DEV_AUTH", "").strip().lower() in {"1", "true", "yes", "on"} else "headers",
+).strip().lower()
+SESSION_COOKIE_NAME = os.getenv("VAULT_SESSION_COOKIE_NAME", "vault_session").strip()
+SESSION_SECRET = os.getenv("VAULT_SESSION_SECRET", "").strip() or os.getenv(
+    "VAULT_OIDC_CLIENT_SECRET",
+    "",
+).strip() or "dev-insecure-session-secret"
+SESSION_MAX_AGE_SECONDS = int(os.getenv("VAULT_SESSION_MAX_AGE_SECONDS", "604800"))
+BOOTSTRAP_ADMIN_EMAILS = {
+    item.strip().lower()
+    for item in os.getenv("VAULT_BOOTSTRAP_ADMIN_EMAILS", "").split(",")
+    if item.strip()
+}
+ADMIN_GROUPS = {
+    item.strip().lower()
+    for item in os.getenv("VAULT_ADMIN_GROUPS", "admin,vault-admin").split(",")
+    if item.strip()
+}
+HEADER_AUTH_ISSUER = os.getenv("VAULT_HEADER_AUTH_ISSUER", "headers").strip() or "headers"
+DEV_AUTH_ISSUER = os.getenv("VAULT_DEV_AUTH_ISSUER", "dev").strip() or "dev"
+
+OIDC_ISSUER = os.getenv("VAULT_OIDC_ISSUER", "").strip().rstrip("/")
+OIDC_CLIENT_ID = os.getenv("VAULT_OIDC_CLIENT_ID", "").strip()
+OIDC_CLIENT_SECRET = os.getenv("VAULT_OIDC_CLIENT_SECRET", "").strip()
+OIDC_SCOPES = os.getenv("VAULT_OIDC_SCOPES", "openid email profile").strip()
+OIDC_REDIRECT_URI = os.getenv("VAULT_OIDC_REDIRECT_URI", "").strip()
+OIDC_CLIENT_AUTH = os.getenv("VAULT_OIDC_CLIENT_AUTH", "client_secret_basic").strip().lower()
+OIDC_STATE_COOKIE_NAME = os.getenv("VAULT_OIDC_STATE_COOKIE_NAME", "vault_oidc_state").strip()
+OIDC_GROUPS_CLAIM = os.getenv("VAULT_OIDC_GROUPS_CLAIM", "groups").strip() or "groups"
+OIDC_EMAIL_CLAIM = os.getenv("VAULT_OIDC_EMAIL_CLAIM", "email").strip() or "email"
+OIDC_NAME_CLAIM = os.getenv("VAULT_OIDC_NAME_CLAIM", "name").strip() or "name"
+OIDC_USERNAME_CLAIM = (
+    os.getenv("VAULT_OIDC_USERNAME_CLAIM", "preferred_username").strip() or "preferred_username"
+)
+OIDC_NONCE_BYTES = int(os.getenv("VAULT_OIDC_NONCE_BYTES", "24"))
+OIDC_DISCOVERY_TTL_SECONDS = int(os.getenv("VAULT_OIDC_DISCOVERY_TTL_SECONDS", "3600"))
+OIDC_HTTP_TIMEOUT_SECONDS = float(os.getenv("VAULT_OIDC_HTTP_TIMEOUT_SECONDS", "8"))
+
+if OIDC_NONCE_BYTES < 16:
+    OIDC_NONCE_BYTES = 16
+
+
+def new_token_urlsafe() -> str:
+    return secrets.token_urlsafe(OIDC_NONCE_BYTES)
 
 STORAGE_BACKEND = os.getenv("VAULT_STORAGE_BACKEND", "local").strip().lower()
 STORAGE_PREFIX = os.getenv("VAULT_STORAGE_PREFIX", "objects").strip().strip("/")

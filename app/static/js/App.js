@@ -94,10 +94,14 @@ export function App({ initial }) {
     (window.location.hostname.includes(".")
       ? window.location.hostname.split(".").slice(1).join(".")
       : "");
+  const authMode = initialBootstrap.auth_mode || "headers";
   const logoutUrl = useMemo(() => {
     const rd = encodeURIComponent(window.location.href);
-    return baseDomain ? `https://auth.${baseDomain}/logout?rd=${rd}` : `/logout?rd=${rd}`;
-  }, [baseDomain]);
+    if (authMode === "headers" && baseDomain) {
+      return `https://auth.${baseDomain}/logout?rd=${rd}`;
+    }
+    return `/logout?rd=${rd}`;
+  }, [authMode, baseDomain]);
   const redirectingRef = useRef(false);
 
   const redirectToLogin = useCallback(() => {
@@ -107,9 +111,12 @@ export function App({ initial }) {
     redirectingRef.current = true;
     setToast("Session expired. Redirecting to login…");
     const rd = encodeURIComponent(window.location.href);
-    const loginUrl = baseDomain ? `https://auth.${baseDomain}/?rd=${rd}` : `/login?rd=${rd}`;
+    const loginUrl =
+      authMode === "headers" && baseDomain
+        ? `https://auth.${baseDomain}/?rd=${rd}`
+        : `/login?rd=${rd}`;
     window.location.href = loginUrl;
-  }, [baseDomain]);
+  }, [authMode, baseDomain]);
   const { downloadWithProgress, transfers, uploadWithProgress } = useTransfers({
     onUnauthorized: redirectToLogin,
   });
@@ -853,7 +860,7 @@ export function App({ initial }) {
     }),
     h(TransferDock, { transfers }),
     h(BulkDragPreview, { drag: dragBundle }),
-    settingsOpen ? h(SettingsModal, { currentUser, onClose: closeSettings }) : null,
+    settingsOpen ? h(SettingsModal, { apiFetch, currentUser, onClose: closeSettings }) : null,
     h(ConfirmToast, { request: confirmRequest, onResolve: resolveConfirm }),
     contextMenu ? h(ContextMenu, { menu: contextMenu, onClose: closeContextMenu }) : null,
     error ? h("div", { className: "toast error" }, error) : null,

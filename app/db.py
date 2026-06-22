@@ -58,6 +58,9 @@ def _schema_needs_reset() -> bool:
         "state_events",
         "blobs",
         "blob_locations",
+        "vault_users",
+        "vault_groups",
+        "vault_group_memberships",
     }
     if not required_tables.issubset(tables):
         return True

@@ -2,6 +2,8 @@ services:
   vault:
     build:
       context: .
+      args:
+        VAULT_VERSION: ${VAULT_VERSION:-}
     image: ${VAULT_IMAGE:-vault-service:dev}
     environment:
       BASE_DOMAIN: ${BASE_DOMAIN:-localhost}

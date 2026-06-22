@@ -1928,6 +1928,12 @@ input[type="file"]::file-selector-button:hover {
   padding: 18px;
   border-right: 1px solid var(--border-extra-subtle);
   background: var(--surface-overlay-muted);
+  display: flex;
+  flex-direction: column;
+}
+
+.settings-nav-list {
+  min-width: 0;
 }
 
 .settings-nav-item {
@@ -1996,6 +2002,33 @@ input[type="file"]::file-selector-button:hover {
   font-size: 0.78rem;
   line-height: 1.25;
   overflow-wrap: anywhere;
+}
+
+.settings-version {
+  min-width: 0;
+  margin-top: auto;
+  padding: 14px 12px 2px;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--text-muted);
+  font-size: 0.74rem;
+  line-height: 1.2;
+}
+
+.settings-version span {
+  flex: 0 0 auto;
+  font-weight: 760;
+}
+
+.settings-version strong {
+  min-width: 0;
+  color: var(--text-secondary);
+  font-weight: 820;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .settings-panel {
@@ -3674,6 +3707,7 @@ input[type="file"]::file-selector-button:hover {
 
   .settings-nav {
     display: flex;
+    flex-direction: row;
     gap: 8px;
     overflow: auto hidden;
     border-right: 0;
@@ -3681,9 +3715,25 @@ input[type="file"]::file-selector-button:hover {
     padding: 12px;
   }
 
+  .settings-nav-list {
+    display: flex;
+    gap: 8px;
+  }
+
   .settings-nav-item {
     width: min(220px, 72vw);
     flex: 0 0 auto;
+  }
+
+  .settings-nav-item + .settings-nav-item {
+    margin-top: 0;
+  }
+
+  .settings-version {
+    flex: 0 0 auto;
+    align-self: center;
+    margin-top: 0;
+    padding: 8px 10px;
   }
 
   .folder-properties-layer {

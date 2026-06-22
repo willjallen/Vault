@@ -720,6 +720,7 @@ function SectionPanel({
 
 export function SettingsModal({
   apiFetch,
+  appVersion = "0.0.0-dev",
   currentUser,
   onClose,
   onPalettePreferenceChange,
@@ -809,18 +810,24 @@ export function SettingsModal({
           ),
         ]),
         h("div", { className: "settings-body", key: "body" }, [
-          h(
-            "nav",
-            { "aria-label": "Settings sections", className: "settings-nav", key: "nav" },
-            sections.map((section) =>
-              h(SectionButton, {
-                active: activeSection === section.id,
-                key: section.id,
-                onSelect: setActiveSection,
-                section,
-              })
-            )
-          ),
+          h("nav", { "aria-label": "Settings sections", className: "settings-nav", key: "nav" }, [
+            h(
+              "div",
+              { className: "settings-nav-list", key: "sections" },
+              sections.map((section) =>
+                h(SectionButton, {
+                  active: activeSection === section.id,
+                  key: section.id,
+                  onSelect: setActiveSection,
+                  section,
+                })
+              )
+            ),
+            h("div", { className: "settings-version", key: "version" }, [
+              h("span", { key: "label" }, "Version"),
+              h("strong", { key: "value" }, appVersion),
+            ]),
+          ]),
           h(SectionPanel, {
             activeSection,
             apiFetch,

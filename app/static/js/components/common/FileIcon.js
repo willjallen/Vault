@@ -1,6 +1,16 @@
 const h = React.createElement;
 
-export function FileIcon({ kind }) {
-  const glyph = kind === "folder" ? "📁" : "📄";
-  return h("span", { className: "file-icon" }, glyph);
+const folderGlyphs = new Map([
+  ["archive", "🗄️"],
+  ["finance", "💼"],
+  ["folder", "📁"],
+  ["home", "🏠"],
+  ["locked", "🔒"],
+  ["photos", "🖼️"],
+  ["project", "📌"],
+]);
+
+export function FileIcon({ color = "", folderIcon = "", kind }) {
+  const glyph = kind === "folder" ? folderGlyphs.get(folderIcon) || "📁" : "📄";
+  return h("span", { className: `file-icon ${color ? `folder-color-${color}` : ""}` }, glyph);
 }

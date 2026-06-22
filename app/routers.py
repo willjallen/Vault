@@ -37,6 +37,8 @@ from .models import (
     DocumentLock,
     DocumentVersion,
     Folder,
+    FolderEvent,
+    FolderPermission,
     StateEvent,
     VaultGroup,
     VaultGroupMembership,
@@ -58,6 +60,8 @@ ARCHIVE_ROOT = "Archive"
 VAULT_ROOT_KEY = "vault"
 ARCHIVE_ROOT_KEY = "archive"
 ROOT_NAMES = {VAULT_ROOT_KEY: "Vault", ARCHIVE_ROOT_KEY: "Archive"}
+FOLDER_COLOR_TOKENS = {"blue", "teal", "green", "amber", "rose", "violet", "slate"}
+FOLDER_ICON_TOKENS = {"folder", "home", "project", "photos", "finance", "locked", "archive"}
 
 
 @dataclass(frozen=True)
@@ -97,6 +101,24 @@ class AdminGroupPayload(BaseModel):
 
 class AdminGroupMemberPayload(BaseModel):
     user_id: int
+
+
+class FolderPropertiesPayload(BaseModel):
+    path: str
+    color: str | None = None
+    icon: str | None = None
+
+
+class FolderPermissionPayload(BaseModel):
+    group_id: int
+    can_view: bool = True
+    can_read: bool = True
+    can_write: bool = False
+
+
+class FolderPermissionsPayload(BaseModel):
+    path: str
+    permissions: list[FolderPermissionPayload] = Field(default_factory=list)
 
 
 DOCUMENT_EVENT_RESOURCES: dict[str, tuple[str, ...]] = {
@@ -327,6 +349,42 @@ def get_or_create_folder_path(db: Session, path: str | None) -> Folder:
             db.flush()
         current = folder
     return current
+
+
+def sanitize_folder_color(value: str | None) -> str | None:
+    normalized = (value or "").strip().lower()
+    if not normalized:
+        return None
+    if normalized not in FOLDER_COLOR_TOKENS:
+        raise HTTPException(status_code=400, detail="Invalid folder color")
+    return normalized
+
+
+def sanitize_folder_icon(value: str | None) -> str | None:
+    normalized = (value or "").strip().lower()
+    if not normalized:
+        return None
+    if normalized not in FOLDER_ICON_TOKENS:
+        raise HTTPException(status_code=400, detail="Invalid folder icon")
+    return normalized
+
+
+def record_folder_event(
+    folder: Folder,
+    user: UserContext,
+    event_type: str,
+    message: str,
+    db: Session,
+) -> None:
+    db.add(
+        FolderEvent(
+            folder=folder,
+            event_type=event_type,
+            actor=user["id"],
+            actor_name=user["name"],
+            message=message,
+        ),
+    )
 
 
 def ensure_unique_folder_name(
@@ -837,6 +895,7 @@ def archive_folder_item(source: Folder, request: Request, user: UserContext, db:
         raise HTTPException(status_code=400, detail="Cannot archive a root folder")
     if folder_is_archive(source):
         raise HTTPException(status_code=400, detail="Folder is already archived")
+    source_path = folder_path(source)
     target_path = public_folder_path(ARCHIVE_ROOT_KEY, folder_relative_path(source))
     target_parent = get_or_create_folder_path(db, "/".join(target_path.split("/")[:-1]))
     target_name = normalize_item_name(target_path.split("/")[-1], "Folder name")
@@ -858,12 +917,14 @@ def archive_folder_item(source: Folder, request: Request, user: UserContext, db:
     source.parent_id = target_parent.id
     source.name = target_name
     set_subtree_root_key(db, source, ARCHIVE_ROOT_KEY)
+    record_folder_event(source, user, "archive", f"Moved to Archive from {source_path}", db)
     return target_path
 
 
 def restore_folder_item(source: Folder, request: Request, user: UserContext, db: Session) -> str:
     if source.is_root or not folder_is_archive(source):
         raise HTTPException(status_code=400, detail="Choose an archived folder to restore")
+    source_path = folder_path(source)
     target_path = folder_relative_path(source)
     target_parent = get_or_create_folder_path(db, "/".join(target_path.split("/")[:-1]))
     target_name = normalize_item_name(target_path.split("/")[-1], "Folder name")
@@ -886,6 +947,7 @@ def restore_folder_item(source: Folder, request: Request, user: UserContext, db:
     source.name = target_name
     set_subtree_root_key(db, source, VAULT_ROOT_KEY)
     prune_empty_archive_folders(db, archive_parent)
+    record_folder_event(source, user, "restore", f"Restored to Vault from {source_path}", db)
     return target_path
 
 
@@ -920,6 +982,7 @@ def move_doc_item(
 def move_folder_item(
     source: Folder,
     destination_folder: str,
+    user: UserContext,
     db: Session,
     name: str | None = None,
 ) -> str:
@@ -929,6 +992,8 @@ def move_folder_item(
     if source.root_key != target_parent.root_key:
         raise HTTPException(status_code=400, detail="Use archive or restore for Archive moves")
     source_path = folder_path(source)
+    source_parent_path = folder_path(source.parent) if source.parent else ""
+    source_name = source.name
     target_name = normalize_item_name(name or source.name, "Folder name")
     target_path = join_path(folder_path(target_parent), target_name)
     if target_path == source_path:
@@ -939,6 +1004,13 @@ def move_folder_item(
     source.parent = target_parent
     source.parent_id = target_parent.id
     source.name = target_name
+    event_type = "rename" if source_parent_path == folder_path(target_parent) and target_name != source_name else "move"
+    message = (
+        f"Renamed from {source_name} to {target_name}"
+        if event_type == "rename"
+        else f"Moved from {source_path} to {target_path}"
+    )
+    record_folder_event(source, user, event_type, message, db)
     return target_path
 
 
@@ -1128,7 +1200,7 @@ def docs_stats_for_folder_payloads(
     return stats
 
 
-def folder_summary_payload(path: str, stats: list[DocStat]) -> dict[str, object]:
+def folder_summary_payload(folder: Folder, path: str, stats: list[DocStat]) -> dict[str, object]:
     latest: dt.datetime | None = None
     size = 0
     for stat in stats:
@@ -1140,11 +1212,92 @@ def folder_summary_payload(path: str, stats: list[DocStat]) -> dict[str, object]
     return {
         "path": path,
         "name": path.split("/")[-1] if path else "Vault",
+        "color": folder.color or "",
+        "icon": folder.icon or "",
         "latest_updated_at": latest.isoformat() if latest else None,
         "latest_updated_display": format_mtime(latest),
         "size_bytes": size,
         "size_display": format_size(size),
     }
+
+
+def folder_counts_payload(folder: Folder, db: Session) -> dict[str, int]:
+    folder_ids = subtree_folder_ids(folder, all_folders(db))
+    document_count = (
+        db.execute(select(Document.id).where(Document.folder_id.in_(folder_ids))).all()
+        if folder_ids
+        else []
+    )
+    return {
+        "folders": max(len(folder_ids) - 1, 0),
+        "documents": len(document_count),
+    }
+
+
+def folder_permissions_payload(folder: Folder, db: Session) -> list[dict[str, object]]:
+    rows = (
+        db.execute(
+            select(FolderPermission, VaultGroup)
+            .join(VaultGroup, VaultGroup.id == FolderPermission.group_id)
+            .where(FolderPermission.folder_id == folder.id)
+            .order_by(VaultGroup.name),
+        )
+        .all()
+    )
+    return [
+        {
+            "id": permission.id,
+            "group_id": group.id,
+            "group_name": group.name,
+            "can_view": bool(permission.can_view),
+            "can_read": bool(permission.can_read),
+            "can_write": bool(permission.can_write),
+        }
+        for permission, group in rows
+    ]
+
+
+def folder_properties_payload(folder: Folder, db: Session) -> dict[str, object]:
+    folders = all_folders(db)
+    path_cache = build_folder_path_cache(folders)
+    path = folder_path(folder, path_cache)
+    docs = list(db.execute(select(Document)).scalars().all())
+    stats = docs_stats_for_folder_payloads(docs, db, path_cache)
+    summary = folder_summary_payload(folder, path, stats)
+    events = (
+        db.execute(
+            select(FolderEvent)
+            .where(FolderEvent.folder_id == folder.id)
+            .order_by(FolderEvent.created_at.desc()),
+        )
+        .scalars()
+        .all()
+    )
+    groups = list(db.execute(select(VaultGroup).order_by(VaultGroup.name)).scalars().all())
+    summary.update(
+        {
+            "id": folder.id,
+            "root": bool(folder.is_root),
+            "archived": folder_is_archive(folder),
+            "created_at": folder.created_at.isoformat() if folder.created_at else None,
+            "created_by": folder.created_by,
+            "created_by_name": folder.created_by_name or folder.created_by or "System",
+            "counts": folder_counts_payload(folder, db),
+            "history": [
+                {
+                    "id": event.id,
+                    "type": event.event_type,
+                    "by": event.actor_name or event.actor or "System",
+                    "message": event.message or event.event_type,
+                    "timestamp": event.created_at.isoformat() if event.created_at else None,
+                }
+                for event in events
+            ],
+            "permissions": folder_permissions_payload(folder, db),
+            "available_groups": [{"id": group.id, "name": group.name} for group in groups],
+        },
+    )
+    return summary
 
 
 def matches_query(query: str, *values: str | None) -> bool:
@@ -1195,7 +1348,7 @@ def build_contents_payload(
         path = folder_path(item, path_cache)
         if search_query and not matches_query(search_query, item.name, path):
             continue
-        folder_rows.append(folder_summary_payload(path, stats))
+        folder_rows.append(folder_summary_payload(item, path, stats))
     if normalized_folder == ARCHIVE_ROOT:
         for row in folder_rows:
             if row["path"] == ARCHIVE_ROOT:
@@ -1682,6 +1835,82 @@ def api_folder_contents(
     return build_contents_payload(db, normalize_folder(folder), q, recursive)
 
 
+@router.get("/api/folders/properties")
+def api_folder_properties(
+    path: str = "",
+    user: UserContext = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    del user
+    ensure_root_folders(db)
+    commit_state(db)
+    folder = get_folder_by_path(db, path)
+    if not folder:
+        raise HTTPException(status_code=404, detail="Folder not found")
+    return folder_properties_payload(folder, db)
+
+
+@router.patch("/api/folders/properties")
+def api_update_folder_properties(
+    payload: FolderPropertiesPayload,
+    user: UserContext = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    ensure_root_folders(db)
+    folder = get_folder_by_path(db, payload.path)
+    if not folder:
+        raise HTTPException(status_code=404, detail="Folder not found")
+    folder.color = sanitize_folder_color(payload.color)
+    folder.icon = sanitize_folder_icon(payload.icon)
+    record_folder_event(folder, user, "metadata", "Updated folder appearance", db)
+    record_folder_change(db, "properties")
+    commit_state(db)
+    return folder_properties_payload(folder, db)
+
+
+@router.put("/api/folders/permissions")
+def api_update_folder_permissions(
+    payload: FolderPermissionsPayload,
+    user: UserContext = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    ensure_root_folders(db)
+    folder = get_folder_by_path(db, payload.path)
+    if not folder:
+        raise HTTPException(status_code=404, detail="Folder not found")
+    seen: set[int] = set()
+    groups_by_id = {group.id: group for group in db.execute(select(VaultGroup)).scalars().all()}
+    existing = {
+        permission.group_id: permission
+        for permission in db.execute(
+            select(FolderPermission).where(FolderPermission.folder_id == folder.id),
+        )
+        .scalars()
+        .all()
+    }
+    for row in payload.permissions:
+        if row.group_id in seen:
+            raise HTTPException(status_code=400, detail="Duplicate group permission")
+        seen.add(row.group_id)
+        if row.group_id not in groups_by_id:
+            raise HTTPException(status_code=404, detail="Group not found")
+        permission = existing.get(row.group_id)
+        if not permission:
+            permission = FolderPermission(folder_id=folder.id, group_id=row.group_id)
+            db.add(permission)
+        permission.can_view = row.can_view
+        permission.can_read = row.can_read
+        permission.can_write = row.can_write
+        permission.updated_at = now_utc()
+    for group_id, permission in existing.items():
+        if group_id not in seen:
+            db.delete(permission)
+    record_folder_event(folder, user, "permissions", "Updated folder permissions", db)
+    record_folder_change(db, "permissions")
+    commit_state(db)
+    return folder_properties_payload(folder, db)
+
+
 @router.get("/api/documents/{doc_id}/detail")
 def api_document_detail(
     doc_id: int,
@@ -1747,7 +1976,6 @@ def create_folder(
     user: UserContext = Depends(current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, str]:
-    del user
     normalized = normalize_folder(folder)
     if not normalized:
         raise HTTPException(status_code=400, detail="Folder path is required")
@@ -1757,8 +1985,16 @@ def create_folder(
     name = normalize_item_name(normalized.split("/")[-1], "Folder name")
     parent = get_or_create_folder_path(db, parent_path)
     ensure_unique_folder_name(db, parent.id, name)
-    created = Folder(root_key=parent.root_key, parent_id=parent.id, name=name, is_root=False)
+    created = Folder(
+        root_key=parent.root_key,
+        parent_id=parent.id,
+        name=name,
+        is_root=False,
+        created_by=user["id"],
+        created_by_name=user["name"],
+    )
     db.add(created)
+    record_folder_event(created, user, "create", f"Created {normalized}", db)
     record_folder_change(db, "created")
     db.commit()
     return {"folder": normalized}
@@ -1786,7 +2022,7 @@ def move_items(
                     folder_item = get_folder_by_path(db, item.path)
                     if not folder_item:
                         raise HTTPException(status_code=404, detail="Folder not found")
-                    moved = move_folder_item(folder_item, destination, db)
+                    moved = move_folder_item(folder_item, destination, user, db)
                     result["ok"].append(action_result(item, moved))
                 changed = True
             except HTTPException as exc:
@@ -1841,6 +2077,7 @@ def rename_item(
                 renamed = move_folder_item(
                     folder_item,
                     destination_folder,
+                    user,
                     db,
                     name=payload.name,
                 )

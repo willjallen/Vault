@@ -83,6 +83,11 @@ export function buildFolderMenuItems(actions) {
   const canPermanentDeleteFolder = isAdmin && isArchivedFolder && folderPath !== "Archive";
   return compactMenuItems([
     { label: "Open", action: () => actions.navigateToFolder(folderPath) },
+    {
+      label: "Properties",
+      action: () => actions.openFolderProperties(folderItem),
+      disabled: busy,
+    },
     hasPath && !isRoot
       ? { label: "Rename", action: () => actions.beginRenameFolder(folderPath), disabled: busy }
       : null,

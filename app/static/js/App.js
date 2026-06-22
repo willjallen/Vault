@@ -1,6 +1,7 @@
 import { FinderShell } from "./components/FinderShell.js";
 import { BulkDragPreview } from "./components/BulkDragPreview.js";
 import { ConfirmToast } from "./components/ConfirmToast.js";
+import { FolderPropertiesModal } from "./components/FolderPropertiesModal.js";
 import { SettingsModal } from "./components/SettingsModal.js";
 import { TransferDock } from "./components/TransferDock.js";
 import { ContextMenu } from "./components/browser/ContextMenu.js";
@@ -50,6 +51,7 @@ export function App({ initial }) {
   const [contextMenu, setContextMenu] = useState(null);
   const [draggingFolderPath, setDraggingFolderPath] = useState(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [folderPropertiesTarget, setFolderPropertiesTarget] = useState(null);
   const [toast, setToast] = useState("");
   const [confirmRequest, setConfirmRequest] = useState(null);
   const uploadInput = useRef(null);
@@ -87,6 +89,18 @@ export function App({ initial }) {
   const closeSettings = useCallback(() => {
     setSettingsOpen(false);
     window.setTimeout(() => settingsButtonRef.current?.focus(), 0);
+  }, []);
+
+  const openFolderProperties = useCallback(
+    (folderItem) => {
+      setFolderPropertiesTarget(folderItem);
+      closeContextMenu();
+    },
+    [closeContextMenu]
+  );
+
+  const closeFolderProperties = useCallback(() => {
+    setFolderPropertiesTarget(null);
   }, []);
 
   const baseDomain =
@@ -650,6 +664,7 @@ export function App({ initial }) {
       handleUnarchiveFolder,
       handleUnlockItems,
       handleUploadClick,
+      openFolderProperties,
       handleView,
       handleVersionUploadClick,
       isAdmin,
@@ -861,6 +876,14 @@ export function App({ initial }) {
     h(TransferDock, { transfers }),
     h(BulkDragPreview, { drag: dragBundle }),
     settingsOpen ? h(SettingsModal, { apiFetch, currentUser, onClose: closeSettings }) : null,
+    folderPropertiesTarget
+      ? h(FolderPropertiesModal, {
+          apiFetch,
+          folder: folderPropertiesTarget,
+          onClose: closeFolderProperties,
+          onUpdated: () => refresh(folder, { invalidateContents: true, sidebar: true }),
+        })
+      : null,
     h(ConfirmToast, { request: confirmRequest, onResolve: resolveConfirm }),
     contextMenu ? h(ContextMenu, { menu: contextMenu, onClose: closeContextMenu }) : null,
     error ? h("div", { className: "toast error" }, error) : null,

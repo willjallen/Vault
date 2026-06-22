@@ -19,7 +19,7 @@ class CheckinStaleStateTests(unittest.TestCase):
                 from app.db import SessionLocal, init_db
                 from app.models import Document, DocumentLock, DocumentVersion
                 from app.routers import (
-                    archive_document,
+                    archive_doc_item,
                     checkin_document,
                     create_document_version,
                     get_or_create_blob_for_data,
@@ -43,7 +43,7 @@ class CheckinStaleStateTests(unittest.TestCase):
                     "name": "Alice",
                     "email": "alice@example.com",
                     "groups": ["vault-users"],
-                    "is_admin": False,
+                    "is_admin": True,
                 }
 
 
@@ -56,7 +56,9 @@ class CheckinStaleStateTests(unittest.TestCase):
 
                     async def read(self) -> bytes:
                         with SessionLocal() as archive_db:
-                            archive_document(self.doc_id, FakeRequest(), user, archive_db)
+                            doc = archive_db.get(Document, self.doc_id)
+                            archive_doc_item(doc, FakeRequest(), user, archive_db)
+                            archive_db.commit()
                         return b"v2 after archive"
 
 

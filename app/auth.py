@@ -47,7 +47,7 @@ from .config import (
     new_token_urlsafe,
 )
 from .db import get_db
-from .models import VaultGroup, VaultGroupMembership, VaultUser
+from .models import Folder, FolderPermission, VaultGroup, VaultGroupMembership, VaultUser
 
 LOCAL_DEV_DOMAINS = {"localhost", "127.0.0.1", "::1", "family.localhost"}
 
@@ -168,12 +168,61 @@ def _context_for_user(user: VaultUser, db: Session) -> UserContext:
     }
 
 
+def _ensure_group_root_permissions(db: Session, group: VaultGroup) -> None:
+    roots = list(db.execute(select(Folder).where(Folder.is_root == True)).scalars())  # noqa: E712
+    for root in roots:
+        exists = db.execute(
+            select(FolderPermission.id).where(
+                FolderPermission.folder_id == root.id,
+                FolderPermission.group_id == group.id,
+            ),
+        ).scalar()
+        if exists:
+            continue
+        db.add(
+            FolderPermission(
+                folder_id=root.id,
+                group_id=group.id,
+                can_view=True,
+                can_read=True,
+                can_write=True,
+            ),
+        )
+
+
+def _sync_vault_groups(db: Session, user: VaultUser, groups: set[str]) -> None:
+    normalized = {group.strip().lower() for group in groups if group.strip()}
+    existing_groups = {group.name.lower(): group for group in db.execute(select(VaultGroup)).scalars()}
+    for group_name in normalized:
+        if group_name not in existing_groups:
+            group = VaultGroup(name=group_name)
+            db.add(group)
+            db.flush()
+            existing_groups[group_name] = group
+        _ensure_group_root_permissions(db, existing_groups[group_name])
+
+    memberships = list(
+        db.execute(
+            select(VaultGroupMembership).where(VaultGroupMembership.user_id == user.id),
+        ).scalars(),
+    )
+    memberships_by_group = {membership.group_id: membership for membership in memberships}
+    target_group_ids = {existing_groups[group_name].id for group_name in normalized}
+    for group_id, membership in memberships_by_group.items():
+        if group_id not in target_group_ids:
+            db.delete(membership)
+    for group_id in target_group_ids:
+        if group_id not in memberships_by_group:
+            db.add(VaultGroupMembership(user_id=user.id, group_id=group_id))
+
+
 def _upsert_vault_user(
     db: Session,
     issuer: str,
     subject: str,
     email: str | None,
     name: str | None,
+    groups: set[str] | None = None,
     admin_hint: bool = False,
     mark_login: bool = False,
 ) -> VaultUser:
@@ -212,6 +261,9 @@ def _upsert_vault_user(
             user.last_login_at = now
         if admin_hint:
             user.is_admin = True
+    db.flush()
+    if groups is not None:
+        _sync_vault_groups(db, user, groups)
     db.commit()
     db.refresh(user)
     if not user.is_active:
@@ -238,6 +290,7 @@ def _dev_identity(db: Session) -> UserContext | None:
         subject,
         email,
         (os.getenv("VAULT_DEV_NAME", "Local Admin") or subject).strip(),
+        groups=groups,
         admin_hint=_admin_hint(email, groups),
     )
     return _context_for_user(user, db)
@@ -264,6 +317,7 @@ def _header_identity(request: Request, db: Session) -> UserContext:
         remote_user,
         email,
         remote_name,
+        groups=groups,
         admin_hint=_admin_hint(email, groups),
     )
     return _context_for_user(user, db)
@@ -474,6 +528,7 @@ def oidc_callback_response(request: Request, db: Session) -> RedirectResponse:
         subject,
         email,
         name,
+        groups=groups,
         admin_hint=_admin_hint(email, groups),
         mark_login=True,
     )

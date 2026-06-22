@@ -20,7 +20,9 @@ class FolderStaleStateTests(unittest.TestCase):
                 from app.models import Document, DocumentEvent, Folder
                 import app.routers as routers
                 from app.routers import (
-                    archive_folder,
+                    ActionItem,
+                    ActionPayload,
+                    archive_items,
                     create_document_version,
                     document_path,
                     folder_path,
@@ -46,7 +48,7 @@ class FolderStaleStateTests(unittest.TestCase):
                     "name": "Alice",
                     "email": "alice@example.com",
                     "groups": ["vault-users"],
-                    "is_admin": False,
+                    "is_admin": True,
                 }
 
 
@@ -96,13 +98,14 @@ class FolderStaleStateTests(unittest.TestCase):
                 routers.storage_write_lock = rename_before_archive_body
                 with SessionLocal() as db:
                     try:
-                        try:
-                            archive_folder(FakeRequest(), "Project", user, db)
-                        except HTTPException as exc:
-                            assert exc.status_code == 404
-                            assert exc.detail == "Folder not found"
-                        else:
-                            raise AssertionError("stale folder archive unexpectedly succeeded")
+                        result = archive_items(
+                            ActionPayload(items=[ActionItem(type="folder", path="Project")]),
+                            FakeRequest(),
+                            user,
+                            db,
+                        )
+                        assert result["ok"] == []
+                        assert result["failed"][0]["detail"] == "Folder not found"
                     finally:
                         routers.storage_write_lock = original_lock
                         db.rollback()

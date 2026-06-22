@@ -265,6 +265,7 @@ def get_root_folder(db: Session, root_key: str) -> Folder:
     root = Folder(root_key=root_key, parent_id=None, name=ROOT_NAMES[root_key], is_root=True)
     db.add(root)
     db.flush()
+    default_folder_permissions(db, root)
     return root
 
 
@@ -273,6 +274,116 @@ def ensure_root_folders(db: Session) -> dict[str, Folder]:
         VAULT_ROOT_KEY: get_root_folder(db, VAULT_ROOT_KEY),
         ARCHIVE_ROOT_KEY: get_root_folder(db, ARCHIVE_ROOT_KEY),
     }
+
+
+def user_group_names(user: UserContext) -> set[str]:
+    return {group.strip().lower() for group in user.get("groups", []) if group.strip()}
+
+
+def access_level(can_view: bool, can_read: bool, can_write: bool) -> int:
+    if can_write:
+        return 3
+    if can_read:
+        return 2
+    if can_view:
+        return 1
+    return 0
+
+
+def default_folder_permissions(db: Session, folder: Folder) -> None:
+    if folder.id is None:
+        db.flush()
+    groups = list(db.execute(select(VaultGroup)).scalars().all())
+    for group in groups:
+        db.add(
+            FolderPermission(
+                folder_id=folder.id,
+                group_id=group.id,
+                can_view=True,
+                can_read=True,
+                can_write=True,
+            ),
+        )
+
+
+def folder_ancestor_ids(folder: Folder) -> list[int]:
+    ids: list[int] = []
+    current: Folder | None = folder
+    seen: set[int] = set()
+    while current and current.id not in seen:
+        seen.add(current.id)
+        ids.append(current.id)
+        current = current.parent
+    return ids
+
+
+def folder_access_level(folder: Folder, user: UserContext, db: Session) -> int:
+    if user["is_admin"]:
+        return 3
+    ancestor_ids = folder_ancestor_ids(folder)
+    permissions = list(
+        db.execute(
+            select(FolderPermission, VaultGroup)
+            .join(VaultGroup, VaultGroup.id == FolderPermission.group_id)
+            .where(FolderPermission.folder_id.in_(ancestor_ids)),
+        ).all(),
+    )
+    permissions_by_folder: dict[int, list[tuple[FolderPermission, VaultGroup]]] = defaultdict(list)
+    for permission, group in permissions:
+        permissions_by_folder[permission.folder_id].append((permission, group))
+    groups = user_group_names(user)
+    for folder_id in ancestor_ids:
+        scoped_permissions = permissions_by_folder.get(folder_id, [])
+        if not scoped_permissions:
+            continue
+        return max(
+            (
+                access_level(permission.can_view, permission.can_read, permission.can_write)
+                for permission, group in scoped_permissions
+                if group.name.strip().lower() in groups
+            ),
+            default=0,
+        )
+    return 0
+
+
+def document_access_level(doc: Document, user: UserContext, db: Session) -> int:
+    return folder_access_level(doc.folder, user, db)
+
+
+def require_folder_access(folder: Folder, user: UserContext, db: Session, level: int) -> None:
+    granted = folder_access_level(folder, user, db)
+    if granted >= level:
+        return
+    if granted > 0:
+        raise HTTPException(status_code=403, detail="Insufficient folder access")
+    raise HTTPException(status_code=404, detail="Folder not found")
+
+
+def require_document_access(doc: Document, user: UserContext, db: Session, level: int) -> None:
+    granted = document_access_level(doc, user, db)
+    if granted >= level:
+        return
+    if granted > 0:
+        raise HTTPException(status_code=403, detail="Insufficient document access")
+    raise HTTPException(status_code=404, detail="Document not found")
+
+
+def nearest_existing_folder_for_path(db: Session, path: str | None) -> Folder:
+    ref = parse_public_folder_path(path)
+    current = get_root_folder(db, ref.root_key)
+    if not ref.relative_path:
+        return current
+    for part in ref.relative_path.split("/"):
+        child = find_child_folder(db, current.id, part)
+        if not child:
+            return current
+        current = child
+    return current
+
+
+def require_write_for_folder_path(db: Session, path: str | None, user: UserContext) -> None:
+    require_folder_access(nearest_existing_folder_for_path(db, path), user, db, 3)
 
 
 def build_folder_path_cache(folders: list[Folder]) -> dict[int, str]:
@@ -393,6 +504,7 @@ def get_or_create_folder_path(db: Session, path: str | None) -> Folder:
             folder.parent = current
             db.add(folder)
             db.flush()
+            default_folder_permissions(db, folder)
         current = folder
     return current
 
@@ -922,11 +1034,13 @@ def batch_state_changed(db: Session, event_type: str) -> None:
 
 def archive_doc_item(doc: Document, request: Request, user: UserContext, db: Session) -> str:
     refresh_document_location(doc, db)
+    require_document_access(doc, user, db, 3)
     if document_is_archive(doc):
         raise HTTPException(status_code=400, detail="Document is already archived")
     source_path = document_path(doc)
     lock = ensure_not_locked_by_other(doc, user, db)
     target_folder_path = public_folder_path(ARCHIVE_ROOT_KEY, folder_relative_path(doc.folder))
+    require_write_for_folder_path(db, target_folder_path, user)
     target_folder = get_or_create_folder_path(db, target_folder_path)
     release_lock(lock, user)
     mutate_doc_location(
@@ -945,12 +1059,14 @@ def archive_doc_item(doc: Document, request: Request, user: UserContext, db: Ses
 
 def restore_doc_item(doc: Document, request: Request, user: UserContext, db: Session) -> str:
     refresh_document_location(doc, db)
+    require_document_access(doc, user, db, 3)
     if not document_is_archive(doc):
         raise HTTPException(status_code=400, detail="Document is not archived")
     source_path = document_path(doc)
     ensure_not_locked_by_other(doc, user, db)
     archive_folder = doc.folder
     target_folder_path = folder_relative_path(doc.folder)
+    require_write_for_folder_path(db, target_folder_path, user)
     target_folder = get_or_create_folder_path(db, target_folder_path)
     mutate_doc_location(
         doc,
@@ -972,8 +1088,10 @@ def archive_folder_item(source: Folder, request: Request, user: UserContext, db:
         raise HTTPException(status_code=400, detail="Cannot archive a root folder")
     if folder_is_archive(source):
         raise HTTPException(status_code=400, detail="Folder is already archived")
+    require_folder_access(source, user, db, 3)
     source_path = folder_path(source)
     target_path = public_folder_path(ARCHIVE_ROOT_KEY, folder_relative_path(source))
+    require_write_for_folder_path(db, "/".join(target_path.split("/")[:-1]), user)
     target_parent = get_or_create_folder_path(db, "/".join(target_path.split("/")[:-1]))
     target_name = normalize_item_name(target_path.split("/")[-1], "Folder name")
     remove_empty_folder_conflict(db, target_parent.id, target_name, source.id)
@@ -1002,8 +1120,10 @@ def archive_folder_item(source: Folder, request: Request, user: UserContext, db:
 def restore_folder_item(source: Folder, request: Request, user: UserContext, db: Session) -> str:
     if source.is_root or not folder_is_archive(source):
         raise HTTPException(status_code=400, detail="Choose an archived folder to restore")
+    require_folder_access(source, user, db, 3)
     source_path = folder_path(source)
     target_path = folder_relative_path(source)
+    require_write_for_folder_path(db, "/".join(target_path.split("/")[:-1]), user)
     target_parent = get_or_create_folder_path(db, "/".join(target_path.split("/")[:-1]))
     target_name = normalize_item_name(target_path.split("/")[-1], "Folder name")
     remove_empty_folder_conflict(db, target_parent.id, target_name, source.id)
@@ -1039,11 +1159,14 @@ def move_doc_item(
     name: str | None = None,
 ) -> str:
     refresh_document_location(doc, db)
+    require_document_access(doc, user, db, 3)
     ensure_not_locked_by_other(doc, user, db)
+    target_ref = parse_public_folder_path(destination_folder)
+    if doc.folder.root_key != target_ref.root_key:
+        raise HTTPException(status_code=400, detail="Use archive or restore for Archive moves")
+    require_write_for_folder_path(db, destination_folder, user)
     target_folder = get_or_create_folder_path(db, destination_folder)
     target_name = normalize_item_name(name or doc.name, "File name")
-    if doc.folder.root_key != target_folder.root_key:
-        raise HTTPException(status_code=400, detail="Use archive or restore for Archive moves")
     old_path = document_path(doc)
     mutate_doc_location(
         doc,
@@ -1068,9 +1191,12 @@ def move_folder_item(
 ) -> str:
     if source.is_root:
         raise HTTPException(status_code=400, detail="Cannot move a root folder")
-    target_parent = get_or_create_folder_path(db, destination_folder)
-    if source.root_key != target_parent.root_key:
+    require_folder_access(source, user, db, 3)
+    target_ref = parse_public_folder_path(destination_folder)
+    if source.root_key != target_ref.root_key:
         raise HTTPException(status_code=400, detail="Use archive or restore for Archive moves")
+    require_write_for_folder_path(db, destination_folder, user)
+    target_parent = get_or_create_folder_path(db, destination_folder)
     source_path = folder_path(source)
     source_parent_path = folder_path(source.parent) if source.parent else ""
     source_name = source.name
@@ -1158,6 +1284,7 @@ def document_row_payload(
     db: Session,
     path_cache: dict[int, str],
     locks: dict[int, DocumentLock] | None = None,
+    user: UserContext | None = None,
 ) -> dict[str, object]:
     latest_version = current_version(doc, db)
     latest_size_bytes = latest_version.blob.size_bytes if latest_version else None
@@ -1165,7 +1292,7 @@ def document_row_payload(
     doc_folder = document_folder_path(doc, path_cache)
     doc_path = document_path(doc, path_cache)
     lock = (locks or {}).get(doc.id)
-    return {
+    payload: dict[str, object] = {
         "id": doc.id,
         "name": doc.name,
         "path": doc_path,
@@ -1188,16 +1315,25 @@ def document_row_payload(
         "lock": lock_payload(lock),
         "archived": document_is_archive(doc),
     }
+    if user is not None:
+        level = document_access_level(doc, user, db)
+        payload["access"] = {
+            "visible": level >= 1,
+            "read": level >= 2,
+            "write": level >= 3,
+        }
+    return payload
 
 
 def document_detail_payload(
     doc: Document,
+    user: UserContext,
     db: Session,
     path_cache: dict[int, str] | None = None,
     locks: dict[int, DocumentLock] | None = None,
 ) -> dict[str, object]:
     cache = path_cache or build_folder_path_cache(all_folders(db))
-    payload = document_row_payload(doc, db, cache, locks or active_locks_by_document(db))
+    payload = document_row_payload(doc, db, cache, locks or active_locks_by_document(db), user)
     versions = (
         db.execute(
             select(DocumentVersion)
@@ -1402,6 +1538,7 @@ def folder_is_in_scope(target: str, candidate: str, recursive: bool) -> bool:
 def build_contents_payload(
     db: Session,
     folder: str,
+    user: UserContext,
     q: str = "",
     recursive: bool = False,
 ) -> dict[str, object]:
@@ -1409,11 +1546,16 @@ def build_contents_payload(
     current_folder = get_folder_by_path(db, folder)
     if not current_folder:
         raise HTTPException(status_code=404, detail="Folder not found")
+    require_folder_access(current_folder, user, db, 1)
     normalized_folder = folder_path(current_folder)
     search_query = q.strip()
     folders = all_folders(db)
     path_cache = build_folder_path_cache(folders)
-    docs = list(db.execute(select(Document)).scalars().all())
+    docs = [
+        doc
+        for doc in db.execute(select(Document)).scalars().all()
+        if document_access_level(doc, user, db) >= 1
+    ]
     locks = active_locks_by_document(db)
     stats = docs_stats_for_folder_payloads(docs, db, path_cache)
 
@@ -1431,6 +1573,8 @@ def build_contents_payload(
 
     folder_rows = []
     for item in folder_candidates:
+        if folder_access_level(item, user, db) < 1:
+            continue
         path = folder_path(item, path_cache)
         if search_query and not matches_query(search_query, item.name, path):
             continue
@@ -1450,7 +1594,7 @@ def build_contents_payload(
         doc_path = document_path(doc, path_cache)
         if search_query and not matches_query(search_query, doc.name, doc_path, doc_folder):
             continue
-        doc_rows.append(document_row_payload(doc, db, path_cache, locks))
+        doc_rows.append(document_row_payload(doc, db, path_cache, locks, user))
 
     folder_rows.sort(key=lambda item: str(item["name"]).lower())
     doc_rows.sort(key=lambda item: str(item["name"]).lower())
@@ -1463,15 +1607,23 @@ def build_contents_payload(
     }
 
 
-def build_sidebar_payload(db: Session) -> dict[str, object]:
+def build_sidebar_payload(db: Session, user: UserContext) -> dict[str, object]:
     ensure_root_folders(db)
     vault_root = get_root_folder(db, VAULT_ROOT_KEY)
     archive_root = get_root_folder(db, ARCHIVE_ROOT_KEY)
     folders = all_folders(db)
     path_cache = build_folder_path_cache(folders)
     children = {
-        "": sorted(folder_path(child, path_cache) for child in vault_root.children),
-        ARCHIVE_ROOT: sorted(folder_path(child, path_cache) for child in archive_root.children),
+        "": sorted(
+            folder_path(child, path_cache)
+            for child in vault_root.children
+            if folder_access_level(child, user, db) >= 1
+        ),
+        ARCHIVE_ROOT: sorted(
+            folder_path(child, path_cache)
+            for child in archive_root.children
+            if folder_access_level(child, user, db) >= 1
+        ),
     }
     metadata = {
         folder_path(item, path_cache): {
@@ -1479,6 +1631,7 @@ def build_sidebar_payload(db: Session) -> dict[str, object]:
             "icon": item.icon or "",
         }
         for item in folders
+        if folder_access_level(item, user, db) >= 1
     }
     return {"folder_children": children, "folder_metadata": metadata}
 
@@ -1502,8 +1655,9 @@ def build_my_edits_payload(user: UserContext, db: Session) -> dict[str, object]:
     )
     return {
         "documents": [
-            document_row_payload(doc, db, path_cache, locks)
+            document_row_payload(doc, db, path_cache, locks, user)
             for doc in sorted(docs, key=lambda item: document_path(item, path_cache).lower())
+            if document_access_level(doc, user, db) >= 3
         ],
     }
 
@@ -1615,6 +1769,7 @@ def commit_admin_change(db: Session, event_type: str) -> dict[str, object]:
 def build_bootstrap_payload(user: UserContext, folder: str, db: Session) -> dict[str, object]:
     ensure_root_folders(db)
     current = get_folder_by_path(db, folder) or get_root_folder(db, VAULT_ROOT_KEY)
+    require_folder_access(current, user, db, 1)
     return {
         "auth_mode": AUTH_MODE,
         "base_domain": BASE_DOMAIN,
@@ -1924,8 +2079,8 @@ def index(
     normalized = normalize_folder(folder)
     state = {
         "bootstrap": build_bootstrap_payload(user, normalized, db),
-        "contents": build_contents_payload(db, normalized),
-        "sidebar": build_sidebar_payload(db),
+        "contents": build_contents_payload(db, normalized, user),
+        "sidebar": build_sidebar_payload(db, user),
         "my_edits": build_my_edits_payload(user, db),
     }
     return templates.TemplateResponse("index.html", {"request": request, "state": state})
@@ -1947,10 +2102,9 @@ def api_sidebar(
     user: UserContext = Depends(current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
-    del user
     ensure_root_folders(db)
     commit_state(db)
-    return build_sidebar_payload(db)
+    return build_sidebar_payload(db, user)
 
 
 @router.get("/api/folders/contents")
@@ -1961,10 +2115,9 @@ def api_folder_contents(
     user: UserContext = Depends(current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
-    del user
     ensure_root_folders(db)
     commit_state(db)
-    return build_contents_payload(db, normalize_folder(folder), q, recursive)
+    return build_contents_payload(db, normalize_folder(folder), user, q, recursive)
 
 
 @router.get("/api/folders/properties")
@@ -1973,12 +2126,12 @@ def api_folder_properties(
     user: UserContext = Depends(current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
-    del user
     ensure_root_folders(db)
     commit_state(db)
     folder = get_folder_by_path(db, path)
     if not folder:
         raise HTTPException(status_code=404, detail="Folder not found")
+    require_folder_access(folder, user, db, 1)
     return folder_properties_payload(folder, db)
 
 
@@ -1993,6 +2146,7 @@ def api_update_folder_properties(
         folder = get_folder_by_path(db, payload.path)
         if not folder:
             raise HTTPException(status_code=404, detail="Folder not found")
+        require_folder_access(folder, user, db, 3)
         folder.color = sanitize_folder_color(payload.color)
         folder.icon = sanitize_folder_icon(payload.icon)
         record_folder_event(folder, user, "metadata", "Updated folder appearance", db)
@@ -2004,7 +2158,7 @@ def api_update_folder_properties(
 @router.put("/api/folders/permissions")
 def api_update_folder_permissions(
     payload: FolderPermissionsPayload,
-    user: UserContext = Depends(current_user),
+    user: UserContext = Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
     ensure_root_folders(db)
@@ -2051,11 +2205,11 @@ def api_document_detail(
     user: UserContext = Depends(current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
-    del user
     ensure_root_folders(db)
     commit_state(db)
     doc = get_document_or_404(doc_id, db)
-    return document_detail_payload(doc, db)
+    require_document_access(doc, user, db, 2)
+    return document_detail_payload(doc, user, db)
 
 
 @router.get("/api/my-edits")
@@ -2118,6 +2272,7 @@ def create_folder(
         if get_folder_by_path(db, normalized):
             raise HTTPException(status_code=400, detail="Folder already exists")
         parent_path = "/".join(normalized.split("/")[:-1])
+        require_write_for_folder_path(db, parent_path, user)
         name = normalize_item_name(normalized.split("/")[-1], "Folder name")
         parent = get_or_create_folder_path(db, parent_path)
         ensure_unique_folder_name(db, parent.id, name)
@@ -2130,6 +2285,8 @@ def create_folder(
             created_by_name=user["name"],
         )
         db.add(created)
+        db.flush()
+        default_folder_permissions(db, created)
         record_folder_event(created, user, "create", f"Created {normalized}", db)
         record_folder_change(db, "created")
         db.commit()
@@ -2351,6 +2508,7 @@ def lock_items(
                     raise HTTPException(status_code=400, detail="Only files can be locked")
                 doc = get_document_or_404(item.id or 0, db)
                 refresh_editable_document(doc, db)
+                require_document_access(doc, user, db, 3)
                 lock, created = acquire_document_lock(doc, user, client_meta(request), db)
                 if created:
                     record_event(
@@ -2388,9 +2546,8 @@ def unlock_items(
                 if item.type != "document":
                     raise HTTPException(status_code=400, detail="Only files can be unlocked")
                 doc = get_document_or_404(item.id or 0, db)
+                require_document_access(doc, user, db, 3)
                 lock = get_active_lock(doc, db)
-                if lock and lock.locked_by != user["id"] and not user["is_admin"]:
-                    raise HTTPException(status_code=403, detail="Document is locked by another user")
                 release_lock(lock, user)
                 record_event(
                     doc,
@@ -2422,13 +2579,18 @@ def download_items(
     docs_to_download: list[Document] = []
     for item in items:
         if item.type == "document":
-            docs_to_download.append(get_document_or_404(item.id or 0, db))
+            doc = get_document_or_404(item.id or 0, db)
+            require_document_access(doc, user, db, 2)
+            docs_to_download.append(doc)
         else:
             folder_item = get_folder_by_path(db, item.path)
             if not folder_item:
                 raise HTTPException(status_code=404, detail="Folder not found")
+            require_folder_access(folder_item, user, db, 2)
             docs_to_download.extend(docs_in_folder_subtree(db, folder_item))
     unique_docs = list({doc.id: doc for doc in docs_to_download}.values())
+    for doc in unique_docs:
+        require_document_access(doc, user, db, 2)
     if len(unique_docs) == 1 and len(items) == 1 and items[0].type == "document":
         doc = unique_docs[0]
         version = current_version(doc, db)
@@ -2496,6 +2658,7 @@ async def create_document(
     mime_type = sanitize_mime_type(file.content_type, filename)
     meta = client_meta(request)
     with storage_write_lock():
+        require_write_for_folder_path(db, folder_path_value, user)
         target_folder = get_or_create_folder_path(db, folder_path_value)
         ensure_unique_document_path(db, target_folder.id, filename)
         blob = get_or_create_blob_for_data(db, data, mime_type)
@@ -2525,8 +2688,13 @@ async def create_document(
 
 
 @router.get("/documents/{doc_id}")
-def document_detail(doc_id: int, db: Session = Depends(get_db)) -> RedirectResponse:
+def document_detail(
+    doc_id: int,
+    user: UserContext = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> RedirectResponse:
     doc = get_document_or_404(doc_id, db)
+    require_document_access(doc, user, db, 1)
     folder_value = document_folder_path(doc)
     return RedirectResponse(url=f"/?folder={quote(folder_value)}", status_code=303)
 
@@ -2539,11 +2707,13 @@ def checkout_document(
     db: Session = Depends(get_db),
 ) -> Response:
     doc = get_document_or_404(doc_id, db)
+    require_document_access(doc, user, db, 3)
     if document_is_archive(doc):
         raise HTTPException(status_code=400, detail="Restore this file before editing")
     meta = client_meta(request)
     with storage_write_lock():
         refresh_editable_document(doc, db)
+        require_document_access(doc, user, db, 3)
         version = current_version(doc, db)
         if not version:
             raise HTTPException(status_code=404, detail="Document has no versions")
@@ -2565,6 +2735,7 @@ async def checkin_document(
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
     doc = get_document_or_404(doc_id, db)
+    require_document_access(doc, user, db, 3)
     if document_is_archive(doc):
         raise HTTPException(status_code=400, detail="Restore this file before editing")
     lock = get_active_lock(doc, db)
@@ -2580,6 +2751,7 @@ async def checkin_document(
     message = note.strip() or f"Uploaded {upload_name}"
     with storage_write_lock():
         refresh_editable_document(doc, db)
+        require_document_access(doc, user, db, 3)
         lock = get_active_lock(doc, db)
         if not lock or lock.locked_by != user["id"]:
             raise HTTPException(
@@ -2624,6 +2796,7 @@ def download_version(
     db: Session = Depends(get_db),
 ) -> Response:
     doc = get_document_or_404(doc_id, db)
+    require_document_access(doc, user, db, 2)
     version = get_version_or_404(doc, version_id, db)
     data = read_version_bytes(version)
     filename = version.original_filename or doc.name

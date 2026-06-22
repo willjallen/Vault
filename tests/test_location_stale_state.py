@@ -34,12 +34,13 @@ class LocationStaleStateTests(unittest.TestCase):
             from app.db import SessionLocal, init_db
             from app.models import Document, DocumentEvent
             from app.routers import (
-                archive_document,
+                archive_doc_item,
                 create_document_version,
+                get_folder_by_path,
                 get_document_or_404,
                 get_or_create_blob_for_data,
                 get_or_create_folder_path,
-                move_document,
+                move_doc_item,
                 now_utc,
             )
             from app.storage import ensure_storage
@@ -59,7 +60,7 @@ class LocationStaleStateTests(unittest.TestCase):
                 "name": "Alice",
                 "email": "alice@example.com",
                 "groups": ["vault-users"],
-                "is_admin": False,
+                "is_admin": True,
             }
 
 
@@ -94,12 +95,14 @@ class LocationStaleStateTests(unittest.TestCase):
 
             stale_db = SessionLocal()
             try:
-                get_document_or_404(doc_id, stale_db)
+                stale_doc = get_document_or_404(doc_id, stale_db)
                 with SessionLocal() as archive_db:
-                    archive_document(doc_id, FakeRequest(), user, archive_db)
+                    doc = archive_db.get(Document, doc_id)
+                    archive_doc_item(doc, FakeRequest(), user, archive_db)
+                    archive_db.commit()
 
                 try:
-                    move_document(doc_id, FakeRequest(), "Other/plan.txt", user, stale_db)
+                    move_doc_item(stale_doc, "Other", FakeRequest(), user, stale_db, name="plan.txt")
                 except HTTPException as exc:
                     assert exc.status_code == 400
                     assert exc.detail == "Use archive or restore for Archive moves"
@@ -113,6 +116,7 @@ class LocationStaleStateTests(unittest.TestCase):
                 assert doc is not None
                 assert doc.folder.root_key == "archive"
                 assert doc.folder.name == "Project"
+                assert get_folder_by_path(db, "Other") is None
                 events = db.query(DocumentEvent).filter_by(document_id=doc_id).all()
                 assert [event.event_type for event in events] == ["archive"]
             """,
@@ -126,7 +130,7 @@ class LocationStaleStateTests(unittest.TestCase):
             from app.db import SessionLocal, init_db
             from app.models import Document, DocumentEvent
             from app.routers import (
-                archive_document,
+                archive_doc_item,
                 create_document_version,
                 get_document_or_404,
                 get_or_create_blob_for_data,
@@ -150,7 +154,7 @@ class LocationStaleStateTests(unittest.TestCase):
                 "name": "Alice",
                 "email": "alice@example.com",
                 "groups": ["vault-users"],
-                "is_admin": False,
+                "is_admin": True,
             }
 
 
@@ -185,12 +189,14 @@ class LocationStaleStateTests(unittest.TestCase):
 
             stale_db = SessionLocal()
             try:
-                get_document_or_404(doc_id, stale_db)
+                stale_doc = get_document_or_404(doc_id, stale_db)
                 with SessionLocal() as archive_db:
-                    archive_document(doc_id, FakeRequest(), user, archive_db)
+                    doc = archive_db.get(Document, doc_id)
+                    archive_doc_item(doc, FakeRequest(), user, archive_db)
+                    archive_db.commit()
 
                 try:
-                    archive_document(doc_id, FakeRequest(), user, stale_db)
+                    archive_doc_item(stale_doc, FakeRequest(), user, stale_db)
                 except HTTPException as exc:
                     assert exc.status_code == 400
                     assert exc.detail == "Document is already archived"

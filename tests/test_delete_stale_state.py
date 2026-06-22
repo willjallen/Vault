@@ -34,15 +34,17 @@ class DeleteStaleStateTests(unittest.TestCase):
             from app.db import SessionLocal, init_db
             from app.models import Blob, Document, DocumentEvent, DocumentVersion
             from app.routers import (
-                archive_document,
+                ActionItem,
+                ActionPayload,
+                archive_doc_item,
                 create_document_version,
-                delete_document,
+                delete_items_forever,
                 get_document_or_404,
                 get_or_create_blob_for_data,
                 get_or_create_folder_path,
                 now_utc,
+                restore_doc_item,
                 storage_reconciliation_report,
-                unarchive_document,
             )
             from app.storage import ensure_storage, get_storage_backend
 
@@ -93,7 +95,8 @@ class DeleteStaleStateTests(unittest.TestCase):
                 )
                 db.commit()
                 doc_id = doc.id
-                archive_document(doc_id, FakeRequest(), admin, db)
+                archive_doc_item(doc, FakeRequest(), admin, db)
+                db.commit()
 
             stale_db = SessionLocal()
             try:
@@ -101,17 +104,18 @@ class DeleteStaleStateTests(unittest.TestCase):
                 assert stale_doc.folder.root_key == "archive"
 
                 with SessionLocal() as restore_db:
-                    unarchive_document(doc_id, FakeRequest(), admin, restore_db)
+                    doc = restore_db.get(Document, doc_id)
+                    restore_doc_item(doc, FakeRequest(), admin, restore_db)
+                    restore_db.commit()
 
-                try:
-                    delete_document(doc_id, FakeRequest(), admin, stale_db)
-                except HTTPException as exc:
-                    assert exc.status_code == 400
-                    assert exc.detail == "Move the document to Archive before deleting"
-                else:
-                    raise AssertionError("stale delete permanently deleted a restored document")
-                finally:
-                    stale_db.rollback()
+                result = delete_items_forever(
+                    ActionPayload(items=[ActionItem(type="document", id=doc_id)]),
+                    admin,
+                    stale_db,
+                )
+                assert result["ok"] == []
+                assert result["failed"][0]["detail"] == "Move the document to Archive before deleting"
+                stale_db.rollback()
             finally:
                 stale_db.close()
 
@@ -139,15 +143,18 @@ class DeleteStaleStateTests(unittest.TestCase):
             from app.db import SessionLocal, init_db
             from app.models import Blob, Document, DocumentEvent, DocumentVersion
             from app.routers import (
-                archive_folder,
+                ActionItem,
+                ActionPayload,
+                archive_folder_item,
                 create_document_version,
-                delete_document,
+                delete_items_forever,
+                get_folder_by_path,
                 get_document_or_404,
                 get_or_create_blob_for_data,
                 get_or_create_folder_path,
                 now_utc,
+                restore_folder_item,
                 storage_reconciliation_report,
-                unarchive_folder,
             )
             from app.storage import ensure_storage, get_storage_backend
 
@@ -198,7 +205,9 @@ class DeleteStaleStateTests(unittest.TestCase):
                 )
                 db.commit()
                 doc_id = doc.id
-                archive_folder(FakeRequest(), "Project", admin, db)
+                source = get_folder_by_path(db, "Project")
+                archive_folder_item(source, FakeRequest(), admin, db)
+                db.commit()
 
             stale_db = SessionLocal()
             try:
@@ -206,17 +215,18 @@ class DeleteStaleStateTests(unittest.TestCase):
                 assert stale_doc.folder.root_key == "archive"
 
                 with SessionLocal() as restore_db:
-                    unarchive_folder(FakeRequest(), "Archive/Project", admin, restore_db)
+                    source = get_folder_by_path(restore_db, "Archive/Project")
+                    restore_folder_item(source, FakeRequest(), admin, restore_db)
+                    restore_db.commit()
 
-                try:
-                    delete_document(doc_id, FakeRequest(), admin, stale_db)
-                except HTTPException as exc:
-                    assert exc.status_code == 400
-                    assert exc.detail == "Move the document to Archive before deleting"
-                else:
-                    raise AssertionError("stale delete permanently deleted a restored document")
-                finally:
-                    stale_db.rollback()
+                result = delete_items_forever(
+                    ActionPayload(items=[ActionItem(type="document", id=doc_id)]),
+                    admin,
+                    stale_db,
+                )
+                assert result["ok"] == []
+                assert result["failed"][0]["detail"] == "Move the document to Archive before deleting"
+                stale_db.rollback()
             finally:
                 stale_db.close()
 

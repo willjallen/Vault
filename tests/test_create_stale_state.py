@@ -43,7 +43,7 @@ class CreateDocumentStaleStateTests(unittest.TestCase):
                     "name": "Alice",
                     "email": "alice@example.com",
                     "groups": [],
-                    "is_admin": False,
+                    "is_admin": True,
                 }
                 bob = {
                     "id": "bob",

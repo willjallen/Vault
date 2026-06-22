@@ -12,11 +12,10 @@ function optimisticLockFor(doc, currentUser) {
 export function createFileLockActions({
   apiFetch,
   currentUser,
-  folder,
   refresh,
   setBusy,
   setError,
-  setState,
+  updateDocument,
   uploadWithProgress,
   downloadWithProgress,
 }) {
@@ -38,7 +37,7 @@ export function createFileLockActions({
         size: file.size,
         url: `/documents/${docId}/checkin`,
       });
-      await refresh(folder);
+      await refresh();
       return true;
     } catch (err) {
       setError(err.message || "Save failed. Please try again.");
@@ -60,7 +59,9 @@ export function createFileLockActions({
       if (!res.ok) {
         throw new Error("Release failed");
       }
-      await refresh(folder);
+      if (updateDocument) {
+        updateDocument(docId, (item) => ({ ...item, lock: { by: null, name: null } }));
+      }
     } catch {
       setError("Could not release the file.");
     } finally {
@@ -81,7 +82,9 @@ export function createFileLockActions({
         const detail = await res.json().catch(() => ({}));
         throw new Error(detail.detail || "Lock failed");
       }
-      await refresh(folder);
+      if (updateDocument) {
+        updateDocument(doc.id, (item) => ({ ...item, lock: optimisticLockFor(item, currentUser) }));
+      }
       return true;
     } catch (err) {
       setError(err.message || "Could not lock the file.");
@@ -123,20 +126,13 @@ export function createFileLockActions({
       name: doc.name,
       size: doc.size_bytes,
       url: `/documents/${doc.id}/checkout`,
-    })
-      .then(() => {
-        setTimeout(() => refresh(folder), 800);
-      })
-      .catch((err) => {
-        setError(err.message || "Checkout failed.");
-        refresh(folder);
-      });
-    setState((prev) => ({
-      ...prev,
-      doc_payloads: (prev.doc_payloads || []).map((d) =>
-        d.id === doc.id ? { ...d, lock: optimisticLockFor(doc, currentUser) } : d
-      ),
-    }));
+    }).catch((err) => {
+      setError(err.message || "Checkout failed.");
+      refresh();
+    });
+    if (updateDocument) {
+      updateDocument(doc.id, (item) => ({ ...item, lock: optimisticLockFor(item, currentUser) }));
+    }
   }
 
   return { handleLock, handleRelease, handleSave, handleStartEdit, handleVersionUpload };

@@ -98,7 +98,7 @@ body.app-root-page .finder-browser {
 body.app-root-page .file-list {
   min-height: 0;
   overflow: auto;
-  padding-right: 2px;
+  padding: 0 2px 72px 0;
 }
 
 body.app-root-page .info-dock {
@@ -647,6 +647,91 @@ header {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  padding-bottom: 72px;
+}
+
+.contents-search {
+  position: absolute;
+  left: 18px;
+  bottom: 14px;
+  z-index: 5;
+  width: min(360px, calc(100% - 36px));
+  min-width: 0;
+  height: 42px;
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr) 32px;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 5px 5px 12px;
+  border: 1px solid #d7dde8;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.94);
+  color: var(--muted);
+  box-shadow: 0 12px 28px rgba(15, 23, 42, 0.12);
+  backdrop-filter: blur(10px);
+}
+
+.contents-search:focus-within {
+  border-color: #b8c7ff;
+  box-shadow:
+    0 0 0 3px rgba(43, 124, 255, 0.14),
+    0 12px 28px rgba(15, 23, 42, 0.12);
+}
+
+.contents-search-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.contents-search input {
+  width: 100%;
+  min-width: 0;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 0.9rem;
+  line-height: 1.2;
+  padding: 0;
+}
+
+.contents-search input::-webkit-search-cancel-button {
+  appearance: none;
+}
+
+.recursive-search-button {
+  width: 32px;
+  height: 32px;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition:
+    background 0.14s ease,
+    border 0.14s ease,
+    color 0.14s ease,
+    transform 0.14s ease;
+}
+
+.recursive-search-button:hover {
+  background: #eef2ff;
+  color: var(--accent-strong);
+}
+
+.recursive-search-button.active {
+  border-color: #cbd5ff;
+  background: #e8edff;
+  color: var(--accent-strong);
+}
+
+.recursive-search-button:active {
+  transform: scale(0.94);
 }
 
 .file-row {

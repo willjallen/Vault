@@ -53,6 +53,10 @@ class Folder(Base):
     name: Mapped[str] = mapped_column(String, nullable=False)
     is_root: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=utcnow)
+    created_by: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_by_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    color: Mapped[str | None] = mapped_column(String, nullable=True)
+    icon: Mapped[str | None] = mapped_column(String, nullable=True)
 
     parent: Mapped["Folder | None"] = relationship(
         "Folder",
@@ -69,6 +73,62 @@ class Folder(Base):
         back_populates="folder",
         cascade="all, delete-orphan",
     )
+    events: Mapped[list["FolderEvent"]] = relationship(
+        "FolderEvent",
+        back_populates="folder",
+        cascade="all, delete-orphan",
+    )
+    permissions: Mapped[list["FolderPermission"]] = relationship(
+        "FolderPermission",
+        back_populates="folder",
+        cascade="all, delete-orphan",
+    )
+
+
+class FolderEvent(Base):
+    __tablename__ = "folder_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    folder_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("folders.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    event_type: Mapped[str] = mapped_column(String, nullable=False)
+    actor: Mapped[str | None] = mapped_column(String, nullable=True)
+    actor_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=utcnow)
+
+    folder: Mapped[Folder] = relationship("Folder", back_populates="events")
+
+
+class FolderPermission(Base):
+    __tablename__ = "folder_permissions"
+    __table_args__ = (UniqueConstraint("folder_id", "group_id", name="uq_folder_permission_group"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    folder_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("folders.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    group_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("vault_groups.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    can_view: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    can_read: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    can_write: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=utcnow)
+
+    folder: Mapped[Folder] = relationship("Folder", back_populates="permissions")
+    group: Mapped["VaultGroup"] = relationship("VaultGroup")
 
 
 class VaultUser(Base):

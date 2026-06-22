@@ -58,6 +58,8 @@ def _schema_needs_reset() -> bool:
         "state_events",
         "blobs",
         "blob_locations",
+        "folder_events",
+        "folder_permissions",
         "vault_users",
         "vault_groups",
         "vault_group_memberships",
@@ -70,6 +72,8 @@ def _schema_needs_reset() -> bool:
     return (
         "root_key" not in folder_columns
         or "is_root" not in folder_columns
+        or "created_by" not in folder_columns
+        or "color" not in folder_columns
         or "folder_id" not in document_columns
         or "blob_id" not in version_columns
     )

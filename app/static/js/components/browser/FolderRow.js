@@ -114,7 +114,11 @@ export function FolderRow({
       onDrop: editing ? undefined : onDrop,
     },
     [
-      h("div", { className: "file-cell icon" }, h(FileIcon, { kind: "folder" })),
+      h(
+        "div",
+        { className: "file-cell icon" },
+        h(FileIcon, { color: folder.color, folderIcon: folder.icon, kind: "folder" })
+      ),
       h("div", { className: "file-cell main" }, [
         editing
           ? h("input", {

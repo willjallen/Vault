@@ -2062,6 +2062,380 @@ input[type="text"]:focus {
   font-weight: 850;
 }
 
+.folder-color-blue {
+  color: #2563eb;
+}
+
+.folder-color-teal {
+  color: #0f766e;
+}
+
+.folder-color-green {
+  color: #15803d;
+}
+
+.folder-color-amber {
+  color: #b45309;
+}
+
+.folder-color-rose {
+  color: #be123c;
+}
+
+.folder-color-violet {
+  color: #7c3aed;
+}
+
+.folder-color-slate {
+  color: #475569;
+}
+
+.folder-properties-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 2520;
+  display: grid;
+  place-items: center;
+  padding: 28px;
+  pointer-events: auto;
+}
+
+.folder-properties-backdrop {
+  position: absolute;
+  inset: 0;
+  border: 0;
+  background: rgba(241, 245, 249, 0.42);
+  opacity: 0;
+  backdrop-filter: blur(0);
+  transition:
+    opacity 0.18s ease,
+    backdrop-filter 0.24s ease;
+}
+
+.folder-properties-window {
+  position: relative;
+  width: min(860px, calc(100vw - 40px));
+  max-height: min(820px, calc(100vh - 48px));
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  overflow: hidden;
+  border: 1px solid rgba(203, 213, 225, 0.95);
+  border-radius: 22px;
+  background: rgba(255, 255, 255, 0.98);
+  color: var(--text);
+  box-shadow:
+    0 34px 88px rgba(15, 23, 42, 0.24),
+    0 0 0 1px rgba(255, 255, 255, 0.72),
+    inset 0 1px 0 rgba(255, 255, 255, 0.95);
+  opacity: 0;
+  transform: translate3d(0, 18px, 0) scale(0.94);
+  transition:
+    opacity 0.16s ease,
+    transform 0.28s cubic-bezier(0.18, 1.34, 0.28, 1);
+}
+
+.folder-properties-layer.phase-visible .folder-properties-backdrop {
+  opacity: 1;
+  backdrop-filter: blur(10px);
+}
+
+.folder-properties-layer.phase-visible .folder-properties-window {
+  opacity: 1;
+  transform: translate3d(0, 0, 0) scale(1);
+}
+
+.folder-properties-layer.phase-leaving .folder-properties-backdrop {
+  opacity: 0;
+  backdrop-filter: blur(0);
+}
+
+.folder-properties-layer.phase-leaving .folder-properties-window {
+  opacity: 0;
+  transform: translate3d(0, 10px, 0) scale(0.97);
+  transition:
+    opacity 0.12s ease,
+    transform 0.14s cubic-bezier(0.64, 0, 0.78, 0);
+}
+
+.folder-properties-head {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 20px 22px;
+  border-bottom: 1px solid rgba(226, 232, 240, 0.92);
+  background: rgba(248, 250, 252, 0.82);
+}
+
+.folder-properties-title {
+  min-width: 0;
+}
+
+.folder-properties-title h2 {
+  margin: 0 0 4px 0;
+  font-size: 1.24rem;
+  letter-spacing: 0;
+  overflow-wrap: anywhere;
+}
+
+.folder-properties-title p:last-child {
+  overflow-wrap: anywhere;
+}
+
+.folder-properties-body,
+.folder-properties-loading {
+  min-width: 0;
+  overflow: auto;
+  padding: 20px;
+}
+
+.folder-properties-body {
+  display: grid;
+  gap: 14px;
+}
+
+.folder-properties-loading {
+  color: #64748b;
+}
+
+.folder-properties-error {
+  border: 1px solid rgba(254, 205, 211, 0.98);
+  border-radius: 14px;
+  padding: 10px 12px;
+  background: #fff1f2;
+  color: #be123c;
+  font-size: 0.84rem;
+  font-weight: 750;
+  overflow-wrap: anywhere;
+}
+
+.folder-properties-card {
+  min-width: 0;
+  border: 1px solid rgba(226, 232, 240, 0.94);
+  border-radius: 16px;
+  padding: 16px;
+  background: #fff;
+  box-shadow:
+    0 12px 28px rgba(15, 23, 42, 0.045),
+    inset 0 1px 0 rgba(255, 255, 255, 0.95);
+}
+
+.folder-properties-card h3 {
+  margin: 0 0 12px 0;
+  font-size: 0.98rem;
+  letter-spacing: 0;
+}
+
+.folder-card-headline {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.folder-card-headline h3 {
+  margin: 0;
+}
+
+.folder-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.folder-detail-grid div {
+  min-width: 0;
+  border-radius: 12px;
+  padding: 10px;
+  background: #f8fafc;
+}
+
+.folder-detail-grid span,
+.folder-detail-grid strong {
+  display: block;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.folder-detail-grid span {
+  color: #64748b;
+  font-size: 0.74rem;
+  font-weight: 780;
+}
+
+.folder-detail-grid strong {
+  margin-top: 3px;
+  font-size: 0.86rem;
+}
+
+.folder-color-grid,
+.folder-icon-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.folder-icon-grid {
+  margin-top: 12px;
+}
+
+.folder-color-choice,
+.folder-icon-choice {
+  min-height: 34px;
+  border: 1px solid rgba(203, 213, 225, 0.95);
+  border-radius: 11px;
+  padding: 7px 10px;
+  background: #fff;
+  color: #334155;
+  font-size: 0.8rem;
+  font-weight: 820;
+  cursor: pointer;
+}
+
+.folder-color-choice::before {
+  content: "";
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  display: inline-block;
+  margin-right: 7px;
+  background: #cbd5e1;
+}
+
+.folder-color-choice.blue::before {
+  background: #2563eb;
+}
+
+.folder-color-choice.teal::before {
+  background: #0f766e;
+}
+
+.folder-color-choice.green::before {
+  background: #15803d;
+}
+
+.folder-color-choice.amber::before {
+  background: #b45309;
+}
+
+.folder-color-choice.rose::before {
+  background: #be123c;
+}
+
+.folder-color-choice.violet::before {
+  background: #7c3aed;
+}
+
+.folder-color-choice.slate::before {
+  background: #475569;
+}
+
+.folder-icon-choice {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.folder-color-choice.active,
+.folder-icon-choice.active {
+  border-color: #93c5fd;
+  background: #eff6ff;
+  color: #1d4ed8;
+  box-shadow: 0 7px 16px rgba(37, 99, 235, 0.1);
+}
+
+.folder-permission-add {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.folder-permission-add select {
+  min-width: min(240px, 100%);
+  border: 1px solid rgba(203, 213, 225, 0.95);
+  border-radius: 10px;
+  padding: 0 10px;
+  background: #fff;
+  color: var(--text);
+  font: inherit;
+}
+
+.folder-permission-list {
+  display: grid;
+  gap: 8px;
+}
+
+.folder-permission-row {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(140px, 1fr) repeat(3, auto) auto;
+  gap: 10px;
+  align-items: center;
+  border: 1px solid rgba(226, 232, 240, 0.92);
+  border-radius: 12px;
+  padding: 10px;
+  background: #f8fafc;
+}
+
+.folder-permission-row strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.folder-permission-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #475569;
+  font-size: 0.8rem;
+  font-weight: 760;
+}
+
+.folder-permission-remove {
+  border: 1px solid rgba(254, 205, 211, 0.95);
+  border-radius: 9px;
+  padding: 6px 9px;
+  background: #fff1f2;
+  color: #be123c;
+  font: inherit;
+  font-size: 0.76rem;
+  font-weight: 820;
+  cursor: pointer;
+}
+
+.folder-history-list {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.folder-history-list li {
+  min-width: 0;
+  border-left: 2px solid #bfdbfe;
+  padding-left: 10px;
+}
+
+.folder-history-list strong,
+.folder-history-list span {
+  display: block;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.folder-history-list strong {
+  font-size: 0.86rem;
+}
+
+.folder-history-list span {
+  margin-top: 2px;
+  color: #64748b;
+  font-size: 0.78rem;
+}
+
 .admin-settings-grid {
   min-width: 0;
   display: grid;
@@ -3044,6 +3418,14 @@ input[type="text"]:focus {
     flex: 0 0 auto;
   }
 
+  .folder-properties-layer {
+    padding: 12px;
+  }
+
+  .folder-detail-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .settings-panel {
     padding: 20px;
   }
@@ -3095,6 +3477,34 @@ input[type="text"]:focus {
     min-width: 0;
   }
 
+  .folder-properties-layer {
+    padding: 0;
+  }
+
+  .folder-properties-window {
+    width: 100%;
+    max-height: 100%;
+    height: 100%;
+    border-radius: 0;
+  }
+
+  .folder-properties-head {
+    padding: 16px;
+  }
+
+  .folder-properties-body {
+    padding: 16px;
+  }
+
+  .folder-detail-grid,
+  .folder-permission-row {
+    grid-template-columns: 1fr;
+  }
+
+  .folder-permission-add {
+    flex-direction: column;
+  }
+
   .admin-card-head {
     align-items: flex-start;
     flex-direction: column;
@@ -3120,6 +3530,8 @@ input[type="text"]:focus {
 @media (prefers-reduced-motion: reduce) {
   .confirm-toast-backdrop,
   .confirm-toast,
+  .folder-properties-backdrop,
+  .folder-properties-window,
   .settings-backdrop,
   .settings-window {
     transition: none;

@@ -1,18 +1,36 @@
 services:
-  vault-service:
-    build:
-      context: .
-    image: vault-service:local
-    container_name: vault-service
+  vault:
+    image: ${VAULT_IMAGE:-ghcr.io/willjallen/vault:latest}
+    container_name: ${VAULT_CONTAINER_NAME:-vault}
+    restart: unless-stopped
     ports:
-      - "127.0.0.1:8000:8000"
+      - "${VAULT_BIND_ADDRESS:-127.0.0.1}:${VAULT_PORT:-8000}:8000"
     environment:
-      BASE_DOMAIN: localhost
-      VAULT_DB_PATH: /vault-metadata/vault-metadata.db
+      BASE_DOMAIN: ${BASE_DOMAIN:-localhost}
+      VAULT_PUBLIC_URL: ${VAULT_PUBLIC_URL:-http://localhost:8000}
+      VAULT_DATA_DIR: /data
+      VAULT_DB_PATH: ${VAULT_DB_PATH:-/data/vault.db}
       VAULT_STORAGE_BACKEND: ${VAULT_STORAGE_BACKEND:-local}
-      VAULT_STORAGE_PREFIX: ${VAULT_STORAGE_PREFIX:-objects}
-      VAULT_OBJECTS_PATH: /vault-objects
+      VAULT_STORAGE_PREFIX: ${VAULT_STORAGE_PREFIX:-}
+      VAULT_OBJECTS_PATH: ${VAULT_OBJECTS_PATH:-/data/objects}
       VAULT_RESET_DB_ON_START: ${VAULT_RESET_DB_ON_START:-0}
+      VAULT_DOCKER_RUNTIME: ${VAULT_DOCKER_RUNTIME:-1}
+      VAULT_AUTH_MODE: ${VAULT_AUTH_MODE:-headers}
+      VAULT_SESSION_SECRET: ${VAULT_SESSION_SECRET:-}
+      VAULT_SESSION_MAX_AGE_SECONDS: ${VAULT_SESSION_MAX_AGE_SECONDS:-604800}
+      VAULT_BOOTSTRAP_ADMIN_EMAILS: ${VAULT_BOOTSTRAP_ADMIN_EMAILS:-}
+      VAULT_ADMIN_GROUPS: ${VAULT_ADMIN_GROUPS:-admin,vault-admin}
+      VAULT_HEADER_AUTH_ISSUER: ${VAULT_HEADER_AUTH_ISSUER:-headers}
+      VAULT_OIDC_ISSUER: ${VAULT_OIDC_ISSUER:-}
+      VAULT_OIDC_CLIENT_ID: ${VAULT_OIDC_CLIENT_ID:-}
+      VAULT_OIDC_CLIENT_SECRET: ${VAULT_OIDC_CLIENT_SECRET:-}
+      VAULT_OIDC_SCOPES: ${VAULT_OIDC_SCOPES:-openid email profile}
+      VAULT_OIDC_REDIRECT_URI: ${VAULT_OIDC_REDIRECT_URI:-}
+      VAULT_OIDC_CLIENT_AUTH: ${VAULT_OIDC_CLIENT_AUTH:-client_secret_basic}
+      VAULT_OIDC_GROUPS_CLAIM: ${VAULT_OIDC_GROUPS_CLAIM:-groups}
+      VAULT_OIDC_EMAIL_CLAIM: ${VAULT_OIDC_EMAIL_CLAIM:-email}
+      VAULT_OIDC_NAME_CLAIM: ${VAULT_OIDC_NAME_CLAIM:-name}
+      VAULT_OIDC_USERNAME_CLAIM: ${VAULT_OIDC_USERNAME_CLAIM:-preferred_username}
       VAULT_S3_BUCKET: ${VAULT_S3_BUCKET:-}
       VAULT_S3_REGION: ${VAULT_S3_REGION:-us-east-1}
       VAULT_S3_ENDPOINT_URL: ${VAULT_S3_ENDPOINT_URL:-}
@@ -27,30 +45,8 @@ services:
       VAULT_R2_ACCESS_KEY_ID: ${VAULT_R2_ACCESS_KEY_ID:-}
       VAULT_R2_SECRET_ACCESS_KEY: ${VAULT_R2_SECRET_ACCESS_KEY:-}
       VAULT_R2_ENDPOINT_URL: ${VAULT_R2_ENDPOINT_URL:-}
-      VAULT_PUBLIC_URL: ${VAULT_PUBLIC_URL:-http://localhost:8000}
-      VAULT_AUTH_MODE: ${VAULT_AUTH_MODE:-headers}
-      VAULT_SESSION_SECRET: ${VAULT_SESSION_SECRET:-dev-insecure-session-secret}
-      VAULT_SESSION_MAX_AGE_SECONDS: ${VAULT_SESSION_MAX_AGE_SECONDS:-604800}
-      VAULT_BOOTSTRAP_ADMIN_EMAILS: ${VAULT_BOOTSTRAP_ADMIN_EMAILS:-admin@example.com}
-      VAULT_ADMIN_GROUPS: ${VAULT_ADMIN_GROUPS:-admin,vault-admin}
-      VAULT_HEADER_AUTH_ISSUER: ${VAULT_HEADER_AUTH_ISSUER:-headers}
-      VAULT_DEV_AUTH: ${VAULT_DEV_AUTH:-0}
-      VAULT_DEV_AUTH_ISSUER: ${VAULT_DEV_AUTH_ISSUER:-dev}
-      VAULT_DEV_USER: ${VAULT_DEV_USER:-local-admin}
-      VAULT_DEV_NAME: ${VAULT_DEV_NAME:-Local Admin}
-      VAULT_DEV_EMAIL: ${VAULT_DEV_EMAIL:-admin@example.com}
-      VAULT_DEV_GROUPS: ${VAULT_DEV_GROUPS:-admin,vault-admin}
-      VAULT_DEFAULT_USER_EMAIL: ${VAULT_DEFAULT_USER_EMAIL:-admin@example.com}
-      VAULT_OIDC_ISSUER: ${VAULT_OIDC_ISSUER:-}
-      VAULT_OIDC_CLIENT_ID: ${VAULT_OIDC_CLIENT_ID:-}
-      VAULT_OIDC_CLIENT_SECRET: ${VAULT_OIDC_CLIENT_SECRET:-}
-      VAULT_OIDC_SCOPES: ${VAULT_OIDC_SCOPES:-openid email profile}
-      VAULT_OIDC_REDIRECT_URI: ${VAULT_OIDC_REDIRECT_URI:-}
-      VAULT_OIDC_CLIENT_AUTH: ${VAULT_OIDC_CLIENT_AUTH:-client_secret_basic}
-      VAULT_OIDC_GROUPS_CLAIM: ${VAULT_OIDC_GROUPS_CLAIM:-groups}
-      VAULT_OIDC_EMAIL_CLAIM: ${VAULT_OIDC_EMAIL_CLAIM:-email}
-      VAULT_OIDC_NAME_CLAIM: ${VAULT_OIDC_NAME_CLAIM:-name}
-      VAULT_OIDC_USERNAME_CLAIM: ${VAULT_OIDC_USERNAME_CLAIM:-preferred_username}
     volumes:
-      - ./.docker-data/objects:/vault-objects
-      - ./.docker-data/metadata:/vault-metadata
+      - vault-data:/data
+
+volumes:
+  vault-data:

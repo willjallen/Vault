@@ -6,18 +6,30 @@ import secrets
 from pathlib import Path
 
 BASE_DOMAIN = os.getenv("BASE_DOMAIN", "family.localhost")
-DB_PATH = Path(os.getenv("VAULT_DB_PATH", "/vault-metadata/vault-metadata.db")).resolve()
+DATA_DIR = Path(os.getenv("VAULT_DATA_DIR", "/data")).resolve()
+DB_PATH = Path(os.getenv("VAULT_DB_PATH", str(DATA_DIR / "vault.db"))).resolve()
 PUBLIC_URL = os.getenv("VAULT_PUBLIC_URL", "").strip().rstrip("/")
+_REQUIRE_SESSION_SECRET_ENV = os.getenv("VAULT_REQUIRE_SESSION_SECRET")
+_DOCKER_RUNTIME_ENV = os.getenv("VAULT_DOCKER_RUNTIME", "0")
+REQUIRE_SESSION_SECRET = (
+    _REQUIRE_SESSION_SECRET_ENV if _REQUIRE_SESSION_SECRET_ENV is not None else _DOCKER_RUNTIME_ENV
+).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 AUTH_MODE = os.getenv(
     "VAULT_AUTH_MODE",
     "dev" if os.getenv("VAULT_DEV_AUTH", "").strip().lower() in {"1", "true", "yes", "on"} else "headers",
 ).strip().lower()
 SESSION_COOKIE_NAME = os.getenv("VAULT_SESSION_COOKIE_NAME", "vault_session").strip()
-SESSION_SECRET = os.getenv("VAULT_SESSION_SECRET", "").strip() or os.getenv(
-    "VAULT_OIDC_CLIENT_SECRET",
-    "",
-).strip() or "dev-insecure-session-secret"
+_SESSION_SECRET_ENV = os.getenv("VAULT_SESSION_SECRET", "").strip()
+_OIDC_CLIENT_SECRET_ENV = os.getenv("VAULT_OIDC_CLIENT_SECRET", "").strip()
+if REQUIRE_SESSION_SECRET and not _SESSION_SECRET_ENV:
+    raise RuntimeError("VAULT_SESSION_SECRET is required when VAULT_REQUIRE_SESSION_SECRET=1")
+SESSION_SECRET = _SESSION_SECRET_ENV or _OIDC_CLIENT_SECRET_ENV or "dev-insecure-session-secret"
 SESSION_MAX_AGE_SECONDS = int(os.getenv("VAULT_SESSION_MAX_AGE_SECONDS", "604800"))
 BOOTSTRAP_ADMIN_EMAILS = {
     item.strip().lower()
@@ -34,7 +46,7 @@ DEV_AUTH_ISSUER = os.getenv("VAULT_DEV_AUTH_ISSUER", "dev").strip() or "dev"
 
 OIDC_ISSUER = os.getenv("VAULT_OIDC_ISSUER", "").strip().rstrip("/")
 OIDC_CLIENT_ID = os.getenv("VAULT_OIDC_CLIENT_ID", "").strip()
-OIDC_CLIENT_SECRET = os.getenv("VAULT_OIDC_CLIENT_SECRET", "").strip()
+OIDC_CLIENT_SECRET = _OIDC_CLIENT_SECRET_ENV
 OIDC_SCOPES = os.getenv("VAULT_OIDC_SCOPES", "openid email profile").strip()
 OIDC_REDIRECT_URI = os.getenv("VAULT_OIDC_REDIRECT_URI", "").strip()
 OIDC_CLIENT_AUTH = os.getenv("VAULT_OIDC_CLIENT_AUTH", "client_secret_basic").strip().lower()
@@ -61,7 +73,10 @@ STORAGE_PREFIX = os.getenv("VAULT_STORAGE_PREFIX", "objects").strip().strip("/")
 OBJECTS_PATH = Path(
     os.getenv(
         "VAULT_OBJECTS_PATH",
-        os.getenv("VAULT_LOCAL_OBJECTS_PATH", os.getenv("VAULT_FILES_PATH", "/vault-objects")),
+        os.getenv(
+            "VAULT_LOCAL_OBJECTS_PATH",
+            os.getenv("VAULT_FILES_PATH", str(DATA_DIR / "objects")),
+        ),
     )
 ).resolve()
 

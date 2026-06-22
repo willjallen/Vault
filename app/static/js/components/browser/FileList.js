@@ -159,10 +159,16 @@ export function VaultFileList({
   }
 
   function renderFileRow(doc) {
+    const editing =
+      draftInFolder &&
+      inlineFolderDraft.mode === "renameFile" &&
+      inlineFolderDraft.docId === doc.id;
     return h(FileRow, {
       key: `document:${doc.id}`,
       doc,
       currentUser,
+      editing,
+      editValue: editing ? inlineFolderDraft.value || "" : "",
       selected: selectedSet.has(`document:${doc.id}`),
       draggingId,
       onSelect: (e) => onSelectItem && onSelectItem(doc, "document", e, orderedItems),
@@ -170,6 +176,9 @@ export function VaultFileList({
       onDragStart: (e) => onFileDragStart(e, doc.id, dragItemsFor(doc, "document")),
       onDragEnd: onFileDragEnd,
       onContextMenu: (e) => onFileContextMenu && onFileContextMenu(e, doc),
+      onEditChange: onInlineFolderNameChange,
+      onEditCommit: onCommitInlineFolder,
+      onEditCancel: onCancelInlineFolder,
     });
   }
 

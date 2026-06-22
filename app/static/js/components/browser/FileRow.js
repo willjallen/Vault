@@ -2,12 +2,15 @@ import { classNames } from "../../lib/utils.js";
 import { FileIcon } from "../common/FileIcon.js";
 import { LockGlyph } from "../common/LockGlyph.js";
 
+const { useEffect, useRef } = React;
 const h = React.createElement;
 
 // eslint-disable-next-line complexity
 export function FileRow({
   doc,
   currentUser,
+  editing,
+  editValue,
   selected,
   draggingId,
   onSelect,
@@ -15,7 +18,11 @@ export function FileRow({
   onDragStart,
   onDragEnd,
   onContextMenu,
+  onEditChange,
+  onEditCommit,
+  onEditCancel,
 }) {
+  const inputRef = useRef(null);
   const lock = doc.lock || {};
   const locked = Boolean(lock && lock.by);
   const isArchived = doc.archived;
@@ -33,6 +40,27 @@ export function FileRow({
   const lockHolderName = locked
     ? lock.name || (lock.by === currentUser.id ? currentUser.name : lock.by)
     : "";
+
+  useEffect(() => {
+    if (!editing || !inputRef.current) {
+      return;
+    }
+    inputRef.current.focus();
+    inputRef.current.select();
+  }, [editing]);
+
+  function commitEdit() {
+    if (onEditCommit) {
+      onEditCommit(editValue);
+    }
+  }
+
+  function cancelEdit() {
+    if (onEditCancel) {
+      onEditCancel();
+    }
+  }
+
   return h(
     "div",
     {
@@ -41,16 +69,20 @@ export function FileRow({
         "file",
         isArchived ? "archived" : "",
         selected ? "selected" : "",
-        draggingId === doc.id ? "dragging" : ""
+        draggingId === doc.id ? "dragging" : "",
+        editing ? "editing" : ""
       ),
-      draggable: true,
-      onClick: onSelect,
-      onDoubleClick: () => onOpen(doc),
-      onDragStart: (e) => onDragStart(e, doc.id),
-      onDragEnd: onDragEnd,
+      draggable: !editing,
+      onClick: editing ? undefined : onSelect,
+      onDoubleClick: editing ? undefined : () => onOpen(doc),
+      onDragStart: editing ? undefined : (e) => onDragStart(e, doc.id),
+      onDragEnd: editing ? undefined : onDragEnd,
       onContextMenu: (e) => {
         e.preventDefault();
         e.stopPropagation();
+        if (editing) {
+          return;
+        }
         if (onContextMenu) {
           onContextMenu(e);
         }
@@ -59,19 +91,43 @@ export function FileRow({
     [
       h("div", { className: "file-cell icon" }, h(FileIcon, { kind: "file" })),
       h("div", { className: "file-cell main" }, [
-        h("div", { className: "file-name-line" }, [
-          h("div", { className: classNames("name", isArchived ? "archived-text" : "") }, doc.name),
-          locked
-            ? h(
-                "span",
-                {
-                  className: "file-lock-indicator",
-                  title: `Checked out by ${lockHolderName}`,
-                },
-                [h(LockGlyph), h("span", null, lockHolderName)]
-              )
-            : null,
-        ]),
+        editing
+          ? h("input", {
+              ref: inputRef,
+              className: "inline-name-editor",
+              type: "text",
+              value: editValue,
+              onClick: (e) => e.stopPropagation(),
+              onChange: (e) => onEditChange && onEditChange(e.target.value),
+              onBlur: commitEdit,
+              onKeyDown: (e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  commitEdit();
+                }
+                if (e.key === "Escape") {
+                  e.preventDefault();
+                  cancelEdit();
+                }
+              },
+            })
+          : h("div", { className: "file-name-line" }, [
+              h(
+                "div",
+                { className: classNames("name", isArchived ? "archived-text" : "") },
+                doc.name
+              ),
+              locked
+                ? h(
+                    "span",
+                    {
+                      className: "file-lock-indicator",
+                      title: `Checked out by ${lockHolderName}`,
+                    },
+                    [h(LockGlyph), h("span", null, lockHolderName)]
+                  )
+                : null,
+            ]),
         h(
           "div",
           {

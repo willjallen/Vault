@@ -1,4 +1,5 @@
 import { classNames } from "../../lib/utils.js";
+import { LockGlyph } from "../common/LockGlyph.js";
 import { StatusBadge } from "../common/StatusBadge.js";
 
 const { useEffect, useMemo, useState } = React;
@@ -119,6 +120,7 @@ export function InfoDock({
   doc,
   currentUserId,
   onDownload,
+  onLock,
   onRename,
   onStartEdit,
   onRelease,
@@ -285,6 +287,18 @@ export function InfoDock({
       h("div", { className: "block-heading" }, [
         h("p", { className: "eyebrow tiny" }, "Editing"),
         lockedByOther ? h("span", { className: "muted tiny" }, statusText) : null,
+        h(
+          "button",
+          {
+            "aria-label": lockedByMe ? "Unlock file" : "Lock file",
+            className: classNames("lock-toggle", lockedByMe ? "active" : ""),
+            type: "button",
+            title: lockedByMe ? "Unlock file" : "Lock file for editing",
+            onClick: () => (lockedByMe ? onRelease(doc.id) : onLock && onLock(doc)),
+            disabled: busy || lockedByOther || isArchived,
+          },
+          h(LockGlyph)
+        ),
       ]),
       lockedByMe && !isArchived
         ? h(
@@ -345,7 +359,7 @@ export function InfoDock({
         h(
           "button",
           { className: "btn secondary compact", type: "button", onClick: () => onDownload(doc) },
-          "Open"
+          "Download"
         ),
         h(
           "button",

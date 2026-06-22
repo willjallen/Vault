@@ -176,6 +176,30 @@ def ensure_not_locked_by_other(
     return lock
 
 
+def acquire_document_lock(
+    doc: Document,
+    user: UserContext,
+    meta: dict[str, str | None],
+    db: Session,
+) -> tuple[DocumentLock, bool]:
+    lock = ensure_not_locked_by_other(doc, user, db)
+    if lock:
+        return lock, False
+
+    lock = DocumentLock(
+        document_id=doc.id,
+        locked_by=user["id"],
+        locked_by_name=user["name"],
+        locked_at=dt.datetime.now(tz=dt.UTC),
+        is_active=True,
+        locked_ip=meta.get("ip"),
+        locked_user_agent=meta.get("user_agent"),
+        force_acquired=False,
+    )
+    db.add(lock)
+    return lock, True
+
+
 def next_version_number(doc_id: int, db: Session) -> int:
     latest_number = (
         db.execute(
@@ -1202,34 +1226,13 @@ def checkout(doc_id: int, request: Request, db: Session = Depends(get_db)) -> Fi
     meta = client_meta(request)
     doc = get_document_or_404(doc_id, db)
     ensure_not_archived(doc)
-    lock = (
-        db.execute(
-            select(DocumentLock).where(
-                DocumentLock.document_id == doc.id,
-                DocumentLock.is_active == True,  # noqa: E712
-            ),
-        )
-        .scalars()
-        .first()
-    )
-    if lock and lock.locked_by != user["id"]:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Document is checked out by {lock.locked_by_name or lock.locked_by}",
-        )
-    if not lock:
-        new_lock = DocumentLock(
-            document_id=doc.id,
-            locked_by=user["id"],
-            locked_by_name=user["name"],
-            locked_at=dt.datetime.now(tz=dt.UTC),
-            is_active=True,
-            locked_ip=meta.get("ip"),
-            locked_user_agent=meta.get("user_agent"),
-            force_acquired=False,
-        )
-        db.add(new_lock)
+    try:
+        acquire_document_lock(doc, user, meta, db)
         db.commit()
+    except HTTPException as exc:
+        if exc.status_code == 403:
+            raise HTTPException(status_code=409, detail=exc.detail) from exc
+        raise
     with storage_write_lock():
         target = FILES_PATH / doc.path
         if not target.exists():
@@ -1237,6 +1240,36 @@ def checkout(doc_id: int, request: Request, db: Session = Depends(get_db)) -> Fi
     record_event(doc, user, "checkout", f"Checked out by {user['name']}", db, meta=meta)
     db.commit()
     return FileResponse(target, filename=target.name, media_type="application/octet-stream")
+
+
+@router.post("/documents/{doc_id}/lock", response_class=JSONResponse)
+def lock_document(doc_id: int, request: Request, db: Session = Depends(get_db)) -> JSONResponse:
+    user = current_user(request)
+    meta = client_meta(request)
+    doc = get_document_or_404(doc_id, db)
+    ensure_not_archived(doc)
+    try:
+        lock, created = acquire_document_lock(doc, user, meta, db)
+    except HTTPException as exc:
+        if exc.status_code == 403:
+            raise HTTPException(status_code=409, detail=exc.detail) from exc
+        raise
+    if created:
+        record_event(doc, user, "checkout", f"Checked out by {user['name']}", db, meta=meta)
+    db.commit()
+    return JSONResponse(
+        {
+            "ok": True,
+            "lock": {
+                "by": lock.locked_by,
+                "name": lock.locked_by_name,
+                "at": lock.locked_at.isoformat() if lock.locked_at else None,
+                "ip": lock.locked_ip,
+                "user_agent": lock.locked_user_agent,
+                "force_acquired": lock.force_acquired,
+            },
+        }
+    )
 
 
 @router.post("/documents/{doc_id}/release")

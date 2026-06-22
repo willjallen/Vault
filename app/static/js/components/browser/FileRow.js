@@ -1,6 +1,6 @@
 import { classNames } from "../../lib/utils.js";
-import { StatusBadge } from "../common/StatusBadge.js";
 import { FileIcon } from "../common/FileIcon.js";
+import { LockGlyph } from "../common/LockGlyph.js";
 
 const h = React.createElement;
 
@@ -17,8 +17,7 @@ export function FileRow({
   onContextMenu,
 }) {
   const lock = doc.lock || {};
-  const lockedByMe = lock && lock.by === currentUser.id;
-  const lockedByOther = lock && lock.by && lock.by !== currentUser.id;
+  const locked = Boolean(lock && lock.by);
   const isArchived = doc.archived;
   const folderPath = doc.folder || "";
   const relativeFolder = isArchived ? folderPath.replace(/^Archive\/?/, "") : folderPath;
@@ -31,6 +30,9 @@ export function FileRow({
   const versionCount =
     doc.version_count ||
     Math.max((doc.versions || []).filter((item) => item.type === "version").length || 0, 1);
+  const lockHolderName = locked
+    ? lock.name || (lock.by === currentUser.id ? currentUser.name : lock.by)
+    : "";
   return h(
     "div",
     {
@@ -58,7 +60,19 @@ export function FileRow({
     [
       h("div", { className: "file-cell icon" }, h(FileIcon, { kind: "file" })),
       h("div", { className: "file-cell main" }, [
-        h("div", { className: classNames("name", isArchived ? "archived-text" : "") }, doc.name),
+        h("div", { className: "file-name-line" }, [
+          h("div", { className: classNames("name", isArchived ? "archived-text" : "") }, doc.name),
+          locked
+            ? h(
+                "span",
+                {
+                  className: "file-lock-indicator",
+                  title: `Checked out by ${lockHolderName}`,
+                },
+                [h(LockGlyph), h("span", null, lockHolderName)]
+              )
+            : null,
+        ]),
         h(
           "div",
           {
@@ -82,7 +96,6 @@ export function FileRow({
         h("span", { className: "muted tiny" }, doc.size_display || "-")
       ),
       h("div", { className: "file-cell status-col" }, [
-        h(StatusBadge, { doc, currentUserId: currentUser.id, showReady: false }),
         h(
           "span",
           {
@@ -91,15 +104,6 @@ export function FileRow({
           },
           `v${versionCount}`
         ),
-        lockedByOther
-          ? h("span", { className: "muted tiny" }, `Checked out by ${lock.name || lock.by}`)
-          : lockedByMe && !doc.archived
-            ? h(
-                "span",
-                { className: "muted tiny linkish", onClick: () => onSelect(doc.id) },
-                "Upload edits"
-              )
-            : null,
       ]),
     ]
   );

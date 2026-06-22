@@ -7,6 +7,7 @@ import {
   buildPageMenuItems,
 } from "./lib/contextMenus.js";
 import { createDropHandlers } from "./lib/dropHandlers.js";
+import { createFileLockActions } from "./lib/fileLockActions.js";
 import {
   folderBaseName,
   folderParent,
@@ -242,6 +243,16 @@ export function App({ initial }) {
     refresh(folder);
   }, [folder, refresh]);
 
+  const { handleLock, handleRelease, handleStartEdit } = createFileLockActions({
+    apiFetch,
+    currentUser,
+    folder,
+    refresh,
+    setBusy,
+    setError,
+    setState,
+  });
+
   async function handleUpload(file, targetFolder = folder) {
     if (!file) {
       return;
@@ -269,27 +280,6 @@ export function App({ initial }) {
     }
   }
 
-  async function handleRelease(docId) {
-    setBusy(true);
-    setError("");
-    const form = new FormData();
-    try {
-      const res = await apiFetch(`/documents/${docId}/release?mode=json`, {
-        method: "POST",
-        body: form,
-      });
-      if (!res.ok) {
-        throw new Error("Release failed");
-      }
-      await refresh(folder);
-      setSelectedId(null);
-    } catch (err) {
-      setError("Could not release the file.");
-    } finally {
-      setBusy(false);
-    }
-  }
-
   async function handleSave(docId, file, note) {
     setBusy(true);
     setError("");
@@ -313,26 +303,6 @@ export function App({ initial }) {
 
   function handleView(doc) {
     triggerDownload(`/documents/${doc.id}/download`);
-  }
-
-  function handleStartEdit(doc) {
-    if (doc.archived) {
-      setError("Restore this file from Archive before editing.");
-      return;
-    }
-    triggerDownload(`/documents/${doc.id}/checkout`);
-    const optimisticLock = {
-      by: currentUser.id,
-      name: currentUser.name,
-      at: new Date().toISOString(),
-    };
-    setState((prev) => ({
-      ...prev,
-      doc_payloads: (prev.doc_payloads || []).map((d) =>
-        d.id === doc.id ? { ...d, lock: optimisticLock } : d
-      ),
-    }));
-    setTimeout(() => refresh(folder), 800);
   }
 
   async function handleMove(docId, newPath) {
@@ -793,6 +763,7 @@ export function App({ initial }) {
       folder,
       handleArchive,
       handleArchiveFolder,
+      handleLock,
       handlePermanentDelete,
       handlePermanentDeleteFolder,
       handleRelease,
@@ -908,6 +879,7 @@ export function App({ initial }) {
       onTriggerUpload: handleUploadClick,
       uploadInputRef: uploadInput,
       onDownload: handleView,
+      onLock: handleLock,
       onRename: handleRenameFile,
       onMove: openMoveDialogForDoc,
       onStartEdit: handleStartEdit,

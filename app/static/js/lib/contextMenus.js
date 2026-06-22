@@ -31,12 +31,10 @@ export function buildFileMenuItems(actions) {
       : { label: "Move to Archive", action: () => actions.handleArchive(doc.id), disabled: busy },
     !doc.archived && !lockedByOther
       ? {
-          label: lockedByMe ? "Re-download (locked)" : "Lock for editing",
-          action: () => actions.handleStartEdit(doc),
+          label: lockedByMe ? "Unlock file" : "Lock for editing",
+          action: () => (lockedByMe ? actions.handleRelease(doc.id) : actions.handleLock(doc)),
+          disabled: busy,
         }
-      : null,
-    lockedByMe && !doc.archived
-      ? { label: "Unlock file", action: () => actions.handleRelease(doc.id), disabled: busy }
       : null,
     isAdmin && doc.archived
       ? {

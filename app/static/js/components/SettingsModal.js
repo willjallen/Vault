@@ -219,7 +219,11 @@ function DraftGroupRow({ disabled, groupName, inputRef, onCancel, onChange, onSu
 
 function UserGroupPicker({ availableGroups, disabled, onSelect }) {
   if (!availableGroups.length) {
-    return h("div", { className: "admin-user-group-menu empty" }, "No groups available");
+    return h(
+      "div",
+      { className: "admin-user-group-menu" },
+      h("div", { className: "admin-user-group-menu-empty" }, "No groups available")
+    );
   }
   return h(
     "div",

@@ -6,8 +6,9 @@
   "scripts": {
     "lint:js": "eslint \"app/static/js/**/*.js\" --max-warnings 0",
     "lint:css": "stylelint \"app/static/**/*.css\" --max-warnings 0",
+    "check:css-tokens": "node scripts/check-css-tokens.mjs",
     "format:js": "prettier --check \"app/static/**/*.{js,css,html}\"",
-    "lint": "npm run lint:js && npm run lint:css && npm run format:js"
+    "lint": "npm run lint:js && npm run lint:css && npm run check:css-tokens && npm run format:js"
   },
   "devDependencies": {
     "eslint": "8.57.0",

@@ -637,7 +637,7 @@ header {
 
 .file-row {
   display: grid;
-  grid-template-columns: 46px minmax(0, 1fr) 170px 90px 160px;
+  grid-template-columns: 46px minmax(0, 1fr) 170px 90px 58px;
   gap: 8px;
   align-items: center;
   padding: 10px 12px;
@@ -787,6 +787,40 @@ header {
   min-width: 0;
   overflow-wrap: anywhere;
   word-break: break-word;
+}
+
+.file-name-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.file-name-line .name {
+  flex: 0 1 auto;
+}
+
+.file-lock-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  min-width: 0;
+  color: var(--danger);
+  font-size: 0.72rem;
+  font-weight: 700;
+  line-height: 1.1;
+}
+
+.file-lock-indicator svg {
+  flex: 0 0 auto;
+}
+
+.file-lock-indicator span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .inline-name-editor {
@@ -943,6 +977,40 @@ header {
   justify-content: space-between;
   flex-wrap: wrap;
   gap: 8px;
+}
+
+.lock-toggle {
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 1px solid #fecdd3;
+  border-radius: 8px;
+  background: #fff5f5;
+  color: var(--danger);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition:
+    background 0.15s ease,
+    border 0.15s ease,
+    color 0.15s ease;
+}
+
+.lock-toggle:hover {
+  border-color: #fda4af;
+  background: #ffe4e6;
+}
+
+.lock-toggle.active {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #fff;
+}
+
+.lock-toggle:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 .editing-block {

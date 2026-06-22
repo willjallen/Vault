@@ -1,4 +1,4 @@
-import { classNames } from "../../lib/utils.js";
+import { classNames, formatBytes } from "../../lib/utils.js";
 import { Icon } from "../common/Icon.js";
 import { LockGlyph } from "../common/LockGlyph.js";
 
@@ -207,13 +207,14 @@ export function InfoDock({
       allFiles &&
       files.every((item) => item.lock?.by && (item.lock.by === currentUserId || isAdmin));
     const totalSize = selectionItems.reduce((sum, item) => sum + (item.size_bytes || 0), 0);
+    const totalSizeDisplay = formatBytes(totalSize, { emptyForZero: false });
     return h("div", { className: "info-dock" }, [
       h("p", { className: "eyebrow tiny" }, "Selection"),
       h("h3", null, `${selectionCount} selected`),
       h(
         "p",
         { className: "muted tiny" },
-        `${files.length} files · ${folders.length} folders · ${totalSize ? `${totalSize} bytes` : "Size unknown"}`
+        `${files.length} files · ${folders.length} folders · ${totalSizeDisplay}`
       ),
       h("div", { className: "actions row wrap compact subtle-actions" }, [
         h(

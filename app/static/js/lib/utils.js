@@ -2,6 +2,36 @@ export function classNames(...args) {
   return args.filter(Boolean).join(" ");
 }
 
+export function formatBytes(bytes, options = {}) {
+  const value = Number(bytes);
+  const emptyForZero = options.emptyForZero ?? true;
+
+  if (!Number.isFinite(value) || value < 0 || (emptyForZero && value === 0)) {
+    return "";
+  }
+
+  let size = value;
+  let unitIndex = 0;
+
+  while (size >= 1024 && unitIndex < 4) {
+    size /= 1024;
+    unitIndex += 1;
+  }
+
+  let unit = "B";
+  if (unitIndex === 1) {
+    unit = "KB";
+  } else if (unitIndex === 2) {
+    unit = "MB";
+  } else if (unitIndex === 3) {
+    unit = "GB";
+  } else if (unitIndex === 4) {
+    unit = "TB";
+  }
+
+  return unitIndex === 0 ? `${size} ${unit}` : `${size.toFixed(1)} ${unit}`;
+}
+
 export function toBreadcrumbs(folder) {
   const safeFolder = folder || "";
   const inArchive = isArchivePath(safeFolder);

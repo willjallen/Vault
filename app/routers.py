@@ -1670,9 +1670,10 @@ def storage_reconciliation_report(db: Session, apply: bool = False) -> dict[str,
     referenced_blob_ids = {
         row[0] for row in db.execute(select(DocumentVersion.blob_id)).all() if row[0] is not None
     }
-    orphan_blob_ids = [
-        blob.id for blob in db.execute(select(Blob)).scalars() if blob.id not in referenced_blob_ids
+    orphan_blobs = [
+        blob for blob in db.execute(select(Blob)).scalars() if blob.id not in referenced_blob_ids
     ]
+    orphan_blob_ids = [blob.id for blob in orphan_blobs]
     local_locations = list(
         db.execute(select(BlobLocation).where(BlobLocation.backend == "local")).scalars(),
     )
@@ -1683,14 +1684,31 @@ def storage_reconciliation_report(db: Session, apply: bool = False) -> dict[str,
     except StorageError:
         local_keys = set()
     unreferenced_local_keys = sorted(local_keys - known_local_keys)
+    orphan_local_keys = sorted(
+        {
+            location.object_key
+            for blob in orphan_blobs
+            for location in blob.locations
+            if location.backend == "local"
+        },
+    )
     if apply:
         local_backend = get_storage_backend("local")
+        for object_key in orphan_local_keys:
+            local_backend.delete_object(object_key)
+        for blob in orphan_blobs:
+            db.delete(blob)
         for object_key in unreferenced_local_keys:
             local_backend.delete_object(object_key)
+        db.flush()
     return {
         "orphan_blob_ids": orphan_blob_ids,
         "unreferenced_local_keys": unreferenced_local_keys,
-        "deleted_local_keys": unreferenced_local_keys if apply else [],
+        "deleted_local_keys": sorted(
+            set(unreferenced_local_keys) | set(orphan_local_keys),
+        )
+        if apply
+        else [],
     }
 
 

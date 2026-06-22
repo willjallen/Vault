@@ -1,4 +1,4 @@
-import { folderNameFromPath } from "./utils.js";
+import { folderNameFromPath, isArchivePath } from "./utils.js";
 
 function getDocFromDrag(dragEvent, docs) {
   const docId =
@@ -43,8 +43,8 @@ function handleFolderDrop({
     setUploadHover(false);
     return;
   }
-  const sourceArchived = draggedFolder.startsWith("Archive");
-  const targetArchived = target.startsWith("Archive");
+  const sourceArchived = isArchivePath(draggedFolder);
+  const targetArchived = isArchivePath(target);
   if (target === "Archive" && !sourceArchived) {
     dropEvent.preventDefault();
     if (isPreview) {

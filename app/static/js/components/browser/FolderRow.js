@@ -25,7 +25,7 @@ export function FolderRow({
   const inputRef = useRef(null);
   const isArchived = isArchivePath(folder.path || "");
   const parentPath = (folder.path || "").split("/").slice(0, -1).join("/");
-  const parentWithinArchive = parentPath.startsWith("Archive");
+  const parentWithinArchive = isArchivePath(parentPath);
   const trimmedParent = parentWithinArchive ? parentPath.replace(/^Archive\/?/, "") : parentPath;
   const parentLabel = trimmedParent
     ? `In ${parentWithinArchive ? `Archive / ${trimmedParent}` : trimmedParent}`

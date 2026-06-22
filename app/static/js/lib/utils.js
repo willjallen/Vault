@@ -60,7 +60,7 @@ export function formatDate(iso) {
 }
 
 export function isArchivePath(path) {
-  return typeof path === "string" && path.startsWith("Archive");
+  return typeof path === "string" && (path === "Archive" || path.startsWith("Archive/"));
 }
 
 export function folderNameFromPath(path) {

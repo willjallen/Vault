@@ -11,8 +11,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from fastapi import HTTPException
-
 from .config import (
     OBJECTS_PATH,
     R2_ACCESS_KEY_ID,
@@ -44,6 +42,18 @@ except ImportError:  # pragma: no cover - exercised on Windows only
     msvcrt = _msvcrt
 
 
+class StorageError(Exception):
+    """Base class for storage backend errors."""
+
+
+class StorageNotFoundError(StorageError):
+    """Raised when a referenced blob is missing from the storage medium."""
+
+
+class StorageConfigurationError(StorageError):
+    """Raised when the configured storage backend cannot serve the request."""
+
+
 @dataclass(frozen=True)
 class StoredBlob:
     hash_algo: str
@@ -52,17 +62,22 @@ class StoredBlob:
     backend: str
     bucket: str
     object_key: str
-    mime_type: str | None = None
 
 
 class BlobStorageBackend:
     name: str
     bucket: str
 
-    def put_bytes(self, data: bytes, mime_type: str | None = None) -> StoredBlob:
+    def put_bytes(self, data: bytes, content_type: str | None = None) -> StoredBlob:
         raise NotImplementedError
 
     def read_bytes(self, object_key: str, bucket: str | None = None) -> bytes:
+        raise NotImplementedError
+
+    def list_object_keys(self) -> list[str]:
+        raise NotImplementedError
+
+    def delete_object(self, object_key: str) -> None:
         raise NotImplementedError
 
     def ensure(self) -> None:
@@ -91,10 +106,11 @@ class LocalBlobStorage(BlobStorageBackend):
         cleaned = object_key.strip().lstrip("/").replace("\\", "/")
         target = (self.root / cleaned).resolve()
         if self.root not in target.parents and target != self.root:
-            raise HTTPException(status_code=400, detail="Invalid object key")
+            raise StorageConfigurationError("Invalid object key")
         return target
 
-    def put_bytes(self, data: bytes, mime_type: str | None = None) -> StoredBlob:
+    def put_bytes(self, data: bytes, content_type: str | None = None) -> StoredBlob:
+        del content_type
         digest = hashlib.sha256(data).hexdigest()
         object_key = object_key_for_hash("sha256", digest)
         target = self._object_path(object_key)
@@ -110,14 +126,28 @@ class LocalBlobStorage(BlobStorageBackend):
             backend=self.name,
             bucket=self.bucket,
             object_key=object_key,
-            mime_type=mime_type,
         )
 
     def read_bytes(self, object_key: str, bucket: str | None = None) -> bytes:
+        del bucket
         target = self._object_path(object_key)
         if not target.exists() or not target.is_file():
-            raise HTTPException(status_code=404, detail="Blob missing from storage")
+            raise StorageNotFoundError("Blob missing from storage")
         return target.read_bytes()
+
+    def list_object_keys(self) -> list[str]:
+        self.ensure()
+        keys: list[str] = []
+        for path in self.root.rglob("*"):
+            if not path.is_file() or path.name.startswith(".vault-storage.lock"):
+                continue
+            keys.append(str(path.relative_to(self.root)).replace("\\", "/"))
+        return sorted(keys)
+
+    def delete_object(self, object_key: str) -> None:
+        target = self._object_path(object_key)
+        if target.exists() and target.is_file():
+            target.unlink()
 
 
 class S3CompatibleBlobStorage(BlobStorageBackend):
@@ -133,7 +163,9 @@ class S3CompatibleBlobStorage(BlobStorageBackend):
         session_token: str | None = None,
     ) -> None:
         if not bucket:
-            raise RuntimeError(f"VAULT_{name.upper()}_BUCKET is required for {name} storage")
+            raise StorageConfigurationError(
+                f"VAULT_{name.upper()}_BUCKET is required for {name} storage",
+            )
         self.name = name
         self.bucket = bucket
         self.region = region
@@ -149,7 +181,7 @@ class S3CompatibleBlobStorage(BlobStorageBackend):
             try:
                 import boto3  # type: ignore[import-untyped]
             except ImportError as exc:  # pragma: no cover - depends on optional package install
-                raise RuntimeError("Install boto3 to use s3 or r2 storage") from exc
+                raise StorageConfigurationError("Install boto3 to use s3 or r2 storage") from exc
             kwargs: dict[str, Any] = {"region_name": self.region}
             if self.endpoint_url:
                 kwargs["endpoint_url"] = self.endpoint_url
@@ -162,15 +194,15 @@ class S3CompatibleBlobStorage(BlobStorageBackend):
             self._client = boto3.client("s3", **kwargs)
         return self._client
 
-    def put_bytes(self, data: bytes, mime_type: str | None = None) -> StoredBlob:
+    def put_bytes(self, data: bytes, content_type: str | None = None) -> StoredBlob:
         digest = hashlib.sha256(data).hexdigest()
         object_key = object_key_for_hash("sha256", digest)
         try:
             self.client.head_object(Bucket=self.bucket, Key=object_key)
         except Exception:
             kwargs = {"Bucket": self.bucket, "Key": object_key, "Body": data}
-            if mime_type:
-                kwargs["ContentType"] = mime_type
+            if content_type:
+                kwargs["ContentType"] = content_type
             self.client.put_object(**kwargs)
         return StoredBlob(
             hash_algo="sha256",
@@ -179,7 +211,6 @@ class S3CompatibleBlobStorage(BlobStorageBackend):
             backend=self.name,
             bucket=self.bucket,
             object_key=object_key,
-            mime_type=mime_type,
         )
 
     def read_bytes(self, object_key: str, bucket: str | None = None) -> bytes:
@@ -187,7 +218,14 @@ class S3CompatibleBlobStorage(BlobStorageBackend):
             response = self.client.get_object(Bucket=bucket or self.bucket, Key=object_key)
             return response["Body"].read()
         except Exception as exc:
-            raise HTTPException(status_code=404, detail="Blob missing from storage") from exc
+            raise StorageNotFoundError("Blob missing from storage") from exc
+
+    def list_object_keys(self) -> list[str]:
+        raise StorageConfigurationError("Object listing is only implemented for local storage")
+
+    def delete_object(self, object_key: str) -> None:
+        del object_key
+        raise StorageConfigurationError("Object deletion is only implemented for local storage")
 
 
 def _build_backend(name: str) -> BlobStorageBackend:
@@ -212,7 +250,7 @@ def _build_backend(name: str) -> BlobStorageBackend:
             access_key_id=R2_ACCESS_KEY_ID,
             secret_access_key=R2_SECRET_ACCESS_KEY,
         )
-    raise RuntimeError(f"Unsupported VAULT_STORAGE_BACKEND: {name}")
+    raise StorageConfigurationError(f"Unsupported VAULT_STORAGE_BACKEND: {name}")
 
 
 _backend_cache: dict[str, BlobStorageBackend] = {}

@@ -2,7 +2,7 @@ import { classNames, isArchivePath } from "../../lib/utils.js";
 
 const h = React.createElement;
 
-export function MyEdits({ edits, selectedId, onSelect }) {
+export function MyEdits({ edits, selectedId, onSelect, onContextMenu }) {
   if (!edits.length) {
     return null;
   }
@@ -22,6 +22,14 @@ export function MyEdits({ edits, selectedId, onSelect }) {
             inArchive ? "archived" : ""
           ),
           onClick: () => onSelect(doc),
+          onContextMenu: (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            onSelect(doc);
+            if (onContextMenu) {
+              onContextMenu(e, doc);
+            }
+          },
         },
         [
           h("span", { className: "chip-dot" }),

@@ -19,7 +19,15 @@ export function buildFileMenuItems(actions) {
   const lockedByMe = lock && lock.by === currentUser.id;
   const lockedByOther = lock && lock.by && lock.by !== currentUser.id;
   return compactMenuItems([
-    { label: "Open", action: () => actions.handleView(doc) },
+    { label: "Download", action: () => actions.handleView(doc) },
+    !doc.archived && !lockedByOther
+      ? {
+          label: lockedByMe ? "Upload" : "Replace",
+          action: () =>
+            actions.handleVersionUploadClick(doc, { renameToUploadedName: !lockedByMe }),
+          disabled: busy,
+        }
+      : null,
     { label: "Rename", action: () => actions.handleRenameFile(doc), disabled: busy },
     {
       label: "Move...",
@@ -51,6 +59,23 @@ export function buildFileMenuItems(actions) {
           disabled: busy,
         }
       : null,
+  ]);
+}
+
+export function buildMyEditMenuItems(actions) {
+  const { doc, busy } = actions;
+  return compactMenuItems([
+    { label: "Download", action: () => actions.handleView(doc) },
+    {
+      label: "Upload",
+      action: () => actions.handleVersionUploadClick(doc),
+      disabled: busy || doc.archived,
+    },
+    {
+      label: "Unlock file",
+      action: () => actions.handleRelease(doc.id),
+      disabled: busy,
+    },
   ]);
 }
 

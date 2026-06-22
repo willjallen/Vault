@@ -4,6 +4,7 @@ import { MoveDialog } from "./components/browser/MoveDialog.js";
 import {
   buildFileMenuItems,
   buildFolderMenuItems,
+  buildMyEditMenuItems,
   buildPageMenuItems,
 } from "./lib/contextMenus.js";
 import { createDropHandlers } from "./lib/dropHandlers.js";
@@ -41,6 +42,9 @@ export function App({ initial }) {
   const [draggingFolderPath, setDraggingFolderPath] = useState(null);
   const [toast, setToast] = useState("");
   const uploadInput = useRef(null);
+  const versionUploadInput = useRef(null);
+  const versionUploadDoc = useRef(null);
+  const versionUploadOptions = useRef({});
   const closeContextMenu = useCallback(() => setContextMenu(null), []);
 
   const baseDomain =
@@ -243,15 +247,38 @@ export function App({ initial }) {
     refresh(folder);
   }, [folder, refresh]);
 
-  const { handleLock, handleRelease, handleStartEdit } = createFileLockActions({
-    apiFetch,
-    currentUser,
-    folder,
-    refresh,
-    setBusy,
-    setError,
-    setState,
-  });
+  const { handleLock, handleRelease, handleSave, handleStartEdit, handleVersionUpload } =
+    createFileLockActions({
+      apiFetch,
+      currentUser,
+      folder,
+      refresh,
+      setBusy,
+      setError,
+      setState,
+    });
+
+  function handleVersionUploadClick(doc, options = {}) {
+    versionUploadDoc.current = doc;
+    versionUploadOptions.current = options;
+    if (versionUploadInput.current) {
+      versionUploadInput.current.click();
+    }
+  }
+
+  async function handleVersionUploadInput(file) {
+    const doc = versionUploadDoc.current;
+    const options = versionUploadOptions.current;
+    versionUploadDoc.current = null;
+    versionUploadOptions.current = {};
+    if (!doc || !file) {
+      return;
+    }
+    await handleVersionUpload(doc, file, options);
+    if (versionUploadInput.current) {
+      versionUploadInput.current.value = "";
+    }
+  }
 
   async function handleUpload(file, targetFolder = folder) {
     if (!file) {
@@ -277,27 +304,6 @@ export function App({ initial }) {
       if (uploadInput.current) {
         uploadInput.current.value = "";
       }
-    }
-  }
-
-  async function handleSave(docId, file, note) {
-    setBusy(true);
-    setError("");
-    const form = new FormData();
-    form.append("file", file);
-    if (note) {
-      form.append("note", note);
-    }
-    try {
-      const res = await apiFetch(`/documents/${docId}/checkin`, { method: "POST", body: form });
-      if (!res.ok) {
-        throw new Error("Save failed");
-      }
-      await refresh(folder);
-    } catch (err) {
-      setError("Save failed. Please try again.");
-    } finally {
-      setBusy(false);
     }
   }
 
@@ -774,6 +780,7 @@ export function App({ initial }) {
       handleUnarchiveFolder,
       handleUploadClick,
       handleView,
+      handleVersionUploadClick,
       isAdmin,
       openMoveDialogForDoc,
       openMoveDialogForFolder,
@@ -792,6 +799,17 @@ export function App({ initial }) {
     }
     setSelectedId(doc.id);
     const items = buildFileMenuItems(contextActions({ doc }));
+    setContextMenu({ x: evt.clientX, y: evt.clientY, items });
+  }
+
+  function handleMyEditContextMenu(evt, doc) {
+    evt.preventDefault();
+    evt.stopPropagation();
+    if (!doc) {
+      return;
+    }
+    setSelectedId(doc.id);
+    const items = buildMyEditMenuItems(contextActions({ doc }));
     setContextMenu({ x: evt.clientX, y: evt.clientY, items });
   }
 
@@ -874,6 +892,7 @@ export function App({ initial }) {
       onFolderDragEnd: handleFolderDragEnd,
       onFileContextMenu: handleFileContextMenu,
       onFolderContextMenu: handleFolderContextMenu,
+      onMyEditContextMenu: handleMyEditContextMenu,
       onPageContextMenu: handlePageContextMenu,
       onUploadFile: (file) => handleUpload(file),
       onTriggerUpload: handleUploadClick,
@@ -906,6 +925,12 @@ export function App({ initial }) {
           onNewFolderNameChange: setMoveNewFolderName,
         })
       : null,
+    h("input", {
+      type: "file",
+      ref: versionUploadInput,
+      className: "hidden-input",
+      onChange: (e) => handleVersionUploadInput(e.target.files[0]),
+    }),
     contextMenu ? h(ContextMenu, { menu: contextMenu, onClose: closeContextMenu }) : null,
     error ? h("div", { className: "toast error" }, error) : null,
     busy ? h("div", { className: "toast subtle" }, "Working...") : null

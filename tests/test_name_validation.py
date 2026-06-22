@@ -8,6 +8,7 @@ from app.routers import (
     ensure_folder_creation_path,
     normalize_folder,
     normalize_item_name,
+    sanitize_mime_type,
 )
 
 
@@ -37,6 +38,19 @@ class NameValidationTests(unittest.TestCase):
         disposition = response.headers["content-disposition"]
         self.assertIn('filename="___.txt"', disposition)
         self.assertIn("filename*=UTF-8''%E8%A8%88%E7%94%BB%F0%9F%98%80.txt", disposition)
+
+    def test_download_content_type_rejects_malformed_legacy_mime_type(self) -> None:
+        response = download_response(b"data", "report.txt", "text/plain\nX-Bad: y")
+
+        self.assertEqual(response.headers["content-type"], "text/plain; charset=utf-8")
+        self.assertNotIn("\n", response.headers["content-type"])
+
+    def test_mime_type_sanitizer_rejects_non_ascii_values(self) -> None:
+        self.assertEqual(sanitize_mime_type("text/😀", "file.bin"), "application/octet-stream")
+        self.assertEqual(
+            sanitize_mime_type("text/plain; charset=utf-8", "file.txt"),
+            "text/plain; charset=utf-8",
+        )
 
     def test_document_uploads_reject_archive_paths(self) -> None:
         with self.assertRaises(HTTPException) as raised:

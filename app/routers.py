@@ -798,13 +798,23 @@ def download_response(data: bytes, filename: str, mime_type: str | None = None) 
     ).strip() or "download"
     ascii_name = "".join(char if 32 <= ord(char) < 127 else "_" for char in safe_name).strip()
     ascii_name = ascii_name or "download"
-    content_type = mime_type or mimetypes.guess_type(safe_name)[0] or "application/octet-stream"
+    content_type = sanitize_mime_type(mime_type, safe_name)
     disposition = f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{quote(safe_name)}'
     return Response(
         content=data,
         media_type=content_type,
         headers={"Content-Disposition": disposition, "Content-Length": str(len(data))},
     )
+
+
+def sanitize_mime_type(mime_type: str | None, filename: str) -> str:
+    fallback = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    candidate = (mime_type or fallback).strip()
+    if not candidate:
+        return fallback
+    if any(ord(char) < 32 or ord(char) == 127 or ord(char) > 126 for char in candidate):
+        return fallback
+    return candidate
 
 
 def action_item_payload(item: ActionItem) -> dict[str, object]:
@@ -2470,7 +2480,7 @@ async def create_document(
     folder_path_value = normalize_folder(folder)
     ensure_document_upload_folder(folder_path_value)
     data = await file.read()
-    mime_type = file.content_type or mimetypes.guess_type(filename)[0]
+    mime_type = sanitize_mime_type(file.content_type, filename)
     meta = client_meta(request)
     with storage_write_lock():
         target_folder = get_or_create_folder_path(db, folder_path_value)
@@ -2552,7 +2562,7 @@ async def checkin_document(
         )
     upload_name = normalize_item_name(file.filename, "File name")
     data = await file.read()
-    mime_type = file.content_type or mimetypes.guess_type(upload_name)[0]
+    mime_type = sanitize_mime_type(file.content_type, upload_name)
     meta = client_meta(request)
     message = note.strip() or f"Uploaded {upload_name}"
     with storage_write_lock():

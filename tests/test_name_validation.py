@@ -2,7 +2,12 @@ import unittest
 
 from fastapi import HTTPException
 
-from app.routers import download_response, normalize_folder, normalize_item_name
+from app.routers import (
+    download_response,
+    ensure_document_upload_folder,
+    normalize_folder,
+    normalize_item_name,
+)
 
 
 class NameValidationTests(unittest.TestCase):
@@ -24,6 +29,12 @@ class NameValidationTests(unittest.TestCase):
         disposition = response.headers["content-disposition"]
         self.assertNotIn("\n", disposition)
         self.assertIn('filename="bad_name.txt"', disposition)
+
+    def test_document_uploads_reject_archive_paths(self) -> None:
+        with self.assertRaises(HTTPException) as raised:
+            ensure_document_upload_folder("Archive/manual")
+
+        self.assertEqual(raised.exception.status_code, 400)
 
 
 if __name__ == "__main__":

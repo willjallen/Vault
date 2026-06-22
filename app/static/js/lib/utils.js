@@ -43,14 +43,6 @@ export function buildTree(childrenMap, nodePath = "") {
   }));
 }
 
-export function triggerDownload(url) {
-  const iframe = document.createElement("iframe");
-  iframe.style.display = "none";
-  iframe.src = url;
-  document.body.appendChild(iframe);
-  setTimeout(() => iframe.remove(), 4000);
-}
-
 export function formatDate(iso) {
   if (!iso) {
     return "Not updated yet";

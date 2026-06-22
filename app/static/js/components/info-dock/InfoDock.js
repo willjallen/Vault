@@ -120,6 +120,7 @@ export function InfoDock({
   doc,
   currentUserId,
   onDownload,
+  onDownloadVersion,
   onLock,
   onRename,
   onStartEdit,
@@ -475,11 +476,12 @@ export function InfoDock({
                       h("span", { className: "history-action" }, actionText),
                       item.download_url
                         ? h(
-                            "a",
+                            "button",
                             {
                               className: "history-download",
-                              href: item.download_url,
+                              onClick: () => onDownloadVersion && onDownloadVersion(item),
                               title: "Download this version",
+                              type: "button",
                             },
                             "Download"
                           )

@@ -1,5 +1,3 @@
-import { triggerDownload } from "./utils.js";
-
 function optimisticLockFor(doc, currentUser) {
   return {
     by: currentUser.id,
@@ -19,6 +17,8 @@ export function createFileLockActions({
   setBusy,
   setError,
   setState,
+  uploadWithProgress,
+  downloadWithProgress,
 }) {
   async function handleSave(docId, file, note, options = {}) {
     setBusy(true);
@@ -32,14 +32,16 @@ export function createFileLockActions({
       form.append("rename_to_upload", "true");
     }
     try {
-      const res = await apiFetch(`/documents/${docId}/checkin`, { method: "POST", body: form });
-      if (!res.ok) {
-        throw new Error("Save failed");
-      }
+      await uploadWithProgress({
+        formData: form,
+        name: file.name,
+        size: file.size,
+        url: `/documents/${docId}/checkin`,
+      });
       await refresh(folder);
       return true;
-    } catch {
-      setError("Save failed. Please try again.");
+    } catch (err) {
+      setError(err.message || "Save failed. Please try again.");
       return false;
     } finally {
       setBusy(false);
@@ -117,14 +119,24 @@ export function createFileLockActions({
       setError("Restore this file from Archive before editing.");
       return;
     }
-    triggerDownload(`/documents/${doc.id}/checkout`);
+    downloadWithProgress({
+      name: doc.name,
+      size: doc.size_bytes,
+      url: `/documents/${doc.id}/checkout`,
+    })
+      .then(() => {
+        setTimeout(() => refresh(folder), 800);
+      })
+      .catch((err) => {
+        setError(err.message || "Checkout failed.");
+        refresh(folder);
+      });
     setState((prev) => ({
       ...prev,
       doc_payloads: (prev.doc_payloads || []).map((d) =>
         d.id === doc.id ? { ...d, lock: optimisticLockFor(doc, currentUser) } : d
       ),
     }));
-    setTimeout(() => refresh(folder), 800);
   }
 
   return { handleLock, handleRelease, handleSave, handleStartEdit, handleVersionUpload };

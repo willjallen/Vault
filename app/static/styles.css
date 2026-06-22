@@ -1174,9 +1174,14 @@ input[type="text"]:focus {
 }
 
 .history-download {
+  border: none;
+  background: transparent;
   color: var(--muted);
+  cursor: pointer;
+  font-family: inherit;
   font-weight: 600;
   font-size: 0.85rem;
+  padding: 0;
   text-decoration: none;
   max-width: 100%;
 }
@@ -1333,6 +1338,191 @@ input[type="text"]:focus {
 .toast.subtle {
   background: #111827;
   color: #e5e7eb;
+}
+
+.transfer-dock {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  z-index: 2300;
+  width: min(370px, calc(100vw - 32px));
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  pointer-events: none;
+}
+
+.transfer-row {
+  pointer-events: auto;
+  display: grid;
+  grid-template-columns: 36px minmax(0, 1fr);
+  gap: 10px;
+  align-items: center;
+  padding: 12px;
+  overflow: hidden;
+  border: 1px solid rgba(215, 221, 232, 0.82);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.94);
+  box-shadow:
+    0 18px 44px rgba(15, 23, 42, 0.18),
+    inset 0 1px 0 rgba(255, 255, 255, 0.9);
+  backdrop-filter: blur(18px);
+  transform-origin: bottom right;
+  transition:
+    opacity 0.16s ease,
+    transform 0.3s cubic-bezier(0.18, 1.18, 0.28, 1),
+    border-color 0.12s ease,
+    box-shadow 0.12s ease;
+  will-change: opacity, transform;
+}
+
+.transfer-row.phase-entering {
+  opacity: 0;
+  transform: translate3d(42px, 20px, 0) scale(0.9) rotate(1deg);
+}
+
+.transfer-row.phase-visible,
+.transfer-row.phase-complete {
+  opacity: 1;
+  transform: translate3d(0, 0, 0) scale(1) rotate(0deg);
+}
+
+.transfer-row.phase-completing {
+  opacity: 1;
+  transform: translate3d(0, -3px, 0) scale(1.018) rotate(-0.15deg);
+}
+
+.transfer-row.phase-leaving {
+  opacity: 0;
+  transform: translate3d(44px, 18px, 0) scale(0.92) rotate(0.8deg);
+  transition:
+    opacity 0.18s ease-in,
+    transform 0.26s cubic-bezier(0.64, 0, 0.78, 0),
+    border-color 0.12s ease,
+    box-shadow 0.12s ease;
+}
+
+.transfer-row.complete:not(.phase-leaving) {
+  border-color: rgba(187, 247, 208, 0.95);
+  box-shadow:
+    0 20px 48px rgba(15, 23, 42, 0.16),
+    0 0 0 3px rgba(34, 197, 94, 0.08),
+    inset 0 1px 0 rgba(255, 255, 255, 0.95);
+}
+
+.transfer-icon {
+  width: 34px;
+  height: 34px;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 800;
+  line-height: 1;
+  transition: transform 0.22s cubic-bezier(0.18, 1.22, 0.28, 1);
+}
+
+.transfer-icon.uploading {
+  color: #075985;
+  background: #e0f2fe;
+}
+
+.transfer-icon.downloading {
+  color: #047857;
+  background: #d1fae5;
+}
+
+.transfer-row.complete .transfer-icon {
+  color: #15803d;
+  background: #dcfce7;
+}
+
+.transfer-row.phase-completing .transfer-icon {
+  transform: scale(1.09) rotate(-2deg);
+}
+
+.transfer-row.phase-complete .transfer-icon,
+.transfer-row.phase-visible .transfer-icon {
+  transform: scale(1) rotate(0deg);
+}
+
+.transfer-row.error .transfer-icon {
+  color: #be123c;
+  background: #ffe4e6;
+}
+
+.transfer-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.transfer-line {
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.transfer-title {
+  flex: 0 0 auto;
+  font-size: 0.88rem;
+  font-weight: 800;
+}
+
+.transfer-name {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 0.84rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.transfer-meta {
+  min-width: 0;
+  overflow: hidden;
+  color: #475467;
+  font-size: 0.78rem;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.transfer-row.error .transfer-meta {
+  color: #be123c;
+}
+
+.transfer-progress {
+  position: relative;
+  height: 5px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #e8edf5;
+}
+
+.transfer-progress span {
+  display: block;
+  height: 100%;
+  min-width: 8px;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #2b7cff, #14b8a6);
+  transition: width 0.14s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.transfer-progress.indeterminate span {
+  width: 46%;
+  min-width: 46%;
+  animation: transfer-indeterminate 1.05s ease-in-out infinite;
+}
+
+.transfer-row.complete .transfer-progress span {
+  background: var(--success);
+}
+
+.transfer-row.error .transfer-progress span {
+  background: var(--danger);
 }
 
 .inline-form {
@@ -1635,6 +1825,16 @@ input[type="text"]:focus {
   margin: 4px 0 0;
 }
 
+@keyframes transfer-indeterminate {
+  0% {
+    transform: translateX(-115%);
+  }
+
+  100% {
+    transform: translateX(245%);
+  }
+}
+
 @media (max-width: 1200px) {
   body {
     padding: 18px;
@@ -1704,5 +1904,19 @@ input[type="text"]:focus {
   .modal-backdrop {
     padding: 0;
     align-items: stretch;
+  }
+}
+
+@media (max-width: 650px) {
+  .transfer-dock {
+    right: 12px;
+    bottom: 12px;
+    width: calc(100vw - 24px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .transfer-progress.indeterminate span {
+    animation: none;
   }
 }

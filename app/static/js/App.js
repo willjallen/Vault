@@ -1,4 +1,5 @@
 import { FinderShell } from "./components/FinderShell.js";
+import { ConfirmToast } from "./components/ConfirmToast.js";
 import { TransferDock } from "./components/TransferDock.js";
 import { ContextMenu } from "./components/browser/ContextMenu.js";
 import { MoveDialog } from "./components/browser/MoveDialog.js";
@@ -43,11 +44,32 @@ export function App({ initial }) {
   const [contextMenu, setContextMenu] = useState(null);
   const [draggingFolderPath, setDraggingFolderPath] = useState(null);
   const [toast, setToast] = useState("");
+  const [confirmRequest, setConfirmRequest] = useState(null);
   const uploadInput = useRef(null);
   const versionUploadInput = useRef(null);
   const versionUploadDoc = useRef(null);
   const versionUploadOptions = useRef({});
+  const confirmResolver = useRef(null);
   const closeContextMenu = useCallback(() => setContextMenu(null), []);
+
+  const resolveConfirm = useCallback((confirmed) => {
+    const resolver = confirmResolver.current;
+    confirmResolver.current = null;
+    setConfirmRequest(null);
+    if (resolver) {
+      resolver(confirmed);
+    }
+  }, []);
+
+  const requestConfirm = useCallback((request) => {
+    if (confirmResolver.current) {
+      confirmResolver.current(false);
+    }
+    return new Promise((resolve) => {
+      confirmResolver.current = resolve;
+      setConfirmRequest(request);
+    });
+  }, []);
 
   const baseDomain =
     initialBootstrap.base_domain ||
@@ -243,7 +265,7 @@ export function App({ initial }) {
         size: file.size,
         url: "/documents",
       });
-      await refresh();
+      await refresh(targetFolder || "", { invalidateContents: true });
     } catch (err) {
       setError(err.message || "Upload failed. Please try again.");
     } finally {
@@ -305,7 +327,7 @@ export function App({ initial }) {
         const detail = await res.json().catch(() => ({}));
         throw new Error(detail.detail || "Move failed");
       }
-      await refresh();
+      await refresh(undefined, { invalidateContents: true });
       success = true;
     } catch (err) {
       setError(err.message || "Move failed.");
@@ -318,6 +340,15 @@ export function App({ initial }) {
   }
 
   async function handleArchive(docId) {
+    const doc = docs.find((item) => item.id === docId) || selectedDoc;
+    const confirmed = await requestConfirm({
+      title: "Move to Archive",
+      message: `Move "${doc?.name || "this file"}" to Archive?`,
+      confirmLabel: "Move",
+    });
+    if (!confirmed) {
+      return false;
+    }
     setBusy(true);
     setError("");
     try {
@@ -326,10 +357,12 @@ export function App({ initial }) {
         const detail = await res.json().catch(() => ({}));
         throw new Error(detail.detail || "Archive failed");
       }
-      await refresh();
+      await refresh(undefined, { invalidateContents: true, sidebar: true });
       setSelectedId(null);
+      return true;
     } catch (err) {
       setError(err.message || "Archive failed.");
+      return false;
     } finally {
       setBusy(false);
     }
@@ -346,7 +379,7 @@ export function App({ initial }) {
       }
       const data = await res.json();
       const destFolder = data.path ? data.path.split("/").slice(0, -1).join("/") : "";
-      await refresh(destFolder);
+      await refresh(destFolder, { invalidateContents: true, sidebar: true });
       replaceFolder(destFolder);
       setSelectedId(null);
     } catch (err) {
@@ -357,6 +390,16 @@ export function App({ initial }) {
   }
 
   async function handlePermanentDelete(docId) {
+    const doc = docs.find((item) => item.id === docId) || selectedDoc;
+    const confirmed = await requestConfirm({
+      title: "Delete forever",
+      message: `Permanently delete "${doc?.name || "this file"}" from Archive? This cannot be undone.`,
+      confirmLabel: "Delete forever",
+      tone: "danger",
+    });
+    if (!confirmed) {
+      return false;
+    }
     setBusy(true);
     setError("");
     try {
@@ -365,10 +408,12 @@ export function App({ initial }) {
         const detail = await res.json().catch(() => ({}));
         throw new Error(detail.detail || "Delete failed");
       }
-      await refresh();
+      await refresh(undefined, { invalidateContents: true, sidebar: true });
       setSelectedId(null);
+      return true;
     } catch (err) {
       setError(err.message || "Delete failed.");
+      return false;
     } finally {
       setBusy(false);
     }
@@ -393,9 +438,12 @@ export function App({ initial }) {
       setError("Delete forever is only available in Archive.");
       return;
     }
-    const confirmed = window.confirm(
-      `This will permanently delete "${selectedFolder}" and everything inside. You cannot undo this.`
-    );
+    const confirmed = await requestConfirm({
+      title: "Delete forever",
+      message: `Permanently delete "${selectedFolder}" and everything inside? This cannot be undone.`,
+      confirmLabel: "Delete forever",
+      tone: "danger",
+    });
     if (!confirmed) {
       return;
     }
@@ -411,7 +459,7 @@ export function App({ initial }) {
       }
       const parentFolder = selectedFolder.split("/").slice(0, -1).join("/");
       const refreshTarget = shouldNavigate ? parentFolder : folder;
-      await refresh(refreshTarget);
+      await refresh(refreshTarget, { invalidateContents: true, sidebar: true });
       if (shouldNavigate) {
         replaceFolder(parentFolder);
       }
@@ -430,7 +478,11 @@ export function App({ initial }) {
       setError("Pick a Vault folder to move into Archive.");
       return;
     }
-    const confirmed = window.confirm(`Move "${selectedFolder}" and everything inside to Archive?`);
+    const confirmed = await requestConfirm({
+      title: "Move to Archive",
+      message: `Move "${selectedFolder}" and everything inside to Archive?`,
+      confirmLabel: "Move",
+    });
     if (!confirmed) {
       return;
     }
@@ -447,7 +499,7 @@ export function App({ initial }) {
       const payload = await res.json();
       const dest = payload.archive_folder || `Archive/${selectedFolder}`;
       const refreshTarget = shouldNavigate ? dest : folder;
-      await refresh(refreshTarget);
+      await refresh(refreshTarget, { invalidateContents: true, sidebar: true });
       if (shouldNavigate) {
         replaceFolder(dest);
       }
@@ -465,7 +517,11 @@ export function App({ initial }) {
       setError("Choose an archived folder to restore.");
       return;
     }
-    const confirmed = window.confirm(`Restore "${selectedFolder}" back to Vault?`);
+    const confirmed = await requestConfirm({
+      title: "Restore to Vault",
+      message: `Restore "${selectedFolder}" back to Vault?`,
+      confirmLabel: "Restore",
+    });
     if (!confirmed) {
       return;
     }
@@ -482,7 +538,7 @@ export function App({ initial }) {
       const payload = await res.json();
       const dest = payload.folder || "";
       const refreshTarget = shouldNavigate ? dest : folder;
-      await refresh(refreshTarget);
+      await refresh(refreshTarget, { invalidateContents: true, sidebar: true });
       if (shouldNavigate) {
         replaceFolder(dest);
       }
@@ -541,7 +597,7 @@ export function App({ initial }) {
         const detail = await res.json().catch(() => ({}));
         throw new Error(detail.detail || "Could not create folder");
       }
-      await refresh(parentFolder || "");
+      await refresh(parentFolder || "", { invalidateContents: true, sidebar: true });
       return true;
     } catch (err) {
       setError(err.message || "Could not create folder");
@@ -691,7 +747,7 @@ export function App({ initial }) {
       const payload = await res.json();
       const dest = payload.folder || normalizedNewPath;
       const refreshTarget = shouldNavigate ? dest : folder;
-      await refresh(refreshTarget);
+      await refresh(refreshTarget, { invalidateContents: true, sidebar: true });
       if (shouldNavigate) {
         replaceFolder(dest);
       }
@@ -908,6 +964,7 @@ export function App({ initial }) {
       onChange: (e) => handleVersionUploadInput(e.target.files[0]),
     }),
     h(TransferDock, { transfers }),
+    h(ConfirmToast, { request: confirmRequest, onResolve: resolveConfirm }),
     contextMenu ? h(ContextMenu, { menu: contextMenu, onClose: closeContextMenu }) : null,
     error ? h("div", { className: "toast error" }, error) : null,
     busy ? h("div", { className: "toast subtle" }, "Working...") : null

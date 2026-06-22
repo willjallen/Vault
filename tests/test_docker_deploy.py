@@ -1,0 +1,150 @@
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import textwrap
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class DockerDeployTests(unittest.TestCase):
+    def run_config_script(self, env_overrides: dict[str, str]) -> dict[str, str]:
+        env = os.environ.copy()
+        for key in (
+            "VAULT_DATA_DIR",
+            "VAULT_DB_PATH",
+            "VAULT_OBJECTS_PATH",
+            "VAULT_LOCAL_OBJECTS_PATH",
+            "VAULT_FILES_PATH",
+            "VAULT_REQUIRE_SESSION_SECRET",
+            "VAULT_DOCKER_RUNTIME",
+            "VAULT_SESSION_SECRET",
+        ):
+            env.pop(key, None)
+        env.update(env_overrides)
+
+        script = """
+        import json
+
+        from app import config
+
+        print(json.dumps({
+            "data_dir": str(config.DATA_DIR),
+            "db_path": str(config.DB_PATH),
+            "objects_path": str(config.OBJECTS_PATH),
+        }))
+        """
+        completed = subprocess.run(
+            [sys.executable, "-c", textwrap.dedent(script)],
+            cwd=ROOT,
+            env=env,
+            check=False,
+            stderr=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
+        return json.loads(completed.stdout)
+
+    def test_data_dir_drives_default_database_and_object_paths(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="vault-data-dir-") as temp_dir:
+            data_dir = Path(temp_dir) / "data"
+            paths = self.run_config_script({"VAULT_DATA_DIR": str(data_dir)})
+
+        self.assertEqual(paths["data_dir"], str(data_dir.resolve()))
+        self.assertEqual(paths["db_path"], str((data_dir / "vault.db").resolve()))
+        self.assertEqual(paths["objects_path"], str((data_dir / "objects").resolve()))
+
+    def test_explicit_database_and_object_paths_override_data_dir(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="vault-data-dir-") as temp_dir:
+            base = Path(temp_dir)
+            paths = self.run_config_script(
+                {
+                    "VAULT_DATA_DIR": str(base / "data"),
+                    "VAULT_DB_PATH": str(base / "metadata" / "vault.db"),
+                    "VAULT_OBJECTS_PATH": str(base / "blobs"),
+                },
+            )
+
+        self.assertEqual(paths["db_path"], str((base / "metadata" / "vault.db").resolve()))
+        self.assertEqual(paths["objects_path"], str((base / "blobs").resolve()))
+
+    def test_docker_runtime_requires_explicit_session_secret(self) -> None:
+        env = os.environ.copy()
+        env.pop("VAULT_REQUIRE_SESSION_SECRET", None)
+        env["VAULT_DOCKER_RUNTIME"] = "1"
+        env.pop("VAULT_SESSION_SECRET", None)
+        script = "import app.config"
+
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=ROOT,
+            env=env,
+            check=False,
+            stderr=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("VAULT_SESSION_SECRET is required", completed.stderr)
+
+    def test_compose_uses_single_data_volume_and_production_auth_defaults(self) -> None:
+        compose = (ROOT / "docker-compose.yml").read_text()
+
+        self.assertIn("ghcr.io/willjallen/vault:latest", compose)
+        self.assertIn("- vault-data:/data", compose)
+        self.assertIn("vault-data:", compose)
+        self.assertEqual(compose.count(":/data"), 1)
+        self.assertNotIn("/vault-metadata", compose)
+        self.assertNotIn("/vault-objects", compose)
+        self.assertIn("VAULT_DOCKER_RUNTIME: ${VAULT_DOCKER_RUNTIME:-1}", compose)
+        self.assertIn("VAULT_SESSION_SECRET: ${VAULT_SESSION_SECRET:-}", compose)
+        self.assertIn("VAULT_AUTH_MODE: ${VAULT_AUTH_MODE:-headers}", compose)
+        self.assertNotIn("VAULT_DEV_AUTH", compose)
+        self.assertNotIn("dev-insecure-session-secret", compose)
+
+    def test_dev_compose_is_the_only_compose_file_that_enables_dev_auth(self) -> None:
+        compose = (ROOT / "docker-compose.yml").read_text()
+        dev_compose = (ROOT / "docker-compose.dev.yml").read_text()
+
+        self.assertNotIn("VAULT_DEV_AUTH", compose)
+        self.assertIn("build:", dev_compose)
+        self.assertIn("VAULT_AUTH_MODE: dev", dev_compose)
+        self.assertIn('VAULT_DEV_AUTH: "1"', dev_compose)
+        self.assertIn("dev-insecure-session-secret-change-me", dev_compose)
+
+    def test_dockerfile_declares_clean_runtime_contract(self) -> None:
+        dockerfile = (ROOT / "Dockerfile").read_text()
+
+        self.assertIn("VAULT_DATA_DIR=/data", dockerfile)
+        self.assertIn("VAULT_DB_PATH=/data/vault.db", dockerfile)
+        self.assertIn("VAULT_OBJECTS_PATH=/data/objects", dockerfile)
+        self.assertIn("VAULT_DOCKER_RUNTIME=1", dockerfile)
+        self.assertIn('VOLUME ["/data"]', dockerfile)
+        self.assertIn("USER vault", dockerfile)
+        self.assertIn("HEALTHCHECK", dockerfile)
+        self.assertNotIn("/vault-metadata", dockerfile)
+        self.assertNotIn("/vault-objects", dockerfile)
+
+    def test_semver_tag_workflow_builds_and_publishes_ghcr_image(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "docker-image.yml").read_text()
+
+        self.assertIn('      - "v*.*.*"', workflow)
+        self.assertIn('      - "[0-9]*.[0-9]*.[0-9]*"', workflow)
+        self.assertIn("Validate semantic version tag", workflow)
+        self.assertIn("ghcr.io/${GITHUB_REPOSITORY,,}", workflow)
+        self.assertIn("docker/login-action@v3", workflow)
+        self.assertIn("docker/metadata-action@v5", workflow)
+        self.assertIn("docker/build-push-action@v6", workflow)
+        self.assertIn("push: true", workflow)
+        self.assertIn("type=semver,pattern={{version}}", workflow)
+        self.assertIn("type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}", workflow)
+
+
+if __name__ == "__main__":
+    unittest.main()

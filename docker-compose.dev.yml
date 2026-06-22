@@ -1,0 +1,16 @@
+services:
+  vault:
+    build:
+      context: .
+    image: ${VAULT_IMAGE:-vault-service:dev}
+    environment:
+      BASE_DOMAIN: ${BASE_DOMAIN:-localhost}
+      VAULT_PUBLIC_URL: ${VAULT_PUBLIC_URL:-http://localhost:8000}
+      VAULT_AUTH_MODE: dev
+      VAULT_DEV_AUTH: "1"
+      VAULT_DEV_AUTH_ISSUER: ${VAULT_DEV_AUTH_ISSUER:-dev}
+      VAULT_DEV_USER: ${VAULT_DEV_USER:-local-admin}
+      VAULT_DEV_NAME: ${VAULT_DEV_NAME:-Local Admin}
+      VAULT_DEV_EMAIL: ${VAULT_DEV_EMAIL:-admin@example.com}
+      VAULT_DEV_GROUPS: ${VAULT_DEV_GROUPS:-admin,vault-admin}
+      VAULT_SESSION_SECRET: ${VAULT_SESSION_SECRET:-dev-insecure-session-secret-change-me}

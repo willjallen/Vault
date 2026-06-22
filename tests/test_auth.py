@@ -162,13 +162,16 @@ class AuthTests(unittest.TestCase):
 
     def test_compose_does_not_publish_dev_auth_to_all_interfaces_by_default(self) -> None:
         compose = (Path(__file__).resolve().parents[1] / "docker-compose.yml").read_text()
+        dev_compose = (Path(__file__).resolve().parents[1] / "docker-compose.dev.yml").read_text()
 
-        self.assertIn('"127.0.0.1:8000:8000"', compose)
+        self.assertIn("${VAULT_BIND_ADDRESS:-127.0.0.1}:${VAULT_PORT:-8000}:8000", compose)
         self.assertIn("VAULT_AUTH_MODE: ${VAULT_AUTH_MODE:-headers}", compose)
-        self.assertIn("VAULT_DEV_AUTH: ${VAULT_DEV_AUTH:-0}", compose)
-        self.assertNotIn('"0.0.0.0:8000:8000"', compose)
+        self.assertNotIn("VAULT_DEV_AUTH", compose)
+        self.assertNotIn("0.0.0.0:8000:8000", compose)
         self.assertNotIn("VAULT_AUTH_MODE: ${VAULT_AUTH_MODE:-dev}", compose)
-        self.assertNotIn("VAULT_DEV_AUTH: ${VAULT_DEV_AUTH:-1}", compose)
+        self.assertNotIn("dev-insecure-session-secret", compose)
+        self.assertIn("VAULT_AUTH_MODE: dev", dev_compose)
+        self.assertIn('VAULT_DEV_AUTH: "1"', dev_compose)
 
 
 if __name__ == "__main__":

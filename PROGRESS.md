@@ -38,3 +38,8 @@
 - Added default write ACL rows for all existing groups when folders are created, and added regression coverage proving ACL-less folders remain inaccessible.
 - Rebased stale-state tests onto the current bulk/item helper APIs, and tightened cross-root move rejection so failed Archive/Vault moves do not create destination folders as a side effect.
 - Validated with `uv run --with-requirements requirements.txt python -m unittest tests.test_auth tests.test_acl_permissions` and `uv run --with-requirements requirements.txt python -m unittest discover -s tests` (33 tests passing).
+- Cleaned up the Docker deployment flow: the image now uses `/data` as the canonical runtime root, runs as a non-root `vault` user, declares a single `/data` volume, includes a healthcheck, and fails closed in Docker runtime unless `VAULT_SESSION_SECRET` is explicitly set.
+- Reworked compose into an image-based production `docker-compose.yml` with one `vault-data:/data` volume and a separate `docker-compose.dev.yml` override for local build/dev auth. Added `.env.example`, `.dockerignore`, and README Docker usage notes.
+- Added a GitHub Actions workflow that publishes `ghcr.io/willjallen/vault` on semantic version tags using Docker metadata/build-push actions.
+- Added Docker deployment tests for `VAULT_DATA_DIR` defaults, explicit path overrides, runtime secret enforcement, compose/dev separation, Dockerfile runtime contract, and the semver tag workflow.
+- Validated Docker flow with `docker build -t vault-service:test .`, direct `docker run` with one `/data` volume and `/health`, production `docker compose` with the local image and one volume, and `uv run --with-requirements requirements.txt python -m unittest discover -s tests` (40 tests passing).

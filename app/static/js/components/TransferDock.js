@@ -1,30 +1,7 @@
-import { classNames } from "../lib/utils.js";
+import { classNames, formatBytes } from "../lib/utils.js";
 import { Icon } from "./common/Icon.js";
 
 const h = React.createElement;
-
-function formatBytes(bytes) {
-  if (!bytes || bytes < 0) {
-    return "";
-  }
-  let value = bytes;
-  let unitIndex = 0;
-  while (value >= 1024 && unitIndex < 4) {
-    value /= 1024;
-    unitIndex += 1;
-  }
-  let unit = "B";
-  if (unitIndex === 1) {
-    unit = "KB";
-  } else if (unitIndex === 2) {
-    unit = "MB";
-  } else if (unitIndex === 3) {
-    unit = "GB";
-  } else if (unitIndex === 4) {
-    unit = "TB";
-  }
-  return unitIndex === 0 ? `${value} ${unit}` : `${value.toFixed(1)} ${unit}`;
-}
 
 function formatEta(seconds) {
   if (!seconds) {

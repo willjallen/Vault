@@ -22,3 +22,4 @@
 - Reproduced stale check-in race: a request validated a checked-out Vault document, the upload read archived it in another session, and check-in still wrote version 2 to the archived document. Added in-lock state refresh/recheck before version creation.
 - Hardened checkout and lock against the same stale archive state by refreshing and rechecking editability inside `storage_write_lock()`, and added stale-session regression tests.
 - Reproduced storage reconciliation non-idempotence: after deleting a document, `apply=True` reported orphan blob IDs but left the blob row, location row, and local object file intact. Added orphan blob/object cleanup to reconciliation apply.
+- Reproduced stale document-location transitions: a stale move could restore an archived document as a plain move, and a stale archive could record duplicate archive transitions. Added in-lock location refresh/rechecks for document move/archive/unarchive.

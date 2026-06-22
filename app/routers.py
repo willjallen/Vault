@@ -333,9 +333,13 @@ def document_is_archive(doc: Document) -> bool:
     return folder_is_archive(doc.folder)
 
 
-def refresh_editable_document(doc: Document, db: Session) -> None:
+def refresh_document_location(doc: Document, db: Session) -> None:
     db.refresh(doc)
     db.expire(doc, ["folder"])
+
+
+def refresh_editable_document(doc: Document, db: Session) -> None:
+    refresh_document_location(doc, db)
     if document_is_archive(doc):
         raise HTTPException(status_code=400, detail="Restore this file before editing")
 
@@ -892,6 +896,7 @@ def batch_state_changed(db: Session, event_type: str) -> None:
 
 
 def archive_doc_item(doc: Document, request: Request, user: UserContext, db: Session) -> str:
+    refresh_document_location(doc, db)
     if document_is_archive(doc):
         raise HTTPException(status_code=400, detail="Document is already archived")
     source_path = document_path(doc)
@@ -914,6 +919,7 @@ def archive_doc_item(doc: Document, request: Request, user: UserContext, db: Ses
 
 
 def restore_doc_item(doc: Document, request: Request, user: UserContext, db: Session) -> str:
+    refresh_document_location(doc, db)
     if not document_is_archive(doc):
         raise HTTPException(status_code=400, detail="Document is not archived")
     source_path = document_path(doc)
@@ -1007,6 +1013,7 @@ def move_doc_item(
     db: Session,
     name: str | None = None,
 ) -> str:
+    refresh_document_location(doc, db)
     ensure_not_locked_by_other(doc, user, db)
     target_folder = get_or_create_folder_path(db, destination_folder)
     target_name = normalize_item_name(name or doc.name, "File name")

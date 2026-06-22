@@ -77,10 +77,10 @@ export function buildMyEditMenuItems(actions) {
 export function buildFolderMenuItems(actions) {
   const { folderItem, busy, isAdmin } = actions;
   const folderPath = folderItem.path || "";
-  const isArchivedFolder = isArchivePath(folderPath);
   const hasPath = Boolean(folderPath);
+  const isArchivedFolder = Boolean(folderItem.archived) || isArchivePath(folderPath);
   const isRoot = !folderPath || folderPath === "Archive";
-  const canPermanentDeleteFolder = isAdmin && isArchivedFolder && folderPath !== "Archive";
+  const canPermanentDeleteFolder = isAdmin && hasPath && isArchivedFolder && !isRoot;
   return compactMenuItems([
     { label: "Open", action: () => actions.navigateToFolder(folderPath) },
     {
@@ -143,7 +143,7 @@ export function buildSelectionMenuItems(actions) {
     }
     return buildFolderMenuItems({
       ...actions,
-      folderItem: { name: item.name, path: item.path },
+      folderItem: item,
     });
   }
 

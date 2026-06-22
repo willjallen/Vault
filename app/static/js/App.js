@@ -922,6 +922,7 @@ export function App({ initial }) {
     settingsOpen
       ? h(SettingsModal, {
           apiFetch,
+          appVersion: initialBootstrap.version,
           currentUser,
           onClose: closeSettings,
           onPalettePreferenceChange: handlePalettePreferenceChange,

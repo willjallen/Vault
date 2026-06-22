@@ -53,6 +53,7 @@ from .storage import (
     new_version_id,
     storage_write_lock,
 )
+from .version import APP_VERSION
 
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
@@ -1774,6 +1775,7 @@ def build_bootstrap_payload(user: UserContext, folder: str, db: Session) -> dict
         "auth_mode": AUTH_MODE,
         "base_domain": BASE_DOMAIN,
         "user": user,
+        "version": APP_VERSION,
         "current_folder": folder_path(current),
     }
 

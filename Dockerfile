@@ -20,6 +20,11 @@ RUN pip install --root-user-action=ignore --no-cache-dir -r requirements.txt \
     && mkdir -p /data \
     && chown -R vault:vault /app /data
 
+ARG VAULT_VERSION=
+ENV VAULT_VERSION=${VAULT_VERSION}
+LABEL org.opencontainers.image.version="${VAULT_VERSION}"
+
+COPY --chown=vault:vault VERSION /app/VERSION
 COPY --chown=vault:vault app /app/app
 
 USER vault

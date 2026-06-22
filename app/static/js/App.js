@@ -1,6 +1,7 @@
 import { FinderShell } from "./components/FinderShell.js";
 import { BulkDragPreview } from "./components/BulkDragPreview.js";
 import { ConfirmToast } from "./components/ConfirmToast.js";
+import { SettingsModal } from "./components/SettingsModal.js";
 import { TransferDock } from "./components/TransferDock.js";
 import { ContextMenu } from "./components/browser/ContextMenu.js";
 import { MoveDialog } from "./components/browser/MoveDialog.js";
@@ -48,12 +49,14 @@ export function App({ initial }) {
   const [inlineFolderDraft, setInlineFolderDraft] = useState(null);
   const [contextMenu, setContextMenu] = useState(null);
   const [draggingFolderPath, setDraggingFolderPath] = useState(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [toast, setToast] = useState("");
   const [confirmRequest, setConfirmRequest] = useState(null);
   const uploadInput = useRef(null);
   const versionUploadInput = useRef(null);
   const versionUploadDoc = useRef(null);
   const versionUploadOptions = useRef({});
+  const settingsButtonRef = useRef(null);
   const confirmResolver = useRef(null);
   const closeContextMenu = useCallback(() => setContextMenu(null), []);
 
@@ -74,6 +77,16 @@ export function App({ initial }) {
       confirmResolver.current = resolve;
       setConfirmRequest(request);
     });
+  }, []);
+
+  const openSettings = useCallback(() => {
+    setSettingsOpen(true);
+    closeContextMenu();
+  }, [closeContextMenu]);
+
+  const closeSettings = useCallback(() => {
+    setSettingsOpen(false);
+    window.setTimeout(() => settingsButtonRef.current?.focus(), 0);
   }, []);
 
   const baseDomain =
@@ -788,6 +801,8 @@ export function App({ initial }) {
       onPageContextMenu: handlePageContextMenu,
       onTriggerUpload: handleUploadClick,
       logoutUrl,
+      onOpenSettings: openSettings,
+      settingsButtonRef,
       onDownload: handleView,
       selectionItems: infoSelectionItems,
       onDownloadSelection: handleDownloadSelection,
@@ -838,6 +853,7 @@ export function App({ initial }) {
     }),
     h(TransferDock, { transfers }),
     h(BulkDragPreview, { drag: dragBundle }),
+    settingsOpen ? h(SettingsModal, { currentUser, onClose: closeSettings }) : null,
     h(ConfirmToast, { request: confirmRequest, onResolve: resolveConfirm }),
     contextMenu ? h(ContextMenu, { menu: contextMenu, onClose: closeContextMenu }) : null,
     error ? h("div", { className: "toast error" }, error) : null,

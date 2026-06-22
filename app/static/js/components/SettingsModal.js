@@ -1,7 +1,7 @@
 import { classNames } from "../lib/utils.js";
 
 const h = React.createElement;
-const { useCallback, useEffect, useRef, useState } = React;
+const { useCallback, useEffect, useMemo, useRef, useState } = React;
 
 const personalSections = [
   { id: "personalization", label: "Personalization", detail: "Appearance, density, and focus" },
@@ -84,36 +84,519 @@ function SettingsRow({ title, copy, control }) {
   ]);
 }
 
-function SectionPanel({ activeSection, currentUser }) {
-  if (activeSection === "admin") {
-    return h("div", { className: "settings-panel" }, [
-      h("div", { className: "settings-panel-head", key: "head" }, [
-        h("p", { className: "eyebrow tiny", key: "eyebrow" }, "Admin"),
-        h("h2", { key: "title" }, "Permissions"),
+async function responseError(res) {
+  try {
+    const body = await res.json();
+    return body.detail || `Request failed (${res.status})`;
+  } catch (_err) {
+    return `Request failed (${res.status})`;
+  }
+}
+
+function userDisplayName(user) {
+  return user?.name || user?.email || user?.subject || `User ${user?.id || ""}`.trim();
+}
+
+function groupMembersLabel(group) {
+  const count = group.members?.length || 0;
+  if (count === 1) {
+    return "1 member";
+  }
+  return `${count} members`;
+}
+
+function availableGroupsForUser(user, groups) {
+  const assigned = new Set((user.groups || []).map((group) => group.id));
+  return groups.filter((group) => !assigned.has(group.id));
+}
+
+function GroupRow({
+  group,
+  disabled,
+  nameValue,
+  onDelete,
+  onNameChange,
+  onNameCommit,
+  onNameReset,
+}) {
+  return h("article", { className: "admin-group-row" }, [
+    h("div", { className: "admin-group-name-wrap", key: "name" }, [
+      h("input", {
+        "aria-label": `Group name: ${group.name}`,
+        className: "admin-group-name-input",
+        disabled,
+        key: "input",
+        onBlur: () => onNameCommit(group),
+        onChange: (evt) => onNameChange(group.id, evt.target.value),
+        onKeyDown: (evt) => {
+          if (evt.key === "Enter") {
+            evt.preventDefault();
+            evt.currentTarget.blur();
+          }
+          if (evt.key === "Escape") {
+            onNameReset(group);
+            evt.currentTarget.blur();
+          }
+        },
+        value: nameValue ?? group.name,
+      }),
+    ]),
+    h("span", { className: "admin-group-count", key: "count" }, groupMembersLabel(group)),
+    h(
+      "button",
+      {
+        "aria-label": `Delete ${group.name}`,
+        className: "admin-delete-button",
+        disabled,
+        key: "delete",
+        onClick: () => onDelete(group),
+        type: "button",
+      },
+      "Delete"
+    ),
+  ]);
+}
+
+function DraftGroupRow({ disabled, groupName, inputRef, onCancel, onChange, onSubmit }) {
+  return h(
+    "form",
+    {
+      className: "admin-group-row admin-group-row-draft",
+      onSubmit,
+    },
+    [
+      h("div", { className: "admin-group-name-wrap", key: "name" }, [
+        h("input", {
+          "aria-label": "New group name",
+          className: "admin-group-name-input",
+          disabled,
+          key: "input",
+          onChange: (evt) => onChange(evt.target.value),
+          onKeyDown: (evt) => {
+            if (evt.key === "Escape") {
+              evt.preventDefault();
+              onCancel();
+            }
+          },
+          placeholder: "Group name",
+          ref: inputRef,
+          type: "text",
+          value: groupName,
+        }),
+      ]),
+      h("span", { className: "admin-group-count muted", key: "count" }, "New group"),
+      h("div", { className: "admin-row-actions", key: "actions" }, [
         h(
-          "p",
-          { className: "muted tiny", key: "copy" },
-          "Role assignment and access controls for the vault."
+          "button",
+          {
+            className: "admin-save-button",
+            disabled: disabled || !groupName.trim(),
+            key: "save",
+            type: "submit",
+          },
+          "Save"
+        ),
+        h(
+          "button",
+          {
+            className: "admin-text-button",
+            disabled,
+            key: "cancel",
+            onClick: onCancel,
+            type: "button",
+          },
+          "Cancel"
         ),
       ]),
-      h("div", { className: "settings-card permissions-card", key: "card" }, [
-        SettingsRow({
-          title: "Default role",
-          copy: "New users start with view-only vault access.",
-          control: SegmentedMock({ options: ["View", "Edit", "Admin"], active: "View" }),
-        }),
-        SettingsRow({
-          title: "Require admin approval",
-          copy: "Permission changes wait for an administrator before taking effect.",
-          control: ToggleMock({ active: true }),
-        }),
-        SettingsRow({
-          title: "Current session",
-          copy: currentUser?.name || currentUser?.id || "Local Admin",
-          control: h("span", { className: "settings-pill" }, "Admin"),
-        }),
+    ]
+  );
+}
+
+function UserGroupPicker({ availableGroups, disabled, onSelect }) {
+  if (!availableGroups.length) {
+    return h("div", { className: "admin-user-group-menu empty" }, "No groups available");
+  }
+  return h(
+    "div",
+    { className: "admin-user-group-menu" },
+    availableGroups.map((group) =>
+      h(
+        "button",
+        {
+          disabled,
+          key: group.id,
+          onClick: () => onSelect(group.id),
+          type: "button",
+        },
+        group.name
+      )
+    )
+  );
+}
+
+function UserRow({
+  disabled,
+  groups,
+  openPicker,
+  onAddGroup,
+  onRemoveGroup,
+  onToggleAdmin,
+  onTogglePicker,
+  user,
+}) {
+  const availableGroups = availableGroupsForUser(user, groups);
+  return h("article", { className: "admin-user-row" }, [
+    h("div", { className: "admin-user-identity", key: "identity" }, [
+      h("strong", { key: "name" }, userDisplayName(user)),
+      h("span", { key: "email" }, user.email || user.subject),
+    ]),
+    h(
+      "div",
+      { className: "admin-user-groups", key: "groups" },
+      user.groups?.length
+        ? user.groups.map((group) =>
+            h("span", { className: "admin-chip removable", key: group.id }, [
+              h("span", { key: "name" }, group.name),
+              h(
+                "button",
+                {
+                  "aria-label": `Remove ${userDisplayName(user)} from ${group.name}`,
+                  disabled,
+                  key: "remove",
+                  onClick: () => onRemoveGroup(user.id, group.id),
+                  type: "button",
+                },
+                "x"
+              ),
+            ])
+          )
+        : h("span", { className: "admin-empty-inline" }, "No groups")
+    ),
+    h("div", { className: "admin-user-controls", key: "controls" }, [
+      h(
+        "span",
+        { className: classNames("admin-role", user.is_admin ? "admin" : "") },
+        user.is_admin ? "Admin" : "User"
+      ),
+      h(
+        "button",
+        {
+          className: "admin-role-button",
+          disabled,
+          onClick: () => onToggleAdmin(user),
+          type: "button",
+        },
+        user.is_admin ? "Demote" : "Promote"
+      ),
+      h("div", { className: "admin-user-add-wrap" }, [
+        h(
+          "button",
+          {
+            "aria-expanded": openPicker,
+            "aria-label": `Add ${userDisplayName(user)} to a group`,
+            className: "admin-plus-button",
+            disabled,
+            onClick: () => onTogglePicker(user.id),
+            type: "button",
+          },
+          "+"
+        ),
+        openPicker
+          ? h(UserGroupPicker, {
+              availableGroups,
+              disabled,
+              onSelect: (groupId) => onAddGroup(user.id, groupId),
+            })
+          : null,
       ]),
-    ]);
+    ]),
+  ]);
+}
+
+function AdminPanel({ apiFetch, currentUser }) {
+  const [directory, setDirectory] = useState({ users: [], groups: [] });
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [draftGroupOpen, setDraftGroupOpen] = useState(false);
+  const [draftGroupName, setDraftGroupName] = useState("");
+  const [editingGroupNames, setEditingGroupNames] = useState({});
+  const [openGroupPickerUserId, setOpenGroupPickerUserId] = useState(null);
+  const [pendingAction, setPendingAction] = useState("");
+  const draftGroupInput = useRef(null);
+
+  const users = useMemo(() => directory.users || [], [directory.users]);
+  const groups = useMemo(() => directory.groups || [], [directory.groups]);
+
+  const loadDirectory = useCallback(async () => {
+    if (!apiFetch) {
+      return;
+    }
+    setLoading(true);
+    setError("");
+    try {
+      const res = await apiFetch("/api/admin/directory");
+      if (!res.ok) {
+        throw new Error(await responseError(res));
+      }
+      setDirectory(await res.json());
+    } catch (err) {
+      setError(err.message || "Could not load admin settings");
+    } finally {
+      setLoading(false);
+    }
+  }, [apiFetch]);
+
+  const commitAdminChange = useCallback(
+    async (label, url, options = {}) => {
+      if (!apiFetch) {
+        return;
+      }
+      setPendingAction(label);
+      setError("");
+      try {
+        const res = await apiFetch(url, {
+          ...options,
+          headers: {
+            "Content-Type": "application/json",
+            ...(options.headers || {}),
+          },
+        });
+        if (!res.ok) {
+          throw new Error(await responseError(res));
+        }
+        const nextDirectory = await res.json();
+        setDirectory(nextDirectory);
+        return nextDirectory;
+      } catch (err) {
+        setError(err.message || "Admin change failed");
+        return null;
+      } finally {
+        setPendingAction("");
+      }
+    },
+    [apiFetch]
+  );
+
+  useEffect(() => {
+    loadDirectory();
+  }, [loadDirectory]);
+
+  useEffect(() => {
+    const nextNames = {};
+    groups.forEach((group) => {
+      nextNames[group.id] = group.name;
+    });
+    setEditingGroupNames(nextNames);
+  }, [groups]);
+
+  useEffect(() => {
+    if (!draftGroupOpen) {
+      return;
+    }
+    const focusTimer = window.setTimeout(() => draftGroupInput.current?.focus(), 40);
+    return () => window.clearTimeout(focusTimer);
+  }, [draftGroupOpen]);
+
+  const handleCreateDraftGroup = useCallback(
+    async (evt) => {
+      evt.preventDefault();
+      const groupName = draftGroupName.trim();
+      if (!groupName) {
+        return;
+      }
+      const nextDirectory = await commitAdminChange("create-group", "/api/admin/groups", {
+        method: "POST",
+        body: JSON.stringify({ name: groupName }),
+      });
+      if (nextDirectory) {
+        setDraftGroupName("");
+        setDraftGroupOpen(false);
+      }
+    },
+    [commitAdminChange, draftGroupName]
+  );
+
+  const handleToggleAdmin = useCallback(
+    (user) => {
+      commitAdminChange(`user-${user.id}-admin`, `/api/admin/users/${user.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ is_admin: !user.is_admin }),
+      });
+    },
+    [commitAdminChange]
+  );
+
+  const handleDeleteGroup = useCallback(
+    (group) => {
+      commitAdminChange(`group-${group.id}-delete`, `/api/admin/groups/${group.id}`, {
+        method: "DELETE",
+      });
+    },
+    [commitAdminChange]
+  );
+
+  const handleGroupNameChange = useCallback((groupId, value) => {
+    setEditingGroupNames((prev) => ({ ...prev, [groupId]: value }));
+  }, []);
+
+  const handleGroupNameReset = useCallback((group) => {
+    setEditingGroupNames((prev) => ({ ...prev, [group.id]: group.name }));
+  }, []);
+
+  const handleGroupNameCommit = useCallback(
+    (group) => {
+      const nextName = (editingGroupNames[group.id] || "").trim();
+      if (!nextName) {
+        handleGroupNameReset(group);
+        return;
+      }
+      if (nextName === group.name) {
+        return;
+      }
+      commitAdminChange(`group-${group.id}-rename`, `/api/admin/groups/${group.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ name: nextName, description: group.description || "" }),
+      });
+    },
+    [commitAdminChange, editingGroupNames, handleGroupNameReset]
+  );
+
+  const handleAddMember = useCallback(
+    (groupId, userId) => {
+      if (!userId) {
+        return;
+      }
+      commitAdminChange(`group-${groupId}-add-${userId}`, `/api/admin/groups/${groupId}/members`, {
+        method: "POST",
+        body: JSON.stringify({ user_id: userId }),
+      });
+    },
+    [commitAdminChange]
+  );
+
+  const handleRemoveMember = useCallback(
+    (groupId, userId) => {
+      commitAdminChange(
+        `group-${groupId}-remove-${userId}`,
+        `/api/admin/groups/${groupId}/members/${userId}`,
+        { method: "DELETE" }
+      );
+    },
+    [commitAdminChange]
+  );
+
+  const handleAddGroupToUser = useCallback(
+    (userId, groupId) => {
+      setOpenGroupPickerUserId(null);
+      handleAddMember(groupId, userId);
+    },
+    [handleAddMember]
+  );
+
+  const handleToggleGroupPicker = useCallback((userId) => {
+    setOpenGroupPickerUserId((current) => (current === userId ? null : userId));
+  }, []);
+
+  return h("div", { className: "settings-panel" }, [
+    h("div", { className: "settings-panel-head", key: "head" }, [
+      h("p", { className: "eyebrow tiny", key: "eyebrow" }, "Admin"),
+      h("h2", { key: "title" }, "Identity"),
+      h(
+        "p",
+        { className: "muted tiny", key: "copy" },
+        currentUser?.name ? `Signed in as ${currentUser.name}.` : "Users and groups for this vault."
+      ),
+    ]),
+    error ? h("div", { className: "admin-error", key: "error" }, error) : null,
+    h("div", { className: "admin-settings-grid", key: "grid" }, [
+      h("section", { className: "admin-card", key: "groups" }, [
+        h("div", { className: "admin-card-head", key: "head" }, [
+          h("div", { key: "copy" }, [
+            h("h3", { key: "title" }, "Groups"),
+            h("p", { className: "muted tiny", key: "note" }, `${groups.length} configured`),
+          ]),
+          h(
+            "button",
+            {
+              "aria-label": "Add group",
+              className: "admin-plus-button large",
+              disabled: Boolean(pendingAction) || draftGroupOpen,
+              key: "add",
+              onClick: () => setDraftGroupOpen(true),
+              type: "button",
+            },
+            "+"
+          ),
+        ]),
+        loading
+          ? h("div", { className: "admin-empty", key: "loading" }, "Loading groups...")
+          : h("div", { className: "admin-list", key: "list" }, [
+              draftGroupOpen
+                ? h(DraftGroupRow, {
+                    disabled: Boolean(pendingAction),
+                    groupName: draftGroupName,
+                    inputRef: draftGroupInput,
+                    key: "draft",
+                    onCancel: () => {
+                      setDraftGroupName("");
+                      setDraftGroupOpen(false);
+                    },
+                    onChange: setDraftGroupName,
+                    onSubmit: handleCreateDraftGroup,
+                  })
+                : null,
+              groups.length
+                ? groups.map((group) =>
+                    h(GroupRow, {
+                      disabled: Boolean(pendingAction),
+                      group,
+                      key: group.id,
+                      nameValue: editingGroupNames[group.id],
+                      onDelete: handleDeleteGroup,
+                      onNameChange: handleGroupNameChange,
+                      onNameCommit: handleGroupNameCommit,
+                      onNameReset: handleGroupNameReset,
+                    })
+                  )
+                : h("div", { className: "admin-empty", key: "empty" }, "No groups yet"),
+            ]),
+      ]),
+      h("section", { className: "admin-card", key: "users" }, [
+        h("div", { className: "admin-card-head compact", key: "head" }, [
+          h("div", null, [
+            h("h3", { key: "title" }, "Users"),
+            h("p", { className: "muted tiny", key: "note" }, `${users.length} known identities`),
+          ]),
+        ]),
+        loading
+          ? h("div", { className: "admin-empty", key: "loading" }, "Loading users...")
+          : users.length
+            ? h(
+                "div",
+                { className: "admin-list", key: "list" },
+                users.map((user) =>
+                  h(UserRow, {
+                    disabled: Boolean(pendingAction),
+                    groups,
+                    key: user.id,
+                    onAddGroup: handleAddGroupToUser,
+                    onRemoveGroup: handleRemoveMember,
+                    onToggleAdmin: handleToggleAdmin,
+                    onTogglePicker: handleToggleGroupPicker,
+                    openPicker: openGroupPickerUserId === user.id,
+                    user,
+                  })
+                )
+              )
+            : h("div", { className: "admin-empty", key: "empty" }, "No users yet"),
+      ]),
+    ]),
+  ]);
+}
+
+function SectionPanel({ activeSection, apiFetch, currentUser }) {
+  if (activeSection === "admin") {
+    return h(AdminPanel, { apiFetch, currentUser });
   }
 
   if (activeSection === "files") {
@@ -236,7 +719,7 @@ function SectionPanel({ activeSection, currentUser }) {
   ]);
 }
 
-export function SettingsModal({ currentUser, onClose }) {
+export function SettingsModal({ apiFetch, currentUser, onClose }) {
   const sections = currentUser?.is_admin ? [...personalSections, adminSection] : personalSections;
   const [activeSection, setActiveSection] = useState(sections[0].id);
   const [phase, setPhase] = useState("entering");
@@ -331,7 +814,7 @@ export function SettingsModal({ currentUser, onClose }) {
               })
             )
           ),
-          h(SectionPanel, { activeSection, currentUser, key: "panel" }),
+          h(SectionPanel, { activeSection, apiFetch, currentUser, key: "panel" }),
         ]),
       ]
     ),

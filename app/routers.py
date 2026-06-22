@@ -341,6 +341,26 @@ def set_subtree_root_key(db: Session, root: Folder, root_key: str) -> None:
         folder.root_key = root_key
 
 
+def folder_has_items(db: Session, folder: Folder) -> bool:
+    child = db.execute(select(Folder.id).where(Folder.parent_id == folder.id).limit(1)).first()
+    if child is not None:
+        return True
+    doc = db.execute(select(Document.id).where(Document.folder_id == folder.id).limit(1)).first()
+    return doc is not None
+
+
+def prune_empty_archive_folders(db: Session, folder: Folder | None) -> None:
+    current = folder
+    while current and folder_is_archive(current) and not current.is_root:
+        db.flush()
+        if folder_has_items(db, current):
+            return
+        parent = current.parent
+        db.delete(current)
+        db.flush()
+        current = parent
+
+
 def get_active_lock(doc: Document, db: Session) -> DocumentLock | None:
     return (
         db.execute(
@@ -1001,6 +1021,7 @@ def unarchive_folder(
     target_parent = get_or_create_folder_path(db, "/".join(target_path.split("/")[:-1]))
     target_name = normalize_item_name(target_path.split("/")[-1], "Folder name")
     ensure_unique_folder_name(db, target_parent.id, target_name, source.id)
+    archive_parent = source.parent
     meta = client_meta(request)
     for doc in docs_in_folder_subtree(db, source):
         record_event(
@@ -1016,6 +1037,7 @@ def unarchive_folder(
     source.parent_id = target_parent.id
     source.name = target_name
     set_subtree_root_key(db, source, VAULT_ROOT_KEY)
+    prune_empty_archive_folders(db, archive_parent)
     db.commit()
     return {"folder": target_path}
 
@@ -1032,9 +1054,11 @@ def permanent_delete_folder(
     target = get_folder_by_path(db, normalized)
     if not target or target.is_root or not folder_is_archive(target):
         raise HTTPException(status_code=400, detail="Delete forever is only available in Archive")
+    archive_parent = target.parent
     for doc in docs_in_folder_subtree(db, target):
         db.delete(doc)
     db.delete(target)
+    prune_empty_archive_folders(db, archive_parent)
     db.commit()
     return {"folder": normalized}
 
@@ -1336,6 +1360,7 @@ def unarchive_document(
     if not document_is_archive(doc):
         raise HTTPException(status_code=400, detail="Document is not archived")
     ensure_not_locked_by_other(doc, user, db)
+    archive_folder = doc.folder
     target_folder_path = folder_relative_path(doc.folder)
     target_folder = get_or_create_folder_path(db, target_folder_path)
     with storage_write_lock():
@@ -1349,6 +1374,7 @@ def unarchive_document(
             "unarchive",
             f"Restored to Vault from {source_path}",
         )
+        prune_empty_archive_folders(db, archive_folder)
         db.commit()
     return {"path": document_path(doc)}
 
@@ -1378,6 +1404,8 @@ def permanent_delete_document(
     if not document_is_archive(doc):
         raise HTTPException(status_code=400, detail="Move the document to Archive before deleting")
     deleted_path = document_path(doc)
+    archive_folder = doc.folder
     db.delete(doc)
+    prune_empty_archive_folders(db, archive_folder)
     db.commit()
     return {"deleted": deleted_path}

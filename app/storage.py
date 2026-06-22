@@ -1,4 +1,3 @@
-# Copyright (c) 2024 The Allen Family
 """Storage backends for content-addressed vault blobs."""
 
 import datetime

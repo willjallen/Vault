@@ -1,4 +1,3 @@
-# Copyright (c) 2024 The Allen Family
 """Authentication and canonical Vault identity helpers."""
 
 import base64
@@ -49,7 +48,7 @@ from .config import (
 from .db import get_db
 from .models import Folder, FolderPermission, VaultGroup, VaultGroupMembership, VaultUser
 
-LOCAL_DEV_DOMAINS = {"localhost", "127.0.0.1", "::1", "family.localhost"}
+LOCAL_DEV_DOMAINS = {"localhost", "127.0.0.1", "::1"}
 
 
 class UserContext(TypedDict):
@@ -82,7 +81,7 @@ def _clean_header(value: str | None) -> str:
 
 
 def _dev_auth_allowed_for_domain() -> bool:
-    base_domain = _clean_header(os.getenv("BASE_DOMAIN", "family.localhost")).lower()
+    base_domain = _clean_header(os.getenv("BASE_DOMAIN", "localhost")).lower()
     return base_domain in LOCAL_DEV_DOMAINS or base_domain.endswith(".localhost")
 
 

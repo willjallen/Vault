@@ -1,4 +1,3 @@
-# Copyright (c) 2024 The Allen Family
 """FastAPI entrypoint for the vault service."""
 
 from pathlib import Path
@@ -7,11 +6,13 @@ from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
+from .config import SITE_NAME
 from .db import init_db
 from .routers import router
 from .storage import ensure_storage
+from .version import APP_VERSION
 
-app = FastAPI(title="Family Vault", version="1.0.0")
+app = FastAPI(title=SITE_NAME, version=APP_VERSION)
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
 
 

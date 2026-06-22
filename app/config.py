@@ -1,11 +1,11 @@
-# Copyright (c) 2024 The Allen Family
 """Configuration helpers for the vault service."""
 
 import os
 import secrets
 from pathlib import Path
 
-BASE_DOMAIN = os.getenv("BASE_DOMAIN", "family.localhost")
+BASE_DOMAIN = os.getenv("BASE_DOMAIN", "localhost")
+SITE_NAME = os.getenv("VAULT_SITE_NAME", "Vault").strip() or "Vault"
 DATA_DIR = Path(os.getenv("VAULT_DATA_DIR", "/data")).resolve()
 DB_PATH = Path(os.getenv("VAULT_DB_PATH", str(DATA_DIR / "vault.db"))).resolve()
 PUBLIC_URL = os.getenv("VAULT_PUBLIC_URL", "").strip().rstrip("/")

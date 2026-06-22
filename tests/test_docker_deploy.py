@@ -23,6 +23,7 @@ class DockerDeployTests(unittest.TestCase):
             "VAULT_REQUIRE_SESSION_SECRET",
             "VAULT_DOCKER_RUNTIME",
             "VAULT_SESSION_SECRET",
+            "VAULT_SITE_NAME",
         ):
             env.pop(key, None)
         env.update(env_overrides)
@@ -36,6 +37,7 @@ class DockerDeployTests(unittest.TestCase):
             "data_dir": str(config.DATA_DIR),
             "db_path": str(config.DB_PATH),
             "objects_path": str(config.OBJECTS_PATH),
+            "site_name": config.SITE_NAME,
         }))
         """
         completed = subprocess.run(
@@ -73,6 +75,13 @@ class DockerDeployTests(unittest.TestCase):
         self.assertEqual(paths["db_path"], str((base / "metadata" / "vault.db").resolve()))
         self.assertEqual(paths["objects_path"], str((base / "blobs").resolve()))
 
+    def test_site_name_defaults_and_can_be_overridden(self) -> None:
+        self.assertEqual(self.run_config_script({})["site_name"], "Vault")
+        self.assertEqual(
+            self.run_config_script({"VAULT_SITE_NAME": "Studio Vault"})["site_name"],
+            "Studio Vault",
+        )
+
     def test_docker_runtime_requires_explicit_session_secret(self) -> None:
         env = os.environ.copy()
         env.pop("VAULT_REQUIRE_SESSION_SECRET", None)
@@ -100,6 +109,7 @@ class DockerDeployTests(unittest.TestCase):
         self.assertIn("- vault-data:/data", compose)
         self.assertIn("vault-data:", compose)
         self.assertEqual(compose.count(":/data"), 1)
+        self.assertIn("VAULT_SITE_NAME: ${VAULT_SITE_NAME:-Vault}", compose)
         self.assertNotIn("/vault-metadata", compose)
         self.assertNotIn("/vault-objects", compose)
         self.assertIn("VAULT_DOCKER_RUNTIME: ${VAULT_DOCKER_RUNTIME:-1}", compose)
@@ -115,6 +125,7 @@ class DockerDeployTests(unittest.TestCase):
         self.assertNotIn("VAULT_DEV_AUTH", compose)
         self.assertIn("build:", dev_compose)
         self.assertIn("VAULT_AUTH_MODE: dev", dev_compose)
+        self.assertIn("VAULT_SITE_NAME: ${VAULT_SITE_NAME:-Vault}", dev_compose)
         self.assertIn('VAULT_DEV_AUTH: "1"', dev_compose)
         self.assertIn("dev-insecure-session-secret-change-me", dev_compose)
 

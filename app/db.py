@@ -1,4 +1,3 @@
-# Copyright (c) 2024 The Allen Family
 """Database setup for the vault service."""
 
 from collections.abc import Generator

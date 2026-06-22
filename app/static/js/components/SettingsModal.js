@@ -698,7 +698,7 @@ function SectionPanel({
         copy:
           palettePreference === "winui"
             ? "Uses a WinUI-inspired neutral ramp and Windows blue accent."
-            : "Uses the existing softer Vault color palette.",
+            : "Uses the existing softer color palette.",
         control: PaletteSegmented({
           onChange: onPalettePreferenceChange,
           value: palettePreference || "cozy",
@@ -726,6 +726,7 @@ export function SettingsModal({
   onPalettePreferenceChange,
   onThemePreferenceChange,
   palettePreference = "cozy",
+  siteName = "Vault",
   themePreference = "system",
 }) {
   const sections = currentUser?.is_admin ? [...personalSections, adminSection] : personalSections;
@@ -793,7 +794,7 @@ export function SettingsModal({
       [
         h("header", { className: "settings-titlebar", key: "titlebar" }, [
           h("div", { className: "settings-title-copy", key: "copy" }, [
-            h("p", { className: "eyebrow tiny", key: "eyebrow" }, "Vault"),
+            h("p", { className: "eyebrow tiny", key: "eyebrow" }, siteName),
             h("h1", { id: "settings-title", key: "title" }, "Settings"),
           ]),
           h(

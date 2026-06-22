@@ -3,13 +3,13 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>{{ doc.path.split('/')[-1] }} - Family Vault</title>
+  <title>{{ doc.path.split('/')[-1] }} - {{ site_name or "Vault" }}</title>
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
   <header>
     <div>
-      <h1>Family Vault</h1>
+      <h1>{{ site_name or "Vault" }}</h1>
       <p class="muted small">Signed in as {{ user.name }}</p>
     </div>
     <div class="header-actions">

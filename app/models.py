@@ -1,4 +1,3 @@
-# Copyright (c) 2024 The Allen Family
 """SQLAlchemy models for the vault service."""
 
 import datetime

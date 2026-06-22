@@ -314,7 +314,7 @@ export function App({ initial }) {
       folderToItem({
         color: vaultMetadata.color,
         icon: vaultMetadata.icon || "house",
-        name: "Vault",
+        name: initialBootstrap.site_name || "Vault",
         path: "",
       }),
       ...childrenFor("", (path) => !isArchivePath(path)),
@@ -326,7 +326,7 @@ export function App({ initial }) {
       }),
       ...childrenFor("Archive", (path) => isArchivePath(path)),
     ];
-  }, [folderChildren, folderMetadata]);
+  }, [folderChildren, folderMetadata, initialBootstrap.site_name]);
   const folderByKey = useMemo(
     () => new Map(folderPaneItems.map((item) => [keyForItem(item), item])),
     [folderPaneItems]
@@ -928,6 +928,7 @@ export function App({ initial }) {
           onPalettePreferenceChange: handlePalettePreferenceChange,
           onThemePreferenceChange: handleThemePreferenceChange,
           palettePreference,
+          siteName: initialBootstrap.site_name || "Vault",
           themePreference,
         })
       : null,

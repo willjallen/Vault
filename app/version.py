@@ -1,4 +1,3 @@
-# Copyright (c) 2024 The Allen Family
 """Application version resolution."""
 
 import os

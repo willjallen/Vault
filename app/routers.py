@@ -1,4 +1,3 @@
-# Copyright (c) 2024 The Allen Family
 """HTTP routes for the vault service."""
 
 import asyncio
@@ -28,7 +27,7 @@ from .auth import (
     oidc_login_response,
     require_admin,
 )
-from .config import AUTH_MODE, BASE_DOMAIN
+from .config import AUTH_MODE, BASE_DOMAIN, SITE_NAME
 from .db import SessionLocal, get_db
 from .models import (
     Blob,
@@ -1774,6 +1773,7 @@ def build_bootstrap_payload(user: UserContext, folder: str, db: Session) -> dict
     return {
         "auth_mode": AUTH_MODE,
         "base_domain": BASE_DOMAIN,
+        "site_name": SITE_NAME,
         "user": user,
         "version": APP_VERSION,
         "current_folder": folder_path(current),

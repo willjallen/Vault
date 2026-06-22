@@ -8,6 +8,7 @@ services:
     environment:
       BASE_DOMAIN: ${BASE_DOMAIN:-localhost}
       VAULT_PUBLIC_URL: ${VAULT_PUBLIC_URL:-http://localhost:8000}
+      VAULT_SITE_NAME: ${VAULT_SITE_NAME:-Vault}
       VAULT_AUTH_MODE: dev
       VAULT_DEV_AUTH: "1"
       VAULT_DEV_AUTH_ISSUER: ${VAULT_DEV_AUTH_ISSUER:-dev}

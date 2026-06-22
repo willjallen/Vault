@@ -3287,7 +3287,7 @@ input[type="file"]::file-selector-button:hover {
 }
 
 .admin-user-group-menu button,
-.admin-user-group-menu.empty {
+.admin-user-group-menu-empty {
   width: 100%;
   min-width: 0;
   border: 0;
@@ -3311,7 +3311,7 @@ input[type="file"]::file-selector-button:hover {
   color: var(--accent-text);
 }
 
-.admin-user-group-menu.empty {
+.admin-user-group-menu-empty {
   color: var(--text-muted);
 }
 

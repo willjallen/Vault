@@ -55,34 +55,14 @@ def _schema_needs_reset() -> bool:
     tables = set(inspector.get_table_names())
     if not tables:
         return False
-    required_tables = {
-        "folders",
-        "documents",
-        "document_versions",
-        "document_locks",
-        "document_events",
-        "state_events",
-        "blobs",
-        "blob_locations",
-        "folder_events",
-        "folder_permissions",
-        "vault_users",
-        "vault_groups",
-        "vault_group_memberships",
-    }
-    if not required_tables.issubset(tables):
-        return True
-    folder_columns = {column["name"] for column in inspector.get_columns("folders")}
-    document_columns = {column["name"] for column in inspector.get_columns("documents")}
-    version_columns = {column["name"] for column in inspector.get_columns("document_versions")}
-    return (
-        "root_key" not in folder_columns
-        or "is_root" not in folder_columns
-        or "created_by" not in folder_columns
-        or "color" not in folder_columns
-        or "folder_id" not in document_columns
-        or "blob_id" not in version_columns
-    )
+    for table in Base.metadata.sorted_tables:
+        if table.name not in tables:
+            return True
+        existing_columns = {column["name"] for column in inspector.get_columns(table.name)}
+        expected_columns = {column.name for column in table.columns}
+        if not expected_columns.issubset(existing_columns):
+            return True
+    return False
 
 
 def _drop_existing_schema() -> None:

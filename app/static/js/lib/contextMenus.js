@@ -1,3 +1,5 @@
+import { isArchivePath } from "./utils.js";
+
 function compactMenuItems(items) {
   const compacted = items.filter(Boolean).reduce((acc, item) => {
     const previous = acc[acc.length - 1];
@@ -82,7 +84,7 @@ export function buildMyEditMenuItems(actions) {
 export function buildFolderMenuItems(actions) {
   const { folderItem, busy, isAdmin } = actions;
   const folderPath = folderItem.path || "";
-  const isArchivedFolder = folderPath.startsWith("Archive");
+  const isArchivedFolder = isArchivePath(folderPath);
   const hasPath = Boolean(folderPath);
   const canPermanentDeleteFolder = isAdmin && isArchivedFolder && folderPath !== "Archive";
   return compactMenuItems([

@@ -3,7 +3,17 @@
 
 import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .db import Base
@@ -15,9 +25,24 @@ def utcnow() -> datetime.datetime:
 
 class Folder(Base):
     __tablename__ = "folders"
-    __table_args__ = (UniqueConstraint("parent_id", "name", name="uq_folders_parent_name"),)
+    __table_args__ = (
+        Index(
+            "uq_folders_root_key",
+            "root_key",
+            unique=True,
+            sqlite_where=text("is_root = 1"),
+        ),
+        Index(
+            "uq_folders_parent_name",
+            "parent_id",
+            "name",
+            unique=True,
+            sqlite_where=text("is_root = 0"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    root_key: Mapped[str] = mapped_column(String, nullable=False, index=True)
     parent_id: Mapped[int | None] = mapped_column(
         Integer,
         ForeignKey("folders.id", ondelete="CASCADE"),
@@ -25,6 +50,7 @@ class Folder(Base):
         index=True,
     )
     name: Mapped[str] = mapped_column(String, nullable=False)
+    is_root: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=utcnow)
 
     parent: Mapped["Folder | None"] = relationship(
@@ -37,39 +63,64 @@ class Folder(Base):
         back_populates="parent",
         cascade="all, delete-orphan",
     )
-    documents: Mapped[list["Document"]] = relationship("Document", back_populates="folder")
-
-
-class StorageObject(Base):
-    __tablename__ = "storage_objects"
-    __table_args__ = (
-        UniqueConstraint("backend", "bucket", "object_key", name="uq_storage_object_location"),
+    documents: Mapped[list["Document"]] = relationship(
+        "Document",
+        back_populates="folder",
+        cascade="all, delete-orphan",
     )
+
+
+class Blob(Base):
+    __tablename__ = "blobs"
+    __table_args__ = (UniqueConstraint("hash_algo", "hash", "size_bytes", name="uq_blob_identity"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     hash_algo: Mapped[str] = mapped_column(String, default="sha256", nullable=False, index=True)
     hash: Mapped[str] = mapped_column(String, nullable=False, index=True)
     size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=utcnow)
+
+    locations: Mapped[list["BlobLocation"]] = relationship(
+        "BlobLocation",
+        back_populates="blob",
+        cascade="all, delete-orphan",
+    )
+    versions: Mapped[list["DocumentVersion"]] = relationship(
+        "DocumentVersion",
+        back_populates="blob",
+    )
+
+
+class BlobLocation(Base):
+    __tablename__ = "blob_locations"
+    __table_args__ = (
+        UniqueConstraint("backend", "bucket", "object_key", name="uq_blob_location"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    blob_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("blobs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
     backend: Mapped[str] = mapped_column(String, nullable=False)
     bucket: Mapped[str] = mapped_column(String, nullable=False, default="")
     object_key: Mapped[str] = mapped_column(String, nullable=False)
-    mime_type: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=utcnow)
 
-    versions: Mapped[list["DocumentVersion"]] = relationship(
-        "DocumentVersion",
-        back_populates="storage_object",
-    )
+    blob: Mapped[Blob] = relationship("Blob", back_populates="locations")
 
 
 class Document(Base):
     __tablename__ = "documents"
+    __table_args__ = (UniqueConstraint("folder_id", "name", name="uq_documents_folder_name"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-    folder_id: Mapped[int | None] = mapped_column(
+    folder_id: Mapped[int] = mapped_column(
         Integer,
-        ForeignKey("folders.id", ondelete="SET NULL"),
-        nullable=True,
+        ForeignKey("folders.id", ondelete="CASCADE"),
+        nullable=False,
         index=True,
     )
     name: Mapped[str] = mapped_column(String, nullable=False)
@@ -83,7 +134,7 @@ class Document(Base):
     version_count: Mapped[int] = mapped_column(Integer, default=0)
     current_version_id: Mapped[str | None] = mapped_column(String, nullable=True)
 
-    folder: Mapped[Folder | None] = relationship("Folder", back_populates="documents")
+    folder: Mapped[Folder] = relationship("Folder", back_populates="documents")
     locks: Mapped[list["DocumentLock"]] = relationship(
         "DocumentLock",
         back_populates="document",
@@ -103,6 +154,14 @@ class Document(Base):
 
 class DocumentLock(Base):
     __tablename__ = "document_locks"
+    __table_args__ = (
+        Index(
+            "uq_document_locks_active_document",
+            "document_id",
+            unique=True,
+            sqlite_where=text("is_active = 1"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     document_id: Mapped[int] = mapped_column(
@@ -114,16 +173,21 @@ class DocumentLock(Base):
     locked_by: Mapped[str] = mapped_column(String, nullable=False)
     locked_by_name: Mapped[str | None] = mapped_column(String, nullable=True)
     locked_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=utcnow)
-    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     locked_ip: Mapped[str | None] = mapped_column(String, nullable=True)
     locked_user_agent: Mapped[str | None] = mapped_column(String, nullable=True)
-    force_acquired: Mapped[bool] = mapped_column(Boolean, default=False)
+    force_acquired: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    released_at: Mapped[datetime.datetime | None] = mapped_column(DateTime, nullable=True)
+    released_by: Mapped[str | None] = mapped_column(String, nullable=True)
 
     document: Mapped[Document] = relationship("Document", back_populates="locks")
 
 
 class DocumentVersion(Base):
     __tablename__ = "document_versions"
+    __table_args__ = (
+        UniqueConstraint("document_id", "version_number", name="uq_versions_document_number"),
+    )
 
     id: Mapped[str] = mapped_column(String, primary_key=True, index=True)
     document_id: Mapped[int] = mapped_column(
@@ -132,9 +196,9 @@ class DocumentVersion(Base):
         nullable=False,
         index=True,
     )
-    storage_object_id: Mapped[int] = mapped_column(
+    blob_id: Mapped[int] = mapped_column(
         Integer,
-        ForeignKey("storage_objects.id"),
+        ForeignKey("blobs.id"),
         nullable=False,
         index=True,
     )
@@ -143,9 +207,6 @@ class DocumentVersion(Base):
     committed_by: Mapped[str] = mapped_column(String, nullable=False)
     committed_by_name: Mapped[str | None] = mapped_column(String, nullable=True)
     message: Mapped[str | None] = mapped_column(Text, nullable=True)
-    checksum: Mapped[str | None] = mapped_column(String, nullable=True)
-    hash_algo: Mapped[str] = mapped_column(String, default="sha256", nullable=False)
-    size_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
     mime_type: Mapped[str | None] = mapped_column(String, nullable=True)
     original_filename: Mapped[str | None] = mapped_column(String, nullable=True)
     upload_ip: Mapped[str | None] = mapped_column(String, nullable=True)
@@ -153,10 +214,7 @@ class DocumentVersion(Base):
     created_via: Mapped[str | None] = mapped_column(String, nullable=True)
 
     document: Mapped[Document] = relationship("Document", back_populates="versions")
-    storage_object: Mapped[StorageObject] = relationship(
-        "StorageObject",
-        back_populates="versions",
-    )
+    blob: Mapped[Blob] = relationship("Blob", back_populates="versions")
 
 
 class DocumentEvent(Base):

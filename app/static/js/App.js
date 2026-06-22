@@ -317,7 +317,7 @@ export function App({ initial }) {
     }
     const doc = docs.find((d) => d.id === docId);
     const pathLower = (newPath || "").trim();
-    const targetInArchive = pathLower.startsWith("Archive");
+    const targetInArchive = isArchivePath(pathLower);
     const docArchived = doc && doc.archived;
     if (docArchived && !targetInArchive) {
       setError("Restore this file before moving it out of Archive.");
@@ -422,7 +422,7 @@ export function App({ initial }) {
       setError("Cannot delete the Archive root.");
       return;
     }
-    if (!selectedFolder.startsWith("Archive")) {
+    if (!isArchivePath(selectedFolder)) {
       setError("Delete forever is only available in Archive.");
       return;
     }
@@ -459,7 +459,7 @@ export function App({ initial }) {
   async function handleArchiveFolder(targetFolder = folder, options = {}) {
     const selectedFolder = typeof targetFolder === "string" ? targetFolder : folder || "";
     const shouldNavigate = options.navigate ?? selectedFolder === folder;
-    if (!selectedFolder || selectedFolder.startsWith("Archive")) {
+    if (!selectedFolder || isArchivePath(selectedFolder)) {
       setError("Pick a Vault folder to move into Archive.");
       return;
     }
@@ -494,7 +494,7 @@ export function App({ initial }) {
   async function handleUnarchiveFolder(targetFolder = folder, options = {}) {
     const selectedFolder = typeof targetFolder === "string" ? targetFolder : folder || "";
     const shouldNavigate = options.navigate ?? selectedFolder === folder;
-    if (!selectedFolder || !selectedFolder.startsWith("Archive")) {
+    if (!selectedFolder || !isArchivePath(selectedFolder)) {
       setError("Choose an archived folder to restore.");
       return;
     }

@@ -17,13 +17,31 @@ from sqlalchemy.orm import Session
 from .auth import UserContext, current_user
 from .config import BASE_DOMAIN
 from .db import get_db
-from .models import Document, DocumentEvent, DocumentLock, DocumentVersion, Folder, StorageObject
-from .storage import get_storage_backend, new_version_id, storage_write_lock
+from .models import (
+    Blob,
+    BlobLocation,
+    Document,
+    DocumentEvent,
+    DocumentLock,
+    DocumentVersion,
+    Folder,
+)
+from .storage import (
+    StorageConfigurationError,
+    StorageError,
+    StorageNotFoundError,
+    get_storage_backend,
+    new_version_id,
+    storage_write_lock,
+)
 
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
 router = APIRouter()
 ARCHIVE_ROOT = "Archive"
+VAULT_ROOT_KEY = "vault"
+ARCHIVE_ROOT_KEY = "archive"
+ROOT_NAMES = {VAULT_ROOT_KEY: "Vault", ARCHIVE_ROOT_KEY: "Archive"}
 
 
 @dataclass(frozen=True)
@@ -31,6 +49,12 @@ class DocStat:
     folder: str
     size_bytes: int
     mtime: dt.datetime | None
+
+
+@dataclass(frozen=True)
+class PublicFolderPath:
+    root_key: str
+    relative_path: str
 
 
 def client_meta(request: Request) -> dict[str, str | None]:
@@ -66,30 +90,36 @@ def normalize_item_name(name: str | None, label: str = "Name") -> str:
     return cleaned
 
 
+def join_path(*parts: str) -> str:
+    return "/".join(part.strip("/") for part in parts if part and part.strip("/"))
+
+
+def parse_public_folder_path(path: str | None) -> PublicFolderPath:
+    normalized = normalize_folder(path)
+    if normalized == ARCHIVE_ROOT:
+        return PublicFolderPath(ARCHIVE_ROOT_KEY, "")
+    if normalized.startswith(f"{ARCHIVE_ROOT}/"):
+        return PublicFolderPath(ARCHIVE_ROOT_KEY, normalized[len(ARCHIVE_ROOT) + 1 :])
+    return PublicFolderPath(VAULT_ROOT_KEY, normalized)
+
+
+def public_folder_path(root_key: str, relative_path: str) -> str:
+    relative = normalize_folder(relative_path)
+    if root_key == ARCHIVE_ROOT_KEY:
+        return join_path(ARCHIVE_ROOT, relative) if relative else ARCHIVE_ROOT
+    return relative
+
+
+def is_archived_path(path: str | None) -> bool:
+    return parse_public_folder_path(path).root_key == ARCHIVE_ROOT_KEY
+
+
 def split_document_path(path: str) -> tuple[str, str]:
     cleaned = normalize_folder(path)
     if not cleaned:
         raise HTTPException(status_code=400, detail="Document path is required")
     parts = cleaned.split("/")
     return "/".join(parts[:-1]), normalize_item_name(parts[-1], "File name")
-
-
-def join_path(*parts: str) -> str:
-    return "/".join(part.strip("/") for part in parts if part and part.strip("/"))
-
-
-def is_archived_path(path: str | None) -> bool:
-    normalized = normalize_folder(path)
-    return normalized == ARCHIVE_ROOT or normalized.startswith(f"{ARCHIVE_ROOT}/")
-
-
-def archive_relative_path(path: str) -> str:
-    normalized = normalize_folder(path)
-    if normalized == ARCHIVE_ROOT:
-        return ""
-    if normalized.startswith(f"{ARCHIVE_ROOT}/"):
-        return normalized[len(ARCHIVE_ROOT) + 1 :]
-    return normalized
 
 
 def format_size(size_bytes: int | None) -> str:
@@ -117,6 +147,198 @@ def format_mtime(timestamp: dt.datetime | None) -> str:
     if not normalized:
         return "Not updated yet"
     return normalized.strftime("%b %d, %Y")
+
+
+def all_folders(db: Session) -> list[Folder]:
+    return list(db.execute(select(Folder)).scalars().all())
+
+
+def get_root_folder(db: Session, root_key: str) -> Folder:
+    root = (
+        db.execute(
+            select(Folder).where(
+                Folder.root_key == root_key,
+                Folder.is_root == True,  # noqa: E712
+            ),
+        )
+        .scalars()
+        .first()
+    )
+    if root:
+        return root
+    root = Folder(root_key=root_key, parent_id=None, name=ROOT_NAMES[root_key], is_root=True)
+    db.add(root)
+    db.flush()
+    return root
+
+
+def ensure_root_folders(db: Session) -> dict[str, Folder]:
+    return {
+        VAULT_ROOT_KEY: get_root_folder(db, VAULT_ROOT_KEY),
+        ARCHIVE_ROOT_KEY: get_root_folder(db, ARCHIVE_ROOT_KEY),
+    }
+
+
+def build_folder_path_cache(folders: list[Folder]) -> dict[int, str]:
+    by_id = {folder.id: folder for folder in folders}
+    cache: dict[int, str] = {}
+
+    def compute(folder_id: int) -> str:
+        if folder_id in cache:
+            return cache[folder_id]
+        folder = by_id[folder_id]
+        if folder.is_root or folder.parent_id is None:
+            cache[folder_id] = public_folder_path(folder.root_key, "")
+            return cache[folder_id]
+        parent = by_id.get(folder.parent_id)
+        if not parent:
+            cache[folder_id] = public_folder_path(folder.root_key, folder.name)
+            return cache[folder_id]
+        parent_path = compute(parent.id)
+        cache[folder_id] = join_path(parent_path, folder.name)
+        return cache[folder_id]
+
+    for folder in folders:
+        compute(folder.id)
+    return cache
+
+
+def folder_relative_path(folder: Folder) -> str:
+    if folder.is_root:
+        return ""
+    parts: list[str] = []
+    current: Folder | None = folder
+    while current and not current.is_root:
+        parts.append(current.name)
+        current = current.parent
+    return "/".join(reversed(parts))
+
+
+def folder_path(folder: Folder, cache: dict[int, str] | None = None) -> str:
+    if cache is not None:
+        fallback = public_folder_path(folder.root_key, folder_relative_path(folder))
+        return cache.get(folder.id, fallback)
+    return public_folder_path(folder.root_key, folder_relative_path(folder))
+
+
+def document_folder_path(doc: Document, cache: dict[int, str] | None = None) -> str:
+    return folder_path(doc.folder, cache)
+
+
+def document_path(doc: Document, cache: dict[int, str] | None = None) -> str:
+    return join_path(document_folder_path(doc, cache), doc.name)
+
+
+def folder_is_archive(folder: Folder) -> bool:
+    return folder.root_key == ARCHIVE_ROOT_KEY
+
+
+def document_is_archive(doc: Document) -> bool:
+    return folder_is_archive(doc.folder)
+
+
+def find_child_folder(db: Session, parent_id: int, name: str) -> Folder | None:
+    return (
+        db.execute(select(Folder).where(Folder.parent_id == parent_id, Folder.name == name))
+        .scalars()
+        .first()
+    )
+
+
+def get_folder_by_path(db: Session, path: str | None) -> Folder | None:
+    ref = parse_public_folder_path(path)
+    current = get_root_folder(db, ref.root_key)
+    if not ref.relative_path:
+        return current
+    for part in ref.relative_path.split("/"):
+        child = find_child_folder(db, current.id, part)
+        if not child:
+            return None
+        current = child
+    return current
+
+
+def get_or_create_folder_path(db: Session, path: str | None) -> Folder:
+    ref = parse_public_folder_path(path)
+    current = get_root_folder(db, ref.root_key)
+    if not ref.relative_path:
+        return current
+    for part in ref.relative_path.split("/"):
+        folder = find_child_folder(db, current.id, part)
+        if not folder:
+            folder = Folder(
+                root_key=ref.root_key,
+                parent_id=current.id,
+                name=part,
+                is_root=False,
+            )
+            folder.parent = current
+            db.add(folder)
+            db.flush()
+        current = folder
+    return current
+
+
+def ensure_unique_folder_name(
+    db: Session,
+    parent_id: int,
+    name: str,
+    exclude_folder_id: int | None = None,
+) -> None:
+    existing = find_child_folder(db, parent_id, name)
+    if existing and existing.id != exclude_folder_id:
+        raise HTTPException(status_code=400, detail="A folder already exists at that path")
+
+
+def document_in_folder(
+    db: Session,
+    folder_id: int,
+    name: str,
+    exclude_doc_id: int | None = None,
+) -> Document | None:
+    statement = select(Document).where(Document.folder_id == folder_id, Document.name == name)
+    if exclude_doc_id is not None:
+        statement = statement.where(Document.id != exclude_doc_id)
+    return db.execute(statement).scalars().first()
+
+
+def ensure_unique_document_path(
+    db: Session,
+    folder_id: int,
+    name: str,
+    exclude_doc_id: int | None = None,
+) -> None:
+    if document_in_folder(db, folder_id, name, exclude_doc_id):
+        raise HTTPException(status_code=400, detail="A document already exists at that path")
+
+
+def folder_children_by_parent(folders: list[Folder]) -> dict[int | None, list[Folder]]:
+    children: dict[int | None, list[Folder]] = defaultdict(list)
+    for folder in folders:
+        children[folder.parent_id].append(folder)
+    return children
+
+
+def subtree_folder_ids(root: Folder, folders: list[Folder]) -> set[int]:
+    children = folder_children_by_parent(folders)
+    pending = [root.id]
+    ids: set[int] = set()
+    while pending:
+        folder_id = pending.pop()
+        ids.add(folder_id)
+        pending.extend(child.id for child in children.get(folder_id, []))
+    return ids
+
+
+def docs_in_folder_subtree(db: Session, root: Folder) -> list[Document]:
+    ids = subtree_folder_ids(root, all_folders(db))
+    return list(db.execute(select(Document).where(Document.folder_id.in_(ids))).scalars().all())
+
+
+def set_subtree_root_key(db: Session, root: Folder, root_key: str) -> None:
+    ids = subtree_folder_ids(root, all_folders(db))
+    for folder in db.execute(select(Folder).where(Folder.id.in_(ids))).scalars():
+        folder.root_key = root_key
 
 
 def get_active_lock(doc: Document, db: Session) -> DocumentLock | None:
@@ -167,6 +389,13 @@ def acquire_document_lock(
     return lock, True
 
 
+def release_lock(lock: DocumentLock | None, user: UserContext) -> None:
+    if lock:
+        lock.is_active = False
+        lock.released_at = now_utc()
+        lock.released_by = user["id"]
+
+
 def record_event(
     doc: Document,
     user: UserContext,
@@ -213,163 +442,6 @@ def get_version_or_404(doc: Document, version_id: str, db: Session) -> DocumentV
     return version
 
 
-def all_folders(db: Session) -> list[Folder]:
-    return list(db.execute(select(Folder)).scalars().all())
-
-
-def build_folder_path_cache(folders: list[Folder]) -> dict[int | None, str]:
-    by_id = {folder.id: folder for folder in folders}
-    cache: dict[int | None, str] = {None: ""}
-
-    def compute(folder_id: int | None) -> str:
-        if folder_id in cache:
-            return cache[folder_id]
-        if folder_id is None:
-            return ""
-        folder = by_id.get(folder_id)
-        if not folder:
-            cache[folder_id] = ""
-            return ""
-        parent_path = compute(folder.parent_id)
-        cache[folder_id] = join_path(parent_path, folder.name)
-        return cache[folder_id]
-
-    for folder in folders:
-        compute(folder.id)
-    return cache
-
-
-def folder_path(folder: Folder | None, cache: dict[int | None, str] | None = None) -> str:
-    if not folder:
-        return ""
-    if cache is not None:
-        return cache.get(folder.id, "")
-    parts = []
-    current: Folder | None = folder
-    while current:
-        parts.append(current.name)
-        current = current.parent
-    return "/".join(reversed(parts))
-
-
-def document_folder_path(doc: Document, cache: dict[int | None, str] | None = None) -> str:
-    if cache is not None:
-        return cache.get(doc.folder_id, "")
-    return folder_path(doc.folder)
-
-
-def document_path(doc: Document, cache: dict[int | None, str] | None = None) -> str:
-    return join_path(document_folder_path(doc, cache), doc.name)
-
-
-def find_child_folder(db: Session, parent_id: int | None, name: str) -> Folder | None:
-    statement = select(Folder).where(Folder.name == name)
-    if parent_id is None:
-        statement = statement.where(Folder.parent_id.is_(None))
-    else:
-        statement = statement.where(Folder.parent_id == parent_id)
-    return db.execute(statement).scalars().first()
-
-
-def get_folder_by_path(db: Session, path: str | None) -> Folder | None:
-    normalized = normalize_folder(path)
-    if not normalized:
-        return None
-    parent_id: int | None = None
-    current: Folder | None = None
-    for part in normalized.split("/"):
-        current = find_child_folder(db, parent_id, part)
-        if not current:
-            return None
-        parent_id = current.id
-    return current
-
-
-def get_or_create_folder_path(db: Session, path: str | None) -> Folder | None:
-    normalized = normalize_folder(path)
-    if not normalized:
-        return None
-    parent_id: int | None = None
-    parent: Folder | None = None
-    for part in normalized.split("/"):
-        folder = find_child_folder(db, parent_id, part)
-        if not folder:
-            folder = Folder(parent_id=parent_id, name=part)
-            folder.parent = parent
-            db.add(folder)
-            db.flush()
-        parent = folder
-        parent_id = folder.id
-    return parent
-
-
-def ensure_archive_folder(db: Session) -> Folder:
-    archive = get_or_create_folder_path(db, ARCHIVE_ROOT)
-    if archive is None:
-        raise HTTPException(status_code=500, detail="Could not create Archive root")
-    return archive
-
-
-def ensure_unique_folder_name(
-    db: Session,
-    parent_id: int | None,
-    name: str,
-    exclude_folder_id: int | None = None,
-) -> None:
-    existing = find_child_folder(db, parent_id, name)
-    if existing and existing.id != exclude_folder_id:
-        raise HTTPException(status_code=400, detail="A folder already exists at that path")
-
-
-def document_in_folder(
-    db: Session,
-    folder_id: int | None,
-    name: str,
-    exclude_doc_id: int | None = None,
-) -> Document | None:
-    statement = select(Document).where(Document.name == name)
-    if folder_id is None:
-        statement = statement.where(Document.folder_id.is_(None))
-    else:
-        statement = statement.where(Document.folder_id == folder_id)
-    if exclude_doc_id is not None:
-        statement = statement.where(Document.id != exclude_doc_id)
-    return db.execute(statement).scalars().first()
-
-
-def ensure_unique_document_path(
-    db: Session,
-    folder_id: int | None,
-    name: str,
-    exclude_doc_id: int | None = None,
-) -> None:
-    if document_in_folder(db, folder_id, name, exclude_doc_id):
-        raise HTTPException(status_code=400, detail="A document already exists at that path")
-
-
-def folder_children_by_parent(folders: list[Folder]) -> dict[int | None, list[Folder]]:
-    children: dict[int | None, list[Folder]] = defaultdict(list)
-    for folder in folders:
-        children[folder.parent_id].append(folder)
-    return children
-
-
-def subtree_folder_ids(root: Folder, folders: list[Folder]) -> set[int]:
-    children = folder_children_by_parent(folders)
-    pending = [root.id]
-    ids: set[int] = set()
-    while pending:
-        folder_id = pending.pop()
-        ids.add(folder_id)
-        pending.extend(child.id for child in children.get(folder_id, []))
-    return ids
-
-
-def docs_in_folder_subtree(db: Session, root: Folder) -> list[Document]:
-    ids = subtree_folder_ids(root, all_folders(db))
-    return list(db.execute(select(Document).where(Document.folder_id.in_(ids))).scalars().all())
-
-
 def next_version_number(doc: Document, db: Session) -> int:
     latest_number = (
         db.execute(
@@ -384,46 +456,72 @@ def next_version_number(doc: Document, db: Session) -> int:
     return (latest_number or 0) + 1
 
 
-def get_or_create_storage_object(
+def get_or_create_blob_for_data(
     db: Session,
     data: bytes,
-    mime_type: str | None,
-) -> StorageObject:
-    stored = get_storage_backend().put_bytes(data, mime_type)
-    obj = (
+    content_type: str | None,
+) -> Blob:
+    try:
+        stored = get_storage_backend().put_bytes(data, content_type)
+    except StorageConfigurationError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except StorageError as exc:
+        raise HTTPException(status_code=500, detail="Storage write failed") from exc
+
+    blob = (
         db.execute(
-            select(StorageObject).where(
-                StorageObject.backend == stored.backend,
-                StorageObject.bucket == stored.bucket,
-                StorageObject.object_key == stored.object_key,
+            select(Blob).where(
+                Blob.hash_algo == stored.hash_algo,
+                Blob.hash == stored.digest,
+                Blob.size_bytes == stored.size_bytes,
             ),
         )
         .scalars()
         .first()
     )
-    if obj:
-        return obj
-    obj = StorageObject(
-        hash_algo=stored.hash_algo,
-        hash=stored.digest,
-        size_bytes=stored.size_bytes,
-        backend=stored.backend,
-        bucket=stored.bucket,
-        object_key=stored.object_key,
-        mime_type=stored.mime_type,
+    if not blob:
+        blob = Blob(
+            hash_algo=stored.hash_algo,
+            hash=stored.digest,
+            size_bytes=stored.size_bytes,
+        )
+        db.add(blob)
+        db.flush()
+
+    location = (
+        db.execute(
+            select(BlobLocation).where(
+                BlobLocation.backend == stored.backend,
+                BlobLocation.bucket == stored.bucket,
+                BlobLocation.object_key == stored.object_key,
+            ),
+        )
+        .scalars()
+        .first()
     )
-    db.add(obj)
-    db.flush()
-    return obj
+    if location and location.blob_id != blob.id:
+        raise HTTPException(status_code=500, detail="Storage location points at another blob")
+    if not location:
+        db.add(
+            BlobLocation(
+                blob_id=blob.id,
+                backend=stored.backend,
+                bucket=stored.bucket,
+                object_key=stored.object_key,
+            ),
+        )
+        db.flush()
+    return blob
 
 
 def create_document_version(
     db: Session,
     doc: Document,
-    storage_object: StorageObject,
+    blob: Blob,
     user: UserContext,
     meta: dict[str, str | None],
     filename: str,
+    mime_type: str | None,
     message: str,
     created_via: str,
 ) -> DocumentVersion:
@@ -432,16 +530,13 @@ def create_document_version(
     version = DocumentVersion(
         id=new_version_id(),
         document_id=doc.id,
-        storage_object_id=storage_object.id,
+        blob_id=blob.id,
         version_number=version_number,
         committed_at=timestamp,
         committed_by=user["id"],
         committed_by_name=user["name"],
         message=message,
-        checksum=storage_object.hash,
-        hash_algo=storage_object.hash_algo,
-        size_bytes=storage_object.size_bytes,
-        mime_type=storage_object.mime_type,
+        mime_type=mime_type,
         original_filename=filename,
         upload_ip=meta.get("ip"),
         upload_user_agent=meta.get("user_agent"),
@@ -482,9 +577,31 @@ def current_version(doc: Document, db: Session) -> DocumentVersion | None:
     )
 
 
+def location_for_blob(blob: Blob) -> BlobLocation:
+    locations = list(blob.locations)
+    if not locations:
+        raise HTTPException(status_code=404, detail="Blob has no storage location")
+    try:
+        current_backend = get_storage_backend().name
+    except StorageConfigurationError:
+        current_backend = ""
+    for location in locations:
+        if location.backend == current_backend:
+            return location
+    return locations[0]
+
+
 def read_version_bytes(version: DocumentVersion) -> bytes:
-    obj = version.storage_object
-    return get_storage_backend(obj.backend).read_bytes(obj.object_key, obj.bucket)
+    location = location_for_blob(version.blob)
+    try:
+        return get_storage_backend(location.backend).read_bytes(
+            location.object_key,
+            location.bucket,
+        )
+    except StorageNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Blob missing from storage") from exc
+    except StorageConfigurationError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 def download_response(data: bytes, filename: str, mime_type: str | None = None) -> Response:
@@ -517,26 +634,25 @@ def dedupe_versions_by_checksum(versions: list[DocumentVersion]) -> list[Documen
     last_checksum: str | None = None
     have_last_checksum = False
     for version in sorted(versions, key=lambda item: item.version_number or 0, reverse=True):
-        checksum = version.checksum
-        if have_last_checksum and checksum and checksum == last_checksum:
+        checksum = version.blob.hash
+        if have_last_checksum and checksum == last_checksum:
             continue
         filtered.append(version)
-        if checksum:
-            last_checksum = checksum
-            have_last_checksum = True
-        else:
-            last_checksum = None
-            have_last_checksum = False
+        last_checksum = checksum
+        have_last_checksum = True
     return filtered
 
 
 def folder_contains_doc_folder(folder: str, doc_folder: str) -> bool:
     if not folder:
-        return True
+        return not is_archived_path(doc_folder)
+    if folder == ARCHIVE_ROOT:
+        return is_archived_path(doc_folder)
     return doc_folder == folder or doc_folder.startswith(f"{folder}/")
 
 
 def build_state(user: UserContext, current_folder: str, db: Session) -> dict[str, object]:
+    ensure_root_folders(db)
     folders = all_folders(db)
     path_cache = build_folder_path_cache(folders)
     docs = db.execute(select(Document)).scalars().all()
@@ -580,7 +696,7 @@ def build_state(user: UserContext, current_folder: str, db: Session) -> dict[str
         doc_versions = versions_by_document.get(doc.id, [])
         filtered_versions = dedupe_versions_by_checksum(doc_versions)
         latest_version = current_version(doc, db)
-        latest_size_bytes = latest_version.storage_object.size_bytes if latest_version else None
+        latest_size_bytes = latest_version.blob.size_bytes if latest_version else None
         latest_updated_at = normalize_timestamp(doc.latest_modified_at)
         lock = locks.get(doc.id)
         history_items: list[dict[str, object]] = []
@@ -598,9 +714,9 @@ def build_state(user: UserContext, current_folder: str, db: Session) -> dict[str
                     "note": version.message,
                     "version_number": version.version_number,
                     "created_via": version.created_via,
-                    "checksum": version.checksum,
-                    "hash_algo": version.hash_algo,
-                    "size_bytes": version.size_bytes,
+                    "checksum": version.blob.hash,
+                    "hash_algo": version.blob.hash_algo,
+                    "size_bytes": version.blob.size_bytes,
                     "mime_type": version.mime_type,
                     "original_filename": version.original_filename,
                     "download_url": f"/documents/{doc.id}/versions/{version.id}/download",
@@ -653,7 +769,7 @@ def build_state(user: UserContext, current_folder: str, db: Session) -> dict[str
                     "user_agent": lock.locked_user_agent if lock else None,
                     "force_acquired": lock.force_acquired if lock else None,
                 },
-                "archived": is_archived_path(doc_folder),
+                "archived": document_is_archive(doc),
                 "versions": history_items,
             },
         )
@@ -662,11 +778,14 @@ def build_state(user: UserContext, current_folder: str, db: Session) -> dict[str
     folder_children: dict[str, list[str]] = defaultdict(list)
     folder_payloads: dict[str, dict[str, object]] = {}
     folder_children.setdefault("", [])
+    folder_children.setdefault(ARCHIVE_ROOT, [])
     for folder in folders:
         path = path_cache.get(folder.id, "")
+        folder_children.setdefault(path, [])
+        if folder.is_root or folder.parent_id is None:
+            continue
         parent_path = path_cache.get(folder.parent_id, "")
         folder_children[parent_path].append(path)
-        folder_children.setdefault(path, [])
 
     all_folder_paths = set(folder_children.keys())
     for child_paths in folder_children.values():
@@ -687,6 +806,7 @@ def build_state(user: UserContext, current_folder: str, db: Session) -> dict[str
             "size_bytes": size,
             "size_display": format_size(size),
         }
+    folder_payloads[ARCHIVE_ROOT]["name"] = ARCHIVE_ROOT
 
     return {
         "base_domain": BASE_DOMAIN,
@@ -702,20 +822,15 @@ def commit_state(db: Session) -> None:
     db.commit()
 
 
-def folder_for_new_path(db: Session, path: str) -> tuple[Folder | None, str]:
+def folder_for_new_path(db: Session, path: str) -> tuple[Folder, str]:
     folder_path_value, name = split_document_path(path)
     folder = get_or_create_folder_path(db, folder_path_value)
     return folder, name
 
 
-def release_lock(lock: DocumentLock | None) -> None:
-    if lock:
-        lock.is_active = False
-
-
 def mutate_doc_location(
     doc: Document,
-    target_folder: Folder | None,
+    target_folder: Folder,
     target_name: str,
     user: UserContext,
     db: Session,
@@ -723,17 +838,40 @@ def mutate_doc_location(
     event_type: str,
     message: str,
 ) -> None:
-    ensure_unique_document_path(
-        db,
-        target_folder.id if target_folder else None,
-        target_name,
-        doc.id,
-    )
+    ensure_unique_document_path(db, target_folder.id, target_name, doc.id)
     doc.folder = target_folder
-    doc.folder_id = target_folder.id if target_folder else None
+    doc.folder_id = target_folder.id
     doc.name = target_name
     doc.latest_modified_at = now_utc()
     record_event(doc, user, event_type, message, db, meta=meta)
+
+
+def storage_reconciliation_report(db: Session, apply: bool = False) -> dict[str, object]:
+    referenced_blob_ids = {
+        row[0] for row in db.execute(select(DocumentVersion.blob_id)).all() if row[0] is not None
+    }
+    orphan_blob_ids = [
+        blob.id for blob in db.execute(select(Blob)).scalars() if blob.id not in referenced_blob_ids
+    ]
+    local_locations = list(
+        db.execute(select(BlobLocation).where(BlobLocation.backend == "local")).scalars(),
+    )
+    known_local_keys = {location.object_key for location in local_locations}
+    try:
+        local_backend = get_storage_backend("local")
+        local_keys = set(local_backend.list_object_keys())
+    except StorageError:
+        local_keys = set()
+    unreferenced_local_keys = sorted(local_keys - known_local_keys)
+    if apply:
+        local_backend = get_storage_backend("local")
+        for object_key in unreferenced_local_keys:
+            local_backend.delete_object(object_key)
+    return {
+        "orphan_blob_ids": orphan_blob_ids,
+        "unreferenced_local_keys": unreferenced_local_keys,
+        "deleted_local_keys": unreferenced_local_keys if apply else [],
+    }
 
 
 @router.get("/", response_class=HTMLResponse)
@@ -743,7 +881,7 @@ def index(
     user: UserContext = Depends(current_user),
     db: Session = Depends(get_db),
 ) -> HTMLResponse:
-    ensure_archive_folder(db)
+    ensure_root_folders(db)
     commit_state(db)
     state = build_state(user, normalize_folder(folder), db)
     return templates.TemplateResponse("index.html", {"request": request, "state": state})
@@ -755,7 +893,7 @@ def api_state(
     user: UserContext = Depends(current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
-    ensure_archive_folder(db)
+    ensure_root_folders(db)
     commit_state(db)
     return build_state(user, normalize_folder(folder), db)
 
@@ -775,8 +913,8 @@ def create_folder(
     parent_path = "/".join(normalized.split("/")[:-1])
     name = normalize_item_name(normalized.split("/")[-1], "Folder name")
     parent = get_or_create_folder_path(db, parent_path)
-    ensure_unique_folder_name(db, parent.id if parent else None, name)
-    created = Folder(parent_id=parent.id if parent else None, name=name)
+    ensure_unique_folder_name(db, parent.id, name)
+    created = Folder(root_key=parent.root_key, parent_id=parent.id, name=name, is_root=False)
     db.add(created)
     db.commit()
     return {"folder": normalized}
@@ -792,31 +930,27 @@ def rename_folder(
     del user
     source_path = normalize_folder(folder)
     target_path = normalize_folder(new_path)
-    if not source_path or source_path == ARCHIVE_ROOT:
-        raise HTTPException(status_code=400, detail="Cannot rename that folder")
-    if not target_path or target_path == ARCHIVE_ROOT:
-        raise HTTPException(status_code=400, detail="Invalid target folder")
     source = get_folder_by_path(db, source_path)
     if not source:
         raise HTTPException(status_code=404, detail="Folder not found")
+    if source.is_root:
+        raise HTTPException(status_code=400, detail="Cannot rename that folder")
+    target_ref = parse_public_folder_path(target_path)
+    if not target_ref.relative_path:
+        raise HTTPException(status_code=400, detail="Invalid target folder")
     if target_path == source_path:
         return {"folder": source_path}
+    if target_ref.root_key != source.root_key:
+        raise HTTPException(status_code=400, detail="Use archive or restore for Archive moves")
     if target_path.startswith(f"{source_path}/"):
         raise HTTPException(status_code=400, detail="Cannot move a folder into itself")
-    if is_archived_path(source_path) != is_archived_path(target_path):
-        raise HTTPException(status_code=400, detail="Use archive or restore for Archive moves")
 
     target_parent_path = "/".join(target_path.split("/")[:-1])
     target_name = normalize_item_name(target_path.split("/")[-1], "Folder name")
     target_parent = get_or_create_folder_path(db, target_parent_path)
-    ensure_unique_folder_name(
-        db,
-        target_parent.id if target_parent else None,
-        target_name,
-        source.id,
-    )
+    ensure_unique_folder_name(db, target_parent.id, target_name, source.id)
     source.parent = target_parent
-    source.parent_id = target_parent.id if target_parent else None
+    source.parent_id = target_parent.id
     source.name = target_name
     db.commit()
     return {"folder": target_path}
@@ -830,28 +964,24 @@ def archive_folder(
     db: Session = Depends(get_db),
 ) -> dict[str, str]:
     source_path = normalize_folder(folder)
-    if not source_path or is_archived_path(source_path):
-        raise HTTPException(status_code=400, detail="Pick a Vault folder to archive")
     source = get_folder_by_path(db, source_path)
-    if not source:
+    if not source or source.is_root:
         raise HTTPException(status_code=404, detail="Folder not found")
-    target_path = join_path(ARCHIVE_ROOT, source_path)
+    if folder_is_archive(source):
+        raise HTTPException(status_code=400, detail="Pick a Vault folder to archive")
+    target_path = public_folder_path(ARCHIVE_ROOT_KEY, folder_relative_path(source))
     target_parent = get_or_create_folder_path(db, "/".join(target_path.split("/")[:-1]))
     target_name = normalize_item_name(target_path.split("/")[-1], "Folder name")
-    ensure_unique_folder_name(
-        db,
-        target_parent.id if target_parent else None,
-        target_name,
-        source.id,
-    )
+    ensure_unique_folder_name(db, target_parent.id, target_name, source.id)
     meta = client_meta(request)
     for doc in docs_in_folder_subtree(db, source):
-        release_lock(get_active_lock(doc, db))
+        release_lock(get_active_lock(doc, db), user)
         record_event(doc, user, "archive", f"Archived from {document_path(doc)}", db, meta=meta)
         doc.latest_modified_at = now_utc()
     source.parent = target_parent
-    source.parent_id = target_parent.id if target_parent else None
+    source.parent_id = target_parent.id
     source.name = target_name
+    set_subtree_root_key(db, source, ARCHIVE_ROOT_KEY)
     db.commit()
     return {"archive_folder": target_path}
 
@@ -864,20 +994,13 @@ def unarchive_folder(
     db: Session = Depends(get_db),
 ) -> dict[str, str]:
     source_path = normalize_folder(folder)
-    if not source_path or source_path == ARCHIVE_ROOT or not is_archived_path(source_path):
-        raise HTTPException(status_code=400, detail="Choose an archived folder to restore")
     source = get_folder_by_path(db, source_path)
-    if not source:
-        raise HTTPException(status_code=404, detail="Folder not found")
-    target_path = archive_relative_path(source_path)
+    if not source or source.is_root or not folder_is_archive(source):
+        raise HTTPException(status_code=400, detail="Choose an archived folder to restore")
+    target_path = folder_relative_path(source)
     target_parent = get_or_create_folder_path(db, "/".join(target_path.split("/")[:-1]))
     target_name = normalize_item_name(target_path.split("/")[-1], "Folder name")
-    ensure_unique_folder_name(
-        db,
-        target_parent.id if target_parent else None,
-        target_name,
-        source.id,
-    )
+    ensure_unique_folder_name(db, target_parent.id, target_name, source.id)
     meta = client_meta(request)
     for doc in docs_in_folder_subtree(db, source):
         record_event(
@@ -890,8 +1013,9 @@ def unarchive_folder(
         )
         doc.latest_modified_at = now_utc()
     source.parent = target_parent
-    source.parent_id = target_parent.id if target_parent else None
+    source.parent_id = target_parent.id
     source.name = target_name
+    set_subtree_root_key(db, source, VAULT_ROOT_KEY)
     db.commit()
     return {"folder": target_path}
 
@@ -905,11 +1029,9 @@ def permanent_delete_folder(
     if not user["is_admin"]:
         raise HTTPException(status_code=403, detail="Admin access required")
     normalized = normalize_folder(folder)
-    if not normalized or normalized == ARCHIVE_ROOT or not is_archived_path(normalized):
-        raise HTTPException(status_code=400, detail="Delete forever is only available in Archive")
     target = get_folder_by_path(db, normalized)
-    if not target:
-        raise HTTPException(status_code=404, detail="Folder not found")
+    if not target or target.is_root or not folder_is_archive(target):
+        raise HTTPException(status_code=400, detail="Delete forever is only available in Archive")
     for doc in docs_in_folder_subtree(db, target):
         db.delete(doc)
     db.delete(target)
@@ -928,14 +1050,14 @@ async def create_document(
     filename = normalize_item_name(file.filename, "File name")
     folder_path_value = normalize_folder(folder)
     target_folder = get_or_create_folder_path(db, folder_path_value)
-    ensure_unique_document_path(db, target_folder.id if target_folder else None, filename)
+    ensure_unique_document_path(db, target_folder.id, filename)
     data = await file.read()
     mime_type = file.content_type or mimetypes.guess_type(filename)[0]
     meta = client_meta(request)
     with storage_write_lock():
-        storage_object = get_or_create_storage_object(db, data, mime_type)
+        blob = get_or_create_blob_for_data(db, data, mime_type)
         doc = Document(
-            folder_id=target_folder.id if target_folder else None,
+            folder_id=target_folder.id,
             name=filename,
             created_by=user["id"],
             created_by_name=user["name"],
@@ -947,10 +1069,11 @@ async def create_document(
         create_document_version(
             db,
             doc,
-            storage_object,
+            blob,
             user,
             meta,
             filename,
+            mime_type,
             f"Uploaded {filename}",
             "upload",
         )
@@ -997,7 +1120,7 @@ def checkout_document(
     db: Session = Depends(get_db),
 ) -> Response:
     doc = get_document_or_404(doc_id, db)
-    if is_archived_path(document_folder_path(doc)):
+    if document_is_archive(doc):
         raise HTTPException(status_code=400, detail="Restore this file before editing")
     version = current_version(doc, db)
     if not version:
@@ -1019,7 +1142,7 @@ def lock_document(
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
     doc = get_document_or_404(doc_id, db)
-    if is_archived_path(document_folder_path(doc)):
+    if document_is_archive(doc):
         raise HTTPException(status_code=400, detail="Restore this file before editing")
     meta = client_meta(request)
     with storage_write_lock():
@@ -1049,7 +1172,7 @@ def release_document(
     lock = get_active_lock(doc, db)
     if lock and lock.locked_by != user["id"] and not user["is_admin"]:
         raise HTTPException(status_code=403, detail="Document is locked by another user")
-    release_lock(lock)
+    release_lock(lock, user)
     record_event(
         doc,
         user,
@@ -1075,7 +1198,7 @@ async def checkin_document(
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
     doc = get_document_or_404(doc_id, db)
-    if is_archived_path(document_folder_path(doc)):
+    if document_is_archive(doc):
         raise HTTPException(status_code=400, detail="Restore this file before editing")
     lock = get_active_lock(doc, db)
     if not lock or lock.locked_by != user["id"]:
@@ -1100,18 +1223,19 @@ async def checkin_document(
                 meta=meta,
             )
             doc.name = upload_name
-        storage_object = get_or_create_storage_object(db, data, mime_type)
+        blob = get_or_create_blob_for_data(db, data, mime_type)
         version = create_document_version(
             db,
             doc,
-            storage_object,
+            blob,
             user,
             meta,
             upload_name,
+            mime_type,
             message,
             "checkin",
         )
-        release_lock(lock)
+        release_lock(lock, user)
         record_event(doc, user, "release", f"Released lock for {document_path(doc)}", db, meta=meta)
         db.commit()
     return {"id": doc.id, "version": version.id, "path": document_path(doc)}
@@ -1152,11 +1276,8 @@ def move_document(
     doc = get_document_or_404(doc_id, db)
     ensure_not_locked_by_other(doc, user, db)
     old_path = document_path(doc)
-    old_archived = is_archived_path(document_folder_path(doc))
     target_folder, target_name = folder_for_new_path(db, new_path)
-    target_folder_path = folder_path(target_folder)
-    new_archived = is_archived_path(target_folder_path)
-    if old_archived != new_archived:
+    if doc.folder.root_key != target_folder.root_key:
         raise HTTPException(status_code=400, detail="Use archive or restore for Archive moves")
     with storage_write_lock():
         mutate_doc_location(
@@ -1167,7 +1288,7 @@ def move_document(
             db,
             client_meta(request),
             "move",
-            f"Moved from {old_path} to {join_path(target_folder_path, target_name)}",
+            f"Moved from {old_path} to {join_path(folder_path(target_folder), target_name)}",
         )
         db.commit()
     return {"path": document_path(doc)}
@@ -1182,13 +1303,13 @@ def archive_document(
 ) -> dict[str, str]:
     doc = get_document_or_404(doc_id, db)
     source_path = document_path(doc)
-    if is_archived_path(document_folder_path(doc)):
+    if document_is_archive(doc):
         raise HTTPException(status_code=400, detail="Document is already archived")
     lock = ensure_not_locked_by_other(doc, user, db)
-    target_folder_path = join_path(ARCHIVE_ROOT, document_folder_path(doc))
+    target_folder_path = public_folder_path(ARCHIVE_ROOT_KEY, folder_relative_path(doc.folder))
     target_folder = get_or_create_folder_path(db, target_folder_path)
     with storage_write_lock():
-        release_lock(lock)
+        release_lock(lock, user)
         mutate_doc_location(
             doc,
             target_folder,
@@ -1212,11 +1333,10 @@ def unarchive_document(
 ) -> dict[str, str]:
     doc = get_document_or_404(doc_id, db)
     source_path = document_path(doc)
-    source_folder = document_folder_path(doc)
-    if not is_archived_path(source_folder):
+    if not document_is_archive(doc):
         raise HTTPException(status_code=400, detail="Document is not archived")
     ensure_not_locked_by_other(doc, user, db)
-    target_folder_path = archive_relative_path(source_folder)
+    target_folder_path = folder_relative_path(doc.folder)
     target_folder = get_or_create_folder_path(db, target_folder_path)
     with storage_write_lock():
         mutate_doc_location(
@@ -1241,7 +1361,7 @@ def delete_document(
     db: Session = Depends(get_db),
 ) -> dict[str, str]:
     doc = get_document_or_404(doc_id, db)
-    if not is_archived_path(document_folder_path(doc)):
+    if not document_is_archive(doc):
         return archive_document(doc_id, request, user, db)
     return permanent_delete_document(doc_id, user, db)
 
@@ -1255,7 +1375,7 @@ def permanent_delete_document(
     if not user["is_admin"]:
         raise HTTPException(status_code=403, detail="Admin access required")
     doc = get_document_or_404(doc_id, db)
-    if not is_archived_path(document_folder_path(doc)):
+    if not document_is_archive(doc):
         raise HTTPException(status_code=400, detail="Move the document to Archive before deleting")
     deleted_path = document_path(doc)
     db.delete(doc)

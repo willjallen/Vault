@@ -1,29 +1,9 @@
 import { classNames } from "../lib/utils.js";
+import { Icon } from "./common/Icon.js";
+import { IconPicker } from "./common/IconPicker.js";
 
 const { useCallback, useEffect, useMemo, useRef, useState } = React;
 const h = React.createElement;
-
-const colorOptions = [
-  { id: "", label: "None" },
-  { id: "blue", label: "Blue" },
-  { id: "teal", label: "Teal" },
-  { id: "green", label: "Green" },
-  { id: "amber", label: "Amber" },
-  { id: "rose", label: "Rose" },
-  { id: "violet", label: "Violet" },
-  { id: "slate", label: "Slate" },
-];
-
-const iconOptions = [
-  { id: "", label: "Default", glyph: "📁" },
-  { id: "folder", label: "Folder", glyph: "📁" },
-  { id: "home", label: "Home", glyph: "🏠" },
-  { id: "project", label: "Project", glyph: "📌" },
-  { id: "photos", label: "Photos", glyph: "🖼️" },
-  { id: "finance", label: "Finance", glyph: "💼" },
-  { id: "locked", label: "Private", glyph: "🔒" },
-  { id: "archive", label: "Archive", glyph: "🗄️" },
-];
 
 function formatTimestamp(timestamp) {
   if (!timestamp) {
@@ -268,7 +248,7 @@ export function FolderPropertiesModal({ apiFetch, folder, onClose, onUpdated }) 
               ref: closeButton,
               type: "button",
             },
-            "x"
+            h(Icon, { icon: "close", size: 16 })
           ),
         ]),
         loading
@@ -316,48 +296,17 @@ export function FolderPropertiesModal({ apiFetch, folder, onClose, onUpdated }) 
                     saving === "appearance" ? "Saving..." : "Save"
                   ),
                 ]),
-                h(
-                  "div",
-                  { className: "folder-color-grid" },
-                  colorOptions.map((option) =>
-                    h(
-                      "button",
-                      {
-                        className: classNames(
-                          "folder-color-choice",
-                          option.id,
-                          color === option.id ? "active" : ""
-                        ),
-                        key: option.id || "none",
-                        onClick: () => setColor(option.id),
-                        type: "button",
-                      },
-                      option.label
-                    )
-                  )
-                ),
-                h(
-                  "div",
-                  { className: "folder-icon-grid" },
-                  iconOptions.map((option) =>
-                    h(
-                      "button",
-                      {
-                        className: classNames(
-                          "folder-icon-choice",
-                          icon === option.id ? "active" : ""
-                        ),
-                        key: option.id || "default",
-                        onClick: () => setIcon(option.id),
-                        type: "button",
-                      },
-                      [
-                        h("span", { key: "glyph" }, option.glyph),
-                        h("span", { key: "label" }, option.label),
-                      ]
-                    )
-                  )
-                ),
+                h("div", { className: "folder-appearance-picker" }, [
+                  h(IconPicker, {
+                    color,
+                    icon,
+                    key: "picker",
+                    onChange: (nextIcon, nextColor) => {
+                      setIcon(nextIcon || "");
+                      setColor(nextColor || "");
+                    },
+                  }),
+                ]),
               ]),
               h("section", { className: "folder-properties-card", key: "permissions" }, [
                 h("div", { className: "folder-card-headline" }, [

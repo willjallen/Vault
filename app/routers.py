@@ -6,6 +6,7 @@ import datetime as dt
 import io
 import json
 import mimetypes
+import re
 import zipfile
 from collections import defaultdict
 from dataclasses import dataclass
@@ -61,7 +62,7 @@ VAULT_ROOT_KEY = "vault"
 ARCHIVE_ROOT_KEY = "archive"
 ROOT_NAMES = {VAULT_ROOT_KEY: "Vault", ARCHIVE_ROOT_KEY: "Archive"}
 FOLDER_COLOR_TOKENS = {"blue", "teal", "green", "amber", "rose", "violet", "slate"}
-FOLDER_ICON_TOKENS = {"folder", "home", "project", "photos", "finance", "locked", "archive"}
+FOLDER_ICON_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 
 
 @dataclass(frozen=True)
@@ -364,7 +365,7 @@ def sanitize_folder_icon(value: str | None) -> str | None:
     normalized = (value or "").strip().lower()
     if not normalized:
         return None
-    if normalized not in FOLDER_ICON_TOKENS:
+    if not FOLDER_ICON_PATTERN.fullmatch(normalized):
         raise HTTPException(status_code=400, detail="Invalid folder icon")
     return normalized
 
@@ -1387,7 +1388,14 @@ def build_sidebar_payload(db: Session) -> dict[str, object]:
         "": sorted(folder_path(child, path_cache) for child in vault_root.children),
         ARCHIVE_ROOT: sorted(folder_path(child, path_cache) for child in archive_root.children),
     }
-    return {"folder_children": children}
+    metadata = {
+        folder_path(item, path_cache): {
+            "color": item.color or "",
+            "icon": item.icon or "",
+        }
+        for item in folders
+    }
+    return {"folder_children": children, "folder_metadata": metadata}
 
 
 def build_my_edits_payload(user: UserContext, db: Session) -> dict[str, object]:

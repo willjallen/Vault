@@ -1,4 +1,5 @@
 import { classNames } from "../lib/utils.js";
+import { Icon } from "./common/Icon.js";
 
 const h = React.createElement;
 const { useCallback, useEffect, useMemo, useRef, useState } = React;
@@ -11,24 +12,6 @@ const personalSections = [
 ];
 
 const adminSection = { id: "admin", label: "Admin", detail: "Users, roles, and permissions" };
-
-function CloseIcon() {
-  return h(
-    "svg",
-    {
-      "aria-hidden": "true",
-      fill: "none",
-      height: 16,
-      stroke: "currentColor",
-      strokeLinecap: "round",
-      strokeLinejoin: "round",
-      strokeWidth: 2,
-      viewBox: "0 0 24 24",
-      width: 16,
-    },
-    [h("path", { d: "M18 6 6 18", key: "a" }), h("path", { d: "m6 6 12 12", key: "b" })]
-  );
-}
 
 function SectionButton({ active, section, onSelect }) {
   return h(
@@ -798,7 +781,7 @@ export function SettingsModal({ apiFetch, currentUser, onClose }) {
               type: "button",
               onClick: finish,
             },
-            h(CloseIcon)
+            h(Icon, { icon: "close", size: 16 })
           ),
         ]),
         h("div", { className: "settings-body", key: "body" }, [

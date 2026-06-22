@@ -1,4 +1,5 @@
 import { classNames } from "../../lib/utils.js";
+import { Icon } from "../common/Icon.js";
 import { LockGlyph } from "../common/LockGlyph.js";
 import { StatusBadge } from "../common/StatusBadge.js";
 
@@ -541,7 +542,11 @@ export function InfoDock({
               `· ${historyCount} ${historyCount === 1 ? "event" : "events"}`
             ),
           ]),
-          h("span", { className: classNames("chevron", historyOpen ? "open" : "") }, "›"),
+          h(
+            "span",
+            { className: classNames("chevron", historyOpen ? "open" : "") },
+            h(Icon, { icon: "chevron-right", size: 12 })
+          ),
         ]
       ),
       historyOpen

@@ -8,6 +8,18 @@ function childrenFromContents(contents) {
   return (contents.folders || []).map((item) => item.path);
 }
 
+function metadataFromContents(contents) {
+  return Object.fromEntries(
+    (contents.folders || []).map((item) => [
+      item.path || "",
+      {
+        color: item.color || "",
+        icon: item.icon || "",
+      },
+    ])
+  );
+}
+
 function emptyContents(folder, q, recursive) {
   return {
     folder: folder || "",
@@ -37,9 +49,11 @@ export function useVaultResources({
   const initialContentsChildren = initialContents.folder
     ? { [initialContents.folder]: childrenFromContents(initialContents) }
     : { "": childrenFromContents(initialContents) };
+  const initialContentsMetadata = metadataFromContents(initialContents);
   const [contents, setContents] = useState(initialContents);
   const [sidebar, setSidebar] = useState(initialSidebar);
   const [contentsChildren, setContentsChildren] = useState(initialContentsChildren);
+  const [contentsMetadata, setContentsMetadata] = useState(initialContentsMetadata);
   const [myEditsState, setMyEditsState] = useState(initialMyEdits);
   const [selectedDocDetail, setSelectedDocDetail] = useState(null);
   const [searchQuery, setSearchQuery] = useState("");
@@ -77,9 +91,13 @@ export function useVaultResources({
   const docs = useMemo(() => displayedContents.documents || [], [displayedContents.documents]);
   const subfolders = useMemo(() => displayedContents.folders || [], [displayedContents.folders]);
   const sidebarChildren = useMemo(() => sidebar.folder_children || {}, [sidebar.folder_children]);
+  const sidebarMetadata = useMemo(() => sidebar.folder_metadata || {}, [sidebar.folder_metadata]);
   const folderChildren = useMemo(() => {
     return { ...sidebarChildren, ...contentsChildren };
   }, [contentsChildren, sidebarChildren]);
+  const folderMetadata = useMemo(() => {
+    return { ...sidebarMetadata, ...contentsMetadata };
+  }, [contentsMetadata, sidebarMetadata]);
   const selectedDoc = selectedDocDetail || docs.find((doc) => doc.id === selectedId) || null;
   const myEdits = myEditsState.documents || [];
 
@@ -96,6 +114,10 @@ export function useVaultResources({
       setContentsChildren((prev) => ({
         ...prev,
         [data.folder || ""]: childrenFromContents(data),
+      }));
+      setContentsMetadata((prev) => ({
+        ...prev,
+        ...metadataFromContents(data),
       }));
     }
   }, []);
@@ -352,6 +374,7 @@ export function useVaultResources({
   return {
     docs,
     folderChildren,
+    folderMetadata,
     myEdits,
     recursiveSearch,
     refresh,

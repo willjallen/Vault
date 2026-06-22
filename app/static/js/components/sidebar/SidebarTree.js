@@ -1,4 +1,5 @@
 import { classNames } from "../../lib/utils.js";
+import { Icon } from "../common/Icon.js";
 import { FolderNode } from "./FolderNode.js";
 
 const h = React.createElement;
@@ -48,7 +49,7 @@ export function SidebarTree({
           },
           onDrop: (e) => onDrop("", e, false),
         },
-        h("span", { className: "folder-glyph" }, "📁"),
+        h("span", { className: "folder-glyph" }, h(Icon, { icon: "house", size: 15 })),
         h("span", { className: "folder-name" }, "Vault")
       ),
       tree.map((node) =>

@@ -1,4 +1,5 @@
 import { classNames, isArchivePath } from "../../lib/utils.js";
+import { Icon } from "../common/Icon.js";
 
 const h = React.createElement;
 
@@ -19,6 +20,16 @@ function directChildren(folderChildren, parentPath, predicate) {
       path,
     }))
     .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function folderShortcutIcon(item, archived) {
+  if (item.icon) {
+    return item.icon;
+  }
+  if (!item.path) {
+    return "house";
+  }
+  return archived ? "box-archive" : "folder";
 }
 
 function isActiveShortcut(path, currentFolder) {
@@ -48,6 +59,7 @@ function SidebarFolderShortcut({
   const isActive = isActiveShortcut(item.path, currentFolder || "");
   const isArchived = isArchivePath(item.path);
   const isDropTarget = dropHint === item.path || (!item.path && dropHint === "");
+  const icon = folderShortcutIcon(item, isArchived);
 
   return h(
     "button",
@@ -84,7 +96,17 @@ function SidebarFolderShortcut({
       },
     },
     [
-      h("span", { className: "folder-glyph" }, isArchived ? "🗂" : "📁"),
+      h(
+        "span",
+        {
+          className: classNames(
+            "folder-glyph",
+            item.color ? `folder-color-${item.color}` : "",
+            isArchived ? "archived-text" : ""
+          ),
+        },
+        h(Icon, { icon, size: 15 })
+      ),
       h("span", { className: "folder-name" }, item.name),
     ]
   );

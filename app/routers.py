@@ -333,6 +333,13 @@ def document_is_archive(doc: Document) -> bool:
     return folder_is_archive(doc.folder)
 
 
+def refresh_editable_document(doc: Document, db: Session) -> None:
+    db.refresh(doc)
+    db.expire(doc, ["folder"])
+    if document_is_archive(doc):
+        raise HTTPException(status_code=400, detail="Restore this file before editing")
+
+
 def find_child_folder(db: Session, parent_id: int, name: str) -> Folder | None:
     return (
         db.execute(select(Folder).where(Folder.parent_id == parent_id, Folder.name == name))
@@ -2268,8 +2275,7 @@ def lock_items(
                 if item.type != "document":
                     raise HTTPException(status_code=400, detail="Only files can be locked")
                 doc = get_document_or_404(item.id or 0, db)
-                if document_is_archive(doc):
-                    raise HTTPException(status_code=400, detail="Restore this file before editing")
+                refresh_editable_document(doc, db)
                 lock, created = acquire_document_lock(doc, user, client_meta(request), db)
                 if created:
                     record_event(
@@ -2460,11 +2466,12 @@ def checkout_document(
     doc = get_document_or_404(doc_id, db)
     if document_is_archive(doc):
         raise HTTPException(status_code=400, detail="Restore this file before editing")
-    version = current_version(doc, db)
-    if not version:
-        raise HTTPException(status_code=404, detail="Document has no versions")
     meta = client_meta(request)
     with storage_write_lock():
+        refresh_editable_document(doc, db)
+        version = current_version(doc, db)
+        if not version:
+            raise HTTPException(status_code=404, detail="Document has no versions")
         acquire_document_lock(doc, user, meta, db)
         record_event(doc, user, "checkout", f"Checked out {document_path(doc)}", db, meta=meta)
         data = read_version_bytes(version)
@@ -2497,10 +2504,7 @@ async def checkin_document(
     meta = client_meta(request)
     message = note.strip() or f"Uploaded {upload_name}"
     with storage_write_lock():
-        db.refresh(doc)
-        db.expire(doc, ["folder"])
-        if document_is_archive(doc):
-            raise HTTPException(status_code=400, detail="Restore this file before editing")
+        refresh_editable_document(doc, db)
         lock = get_active_lock(doc, db)
         if not lock or lock.locked_by != user["id"]:
             raise HTTPException(

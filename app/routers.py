@@ -279,10 +279,15 @@ def build_folder_path_cache(folders: list[Folder]) -> dict[int, str]:
     by_id = {folder.id: folder for folder in folders}
     cache: dict[int, str] = {}
 
-    def compute(folder_id: int) -> str:
+    def compute(folder_id: int, visiting: set[int] | None = None) -> str:
         if folder_id in cache:
             return cache[folder_id]
+        visiting = visiting or set()
         folder = by_id[folder_id]
+        if folder_id in visiting:
+            cache[folder_id] = public_folder_path(folder.root_key, folder.name)
+            return cache[folder_id]
+        visiting.add(folder_id)
         if folder.is_root or folder.parent_id is None:
             cache[folder_id] = public_folder_path(folder.root_key, "")
             return cache[folder_id]
@@ -290,7 +295,9 @@ def build_folder_path_cache(folders: list[Folder]) -> dict[int, str]:
         if not parent:
             cache[folder_id] = public_folder_path(folder.root_key, folder.name)
             return cache[folder_id]
-        parent_path = compute(parent.id)
+        parent_path = compute(parent.id, visiting)
+        if folder_id in cache:
+            return cache[folder_id]
         cache[folder_id] = join_path(parent_path, folder.name)
         return cache[folder_id]
 
@@ -304,7 +311,11 @@ def folder_relative_path(folder: Folder) -> str:
         return ""
     parts: list[str] = []
     current: Folder | None = folder
+    seen: set[int] = set()
     while current and not current.is_root:
+        if current.id in seen:
+            break
+        seen.add(current.id)
         parts.append(current.name)
         current = current.parent
     return "/".join(reversed(parts))
@@ -480,6 +491,8 @@ def subtree_folder_ids(root: Folder, folders: list[Folder]) -> set[int]:
     ids: set[int] = set()
     while pending:
         folder_id = pending.pop()
+        if folder_id in ids:
+            continue
         ids.add(folder_id)
         pending.extend(child.id for child in children.get(folder_id, []))
     return ids

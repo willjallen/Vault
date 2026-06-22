@@ -103,7 +103,7 @@ export function useMoveDialog({
         const detail = await res.json().catch(() => ({}));
         throw new Error(detail.detail || "Could not create folder");
       }
-      await refresh(base);
+      await refresh(base, { invalidateContents: true, sidebar: true });
       setMoveDestination(newPath);
       setMoveNewFolderName("");
     } catch (err) {

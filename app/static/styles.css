@@ -1425,6 +1425,166 @@ input[type="text"]:focus {
   color: #e5e7eb;
 }
 
+.confirm-toast-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 2400;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  pointer-events: auto;
+}
+
+.confirm-toast-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(241, 245, 249, 0.34);
+  opacity: 0;
+  backdrop-filter: blur(0);
+  transition:
+    opacity 0.18s ease,
+    backdrop-filter 0.24s ease;
+}
+
+.confirm-toast {
+  position: relative;
+  width: min(540px, calc(100vw - 36px));
+  min-height: 188px;
+  overflow: hidden;
+  border: 1px solid rgba(203, 213, 225, 0.95);
+  border-radius: 18px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.99), rgba(248, 250, 252, 0.98));
+  color: var(--text);
+  box-shadow:
+    0 30px 80px rgba(15, 23, 42, 0.22),
+    0 0 0 1px rgba(255, 255, 255, 0.72),
+    inset 0 1px 0 rgba(255, 255, 255, 0.95);
+  backdrop-filter: blur(18px);
+  opacity: 0;
+  transform: translate3d(0, 18px, 0) scale(0.91);
+  transform-origin: center;
+  transition:
+    opacity 0.16s ease,
+    transform 0.28s cubic-bezier(0.18, 1.32, 0.28, 1);
+  will-change: opacity, transform;
+}
+
+.confirm-toast-layer.phase-visible .confirm-toast-backdrop {
+  opacity: 1;
+  backdrop-filter: blur(9px);
+}
+
+.confirm-toast-layer.phase-visible .confirm-toast {
+  opacity: 1;
+  transform: translate3d(0, 0, 0) scale(1);
+}
+
+.confirm-toast-layer.phase-leaving .confirm-toast-backdrop {
+  opacity: 0;
+  backdrop-filter: blur(0);
+  transition:
+    opacity 0.12s ease,
+    backdrop-filter 0.12s ease;
+}
+
+.confirm-toast-layer.phase-leaving .confirm-toast {
+  opacity: 0;
+  transform: translate3d(0, 10px, 0) scale(0.96);
+  transition:
+    opacity 0.12s ease,
+    transform 0.14s cubic-bezier(0.64, 0, 0.78, 0);
+}
+
+.confirm-toast.danger {
+  border-color: rgba(253, 164, 175, 0.8);
+  background: linear-gradient(180deg, rgba(255, 251, 251, 0.99), rgba(255, 245, 245, 0.98));
+  box-shadow:
+    0 30px 80px rgba(15, 23, 42, 0.22),
+    0 0 0 1px rgba(255, 255, 255, 0.75),
+    0 0 0 6px rgba(225, 29, 72, 0.045),
+    inset 0 1px 0 rgba(255, 255, 255, 0.95);
+}
+
+.confirm-toast-content {
+  position: relative;
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto;
+  gap: 24px;
+  min-height: 188px;
+  padding: 28px;
+}
+
+.confirm-toast-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  justify-content: center;
+}
+
+.confirm-toast-title {
+  font-size: 1.18rem;
+  font-weight: 800;
+  line-height: 1.2;
+  overflow-wrap: anywhere;
+}
+
+.confirm-toast-message {
+  color: #475467;
+  font-size: 0.96rem;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.confirm-toast-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  padding-top: 16px;
+  border-top: 1px solid rgba(226, 232, 240, 0.86);
+}
+
+.confirm-toast-button {
+  min-height: 38px;
+  border: 1px solid var(--outline);
+  border-radius: 10px;
+  padding: 8px 14px;
+  background: #fff;
+  color: var(--text);
+  font-weight: 750;
+  cursor: pointer;
+  transition:
+    transform 0.14s cubic-bezier(0.2, 1.25, 0.32, 1),
+    box-shadow 0.14s ease,
+    border-color 0.14s ease,
+    background 0.14s ease;
+}
+
+.confirm-toast-button:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 8px 18px rgba(15, 23, 42, 0.1);
+}
+
+.confirm-toast-button:active {
+  transform: translateY(1px) scale(0.98);
+}
+
+.confirm-toast-button.primary {
+  border-color: #1d4ed8;
+  background: #2563eb;
+  color: #fff;
+}
+
+.confirm-toast-button.danger {
+  border-color: #be123c;
+  background: #e11d48;
+  color: #fff;
+}
+
+.confirm-toast-button.cancel {
+  color: #475467;
+}
+
 .transfer-dock {
   position: fixed;
   right: 20px;
@@ -1993,6 +2153,10 @@ input[type="text"]:focus {
 }
 
 @media (max-width: 650px) {
+  .confirm-toast-layer {
+    padding: 12px;
+  }
+
   .transfer-dock {
     right: 12px;
     bottom: 12px;
@@ -2001,6 +2165,11 @@ input[type="text"]:focus {
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .confirm-toast-backdrop,
+  .confirm-toast {
+    transition: none;
+  }
+
   .transfer-progress.indeterminate span {
     animation: none;
   }

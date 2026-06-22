@@ -389,14 +389,7 @@ export function InfoDock({
               {
                 className: "btn danger",
                 type: "button",
-                onClick: () => {
-                  const confirmed = window.confirm(
-                    `This will permanently delete "${doc.name}" from the archive. You cannot undo this.`
-                  );
-                  if (confirmed) {
-                    onPermanentDelete(doc.id);
-                  }
-                },
+                onClick: () => onPermanentDelete(doc.id),
                 disabled: busy,
               },
               "Delete forever"

@@ -49,14 +49,7 @@ export function buildFileMenuItems(actions) {
     isAdmin && doc.archived
       ? {
           label: "Delete forever",
-          action: () => {
-            const confirmed = window.confirm(
-              `This will permanently delete "${doc.name}" from the archive. You cannot undo this.`
-            );
-            if (confirmed) {
-              actions.handlePermanentDelete(doc.id);
-            }
-          },
+          action: () => actions.handlePermanentDelete(doc.id),
           danger: true,
           disabled: busy,
         }

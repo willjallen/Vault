@@ -83,6 +83,12 @@ export function useVaultResources({
   const selectedDoc = selectedDocDetail || docs.find((doc) => doc.id === selectedId) || null;
   const myEdits = myEditsState.documents || [];
 
+  const invalidateContentsCache = useCallback(() => {
+    contentsCacheRef.current.clear();
+    prefetchingKeysRef.current.clear();
+    setContentsChildren({});
+  }, []);
+
   const rememberContents = useCallback((data) => {
     const key = contentsKey(data.folder || "", data.q || "", data.recursive);
     contentsCacheRef.current.set(key, data);
@@ -202,20 +208,32 @@ export function useVaultResources({
   );
 
   const refresh = useCallback(
-    async (nextFolder) => {
+    async (nextFolder, options = {}) => {
+      if (options.invalidateContents) {
+        invalidateContentsCache();
+      }
       try {
-        await Promise.all([
+        const requests = [
           fetchContents(nextFolder),
+          options.sidebar ? fetchSidebar() : Promise.resolve(null),
           fetchMyEdits(),
           selectedIdRef.current
             ? fetchDocumentDetail(selectedIdRef.current)
             : Promise.resolve(null),
-        ]);
+        ];
+        await Promise.all(requests);
       } catch {
         setError("Could not refresh data.");
       }
     },
-    [fetchContents, fetchDocumentDetail, fetchMyEdits, setError]
+    [
+      fetchContents,
+      fetchDocumentDetail,
+      fetchMyEdits,
+      fetchSidebar,
+      invalidateContentsCache,
+      setError,
+    ]
   );
 
   const updateDocumentInViews = useCallback((docId, updater) => {
@@ -281,8 +299,10 @@ export function useVaultResources({
       const resources = new Set(pendingResources);
       pendingResources.clear();
       refreshTimer = null;
+      if (resources.has("contents") || resources.has("sidebar")) {
+        invalidateContentsCache();
+      }
       if (resources.has("contents")) {
-        contentsCacheRef.current.clear();
         fetchContents().catch(() => setError("Could not refresh contents."));
       }
       if (resources.has("sidebar")) {
@@ -320,7 +340,14 @@ export function useVaultResources({
         window.clearTimeout(refreshTimer);
       }
     };
-  }, [fetchContents, fetchDocumentDetail, fetchMyEdits, fetchSidebar, setError]);
+  }, [
+    fetchContents,
+    fetchDocumentDetail,
+    fetchMyEdits,
+    fetchSidebar,
+    invalidateContentsCache,
+    setError,
+  ]);
 
   return {
     docs,

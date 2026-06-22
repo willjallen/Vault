@@ -71,6 +71,29 @@ function ThemeSegmented({ value, onChange }) {
   );
 }
 
+function PaletteSegmented({ value, onChange }) {
+  const options = [
+    { id: "cozy", label: "Cozy" },
+    { id: "winui", label: "WinUI" },
+  ];
+  return h(
+    "div",
+    { className: "settings-segmented palette-choice", role: "group", "aria-label": "Palette" },
+    options.map((option) =>
+      h(
+        "button",
+        {
+          className: classNames(value === option.id ? "active" : ""),
+          key: option.id,
+          onClick: () => onChange(option.id),
+          type: "button",
+        },
+        option.label
+      )
+    )
+  );
+}
+
 function SliderMock({ value }) {
   return h(
     "div",
@@ -607,7 +630,9 @@ function SectionPanel({
   activeSection,
   apiFetch,
   currentUser,
+  onPalettePreferenceChange,
   onThemePreferenceChange,
+  palettePreference,
   themePreference,
 }) {
   if (activeSection === "admin") {
@@ -669,6 +694,17 @@ function SectionPanel({
         }),
       }),
       SettingsRow({
+        title: "Palette",
+        copy:
+          palettePreference === "winui"
+            ? "Uses a WinUI-inspired neutral ramp and Windows blue accent."
+            : "Uses the existing softer Vault color palette.",
+        control: PaletteSegmented({
+          onChange: onPalettePreferenceChange,
+          value: palettePreference || "cozy",
+        }),
+      }),
+      SettingsRow({
         title: "Sidebar labels",
         copy: "Keep folder names readable in the left pane.",
         control: ToggleMock({ active: true }),
@@ -686,7 +722,9 @@ export function SettingsModal({
   apiFetch,
   currentUser,
   onClose,
+  onPalettePreferenceChange,
   onThemePreferenceChange,
+  palettePreference = "cozy",
   themePreference = "system",
 }) {
   const sections = currentUser?.is_admin ? [...personalSections, adminSection] : personalSections;
@@ -788,7 +826,9 @@ export function SettingsModal({
             apiFetch,
             currentUser,
             key: "panel",
+            onPalettePreferenceChange,
             onThemePreferenceChange,
+            palettePreference,
             themePreference,
           }),
         ]),

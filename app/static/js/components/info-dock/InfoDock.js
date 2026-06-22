@@ -370,9 +370,7 @@ export function InfoDock({
       h("div", { className: "summary-top" }, [
         h("div", { className: "summary-title" }, [
           h("p", { className: "eyebrow tiny" }, "Details"),
-          h("div", { className: "summary-heading" }, [
-            h("h3", null, doc.name),
-          ]),
+          h("div", { className: "summary-heading" }, [h("h3", null, doc.name)]),
           h("div", { className: "muted tiny location-line" }, [
             "Location: ",
             locationParts

@@ -200,6 +200,19 @@ def is_archived_path(path: str | None) -> bool:
     return parse_public_folder_path(path).root_key == ARCHIVE_ROOT_KEY
 
 
+def ensure_document_upload_folder(folder: str) -> None:
+    if is_archived_path(folder):
+        raise HTTPException(status_code=400, detail="Upload new documents to Vault")
+
+
+def split_document_path(path: str) -> tuple[str, str]:
+    cleaned = normalize_folder(path)
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="Document path is required")
+    parts = cleaned.split("/")
+    return "/".join(parts[:-1]), normalize_item_name(parts[-1], "File name")
+
+
 def format_size(size_bytes: int | None) -> str:
     if size_bytes is None:
         return "-"
@@ -2377,6 +2390,7 @@ async def create_document(
 ) -> dict[str, object]:
     filename = normalize_item_name(file.filename, "File name")
     folder_path_value = normalize_folder(folder)
+    ensure_document_upload_folder(folder_path_value)
     target_folder = get_or_create_folder_path(db, folder_path_value)
     ensure_unique_document_path(db, target_folder.id, filename)
     data = await file.read()

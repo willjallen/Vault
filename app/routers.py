@@ -2442,12 +2442,12 @@ async def create_document(
     filename = normalize_item_name(file.filename, "File name")
     folder_path_value = normalize_folder(folder)
     ensure_document_upload_folder(folder_path_value)
-    target_folder = get_or_create_folder_path(db, folder_path_value)
-    ensure_unique_document_path(db, target_folder.id, filename)
     data = await file.read()
     mime_type = file.content_type or mimetypes.guess_type(filename)[0]
     meta = client_meta(request)
     with storage_write_lock():
+        target_folder = get_or_create_folder_path(db, folder_path_value)
+        ensure_unique_document_path(db, target_folder.id, filename)
         blob = get_or_create_blob_for_data(db, data, mime_type)
         doc = Document(
             folder_id=target_folder.id,

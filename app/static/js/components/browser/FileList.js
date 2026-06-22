@@ -5,6 +5,44 @@ import { FileRow } from "./FileRow.js";
 import { EmptyState } from "./EmptyState.js";
 
 const h = React.createElement;
+const SORT_COLUMNS = [
+  { key: "name", label: "Name", className: "name", defaultDirection: "asc" },
+  { key: "date", label: "Date", className: "date", defaultDirection: "desc" },
+  { key: "user", label: "User", className: "user", defaultDirection: "asc" },
+  { key: "size", label: "Size", className: "size", defaultDirection: "desc" },
+];
+
+function ContentsSortButton({ column, sort, onSortChange }) {
+  const active = sort?.key === column.key;
+  const direction = active ? sort.direction : column.defaultDirection;
+  return h(
+    "button",
+    {
+      type: "button",
+      className: classNames(
+        "contents-sort-button",
+        `contents-sort-${column.className}`,
+        active ? "active" : ""
+      ),
+      "aria-sort": active ? (direction === "desc" ? "descending" : "ascending") : "none",
+      onClick: (e) => {
+        e.stopPropagation();
+        if (onSortChange) {
+          onSortChange(column.key);
+        }
+      },
+    },
+    [
+      h("span", { key: "label" }, column.label),
+      h(Icon, {
+        className: classNames("contents-sort-arrow", active ? "active" : "preview"),
+        icon: direction === "desc" ? "arrow-down" : "arrow-up",
+        key: "icon",
+        size: 10,
+      }),
+    ]
+  );
+}
 
 export function VaultFileList({
   folder,
@@ -13,6 +51,7 @@ export function VaultFileList({
   currentUser,
   selectedKeys = [],
   orderedItems = [],
+  sort,
   searchQuery = "",
   recursiveSearch = false,
   draggingId,
@@ -23,6 +62,7 @@ export function VaultFileList({
   onSelectItem,
   onSearchQueryChange,
   onRecursiveSearchChange,
+  onSortChange,
   onBackgroundClick,
   onOpenFile,
   onFileDragStart,
@@ -82,12 +122,55 @@ export function VaultFileList({
   }
 
   function handleBackgroundClick(e) {
-    if (e.target.closest && e.target.closest(".file-row")) {
+    if (e.target.closest && e.target.closest(".file-row, .contents-table-head")) {
       return;
     }
     if (onBackgroundClick) {
       onBackgroundClick();
     }
+  }
+
+  function renderFolderRow(folderItem) {
+    return h(FolderRow, {
+      key: `folder:${folderItem.path || ""}`,
+      folder: folderItem,
+      editing:
+        draftInFolder &&
+        inlineFolderDraft.mode === "rename" &&
+        inlineFolderDraft.path === folderItem.path,
+      editValue: inlineFolderDraft?.value || "",
+      isDropTarget: dropHint === folderItem.path,
+      isDragging: draggingFolderPath === folderItem.path,
+      selected: selectedSet.has(`folder:${folderItem.path || ""}`),
+      onSelect: (e) => onSelectItem && onSelectItem(folderItem, "folder", e, orderedItems),
+      onOpen: () => onSelectFolder(folderItem.path),
+      onDropEnter: (e) => onDropOnFolder(folderItem.path, e, true),
+      onDrop: (e) => onDropOnFolder(folderItem.path, e, false),
+      onDropLeave: onClearDropHint,
+      onDragStart: (e) =>
+        onFolderDragStart &&
+        onFolderDragStart(e, folderItem.path, dragItemsFor(folderItem, "folder")),
+      onDragEnd: onFolderDragEnd,
+      onContextMenu: (e) => onFolderContextMenu && onFolderContextMenu(e, folderItem),
+      onEditChange: onInlineFolderNameChange,
+      onEditCommit: onCommitInlineFolder,
+      onEditCancel: onCancelInlineFolder,
+    });
+  }
+
+  function renderFileRow(doc) {
+    return h(FileRow, {
+      key: `document:${doc.id}`,
+      doc,
+      currentUser,
+      selected: selectedSet.has(`document:${doc.id}`),
+      draggingId,
+      onSelect: (e) => onSelectItem && onSelectItem(doc, "document", e, orderedItems),
+      onOpen: onOpenFile,
+      onDragStart: (e) => onFileDragStart(e, doc.id, dragItemsFor(doc, "document")),
+      onDragEnd: onFileDragEnd,
+      onContextMenu: (e) => onFileContextMenu && onFileContextMenu(e, doc),
+    });
   }
 
   return h(
@@ -129,6 +212,26 @@ export function VaultFileList({
           ? h("div", { className: "muted tiny" }, "Drop files here to start this folder.")
           : h("div", { className: "muted tiny quiet-text" }, "Select an item to see details."),
       ]),
+      h(
+        "div",
+        {
+          className: "contents-table-head",
+          onClick: (e) => e.stopPropagation(),
+          onMouseDown: (e) => e.stopPropagation(),
+        },
+        [
+          h("span", { className: "contents-sort-spacer", key: "spacer" }),
+          ...SORT_COLUMNS.map((column) =>
+            h(ContentsSortButton, {
+              column,
+              key: column.key,
+              onSortChange,
+              sort,
+            })
+          ),
+          h("span", { className: "contents-sort-status", key: "status" }),
+        ]
+      ),
       h("div", { className: "file-list" }, [
         createDraft
           ? h(FolderRow, {
@@ -152,46 +255,8 @@ export function VaultFileList({
               onEditCancel: onCancelInlineFolder,
             })
           : null,
-        ...subfolders.map((folderItem) =>
-          h(FolderRow, {
-            key: folderItem.path || "root",
-            folder: folderItem,
-            editing:
-              draftInFolder &&
-              inlineFolderDraft.mode === "rename" &&
-              inlineFolderDraft.path === folderItem.path,
-            editValue: inlineFolderDraft?.value || "",
-            isDropTarget: dropHint === folderItem.path,
-            isDragging: draggingFolderPath === folderItem.path,
-            selected: selectedSet.has(`folder:${folderItem.path || ""}`),
-            onSelect: (e) => onSelectItem && onSelectItem(folderItem, "folder", e, orderedItems),
-            onOpen: () => onSelectFolder(folderItem.path),
-            onDropEnter: (e) => onDropOnFolder(folderItem.path, e, true),
-            onDrop: (e) => onDropOnFolder(folderItem.path, e, false),
-            onDropLeave: onClearDropHint,
-            onDragStart: (e) =>
-              onFolderDragStart &&
-              onFolderDragStart(e, folderItem.path, dragItemsFor(folderItem, "folder")),
-            onDragEnd: onFolderDragEnd,
-            onContextMenu: (e) => onFolderContextMenu && onFolderContextMenu(e, folderItem),
-            onEditChange: onInlineFolderNameChange,
-            onEditCommit: onCommitInlineFolder,
-            onEditCancel: onCancelInlineFolder,
-          })
-        ),
-        ...files.map((doc) =>
-          h(FileRow, {
-            key: doc.id,
-            doc,
-            currentUser,
-            selected: selectedSet.has(`document:${doc.id}`),
-            draggingId,
-            onSelect: (e) => onSelectItem && onSelectItem(doc, "document", e, orderedItems),
-            onOpen: onOpenFile,
-            onDragStart: (e) => onFileDragStart(e, doc.id, dragItemsFor(doc, "document")),
-            onDragEnd: onFileDragEnd,
-            onContextMenu: (e) => onFileContextMenu && onFileContextMenu(e, doc),
-          })
+        ...orderedItems.map((item) =>
+          item.type === "folder" ? renderFolderRow(item) : renderFileRow(item)
         ),
         emptyState ? h(EmptyState, { onUpload: onUploadClick }) : null,
       ]),

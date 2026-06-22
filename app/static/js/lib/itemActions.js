@@ -12,11 +12,18 @@ export function docToItem(doc) {
     archived: Boolean(doc.archived),
     folder: doc.folder || "",
     id: doc.id,
+    latest_by: doc.latest_by || "",
+    latest_updated_at: doc.latest_updated_at || null,
+    latest_updated_display: doc.latest_updated_display || "",
+    latest_version_number: doc.latest_version_number || 0,
     lock: doc.lock || {},
     name: doc.name,
     path: doc.path || (doc.folder ? `${doc.folder}/${doc.name}` : doc.name),
     size_bytes: doc.size_bytes || 0,
+    size_display: doc.size_display || "",
     type: "document",
+    version_count: doc.version_count || 0,
+    versions: doc.versions || [],
   };
 }
 
@@ -25,6 +32,7 @@ export function folderToItem(folderItem) {
     archived: isArchivePath(folderItem.path || ""),
     color: folderItem.color || "",
     icon: folderItem.icon || "",
+    latest_by: folderItem.latest_by || "",
     latest_updated_at: folderItem.latest_updated_at || null,
     latest_updated_display: folderItem.latest_updated_display || "",
     name: folderItem.name || folderBaseName(folderItem.path || "", "Folder"),

@@ -82,13 +82,14 @@ export function FileRow({
       ]),
       h("div", { className: "file-cell meta" }, [
         doc.latest_updated_display
-          ? h(
-              "div",
-              { className: "muted tiny" },
-              `${doc.latest_updated_display}${doc.latest_by ? ` · ${doc.latest_by}` : ""}`
-            )
+          ? h("div", { className: "muted tiny" }, doc.latest_updated_display)
           : h("div", { className: "muted tiny" }, "No updates yet"),
       ]),
+      h(
+        "div",
+        { className: "file-cell user" },
+        h("span", { className: "muted tiny" }, doc.latest_by || "-")
+      ),
       h(
         "div",
         { className: "file-cell size" },

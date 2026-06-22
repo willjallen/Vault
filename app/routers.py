@@ -70,6 +70,7 @@ class DocStat:
     folder: str
     size_bytes: int
     mtime: dt.datetime | None
+    latest_by: str | None
 
 
 @dataclass(frozen=True)
@@ -1196,6 +1197,9 @@ def docs_stats_for_folder_payloads(
                 document_folder_path(doc, path_cache),
                 latest_version.blob.size_bytes if latest_version else 0,
                 normalize_timestamp(doc.latest_modified_at),
+                (latest_version.committed_by_name or latest_version.committed_by)
+                if latest_version
+                else None,
             ),
         )
     return stats
@@ -1203,6 +1207,7 @@ def docs_stats_for_folder_payloads(
 
 def folder_summary_payload(folder: Folder, path: str, stats: list[DocStat]) -> dict[str, object]:
     latest: dt.datetime | None = None
+    latest_by: str | None = None
     size = 0
     for stat in stats:
         if not folder_contains_doc_folder(path, stat.folder):
@@ -1210,11 +1215,13 @@ def folder_summary_payload(folder: Folder, path: str, stats: list[DocStat]) -> d
         size += stat.size_bytes
         if stat.mtime and (latest is None or stat.mtime > latest):
             latest = stat.mtime
+            latest_by = stat.latest_by
     return {
         "path": path,
         "name": path.split("/")[-1] if path else "Vault",
         "color": folder.color or "",
         "icon": folder.icon or "",
+        "latest_by": latest_by,
         "latest_updated_at": latest.isoformat() if latest else None,
         "latest_updated_display": format_mtime(latest),
         "size_bytes": size,

@@ -161,6 +161,11 @@ export function FolderRow({
       ),
       h(
         "div",
+        { className: "file-cell user" },
+        h("span", { className: "muted tiny" }, folder.latest_by || "-")
+      ),
+      h(
+        "div",
         { className: "file-cell size" },
         h("span", { className: "muted tiny" }, folder.size_display || "0 B")
       ),

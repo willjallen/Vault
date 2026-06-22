@@ -65,7 +65,7 @@ export function FinderShell({
 }) {
   return h(
     "div",
-    { className: "finder-shell card", onContextMenu: onPageContextMenu },
+    { className: "finder-shell", onContextMenu: onPageContextMenu },
     h(Toolbar, {
       folder,
       breadcrumbs,

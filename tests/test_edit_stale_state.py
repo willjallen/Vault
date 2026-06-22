@@ -34,12 +34,14 @@ class EditStaleStateTests(unittest.TestCase):
             from app.db import SessionLocal, init_db
             from app.models import Document, DocumentLock
             from app.routers import (
-                archive_document,
+                ActionItem,
+                ActionPayload,
+                archive_doc_item,
                 create_document_version,
                 get_document_or_404,
                 get_or_create_blob_for_data,
                 get_or_create_folder_path,
-                lock_document,
+                lock_items,
                 now_utc,
             )
             from app.storage import ensure_storage
@@ -59,7 +61,7 @@ class EditStaleStateTests(unittest.TestCase):
                 "name": "Alice",
                 "email": "alice@example.com",
                 "groups": ["vault-users"],
-                "is_admin": False,
+                "is_admin": True,
             }
 
 
@@ -96,15 +98,18 @@ class EditStaleStateTests(unittest.TestCase):
             try:
                 get_document_or_404(doc_id, stale_db)
                 with SessionLocal() as archive_db:
-                    archive_document(doc_id, FakeRequest(), user, archive_db)
+                    doc = archive_db.get(Document, doc_id)
+                    archive_doc_item(doc, FakeRequest(), user, archive_db)
+                    archive_db.commit()
 
-                try:
-                    lock_document(doc_id, FakeRequest(), user, stale_db)
-                except HTTPException as exc:
-                    assert exc.status_code == 400
-                    assert exc.detail == "Restore this file before editing"
-                else:
-                    raise AssertionError("lock unexpectedly succeeded on an archived document")
+                result = lock_items(
+                    ActionPayload(items=[ActionItem(type="document", id=doc_id)]),
+                    FakeRequest(),
+                    user,
+                    stale_db,
+                )
+                assert result["ok"] == []
+                assert result["failed"][0]["detail"] == "Restore this file before editing"
             finally:
                 stale_db.close()
 
@@ -124,7 +129,7 @@ class EditStaleStateTests(unittest.TestCase):
             from app.db import SessionLocal, init_db
             from app.models import Document, DocumentLock
             from app.routers import (
-                archive_document,
+                archive_doc_item,
                 checkout_document,
                 create_document_version,
                 get_document_or_404,
@@ -149,7 +154,7 @@ class EditStaleStateTests(unittest.TestCase):
                 "name": "Alice",
                 "email": "alice@example.com",
                 "groups": ["vault-users"],
-                "is_admin": False,
+                "is_admin": True,
             }
 
 
@@ -186,7 +191,9 @@ class EditStaleStateTests(unittest.TestCase):
             try:
                 get_document_or_404(doc_id, stale_db)
                 with SessionLocal() as archive_db:
-                    archive_document(doc_id, FakeRequest(), user, archive_db)
+                    doc = archive_db.get(Document, doc_id)
+                    archive_doc_item(doc, FakeRequest(), user, archive_db)
+                    archive_db.commit()
 
                 try:
                     checkout_document(doc_id, FakeRequest(), user, stale_db)

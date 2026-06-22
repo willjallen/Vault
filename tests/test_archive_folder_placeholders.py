@@ -31,7 +31,7 @@ class ArchiveFolderPlaceholderTests(unittest.TestCase):
             """
             from app.db import SessionLocal, init_db
             from app.models import Folder
-            from app.routers import archive_folder, get_or_create_folder_path
+            from app.routers import archive_folder_item, get_folder_by_path, get_or_create_folder_path
 
 
             class FakeClient:
@@ -49,7 +49,7 @@ class ArchiveFolderPlaceholderTests(unittest.TestCase):
                 "name": "User",
                 "email": "user@example.com",
                 "groups": ["vault-users"],
-                "is_admin": False,
+                "is_admin": True,
             }
 
             with SessionLocal() as db:
@@ -57,8 +57,10 @@ class ArchiveFolderPlaceholderTests(unittest.TestCase):
                 get_or_create_folder_path(db, "Archive/Project")
                 db.commit()
 
-                result = archive_folder(FakeRequest(), "Project", user, db)
-                assert result == {"archive_folder": "Archive/Project"}
+                source = get_folder_by_path(db, "Project")
+                result = archive_folder_item(source, FakeRequest(), user, db)
+                db.commit()
+                assert result == "Archive/Project"
 
                 rows = db.query(Folder).filter_by(name="Project").all()
                 assert len(rows) == 1
@@ -75,7 +77,7 @@ class ArchiveFolderPlaceholderTests(unittest.TestCase):
 
             from app.db import SessionLocal, init_db
             from app.models import Folder
-            from app.routers import archive_folder, get_or_create_folder_path
+            from app.routers import archive_folder_item, get_folder_by_path, get_or_create_folder_path
 
 
             class FakeClient:
@@ -93,7 +95,7 @@ class ArchiveFolderPlaceholderTests(unittest.TestCase):
                 "name": "User",
                 "email": "user@example.com",
                 "groups": ["vault-users"],
-                "is_admin": False,
+                "is_admin": True,
             }
 
             with SessionLocal() as db:
@@ -102,7 +104,8 @@ class ArchiveFolderPlaceholderTests(unittest.TestCase):
                 db.commit()
 
                 try:
-                    archive_folder(FakeRequest(), "Project", user, db)
+                    source = get_folder_by_path(db, "Project")
+                    archive_folder_item(source, FakeRequest(), user, db)
                 except HTTPException as exc:
                     assert exc.status_code == 400
                     assert exc.detail == "A folder already exists at that path"
@@ -119,7 +122,7 @@ class ArchiveFolderPlaceholderTests(unittest.TestCase):
             """
             from app.db import SessionLocal, init_db
             from app.models import Folder
-            from app.routers import archive_folder, get_or_create_folder_path, unarchive_folder
+            from app.routers import archive_folder_item, get_folder_by_path, get_or_create_folder_path, restore_folder_item
 
 
             class FakeClient:
@@ -137,19 +140,23 @@ class ArchiveFolderPlaceholderTests(unittest.TestCase):
                 "name": "User",
                 "email": "user@example.com",
                 "groups": ["vault-users"],
-                "is_admin": False,
+                "is_admin": True,
             }
 
             with SessionLocal() as db:
                 get_or_create_folder_path(db, "Project")
                 db.commit()
 
-                archive_folder(FakeRequest(), "Project", user, db)
+                source = get_folder_by_path(db, "Project")
+                archive_folder_item(source, FakeRequest(), user, db)
+                db.commit()
                 get_or_create_folder_path(db, "Project")
                 db.commit()
 
-                result = unarchive_folder(FakeRequest(), "Archive/Project", user, db)
-                assert result == {"folder": "Project"}
+                source = get_folder_by_path(db, "Archive/Project")
+                result = restore_folder_item(source, FakeRequest(), user, db)
+                db.commit()
+                assert result == "Project"
 
                 rows = db.query(Folder).filter_by(name="Project").all()
                 assert len(rows) == 1
@@ -166,7 +173,7 @@ class ArchiveFolderPlaceholderTests(unittest.TestCase):
 
             from app.db import SessionLocal, init_db
             from app.models import Folder
-            from app.routers import archive_folder, get_or_create_folder_path, unarchive_folder
+            from app.routers import archive_folder_item, get_folder_by_path, get_or_create_folder_path, restore_folder_item
 
 
             class FakeClient:
@@ -184,19 +191,22 @@ class ArchiveFolderPlaceholderTests(unittest.TestCase):
                 "name": "User",
                 "email": "user@example.com",
                 "groups": ["vault-users"],
-                "is_admin": False,
+                "is_admin": True,
             }
 
             with SessionLocal() as db:
                 get_or_create_folder_path(db, "Project")
                 db.commit()
 
-                archive_folder(FakeRequest(), "Project", user, db)
+                source = get_folder_by_path(db, "Project")
+                archive_folder_item(source, FakeRequest(), user, db)
+                db.commit()
                 get_or_create_folder_path(db, "Project/Existing")
                 db.commit()
 
                 try:
-                    unarchive_folder(FakeRequest(), "Archive/Project", user, db)
+                    source = get_folder_by_path(db, "Archive/Project")
+                    restore_folder_item(source, FakeRequest(), user, db)
                 except HTTPException as exc:
                     assert exc.status_code == 400
                     assert exc.detail == "A folder already exists at that path"

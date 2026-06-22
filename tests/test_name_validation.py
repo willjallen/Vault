@@ -31,6 +31,13 @@ class NameValidationTests(unittest.TestCase):
         self.assertNotIn("\n", disposition)
         self.assertIn('filename="bad_name.txt"', disposition)
 
+    def test_download_filename_uses_ascii_fallback_for_unicode_names(self) -> None:
+        response = download_response(b"data", "計画😀.txt", "text/plain")
+
+        disposition = response.headers["content-disposition"]
+        self.assertIn('filename="___.txt"', disposition)
+        self.assertIn("filename*=UTF-8''%E8%A8%88%E7%94%BB%F0%9F%98%80.txt", disposition)
+
     def test_document_uploads_reject_archive_paths(self) -> None:
         with self.assertRaises(HTTPException) as raised:
             ensure_document_upload_folder("Archive/manual")

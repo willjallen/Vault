@@ -1964,15 +1964,16 @@ def api_update_folder_properties(
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
     ensure_root_folders(db)
-    folder = get_folder_by_path(db, payload.path)
-    if not folder:
-        raise HTTPException(status_code=404, detail="Folder not found")
-    folder.color = sanitize_folder_color(payload.color)
-    folder.icon = sanitize_folder_icon(payload.icon)
-    record_folder_event(folder, user, "metadata", "Updated folder appearance", db)
-    record_folder_change(db, "properties")
-    commit_state(db)
-    return folder_properties_payload(folder, db)
+    with storage_write_lock():
+        folder = get_folder_by_path(db, payload.path)
+        if not folder:
+            raise HTTPException(status_code=404, detail="Folder not found")
+        folder.color = sanitize_folder_color(payload.color)
+        folder.icon = sanitize_folder_icon(payload.icon)
+        record_folder_event(folder, user, "metadata", "Updated folder appearance", db)
+        record_folder_change(db, "properties")
+        commit_state(db)
+        return folder_properties_payload(folder, db)
 
 
 @router.put("/api/folders/permissions")
@@ -1982,40 +1983,41 @@ def api_update_folder_permissions(
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
     ensure_root_folders(db)
-    folder = get_folder_by_path(db, payload.path)
-    if not folder:
-        raise HTTPException(status_code=404, detail="Folder not found")
-    seen: set[int] = set()
-    groups_by_id = {group.id: group for group in db.execute(select(VaultGroup)).scalars().all()}
-    existing = {
-        permission.group_id: permission
-        for permission in db.execute(
-            select(FolderPermission).where(FolderPermission.folder_id == folder.id),
-        )
-        .scalars()
-        .all()
-    }
-    for row in payload.permissions:
-        if row.group_id in seen:
-            raise HTTPException(status_code=400, detail="Duplicate group permission")
-        seen.add(row.group_id)
-        if row.group_id not in groups_by_id:
-            raise HTTPException(status_code=404, detail="Group not found")
-        permission = existing.get(row.group_id)
-        if not permission:
-            permission = FolderPermission(folder_id=folder.id, group_id=row.group_id)
-            db.add(permission)
-        permission.can_view = row.can_view
-        permission.can_read = row.can_read
-        permission.can_write = row.can_write
-        permission.updated_at = now_utc()
-    for group_id, permission in existing.items():
-        if group_id not in seen:
-            db.delete(permission)
-    record_folder_event(folder, user, "permissions", "Updated folder permissions", db)
-    record_folder_change(db, "permissions")
-    commit_state(db)
-    return folder_properties_payload(folder, db)
+    with storage_write_lock():
+        folder = get_folder_by_path(db, payload.path)
+        if not folder:
+            raise HTTPException(status_code=404, detail="Folder not found")
+        seen: set[int] = set()
+        groups_by_id = {group.id: group for group in db.execute(select(VaultGroup)).scalars().all()}
+        existing = {
+            permission.group_id: permission
+            for permission in db.execute(
+                select(FolderPermission).where(FolderPermission.folder_id == folder.id),
+            )
+            .scalars()
+            .all()
+        }
+        for row in payload.permissions:
+            if row.group_id in seen:
+                raise HTTPException(status_code=400, detail="Duplicate group permission")
+            seen.add(row.group_id)
+            if row.group_id not in groups_by_id:
+                raise HTTPException(status_code=404, detail="Group not found")
+            permission = existing.get(row.group_id)
+            if not permission:
+                permission = FolderPermission(folder_id=folder.id, group_id=row.group_id)
+                db.add(permission)
+            permission.can_view = row.can_view
+            permission.can_read = row.can_read
+            permission.can_write = row.can_write
+            permission.updated_at = now_utc()
+        for group_id, permission in existing.items():
+            if group_id not in seen:
+                db.delete(permission)
+        record_folder_event(folder, user, "permissions", "Updated folder permissions", db)
+        record_folder_change(db, "permissions")
+        commit_state(db)
+        return folder_properties_payload(folder, db)
 
 
 @router.get("/api/documents/{doc_id}/detail")
@@ -2087,24 +2089,25 @@ def create_folder(
     if not normalized:
         raise HTTPException(status_code=400, detail="Folder path is required")
     ensure_folder_creation_path(normalized)
-    if get_folder_by_path(db, normalized):
-        raise HTTPException(status_code=400, detail="Folder already exists")
-    parent_path = "/".join(normalized.split("/")[:-1])
-    name = normalize_item_name(normalized.split("/")[-1], "Folder name")
-    parent = get_or_create_folder_path(db, parent_path)
-    ensure_unique_folder_name(db, parent.id, name)
-    created = Folder(
-        root_key=parent.root_key,
-        parent_id=parent.id,
-        name=name,
-        is_root=False,
-        created_by=user["id"],
-        created_by_name=user["name"],
-    )
-    db.add(created)
-    record_folder_event(created, user, "create", f"Created {normalized}", db)
-    record_folder_change(db, "created")
-    db.commit()
+    with storage_write_lock():
+        if get_folder_by_path(db, normalized):
+            raise HTTPException(status_code=400, detail="Folder already exists")
+        parent_path = "/".join(normalized.split("/")[:-1])
+        name = normalize_item_name(normalized.split("/")[-1], "Folder name")
+        parent = get_or_create_folder_path(db, parent_path)
+        ensure_unique_folder_name(db, parent.id, name)
+        created = Folder(
+            root_key=parent.root_key,
+            parent_id=parent.id,
+            name=name,
+            is_root=False,
+            created_by=user["id"],
+            created_by_name=user["name"],
+        )
+        db.add(created)
+        record_folder_event(created, user, "create", f"Created {normalized}", db)
+        record_folder_change(db, "created")
+        db.commit()
     return {"folder": normalized}
 
 

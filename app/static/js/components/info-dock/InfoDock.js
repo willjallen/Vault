@@ -1,7 +1,6 @@
 import { classNames } from "../../lib/utils.js";
 import { Icon } from "../common/Icon.js";
 import { LockGlyph } from "../common/LockGlyph.js";
-import { StatusBadge } from "../common/StatusBadge.js";
 
 const { useEffect, useMemo, useState } = React;
 const h = React.createElement;
@@ -325,12 +324,12 @@ export function InfoDock({
   }
 
   const statusText = lockedByMe
-    ? "Checked out by you"
+    ? ""
     : lockedByOther
       ? `Checked out by ${doc.lock.name || doc.lock.by}`
       : isArchived
         ? "Archived"
-        : "Ready to edit";
+        : "";
 
   const helperText = lockedByMe
     ? "While it's checked out, others can't upload new versions."
@@ -373,7 +372,6 @@ export function InfoDock({
           h("p", { className: "eyebrow tiny" }, "Details"),
           h("div", { className: "summary-heading" }, [
             h("h3", null, doc.name),
-            h(StatusBadge, { doc, currentUserId, labelOverride: statusText }),
           ]),
           h("div", { className: "muted tiny location-line" }, [
             "Location: ",

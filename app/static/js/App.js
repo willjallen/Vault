@@ -12,6 +12,11 @@ import {
   buildSelectionMenuItems,
 } from "./lib/contextMenus.js";
 import { createDropHandlers } from "./lib/dropHandlers.js";
+import {
+  compareContentsItems,
+  DEFAULT_CONTENTS_SORT,
+  nextContentsSort,
+} from "./lib/contentSort.js";
 import { createFileLockActions } from "./lib/fileLockActions.js";
 import { createFolderActionHandlers } from "./lib/folderActions.js";
 import {
@@ -58,6 +63,7 @@ export function App({ initial }) {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [themePreference, setThemePreference] = useState(readStoredThemePreference);
   const [folderPropertiesTarget, setFolderPropertiesTarget] = useState(null);
+  const [contentsSort, setContentsSort] = useState(DEFAULT_CONTENTS_SORT);
   const [toast, setToast] = useState("");
   const [confirmRequest, setConfirmRequest] = useState(null);
   const uploadInput = useRef(null);
@@ -289,9 +295,17 @@ export function App({ initial }) {
     setSelectedId,
   });
 
-  const contentsItems = useMemo(
+  const unsortedContentsItems = useMemo(
     () => [...subfolders.map(folderToItem), ...docs.map(docToItem)],
     [docs, subfolders]
+  );
+  const contentsItems = useMemo(
+    () =>
+      unsortedContentsItems
+        .filter(Boolean)
+        .slice()
+        .sort((a, b) => compareContentsItems(a, b, contentsSort)),
+    [contentsSort, unsortedContentsItems]
   );
   const contentsByKey = useMemo(
     () => new Map(contentsItems.map((item) => [keyForItem(item), item])),
@@ -433,6 +447,10 @@ export function App({ initial }) {
     }
     clearAllSelections();
     navigateToFolder(item.path || "");
+  }
+
+  function handleContentsSortChange(key) {
+    setContentsSort((current) => nextContentsSort(current, key));
   }
 
   const { handleLock, handleRelease, handleSave, handleStartEdit, handleVersionUpload } =
@@ -816,6 +834,7 @@ export function App({ initial }) {
       files: docs,
       selectedId,
       contentsItems,
+      contentsSort,
       contentsSelection,
       folderItems: folderPaneItems,
       folderSelection,
@@ -844,6 +863,7 @@ export function App({ initial }) {
       onSelectFolderItem: handleSelectFolderItem,
       onSearchQueryChange: setSearchQuery,
       onRecursiveSearchChange: setRecursiveSearch,
+      onContentsSortChange: handleContentsSortChange,
       onClearSelection: () => {
         setContentsSelection([]);
         setContentsAnchor(null);

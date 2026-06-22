@@ -1,0 +1,44 @@
+* text=auto eol=lf
+
+# Keep binary assets byte-for-byte.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.br binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.otf binary
+*.eot binary
+
+# Common media and DCC/game asset formats should never be line-normalized.
+*.mp3 binary
+*.wav binary
+*.ogg binary
+*.flac binary
+*.mp4 binary
+*.mov binary
+*.avi binary
+*.blend binary
+*.fbx binary
+*.glb binary
+*.gltf binary
+*.obj binary
+*.usd binary
+*.usdz binary
+*.exr binary
+*.hdr binary
+*.tga binary
+*.psd binary
+*.ai binary
+
+# Local database/runtime artifacts, if ever force-added, are binary.
+*.db binary
+*.sqlite binary
+*.sqlite3 binary

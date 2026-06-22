@@ -19,8 +19,15 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .auth import UserContext, current_user
-from .config import BASE_DOMAIN
+from .auth import (
+    UserContext,
+    current_user,
+    logout_response,
+    oidc_callback_response,
+    oidc_login_response,
+    require_admin,
+)
+from .config import AUTH_MODE, BASE_DOMAIN
 from .db import SessionLocal, get_db
 from .models import (
     Blob,
@@ -31,6 +38,9 @@ from .models import (
     DocumentVersion,
     Folder,
     StateEvent,
+    VaultGroup,
+    VaultGroupMembership,
+    VaultUser,
 )
 from .storage import (
     StorageConfigurationError,
@@ -73,6 +83,20 @@ class ActionPayload(BaseModel):
     items: list[ActionItem] = Field(default_factory=list)
     destination_folder: str | None = None
     name: str | None = None
+
+
+class AdminUserUpdate(BaseModel):
+    is_admin: bool | None = None
+    is_active: bool | None = None
+
+
+class AdminGroupPayload(BaseModel):
+    name: str
+    description: str | None = None
+
+
+class AdminGroupMemberPayload(BaseModel):
+    user_id: int
 
 
 DOCUMENT_EVENT_RESOURCES: dict[str, tuple[str, ...]] = {
@@ -1238,10 +1262,115 @@ def build_my_edits_payload(user: UserContext, db: Session) -> dict[str, object]:
     }
 
 
+def normalize_group_name(name: str | None) -> str:
+    cleaned = (name or "").strip()
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="Group name is required")
+    if "/" in cleaned or "\\" in cleaned or cleaned in {".", ".."}:
+        raise HTTPException(status_code=400, detail="Invalid group name")
+    return " ".join(cleaned.split())
+
+
+def build_admin_directory_payload(db: Session) -> dict[str, object]:
+    users = list(
+        db.execute(
+            select(VaultUser).order_by(VaultUser.name, VaultUser.email, VaultUser.id),
+        )
+        .scalars()
+        .all(),
+    )
+    groups = list(db.execute(select(VaultGroup).order_by(VaultGroup.name)).scalars().all())
+    memberships = list(db.execute(select(VaultGroupMembership)).scalars().all())
+    groups_by_id = {group.id: group for group in groups}
+    users_by_id = {user.id: user for user in users}
+    group_ids_by_user: dict[int, list[int]] = defaultdict(list)
+    user_ids_by_group: dict[int, list[int]] = defaultdict(list)
+    for membership in memberships:
+        if membership.user_id in users_by_id and membership.group_id in groups_by_id:
+            group_ids_by_user[membership.user_id].append(membership.group_id)
+            user_ids_by_group[membership.group_id].append(membership.user_id)
+
+    return {
+        "users": [
+            {
+                "id": user.id,
+                "issuer": user.issuer,
+                "subject": user.subject,
+                "email": user.email or "",
+                "name": user.name,
+                "is_admin": bool(user.is_admin),
+                "is_active": bool(user.is_active),
+                "created_at": user.created_at.isoformat() if user.created_at else None,
+                "last_login_at": user.last_login_at.isoformat() if user.last_login_at else None,
+                "last_seen_at": user.last_seen_at.isoformat() if user.last_seen_at else None,
+                "groups": [
+                    {"id": groups_by_id[group_id].id, "name": groups_by_id[group_id].name}
+                    for group_id in sorted(
+                        group_ids_by_user[user.id],
+                        key=lambda item: groups_by_id[item].name.lower(),
+                    )
+                ],
+            }
+            for user in users
+        ],
+        "groups": [
+            {
+                "id": group.id,
+                "name": group.name,
+                "description": group.description or "",
+                "members": [
+                    {
+                        "id": users_by_id[user_id].id,
+                        "name": users_by_id[user_id].name,
+                        "email": users_by_id[user_id].email or "",
+                    }
+                    for user_id in sorted(
+                        user_ids_by_group[group.id],
+                        key=lambda item: users_by_id[item].name.lower(),
+                    )
+                ],
+            }
+            for group in groups
+        ],
+    }
+
+
+def ensure_not_last_active_admin(db: Session, target: VaultUser) -> None:
+    if not target.is_admin or not target.is_active:
+        return
+    active_admins = list(
+        db.execute(
+            select(VaultUser).where(
+                VaultUser.is_admin == True,  # noqa: E712
+                VaultUser.is_active == True,  # noqa: E712
+            ),
+        )
+        .scalars()
+        .all(),
+    )
+    if len(active_admins) == 1 and active_admins[0].id == target.id:
+        raise HTTPException(status_code=400, detail="At least one active admin is required")
+
+
+def find_group_by_normalized_name(db: Session, name: str) -> VaultGroup | None:
+    lowered = name.lower()
+    for group in db.execute(select(VaultGroup)).scalars().all():
+        if group.name.lower() == lowered:
+            return group
+    return None
+
+
+def commit_admin_change(db: Session, event_type: str) -> dict[str, object]:
+    record_state_change(db, f"admin.{event_type}", ("admin",))
+    commit_state(db)
+    return build_admin_directory_payload(db)
+
+
 def build_bootstrap_payload(user: UserContext, folder: str, db: Session) -> dict[str, object]:
     ensure_root_folders(db)
     current = get_folder_by_path(db, folder) or get_root_folder(db, VAULT_ROOT_KEY)
     return {
+        "auth_mode": AUTH_MODE,
         "base_domain": BASE_DOMAIN,
         "user": user,
         "current_folder": folder_path(current),
@@ -1349,6 +1478,153 @@ def storage_reconciliation_report(db: Session, apply: bool = False) -> dict[str,
         "unreferenced_local_keys": unreferenced_local_keys,
         "deleted_local_keys": unreferenced_local_keys if apply else [],
     }
+
+
+@router.get("/login")
+def login(request: Request) -> RedirectResponse:
+    return oidc_login_response(request)
+
+
+@router.get("/auth/callback")
+def auth_callback(
+    request: Request,
+    db: Session = Depends(get_db),
+) -> RedirectResponse:
+    return oidc_callback_response(request, db)
+
+
+@router.get("/logout")
+def logout(request: Request) -> RedirectResponse:
+    return logout_response(request)
+
+
+@router.get("/api/admin/directory")
+def api_admin_directory(
+    user: UserContext = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    del user
+    return build_admin_directory_payload(db)
+
+
+@router.patch("/api/admin/users/{user_id}")
+def api_admin_update_user(
+    user_id: int,
+    payload: AdminUserUpdate,
+    user: UserContext = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    del user
+    target = db.get(VaultUser, user_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    if payload.is_admin is False or payload.is_active is False:
+        ensure_not_last_active_admin(db, target)
+    if payload.is_admin is not None:
+        target.is_admin = payload.is_admin
+    if payload.is_active is not None:
+        target.is_active = payload.is_active
+    return commit_admin_change(db, "user.updated")
+
+
+@router.post("/api/admin/groups")
+def api_admin_create_group(
+    payload: AdminGroupPayload,
+    user: UserContext = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    del user
+    name = normalize_group_name(payload.name)
+    if find_group_by_normalized_name(db, name):
+        raise HTTPException(status_code=409, detail="Group already exists")
+    description = (payload.description or "").strip() or None
+    db.add(VaultGroup(name=name, description=description))
+    return commit_admin_change(db, "group.created")
+
+
+@router.patch("/api/admin/groups/{group_id}")
+def api_admin_update_group(
+    group_id: int,
+    payload: AdminGroupPayload,
+    user: UserContext = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    del user
+    group = db.get(VaultGroup, group_id)
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found")
+    name = normalize_group_name(payload.name)
+    existing = find_group_by_normalized_name(db, name)
+    if existing and existing.id != group.id:
+        raise HTTPException(status_code=409, detail="Group already exists")
+    group.name = name
+    group.description = (payload.description or "").strip() or None
+    return commit_admin_change(db, "group.updated")
+
+
+@router.delete("/api/admin/groups/{group_id}")
+def api_admin_delete_group(
+    group_id: int,
+    user: UserContext = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    del user
+    group = db.get(VaultGroup, group_id)
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found")
+    db.delete(group)
+    return commit_admin_change(db, "group.deleted")
+
+
+@router.post("/api/admin/groups/{group_id}/members")
+def api_admin_add_group_member(
+    group_id: int,
+    payload: AdminGroupMemberPayload,
+    user: UserContext = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    del user
+    group = db.get(VaultGroup, group_id)
+    member = db.get(VaultUser, payload.user_id)
+    if not group or not member:
+        raise HTTPException(status_code=404, detail="Group or user not found")
+    existing = (
+        db.execute(
+            select(VaultGroupMembership).where(
+                VaultGroupMembership.group_id == group.id,
+                VaultGroupMembership.user_id == member.id,
+            ),
+        )
+        .scalars()
+        .first()
+    )
+    if not existing:
+        db.add(VaultGroupMembership(group_id=group.id, user_id=member.id))
+    return commit_admin_change(db, "group.member.added")
+
+
+@router.delete("/api/admin/groups/{group_id}/members/{user_id}")
+def api_admin_remove_group_member(
+    group_id: int,
+    user_id: int,
+    user: UserContext = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    del user
+    membership = (
+        db.execute(
+            select(VaultGroupMembership).where(
+                VaultGroupMembership.group_id == group_id,
+                VaultGroupMembership.user_id == user_id,
+            ),
+        )
+        .scalars()
+        .first()
+    )
+    if not membership:
+        raise HTTPException(status_code=404, detail="Membership not found")
+    db.delete(membership)
+    return commit_admin_change(db, "group.member.removed")
 
 
 @router.get("/", response_class=HTMLResponse)

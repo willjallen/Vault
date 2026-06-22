@@ -9,10 +9,10 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    JSON,
     String,
     Text,
     UniqueConstraint,
-    JSON,
     text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -69,6 +69,70 @@ class Folder(Base):
         back_populates="folder",
         cascade="all, delete-orphan",
     )
+
+
+class VaultUser(Base):
+    __tablename__ = "vault_users"
+    __table_args__ = (
+        UniqueConstraint("issuer", "subject", name="uq_vault_users_identity"),
+        Index("ix_vault_users_email", "email"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    issuer: Mapped[str] = mapped_column(String, nullable=False)
+    subject: Mapped[str] = mapped_column(String, nullable=False)
+    email: Mapped[str | None] = mapped_column(String, nullable=True)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    is_admin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=utcnow)
+    last_login_at: Mapped[datetime.datetime | None] = mapped_column(DateTime, nullable=True)
+    last_seen_at: Mapped[datetime.datetime | None] = mapped_column(DateTime, nullable=True)
+
+    memberships: Mapped[list["VaultGroupMembership"]] = relationship(
+        "VaultGroupMembership",
+        back_populates="user",
+        cascade="all, delete-orphan",
+    )
+
+
+class VaultGroup(Base):
+    __tablename__ = "vault_groups"
+    __table_args__ = (UniqueConstraint("name", name="uq_vault_groups_name"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=utcnow)
+
+    memberships: Mapped[list["VaultGroupMembership"]] = relationship(
+        "VaultGroupMembership",
+        back_populates="group",
+        cascade="all, delete-orphan",
+    )
+
+
+class VaultGroupMembership(Base):
+    __tablename__ = "vault_group_memberships"
+    __table_args__ = (UniqueConstraint("user_id", "group_id", name="uq_vault_group_membership"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("vault_users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    group_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("vault_groups.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=utcnow)
+
+    user: Mapped[VaultUser] = relationship("VaultUser", back_populates="memberships")
+    group: Mapped[VaultGroup] = relationship("VaultGroup", back_populates="memberships")
 
 
 class Blob(Base):

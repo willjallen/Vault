@@ -42,6 +42,7 @@ export function FinderShell({
   onFolderDragEnd,
   onFileContextMenu,
   onFolderContextMenu,
+  onMyEditContextMenu,
   onPageContextMenu,
   inlineFolderDraft,
   onInlineFolderNameChange,
@@ -106,6 +107,7 @@ export function FinderShell({
             onSelectFolder(doc.folder || "");
             onSelectDoc(doc.id);
           },
+          onContextMenu: onMyEditContextMenu,
         })
       ),
       h(VaultFileList, {

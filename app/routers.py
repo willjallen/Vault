@@ -301,7 +301,8 @@ def snapshot_version(
                 checksum=checksum,
             )
     version_id = new_version_id()
-    version_path = version_file_path(doc, version_id)
+    original_filename = filename or Path(doc.path).name
+    version_path = version_file_path(doc, version_id, original_filename)
     staged_version = stage_write(version_path, data)
     # Remove any temporary backups immediately; callers will clean up the main file on rollback.
     staged_version.finalize()
@@ -316,7 +317,6 @@ def snapshot_version(
     size_bytes = len(data) if data is not None else None
     upload_ip = meta.get("ip") if meta else None
     upload_user_agent = meta.get("user_agent") if meta else None
-    original_filename = filename or Path(doc.path).name
     if update_latest:
         doc.latest_commit = version_id
         doc.latest_modified_by = user["id"]
@@ -1148,7 +1148,7 @@ async def upload_document(
         db.flush()
 
         working_stage = stage_write(target, data)
-        version_path = version_file_path(doc, version_id)
+        version_path = version_file_path(doc, version_id, filename)
         version_stage = stage_write(version_path, data)
 
         version = DocumentVersion(
@@ -1321,6 +1321,7 @@ async def checkin(
     request: Request,
     file: UploadFile = File(...),
     note: str | None = Form(None),
+    rename_to_upload: bool = Form(False),
     redirect_to: str | None = Form(None),
     db: Session = Depends(get_db),
 ) -> RedirectResponse:
@@ -1346,9 +1347,27 @@ async def checkin(
     now = dt.datetime.now(tz=dt.UTC)
     with storage_write_lock():
         ensure_storage()
-        target = safe_path(doc.path)
-        working_stage = stage_write(target, data)
-        version_path = version_file_path(doc, version_id)
+        current_path = doc.path
+        current_target = safe_path(current_path)
+        upload_name = Path(file.filename or current_path).name
+        next_path = current_path
+        if rename_to_upload:
+            if not upload_name:
+                raise HTTPException(status_code=400, detail="Filename missing")
+            parent = str(Path(current_path).parent).replace("\\", "/")
+            next_path = upload_name if parent in ("", ".") else f"{parent}/{upload_name}"
+            next_target = safe_path(next_path)
+            if next_target != current_target and next_target.exists():
+                raise HTTPException(status_code=400, detail="File already exists")
+        else:
+            next_target = current_target
+
+        doc.path = next_path
+        working_stage = stage_write(current_target, data)
+        move_stage = (
+            stage_move(current_target, next_target) if next_target != current_target else None
+        )
+        version_path = version_file_path(doc, version_id, upload_name)
         version_stage = stage_write(version_path, data)
 
         checksum = hashlib.sha256(data).hexdigest()
@@ -1361,6 +1380,7 @@ async def checkin(
         doc.latest_commit = version_id
         doc.latest_modified_by = user["id"]
         doc.latest_modified_at = now
+        doc.path = next_path
         doc.latest_version_number = version_number
         doc.version_count = max(doc.version_count or 0, version_number)
         version = DocumentVersion(
@@ -1374,7 +1394,7 @@ async def checkin(
             hash_algo="sha256",
             size_bytes=len(data),
             mime_type=mime_type,
-            original_filename=Path(file.filename or doc.path).name,
+            original_filename=upload_name,
             upload_ip=meta.get("ip"),
             upload_user_agent=meta.get("user_agent"),
             created_via="checkin",
@@ -1386,11 +1406,15 @@ async def checkin(
             db.commit()
         except Exception:
             working_stage.rollback()
+            if move_stage:
+                move_stage.rollback()
             version_stage.rollback()
             db.rollback()
             raise
         else:
             working_stage.finalize()
+            if move_stage:
+                move_stage.finalize()
             version_stage.finalize()
     return RedirectResponse(url=safe_redirect(redirect_to), status_code=303)
 
@@ -1421,11 +1445,11 @@ def download_version(
         raise HTTPException(status_code=404, detail="Version not found")
 
     with storage_write_lock():
-        target = version_file_path(doc, version_id)
+        target = version_file_path(doc, version_id, version.original_filename)
         if not target.exists():
             raise HTTPException(status_code=404, detail="Version file missing from repository")
 
-    download_name = Path(doc.path).name
+    download_name = version.original_filename or Path(doc.path).name
     suffix = target.suffix
     if suffix and not download_name.endswith(suffix):
         download_name = f"{Path(download_name).stem}{suffix}"

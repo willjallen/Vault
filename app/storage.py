@@ -88,11 +88,11 @@ def version_dir(doc_id: int) -> Path:
     return FILES_PATH / ".versions" / str(doc_id)
 
 
-def version_file_path(doc: Document, version_id: str) -> Path:
+def version_file_path(doc: Document, version_id: str, filename: str | None = None) -> Path:
     """Build the path to a specific version file for a document."""
-    suffix = Path(doc.path).suffix
-    filename = f"{version_id}{suffix}" if suffix else version_id
-    return version_dir(doc.id) / filename
+    suffix = Path(filename or doc.path).suffix
+    version_filename = f"{version_id}{suffix}" if suffix else version_id
+    return version_dir(doc.id) / version_filename
 
 
 class StagedChange:

@@ -926,6 +926,14 @@ def archive_folder_item(source: Folder, request: Request, user: UserContext, db:
     target_path = public_folder_path(ARCHIVE_ROOT_KEY, folder_relative_path(source))
     target_parent = get_or_create_folder_path(db, "/".join(target_path.split("/")[:-1]))
     target_name = normalize_item_name(target_path.split("/")[-1], "Folder name")
+    existing_target = find_child_folder(db, target_parent.id, target_name)
+    if (
+        existing_target
+        and existing_target.id != source.id
+        and not folder_has_items(db, existing_target)
+    ):
+        db.delete(existing_target)
+        db.flush()
     ensure_unique_folder_name(db, target_parent.id, target_name, source.id)
     meta = client_meta(request)
     for doc in docs_in_folder_subtree(db, source):

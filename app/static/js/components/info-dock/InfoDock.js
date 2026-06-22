@@ -115,25 +115,38 @@ function filterHistoryItems(historyItems) {
   });
 }
 
+function isRootFolder(item) {
+  return item.type === "folder" && (!item.path || item.path === "Archive");
+}
+
 // eslint-disable-next-line complexity
 export function InfoDock({
   doc,
+  selectionItems = [],
   currentUserId,
   onDownload,
+  onDownloadSelection,
   onDownloadVersion,
   onLock,
+  onLockSelection,
   onRename,
   onStartEdit,
   onRelease,
+  onReleaseSelection,
   onSave,
   onArchive,
+  onArchiveSelection,
   onUnarchive,
+  onRestoreSelection,
   onPermanentDelete,
+  onDeleteSelection,
   onOpenFolder,
   onMove,
+  onMoveSelection,
   isAdmin,
   busy,
 }) {
+  const selectionCount = selectionItems.length;
   const lockedByMe = doc && doc.lock && doc.lock.by === currentUserId;
   const lockedByOther = doc && doc.lock && doc.lock.by && doc.lock.by !== currentUserId;
   const isArchived = doc?.archived;
@@ -179,6 +192,113 @@ export function InfoDock({
     }
     return parts;
   }, [isArchived, trimmedFolder]);
+
+  if (selectionCount && !(selectionCount === 1 && selectionItems[0].type === "document" && doc)) {
+    const files = selectionItems.filter((item) => item.type === "document");
+    const folders = selectionItems.filter((item) => item.type === "folder");
+    const allArchived = selectionItems.every((item) => item.archived);
+    const noneArchived = selectionItems.every((item) => !item.archived);
+    const noRoots = selectionItems.every((item) => !isRootFolder(item));
+    const sameLocationScope = allArchived || noneArchived;
+    const allFiles = files.length === selectionItems.length;
+    const lockable =
+      allFiles && files.every((item) => !item.archived && !(item.lock && item.lock.by));
+    const unlockable =
+      allFiles &&
+      files.every((item) => item.lock?.by && (item.lock.by === currentUserId || isAdmin));
+    const totalSize = selectionItems.reduce((sum, item) => sum + (item.size_bytes || 0), 0);
+    return h("div", { className: "info-dock" }, [
+      h("p", { className: "eyebrow tiny" }, "Selection"),
+      h("h3", null, `${selectionCount} selected`),
+      h(
+        "p",
+        { className: "muted tiny" },
+        `${files.length} files · ${folders.length} folders · ${totalSize ? `${totalSize} bytes` : "Size unknown"}`
+      ),
+      h("div", { className: "actions row wrap compact subtle-actions" }, [
+        h(
+          "button",
+          {
+            className: "btn secondary compact",
+            type: "button",
+            onClick: () => onDownloadSelection && onDownloadSelection(selectionItems),
+            disabled: busy || !noRoots,
+          },
+          "Download"
+        ),
+        h(
+          "button",
+          {
+            className: "btn secondary compact",
+            type: "button",
+            onClick: () => onMoveSelection && onMoveSelection(selectionItems),
+            disabled: busy || !noRoots || !sameLocationScope,
+          },
+          "Move..."
+        ),
+        noneArchived && noRoots
+          ? h(
+              "button",
+              {
+                className: "btn secondary compact",
+                type: "button",
+                onClick: () => onArchiveSelection && onArchiveSelection(selectionItems),
+                disabled: busy,
+              },
+              "Move to Archive"
+            )
+          : null,
+        allArchived && noRoots
+          ? h(
+              "button",
+              {
+                className: "btn secondary compact",
+                type: "button",
+                onClick: () => onRestoreSelection && onRestoreSelection(selectionItems),
+                disabled: busy,
+              },
+              "Restore"
+            )
+          : null,
+        lockable
+          ? h(
+              "button",
+              {
+                className: "btn secondary compact",
+                type: "button",
+                onClick: () => onLockSelection && onLockSelection(selectionItems),
+                disabled: busy,
+              },
+              "Lock"
+            )
+          : null,
+        unlockable
+          ? h(
+              "button",
+              {
+                className: "btn secondary compact",
+                type: "button",
+                onClick: () => onReleaseSelection && onReleaseSelection(selectionItems),
+                disabled: busy,
+              },
+              "Unlock"
+            )
+          : null,
+        allArchived && noRoots && isAdmin
+          ? h(
+              "button",
+              {
+                className: "btn danger compact",
+                type: "button",
+                onClick: () => onDeleteSelection && onDeleteSelection(selectionItems),
+                disabled: busy,
+              },
+              "Delete forever"
+            )
+          : null,
+      ]),
+    ]);
+  }
 
   if (!doc) {
     return h("div", { className: "info-dock empty" }, [

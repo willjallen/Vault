@@ -4,14 +4,30 @@ import { FileIcon } from "../common/FileIcon.js";
 const { useEffect, useRef } = React;
 const h = React.createElement;
 
+function parentLabelForFolder(folder) {
+  const folderPath = folder.path || "";
+  const parentPath = folderPath.split("/").slice(0, -1).join("/");
+  const parentWithinArchive = isArchivePath(parentPath);
+  const trimmedParent = parentWithinArchive ? parentPath.replace(/^Archive\/?/, "") : parentPath;
+  if (trimmedParent) {
+    return `In ${parentWithinArchive ? `Archive / ${trimmedParent}` : trimmedParent}`;
+  }
+  if (parentWithinArchive || isArchivePath(folderPath)) {
+    return "In Archive";
+  }
+  return "In Vault";
+}
+
 export function FolderRow({
   folder,
   editing,
   editValue,
   isDraft,
+  selected,
   isDropTarget,
   isDragging,
   onOpen,
+  onSelect,
   onDropEnter,
   onDrop,
   onDropLeave,
@@ -24,14 +40,7 @@ export function FolderRow({
 }) {
   const inputRef = useRef(null);
   const isArchived = isArchivePath(folder.path || "");
-  const parentPath = (folder.path || "").split("/").slice(0, -1).join("/");
-  const parentWithinArchive = isArchivePath(parentPath);
-  const trimmedParent = parentWithinArchive ? parentPath.replace(/^Archive\/?/, "") : parentPath;
-  const parentLabel = trimmedParent
-    ? `In ${parentWithinArchive ? `Archive / ${trimmedParent}` : trimmedParent}`
-    : parentWithinArchive || isArchived
-      ? "In Archive"
-      : "In Vault";
+  const parentLabel = parentLabelForFolder(folder);
 
   useEffect(() => {
     if (!editing || !inputRef.current) {
@@ -60,13 +69,22 @@ export function FolderRow({
         "file-row",
         "folder",
         isArchived ? "archived" : "",
+        selected ? "selected" : "",
         isDropTarget ? "drop-target" : "",
         isDragging ? "dragging" : "",
         editing ? "editing" : ""
       ),
       draggable: !editing && !isDraft,
-      onClick: editing ? undefined : onOpen,
-      onDoubleClick: editing ? undefined : onOpen,
+      tabIndex: editing ? undefined : 0,
+      onClick: editing ? undefined : onSelect,
+      onKeyDown: editing
+        ? undefined
+        : (e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              onOpen();
+            }
+          },
       onContextMenu: (e) => {
         if (editing) {
           e.preventDefault();

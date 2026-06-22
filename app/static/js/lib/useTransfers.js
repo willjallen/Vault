@@ -152,12 +152,15 @@ export function useTransfers({ onUnauthorized } = {}) {
   );
 
   const downloadWithProgress = useCallback(
-    async ({ url, name: displayName, size }) => {
+    async ({ url, name: displayName, size, method, body, headers }) => {
       const id = createTransfer("download", displayName || "Download", size || null);
       try {
         const result = await downloadBlob({
+          body,
           fallbackName: displayName,
           fallbackTotal: size || null,
+          headers,
+          method,
           onProgress: (progress) => updateProgress(id, progress),
           url,
         });

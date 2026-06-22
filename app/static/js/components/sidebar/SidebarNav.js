@@ -35,7 +35,13 @@ function SidebarFolderShortcut({
   item,
   currentFolder,
   dropHint,
+  selected,
   onSelect,
+  onSelectItem,
+  onContextMenu,
+  onFolderDragStart,
+  onFolderDragEnd,
+  draggingFolderPath,
   onDropOnFolder,
   onClearDropHint,
 }) {
@@ -49,13 +55,25 @@ function SidebarFolderShortcut({
       className: classNames(
         "folder-node",
         item.child ? "child-shortcut" : "",
+        selected ? "selected" : "",
         isActive ? "active" : "",
         isDropTarget ? "drop-target" : "",
+        draggingFolderPath === item.path ? "dragging" : "",
         isArchived ? "archived" : ""
       ),
       type: "button",
+      draggable: Boolean(item.path && item.path !== "Archive"),
       title: item.path || item.name,
-      onClick: () => onSelect(item.path),
+      onClick: (e) => onSelectItem && onSelectItem(item, e),
+      onContextMenu: (e) => onContextMenu && onContextMenu(e, { ...item, sourcePane: "folders" }),
+      onDragStart: (e) => onFolderDragStart && onFolderDragStart(e, item.path),
+      onDragEnd: onFolderDragEnd,
+      onKeyDown: (e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          onSelect(item.path);
+        }
+      },
       onDragEnter: (e) => onDropOnFolder(item.path, e, true),
       onDragOver: (e) => e.preventDefault(),
       onDrop: (e) => onDropOnFolder(item.path, e, false),
@@ -75,12 +93,21 @@ function SidebarFolderShortcut({
 function SidebarFolderList({
   title,
   items,
+  orderedItems,
   currentFolder,
   dropHint,
+  selectedKeys,
   onSelect,
+  onSelectItem,
+  onContextMenu,
+  onFolderDragStart,
+  onFolderDragEnd,
+  draggingFolderPath,
   onDropOnFolder,
   onClearDropHint,
 }) {
+  const selectedSet = new Set(selectedKeys || []);
+  const paneItems = orderedItems || items;
   return h("div", { className: "sidebar-section" }, [
     h("p", { className: "eyebrow tiny" }, title),
     h(
@@ -92,7 +119,22 @@ function SidebarFolderList({
           item,
           currentFolder,
           dropHint,
+          selected: selectedSet.has(`folder:${item.path || ""}`),
           onSelect,
+          onSelectItem: (selectedItem, e) =>
+            onSelectItem && onSelectItem(selectedItem, e, paneItems),
+          onContextMenu,
+          onFolderDragStart: (e, path) => {
+            const key = `folder:${path || ""}`;
+            const dragItems = selectedSet.has(key)
+              ? paneItems.filter((folderItem) => selectedSet.has(`folder:${folderItem.path || ""}`))
+              : [item];
+            if (onFolderDragStart) {
+              onFolderDragStart(e, path, dragItems);
+            }
+          },
+          onFolderDragEnd,
+          draggingFolderPath,
           onDropOnFolder,
           onClearDropHint,
         })
@@ -104,36 +146,61 @@ function SidebarFolderList({
 export function SidebarNav({
   currentFolder,
   folderChildren,
+  folderItems,
+  selectedKeys = [],
   dropHint,
   onSelect,
+  onSelectItem,
+  onContextMenu,
+  onFolderDragStart,
+  onFolderDragEnd,
+  draggingFolderPath,
   onDropOnFolder,
   onClearDropHint,
 }) {
-  const vaultItems = [
+  const allItems = folderItems || [
     { name: "Vault", path: "" },
     ...directChildren(folderChildren || {}, "", (child) => !isArchivePath(child)),
-  ];
-  const archiveItems = [
     { name: "Archive", path: "Archive" },
     ...directChildren(folderChildren || {}, "Archive", (child) => isArchivePath(child)),
   ];
+  const vaultItems = allItems.filter(
+    (item) => item.path !== "Archive" && !isArchivePath(item.path)
+  );
+  const archiveItems = allItems.filter(
+    (item) => item.path === "Archive" || isArchivePath(item.path)
+  );
 
   return h("div", null, [
     h(SidebarFolderList, {
       title: "Folders",
       items: vaultItems,
+      orderedItems: allItems,
       currentFolder: currentFolder || "",
       dropHint,
+      selectedKeys,
       onSelect,
+      onSelectItem,
+      onContextMenu,
+      onFolderDragStart,
+      onFolderDragEnd,
+      draggingFolderPath,
       onDropOnFolder,
       onClearDropHint,
     }),
     h(SidebarFolderList, {
       title: "Archive",
       items: archiveItems,
+      orderedItems: allItems,
       currentFolder: currentFolder || "",
       dropHint,
+      selectedKeys,
       onSelect,
+      onSelectItem,
+      onContextMenu,
+      onFolderDragStart,
+      onFolderDragEnd,
+      draggingFolderPath,
       onDropOnFolder,
       onClearDropHint,
     }),

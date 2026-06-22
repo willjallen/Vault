@@ -8,7 +8,7 @@ const h = React.createElement;
 export function FileRow({
   doc,
   currentUser,
-  selectedId,
+  selected,
   draggingId,
   onSelect,
   onOpen,
@@ -40,18 +40,17 @@ export function FileRow({
         "file-row",
         "file",
         isArchived ? "archived" : "",
-        selectedId === doc.id ? "selected" : "",
+        selected ? "selected" : "",
         draggingId === doc.id ? "dragging" : ""
       ),
       draggable: true,
-      onClick: () => onSelect(doc.id),
+      onClick: onSelect,
       onDoubleClick: () => onOpen(doc),
       onDragStart: (e) => onDragStart(e, doc.id),
       onDragEnd: onDragEnd,
       onContextMenu: (e) => {
         e.preventDefault();
         e.stopPropagation();
-        onSelect(doc.id);
         if (onContextMenu) {
           onContextMenu(e);
         }
@@ -99,7 +98,7 @@ export function FileRow({
         h(
           "span",
           {
-            className: classNames("version-chip", selectedId === doc.id ? "visible" : ""),
+            className: classNames("version-chip", selected ? "visible" : ""),
             title: `Current version: v${versionCount}`,
           },
           `v${versionCount}`

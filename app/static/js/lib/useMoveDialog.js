@@ -5,6 +5,7 @@ const { useState } = React;
 export function useMoveDialog({
   folder,
   handleMove,
+  handleMoveSelection,
   handleRenameFolder,
   apiFetch,
   refresh,
@@ -49,6 +50,26 @@ export function useMoveDialog({
       archived: inArchive,
     });
     setMoveDestination(parentPath || (inArchive ? "Archive" : ""));
+    setMoveNewFolderName("");
+  }
+
+  function openMoveDialogForSelection(items) {
+    if (!items || !items.length) {
+      return;
+    }
+    const first = items[0];
+    const archived = items.every((item) => item.archived);
+    const baseFolder =
+      first.type === "folder" ? first.path.split("/").slice(0, -1).join("/") : first.folder || "";
+    setMoveTarget({
+      type: "selection",
+      items,
+      name: `${items.length} items`,
+      path: first.path || "",
+      folder: baseFolder,
+      archived,
+    });
+    setMoveDestination(baseFolder || (archived ? "Archive" : ""));
     setMoveNewFolderName("");
   }
 
@@ -119,10 +140,23 @@ export function useMoveDialog({
     }
     const destinationFolder = moveDestination || (movingTargetInArchive ? "Archive" : "");
     const targetName =
-      moveTarget.type === "folder"
-        ? folderNameFromPath(moveTarget.path)
-        : moveTarget.name || folderNameFromPath(moveTarget.path);
-    const desiredPath = destinationFolder ? `${destinationFolder}/${targetName}` : targetName;
+      moveTarget.type === "selection"
+        ? ""
+        : moveTarget.type === "folder"
+          ? folderNameFromPath(moveTarget.path)
+          : moveTarget.name || folderNameFromPath(moveTarget.path);
+    const desiredPath = targetName
+      ? destinationFolder
+        ? `${destinationFolder}/${targetName}`
+        : targetName
+      : destinationFolder;
+    if (moveTarget.type === "selection") {
+      const selectionMoved = await handleMoveSelection(moveTarget.items, destinationFolder);
+      if (selectionMoved) {
+        closeMoveDialog();
+      }
+      return;
+    }
     if (moveTarget.type === "folder") {
       const normalizedTarget = moveTarget.path || "";
       if (desiredPath === normalizedTarget) {
@@ -157,6 +191,7 @@ export function useMoveDialog({
     creatingMoveFolder,
     openMoveDialogForDoc,
     openMoveDialogForFolder,
+    openMoveDialogForSelection,
     closeMoveDialog,
     setMoveDestinationSafe,
     handleCreateMoveFolder,

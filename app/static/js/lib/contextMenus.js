@@ -79,20 +79,21 @@ export function buildFolderMenuItems(actions) {
   const folderPath = folderItem.path || "";
   const isArchivedFolder = isArchivePath(folderPath);
   const hasPath = Boolean(folderPath);
+  const isRoot = !folderPath || folderPath === "Archive";
   const canPermanentDeleteFolder = isAdmin && isArchivedFolder && folderPath !== "Archive";
   return compactMenuItems([
     { label: "Open", action: () => actions.navigateToFolder(folderPath) },
-    hasPath
+    hasPath && !isRoot
       ? { label: "Rename", action: () => actions.beginRenameFolder(folderPath), disabled: busy }
       : null,
-    hasPath
+    hasPath && !isRoot
       ? {
           label: "Move...",
           action: () => actions.openMoveDialogForFolder(folderItem),
           disabled: busy,
         }
       : null,
-    hasPath
+    hasPath && !isRoot
       ? isArchivedFolder
         ? {
             label: "Restore to Vault",
@@ -109,6 +110,95 @@ export function buildFolderMenuItems(actions) {
       ? {
           label: "Delete forever",
           action: () => actions.handlePermanentDeleteFolder(folderPath),
+          danger: true,
+          disabled: busy,
+        }
+      : null,
+  ]);
+}
+
+function isLockedByOther(doc, currentUser) {
+  return doc.lock?.by && doc.lock.by !== currentUser.id;
+}
+
+function isLockedByMeOrAdmin(doc, currentUser, isAdmin) {
+  return doc.lock?.by && (doc.lock.by === currentUser.id || isAdmin);
+}
+
+function isRootFolder(item) {
+  return item.type === "folder" && (!item.path || item.path === "Archive");
+}
+
+export function buildSelectionMenuItems(actions) {
+  const { selectedItems = [], busy, currentUser, isAdmin } = actions;
+  if (selectedItems.length === 1) {
+    const item = selectedItems[0];
+    if (item.type === "document") {
+      return buildFileMenuItems({ ...actions, doc: item });
+    }
+    return buildFolderMenuItems({
+      ...actions,
+      folderItem: { name: item.name, path: item.path },
+    });
+  }
+
+  const docs = selectedItems.filter((item) => item.type === "document");
+  const allDocs = docs.length === selectedItems.length;
+  const noRoots = selectedItems.every((item) => !isRootFolder(item));
+  const allArchived = selectedItems.every((item) => item.archived);
+  const noneArchived = selectedItems.every((item) => !item.archived);
+  const sameLocationScope = allArchived || noneArchived;
+  const canMove =
+    noRoots &&
+    sameLocationScope &&
+    selectedItems.every((item) => item.type === "folder" || !isLockedByOther(item, currentUser));
+  const canLock = allDocs && docs.every((doc) => !doc.archived && !doc.lock?.by);
+  const canUnlock = allDocs && docs.every((doc) => isLockedByMeOrAdmin(doc, currentUser, isAdmin));
+  const canDelete = isAdmin && allArchived && noRoots;
+
+  return compactMenuItems([
+    {
+      label: "Download",
+      action: () => actions.handleDownloadSelection(selectedItems),
+      disabled: busy || !noRoots,
+    },
+    {
+      label: "Move...",
+      action: () => actions.openMoveDialogForSelection(selectedItems),
+      disabled: busy || !canMove,
+    },
+    noneArchived && noRoots
+      ? {
+          label: "Move to Archive",
+          action: () => actions.handleArchiveItems(selectedItems),
+          disabled: busy,
+        }
+      : null,
+    allArchived && noRoots
+      ? {
+          label: "Restore to Vault",
+          action: () => actions.handleRestoreItems(selectedItems),
+          disabled: busy,
+        }
+      : null,
+    canLock
+      ? {
+          label: "Lock files",
+          action: () => actions.handleLockItems(selectedItems),
+          disabled: busy,
+        }
+      : null,
+    canUnlock
+      ? {
+          label: "Unlock files",
+          action: () => actions.handleUnlockItems(selectedItems),
+          disabled: busy,
+        }
+      : null,
+    canDelete
+      ? {
+          label: "Delete forever",
+          action: () => actions.handleDeleteForeverItems(selectedItems),
           danger: true,
           disabled: busy,
         }

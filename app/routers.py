@@ -631,7 +631,7 @@ def download_response(data: bytes, filename: str, mime_type: str | None = None) 
     return Response(
         content=data,
         media_type=content_type,
-        headers={"Content-Disposition": disposition},
+        headers={"Content-Disposition": disposition, "Content-Length": str(len(data))},
     )
 
 

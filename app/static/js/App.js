@@ -1,4 +1,5 @@
 import { FinderShell } from "./components/FinderShell.js";
+import { TransferDock } from "./components/TransferDock.js";
 import { ContextMenu } from "./components/browser/ContextMenu.js";
 import { MoveDialog } from "./components/browser/MoveDialog.js";
 import {
@@ -16,10 +17,10 @@ import {
   isArchivePath,
   normalizeFolderName,
   toBreadcrumbs,
-  triggerDownload,
 } from "./lib/utils.js";
 import { useMouseNavigation } from "./lib/useMouseNavigation.js";
 import { useMoveDialog } from "./lib/useMoveDialog.js";
+import { useTransfers } from "./lib/useTransfers.js";
 
 const { useEffect, useMemo, useState, useCallback, useRef } = React;
 const h = React.createElement;
@@ -71,6 +72,9 @@ export function App({ initial }) {
     const loginUrl = baseDomain ? `https://auth.${baseDomain}/?rd=${rd}` : `/login?rd=${rd}`;
     window.location.href = loginUrl;
   }, [baseDomain]);
+  const { downloadWithProgress, transfers, uploadWithProgress } = useTransfers({
+    onUnauthorized: redirectToLogin,
+  });
 
   const apiFetch = useCallback(
     async (url, options = {}) => {
@@ -260,6 +264,8 @@ export function App({ initial }) {
       setBusy,
       setError,
       setState,
+      uploadWithProgress,
+      downloadWithProgress,
     });
 
   function handleVersionUploadClick(doc, options = {}) {
@@ -294,11 +300,12 @@ export function App({ initial }) {
     form.append("file", file);
     form.append("folder", targetFolder || "");
     try {
-      const res = await apiFetch("/documents", { method: "POST", body: form });
-      if (!res.ok) {
-        const detail = await res.json().catch(() => ({}));
-        throw new Error(detail.detail || "Upload failed");
-      }
+      await uploadWithProgress({
+        formData: form,
+        name: file.name,
+        size: file.size,
+        url: "/documents",
+      });
       await refresh(folder);
     } catch (err) {
       setError(err.message || "Upload failed. Please try again.");
@@ -312,7 +319,26 @@ export function App({ initial }) {
   }
 
   function handleView(doc) {
-    triggerDownload(`/documents/${doc.id}/download`);
+    downloadWithProgress({
+      name: doc.name,
+      size: doc.size_bytes,
+      url: `/documents/${doc.id}/download`,
+    }).catch((err) => {
+      setError(err.message || "Download failed.");
+    });
+  }
+
+  function handleVersionDownload(item) {
+    if (!item.download_url) {
+      return;
+    }
+    downloadWithProgress({
+      name: item.original_filename || selectedDoc?.name || "download",
+      size: item.size_bytes,
+      url: item.download_url,
+    }).catch((err) => {
+      setError(err.message || "Download failed.");
+    });
   }
 
   async function handleMove(docId, newPath) {
@@ -901,6 +927,7 @@ export function App({ initial }) {
       onTriggerUpload: handleUploadClick,
       logoutUrl,
       onDownload: handleView,
+      onDownloadVersion: handleVersionDownload,
       onLock: handleLock,
       onRename: handleRenameFile,
       onMove: openMoveDialogForDoc,
@@ -939,6 +966,7 @@ export function App({ initial }) {
       className: "hidden-input",
       onChange: (e) => handleVersionUploadInput(e.target.files[0]),
     }),
+    h(TransferDock, { transfers }),
     contextMenu ? h(ContextMenu, { menu: contextMenu, onClose: closeContextMenu }) : null,
     error ? h("div", { className: "toast error" }, error) : null,
     busy ? h("div", { className: "toast subtle" }, "Working...") : null

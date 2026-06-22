@@ -5,10 +5,10 @@ from collections.abc import Generator
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import Connection, create_engine, event
+from sqlalchemy import Connection, create_engine, event, inspect
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
-from .config import DB_PATH
+from .config import DB_PATH, RESET_DB_ON_START
 
 
 class Base(DeclarativeBase):
@@ -44,7 +44,20 @@ def init_db() -> None:
     # Import models so SQLAlchemy is aware of them before creating tables
     from . import models  # noqa: F401
 
+    if RESET_DB_ON_START or _schema_needs_reset():
+        Base.metadata.drop_all(bind=engine)
     Base.metadata.create_all(bind=engine)
+
+
+def _schema_needs_reset() -> bool:
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names())
+    if not tables:
+        return False
+    if "documents" not in tables:
+        return False
+    document_columns = {column["name"] for column in inspector.get_columns("documents")}
+    return "folder_id" not in document_columns or "current_version_id" not in document_columns
 
 
 def get_db() -> Generator[Session, None, None]:

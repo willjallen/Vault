@@ -21,15 +21,16 @@ import {
 import { useMouseNavigation } from "./lib/useMouseNavigation.js";
 import { useMoveDialog } from "./lib/useMoveDialog.js";
 import { useTransfers } from "./lib/useTransfers.js";
+import { useVaultResources } from "./lib/useVaultResources.js";
 
 const { useEffect, useMemo, useState, useCallback, useRef } = React;
 const h = React.createElement;
 
 export function App({ initial }) {
-  const [folder, setFolder] = useState(initial.current_folder || "");
+  const initialBootstrap = initial.bootstrap || initial;
+  const [folder, setFolder] = useState(initialBootstrap.current_folder || "");
   const [folderBackStack, setFolderBackStack] = useState([]);
   const [folderForwardStack, setFolderForwardStack] = useState([]);
-  const [state, setState] = useState(initial);
   const [selectedId, setSelectedId] = useState(null);
   const [uploading, setUploading] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -49,7 +50,7 @@ export function App({ initial }) {
   const closeContextMenu = useCallback(() => setContextMenu(null), []);
 
   const baseDomain =
-    state.base_domain ||
+    initialBootstrap.base_domain ||
     (window.location.hostname.includes(".")
       ? window.location.hostname.split(".").slice(1).join(".")
       : "");
@@ -58,9 +59,6 @@ export function App({ initial }) {
     return baseDomain ? `https://auth.${baseDomain}/logout?rd=${rd}` : `/logout?rd=${rd}`;
   }, [baseDomain]);
   const redirectingRef = useRef(false);
-  const docs = useMemo(() => state.doc_payloads || [], [state.doc_payloads]);
-  const folderChildren = useMemo(() => state.folder_children || {}, [state.folder_children]);
-  const folderPayloads = useMemo(() => state.folder_payloads || {}, [state.folder_payloads]);
 
   const redirectToLogin = useCallback(() => {
     if (redirectingRef.current) {
@@ -96,56 +94,10 @@ export function App({ initial }) {
     [redirectToLogin]
   );
 
-  const currentUser = state.user || {};
+  const currentUser = initialBootstrap.user || {};
   const isAdmin = Boolean(currentUser.is_admin);
 
-  const inArchiveView = isArchivePath(folder);
-
-  const visibleDocs = useMemo(() => {
-    const targetFolder = folder || "";
-    return docs
-      .filter((d) => {
-        const docFolder = d.folder || "";
-        if (inArchiveView) {
-          return docFolder === targetFolder;
-        }
-        if (isArchivePath(docFolder)) {
-          return false;
-        }
-        return docFolder === targetFolder;
-      })
-      .slice()
-      .sort((a, b) => a.name.localeCompare(b.name));
-  }, [docs, folder, inArchiveView]);
-
-  const subfolders = useMemo(() => {
-    const targetFolder = folder || "";
-    // eslint-disable-next-line security/detect-object-injection
-    const raw = (folderChildren[targetFolder] || []).filter((path) =>
-      inArchiveView ? isArchivePath(path) : !isArchivePath(path)
-    );
-    return raw
-      .map((path) => {
-        // eslint-disable-next-line security/detect-object-injection
-        const payload = folderPayloads[path] || {};
-        return {
-          path,
-          name:
-            payload.name ||
-            path.split("/").filter(Boolean).slice(-1)[0] ||
-            (inArchiveView ? "Archive" : "Vault"),
-          latest_updated_display: payload.latest_updated_display || "Not updated yet",
-          latest_updated_at: payload.latest_updated_at || null,
-          size_bytes: payload.size_bytes || 0,
-          size_display: payload.size_display || "0 B",
-        };
-      })
-      .sort((a, b) => a.name.localeCompare(b.name));
-  }, [folderChildren, folder, folderPayloads, inArchiveView]);
-
   const breadcrumbs = useMemo(() => toBreadcrumbs(folder || ""), [folder]);
-  const selectedDoc = docs.find((d) => d.id === selectedId) || null;
-  const myEdits = docs.filter((d) => d.lock && d.lock.by === currentUser.id);
   const canGoBack = folderBackStack.length > 0;
   const canGoForward = folderForwardStack.length > 0;
   const canGoUp = Boolean(folder);
@@ -217,53 +169,38 @@ export function App({ initial }) {
   }, [folder]);
 
   useEffect(() => {
-    if (!selectedId) {
-      return;
-    }
-    const doc = docs.find((d) => d.id === selectedId);
-    const targetFolder = folder || "";
-    if (!doc || doc.folder !== targetFolder) {
-      setSelectedId(null);
-    }
-  }, [docs, selectedId, folder]);
-
-  useEffect(() => {
     closeContextMenu();
   }, [folder, closeContextMenu]);
 
-  useEffect(() => {
-    const interval = setInterval(() => {
-      apiFetch(`/api/state?folder=${encodeURIComponent(folder || "")}`).catch(() => {});
-    }, 45000);
-    return () => clearInterval(interval);
-  }, [apiFetch, folder]);
-
-  const refresh = useCallback(
-    async (nextFolder = folder) => {
-      try {
-        const res = await apiFetch(`/api/state?folder=${encodeURIComponent(nextFolder || "")}`);
-        const data = await res.json();
-        setState((prev) => ({ ...prev, ...data }));
-      } catch (err) {
-        setError("Could not refresh data.");
-      }
-    },
-    [apiFetch, folder]
-  );
-
-  useEffect(() => {
-    refresh(folder);
-  }, [folder, refresh]);
+  const {
+    docs,
+    folderChildren,
+    myEdits,
+    recursiveSearch,
+    refresh,
+    searchQuery,
+    selectedDoc,
+    setRecursiveSearch,
+    setSearchQuery,
+    subfolders,
+    updateDocumentInViews,
+  } = useVaultResources({
+    initial,
+    apiFetch,
+    folder,
+    selectedId,
+    setError,
+    setSelectedId,
+  });
 
   const { handleLock, handleRelease, handleSave, handleStartEdit, handleVersionUpload } =
     createFileLockActions({
       apiFetch,
       currentUser,
-      folder,
       refresh,
       setBusy,
       setError,
-      setState,
+      updateDocument: updateDocumentInViews,
       uploadWithProgress,
       downloadWithProgress,
     });
@@ -306,7 +243,7 @@ export function App({ initial }) {
         size: file.size,
         url: "/documents",
       });
-      await refresh(folder);
+      await refresh();
     } catch (err) {
       setError(err.message || "Upload failed. Please try again.");
     } finally {
@@ -368,7 +305,7 @@ export function App({ initial }) {
         const detail = await res.json().catch(() => ({}));
         throw new Error(detail.detail || "Move failed");
       }
-      await refresh(folder);
+      await refresh();
       success = true;
     } catch (err) {
       setError(err.message || "Move failed.");
@@ -389,7 +326,7 @@ export function App({ initial }) {
         const detail = await res.json().catch(() => ({}));
         throw new Error(detail.detail || "Archive failed");
       }
-      await refresh(folder);
+      await refresh();
       setSelectedId(null);
     } catch (err) {
       setError(err.message || "Archive failed.");
@@ -428,7 +365,7 @@ export function App({ initial }) {
         const detail = await res.json().catch(() => ({}));
         throw new Error(detail.detail || "Delete failed");
       }
-      await refresh(folder);
+      await refresh();
       setSelectedId(null);
     } catch (err) {
       setError(err.message || "Delete failed.");
@@ -888,9 +825,11 @@ export function App({ initial }) {
       myEdits,
       folderChildren,
       subfolders,
-      files: visibleDocs,
+      files: docs,
       selectedId,
       selectedDoc,
+      searchQuery,
+      recursiveSearch,
       dropHint,
       uploadHover,
       draggingId,
@@ -909,6 +848,8 @@ export function App({ initial }) {
       onNavigateUp: navigateUp,
       onSelectFolder: navigateToFolder,
       onSelectDoc: setSelectedId,
+      onSearchQueryChange: setSearchQuery,
+      onRecursiveSearchChange: setRecursiveSearch,
       onClearSelection: () => setSelectedId(null),
       onOpenDoc: handleView,
       onDropOnFolder: handleDropOnFolder,

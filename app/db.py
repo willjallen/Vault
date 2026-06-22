@@ -5,7 +5,7 @@ from collections.abc import Generator
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import Connection, MetaData, create_engine, event, inspect, select
+from sqlalchemy import MetaData, create_engine, event, inspect, select
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from .config import DB_PATH, RESET_DB_ON_START
@@ -33,12 +33,6 @@ def set_sqlite_pragma(dbapi_connection: Any, _: object) -> None:
     cursor.close()
 
 
-@event.listens_for(engine, "begin")
-def set_begin_immediate(conn: Connection) -> None:
-    # Ensure write transactions grab the lock up front to reduce mid-flight SQLITE_BUSY.
-    conn.exec_driver_sql("BEGIN IMMEDIATE")
-
-
 def init_db() -> None:
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     # Import models so SQLAlchemy is aware of them before creating tables
@@ -61,6 +55,7 @@ def _schema_needs_reset() -> bool:
         "document_versions",
         "document_locks",
         "document_events",
+        "state_events",
         "blobs",
         "blob_locations",
     }

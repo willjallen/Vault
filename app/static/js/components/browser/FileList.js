@@ -5,18 +5,63 @@ import { EmptyState } from "./EmptyState.js";
 
 const h = React.createElement;
 
+function SearchIcon() {
+  return h(
+    "svg",
+    {
+      "aria-hidden": "true",
+      viewBox: "0 0 20 20",
+      width: 16,
+      height: 16,
+      fill: "none",
+      stroke: "currentColor",
+      strokeWidth: 1.8,
+      strokeLinecap: "round",
+      strokeLinejoin: "round",
+    },
+    [h("circle", { cx: 9, cy: 9, r: 5 }), h("path", { d: "m13 13 4 4" })]
+  );
+}
+
+function RecursiveSearchIcon() {
+  return h(
+    "svg",
+    {
+      "aria-hidden": "true",
+      viewBox: "0 0 20 20",
+      width: 16,
+      height: 16,
+      fill: "none",
+      stroke: "currentColor",
+      strokeWidth: 1.8,
+      strokeLinecap: "round",
+      strokeLinejoin: "round",
+    },
+    [
+      h("path", { d: "M4 5h4a4 4 0 0 1 4 4v6" }),
+      h("path", { d: "M4 15h4a4 4 0 0 0 4-4V5" }),
+      h("path", { d: "m9 12 3 3 3-3" }),
+      h("path", { d: "m9 8 3-3 3 3" }),
+    ]
+  );
+}
+
 export function VaultFileList({
   folder,
   subfolders,
   files,
   currentUser,
   selectedId,
+  searchQuery = "",
+  recursiveSearch = false,
   draggingId,
   draggingFolderPath,
   dropHint,
   uploadHover,
   onSelectFolder,
   onSelectFile,
+  onSearchQueryChange,
+  onRecursiveSearchChange,
   onBackgroundClick,
   onOpenFile,
   onFileDragStart,
@@ -39,7 +84,8 @@ export function VaultFileList({
   const inArchive = isArchivePath(folder);
   const draftInFolder = inlineFolderDraft && inlineFolderDraft.parent === (folder || "");
   const createDraft = draftInFolder && inlineFolderDraft.mode === "create";
-  const emptyState = files.length === 0 && subfolders.length === 0 && !createDraft;
+  const hasRows = files.length > 0 || subfolders.length > 0 || createDraft;
+  const emptyState = !hasRows;
 
   function handleBackgroundClick(e) {
     if (e.target.closest && e.target.closest(".file-row")) {
@@ -149,10 +195,40 @@ export function VaultFileList({
             onContextMenu: (e) => onFileContextMenu && onFileContextMenu(e, doc),
           })
         ),
-        files.length === 0 && subfolders.length === 0
-          ? h(EmptyState, { onUpload: onUploadClick })
-          : null,
+        emptyState ? h(EmptyState, { onUpload: onUploadClick }) : null,
       ]),
+      h(
+        "div",
+        {
+          className: "contents-search",
+          onClick: (e) => e.stopPropagation(),
+          onMouseDown: (e) => e.stopPropagation(),
+        },
+        [
+          h("span", { className: "contents-search-icon" }, h(SearchIcon)),
+          h("input", {
+            type: "search",
+            value: searchQuery,
+            placeholder: "Search",
+            "aria-label": "Search contents",
+            onChange: (e) => onSearchQueryChange && onSearchQueryChange(e.target.value),
+          }),
+          h(
+            "button",
+            {
+              type: "button",
+              className: classNames("recursive-search-button", recursiveSearch ? "active" : ""),
+              title: recursiveSearch ? "Searching subfolders" : "Search subfolders",
+              "aria-label": recursiveSearch
+                ? "Disable recursive search"
+                : "Enable recursive search",
+              "aria-pressed": recursiveSearch,
+              onClick: () => onRecursiveSearchChange && onRecursiveSearchChange(!recursiveSearch),
+            },
+            h(RecursiveSearchIcon)
+          ),
+        ]
+      ),
     ]
   );
 }

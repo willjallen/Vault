@@ -1,7 +1,9 @@
 # Copyright (c) 2024 The Allen Family
 """HTTP routes for the vault service."""
 
+import asyncio
 import datetime as dt
+import json
 import mimetypes
 from collections import defaultdict
 from dataclasses import dataclass
@@ -9,14 +11,14 @@ from pathlib import Path
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Response, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .auth import UserContext, current_user
 from .config import BASE_DOMAIN
-from .db import get_db
+from .db import SessionLocal, get_db
 from .models import (
     Blob,
     BlobLocation,
@@ -25,6 +27,7 @@ from .models import (
     DocumentLock,
     DocumentVersion,
     Folder,
+    StateEvent,
 )
 from .storage import (
     StorageConfigurationError,
@@ -55,6 +58,22 @@ class DocStat:
 class PublicFolderPath:
     root_key: str
     relative_path: str
+
+
+DOCUMENT_EVENT_RESOURCES: dict[str, tuple[str, ...]] = {
+    "download": ("document_detail",),
+    "checkout": ("contents", "document_detail", "my_edits"),
+    "lock": ("contents", "document_detail", "my_edits"),
+    "release": ("contents", "document_detail", "my_edits"),
+    "move": ("contents", "sidebar", "document_detail"),
+    "archive": ("contents", "sidebar", "document_detail", "my_edits"),
+    "unarchive": ("contents", "sidebar", "document_detail", "my_edits"),
+}
+
+VERSION_CHANGE_RESOURCES: dict[str, tuple[str, ...]] = {
+    "upload": ("contents", "sidebar", "document_detail"),
+    "checkin": ("contents", "document_detail", "my_edits"),
+}
 
 
 def client_meta(request: Request) -> dict[str, str | None]:
@@ -424,6 +443,7 @@ def record_event(
     db: Session,
     meta: dict[str, str | None] | None = None,
     result: str | None = None,
+    publish_state: bool = True,
 ) -> DocumentEvent:
     event = DocumentEvent(
         document_id=doc.id,
@@ -436,6 +456,12 @@ def record_event(
         user_agent=meta.get("user_agent") if meta else None,
     )
     db.add(event)
+    if publish_state:
+        record_state_change(
+            db,
+            f"document.{event_type}",
+            DOCUMENT_EVENT_RESOURCES.get(event_type, ("document_detail",)),
+        )
     return event
 
 
@@ -568,6 +594,11 @@ def create_document_version(
     doc.latest_modified_by = user["id"]
     doc.latest_version_number = version_number
     doc.version_count = max(doc.version_count or 0, version_number)
+    record_state_change(
+        db,
+        f"document.{created_via}",
+        VERSION_CHANGE_RESOURCES.get(created_via, ("contents", "document_detail")),
+    )
     return version
 
 
@@ -671,171 +702,345 @@ def folder_contains_doc_folder(folder: str, doc_folder: str) -> bool:
     return doc_folder == folder or doc_folder.startswith(f"{folder}/")
 
 
-def build_state(user: UserContext, current_folder: str, db: Session) -> dict[str, object]:
-    ensure_root_folders(db)
-    folders = all_folders(db)
-    path_cache = build_folder_path_cache(folders)
-    docs = db.execute(select(Document)).scalars().all()
-    locks = {
+def active_locks_by_document(db: Session) -> dict[int, DocumentLock]:
+    return {
         lock.document_id: lock
         for lock in db.execute(select(DocumentLock).where(DocumentLock.is_active == True)).scalars()  # noqa: E712
     }
+
+
+def lock_payload(lock: DocumentLock | None) -> dict[str, object | None]:
+    return {
+        "by": lock.locked_by if lock else None,
+        "name": lock.locked_by_name if lock else None,
+        "at": lock.locked_at.isoformat() if lock and lock.locked_at else None,
+        "ip": lock.locked_ip if lock else None,
+        "user_agent": lock.locked_user_agent if lock else None,
+        "force_acquired": lock.force_acquired if lock else None,
+    }
+
+
+def document_row_payload(
+    doc: Document,
+    db: Session,
+    path_cache: dict[int, str],
+    locks: dict[int, DocumentLock] | None = None,
+) -> dict[str, object]:
+    latest_version = current_version(doc, db)
+    latest_size_bytes = latest_version.blob.size_bytes if latest_version else None
+    latest_updated_at = normalize_timestamp(doc.latest_modified_at)
+    doc_folder = document_folder_path(doc, path_cache)
+    doc_path = document_path(doc, path_cache)
+    lock = (locks or {}).get(doc.id)
+    return {
+        "id": doc.id,
+        "name": doc.name,
+        "path": doc_path,
+        "folder": doc_folder,
+        "latest_updated_at": latest_updated_at.isoformat() if latest_updated_at else None,
+        "latest_updated_display": format_mtime(latest_updated_at),
+        "latest_by": (latest_version.committed_by_name or latest_version.committed_by)
+        if latest_version
+        else None,
+        "latest_message": latest_version.message if latest_version else None,
+        "latest_version_number": latest_version.version_number
+        if latest_version
+        else doc.latest_version_number,
+        "version_count": doc.version_count or 0,
+        "created_by": doc.created_by,
+        "created_by_name": doc.created_by_name,
+        "created_at": doc.created_at.isoformat() if doc.created_at else None,
+        "size_bytes": latest_size_bytes,
+        "size_display": format_size(latest_size_bytes),
+        "lock": lock_payload(lock),
+        "archived": document_is_archive(doc),
+    }
+
+
+def document_detail_payload(
+    doc: Document,
+    db: Session,
+    path_cache: dict[int, str] | None = None,
+    locks: dict[int, DocumentLock] | None = None,
+) -> dict[str, object]:
+    cache = path_cache or build_folder_path_cache(all_folders(db))
+    payload = document_row_payload(doc, db, cache, locks or active_locks_by_document(db))
     versions = (
         db.execute(
-            select(DocumentVersion).order_by(
-                DocumentVersion.document_id,
-                DocumentVersion.committed_at.desc(),
-            ),
+            select(DocumentVersion)
+            .where(DocumentVersion.document_id == doc.id)
+            .order_by(DocumentVersion.committed_at.desc()),
         )
         .scalars()
         .all()
     )
     events = (
         db.execute(
-            select(DocumentEvent).order_by(
-                DocumentEvent.document_id,
-                DocumentEvent.created_at.desc(),
+            select(DocumentEvent)
+            .where(DocumentEvent.document_id == doc.id)
+            .order_by(DocumentEvent.created_at.desc()),
+        )
+        .scalars()
+        .all()
+    )
+    filtered_versions = dedupe_versions_by_checksum(list(versions))
+    version_signatures = {version_signature(version) for version in filtered_versions}
+    history_items: list[dict[str, object]] = []
+    for version in filtered_versions:
+        history_items.append(
+            {
+                "id": version.id,
+                "type": "version",
+                "timestamp": version.committed_at.isoformat() if version.committed_at else None,
+                "display": version.committed_at.strftime("%b %d, %Y %H:%M")
+                if version.committed_at
+                else "Version",
+                "by": version.committed_by_name or version.committed_by,
+                "note": version.message,
+                "version_number": version.version_number,
+                "created_via": version.created_via,
+                "checksum": version.blob.hash,
+                "hash_algo": version.blob.hash_algo,
+                "size_bytes": version.blob.size_bytes,
+                "mime_type": version.mime_type,
+                "original_filename": version.original_filename,
+                "download_url": f"/documents/{doc.id}/versions/{version.id}/download",
+            },
+        )
+    for event in events:
+        if event_signature(event) in version_signatures:
+            continue
+        history_items.append(
+            {
+                "id": f"event-{event.id}",
+                "type": event.event_type,
+                "timestamp": event.created_at.isoformat() if event.created_at else None,
+                "display": event.created_at.strftime("%b %d, %Y %H:%M")
+                if event.created_at
+                else event.event_type.title(),
+                "by": event.actor_name or event.actor,
+                "note": event.message,
+                "result": event.result,
+                "download_url": None,
+            },
+        )
+    history_items.sort(key=lambda item: str(item["timestamp"] or ""), reverse=True)
+    payload["versions"] = history_items
+    return payload
+
+
+def docs_stats_for_folder_payloads(
+    docs: list[Document],
+    db: Session,
+    path_cache: dict[int, str],
+) -> list[DocStat]:
+    stats: list[DocStat] = []
+    for doc in docs:
+        latest_version = current_version(doc, db)
+        stats.append(
+            DocStat(
+                document_folder_path(doc, path_cache),
+                latest_version.blob.size_bytes if latest_version else 0,
+                normalize_timestamp(doc.latest_modified_at),
+            ),
+        )
+    return stats
+
+
+def folder_summary_payload(path: str, stats: list[DocStat]) -> dict[str, object]:
+    latest: dt.datetime | None = None
+    size = 0
+    for stat in stats:
+        if not folder_contains_doc_folder(path, stat.folder):
+            continue
+        size += stat.size_bytes
+        if stat.mtime and (latest is None or stat.mtime > latest):
+            latest = stat.mtime
+    return {
+        "path": path,
+        "name": path.split("/")[-1] if path else "Vault",
+        "latest_updated_at": latest.isoformat() if latest else None,
+        "latest_updated_display": format_mtime(latest),
+        "size_bytes": size,
+        "size_display": format_size(size),
+    }
+
+
+def matches_query(query: str, *values: str | None) -> bool:
+    needle = query.strip().lower()
+    if not needle:
+        return True
+    return any(needle in (value or "").lower() for value in values)
+
+
+def folder_is_in_scope(target: str, candidate: str, recursive: bool) -> bool:
+    if recursive:
+        return folder_contains_doc_folder(target, candidate)
+    return candidate == target
+
+
+def build_contents_payload(
+    db: Session,
+    folder: str,
+    q: str = "",
+    recursive: bool = False,
+) -> dict[str, object]:
+    ensure_root_folders(db)
+    current_folder = get_folder_by_path(db, folder)
+    if not current_folder:
+        raise HTTPException(status_code=404, detail="Folder not found")
+    normalized_folder = folder_path(current_folder)
+    search_query = q.strip()
+    folders = all_folders(db)
+    path_cache = build_folder_path_cache(folders)
+    docs = list(db.execute(select(Document)).scalars().all())
+    locks = active_locks_by_document(db)
+    stats = docs_stats_for_folder_payloads(docs, db, path_cache)
+
+    if search_query and recursive:
+        folder_candidates = [
+            item
+            for item in folders
+            if not item.is_root
+            and item.id != current_folder.id
+            and folder_is_archive(item) == folder_is_archive(current_folder)
+            and folder_contains_doc_folder(normalized_folder, folder_path(item, path_cache))
+        ]
+    else:
+        folder_candidates = list(current_folder.children)
+
+    folder_rows = []
+    for item in folder_candidates:
+        path = folder_path(item, path_cache)
+        if search_query and not matches_query(search_query, item.name, path):
+            continue
+        folder_rows.append(folder_summary_payload(path, stats))
+    if normalized_folder == ARCHIVE_ROOT:
+        for row in folder_rows:
+            if row["path"] == ARCHIVE_ROOT:
+                row["name"] = ARCHIVE_ROOT
+
+    doc_rows = []
+    for doc in docs:
+        doc_folder = document_folder_path(doc, path_cache)
+        if folder_is_archive(doc.folder) != folder_is_archive(current_folder):
+            continue
+        if not folder_is_in_scope(normalized_folder, doc_folder, bool(search_query and recursive)):
+            continue
+        doc_path = document_path(doc, path_cache)
+        if search_query and not matches_query(search_query, doc.name, doc_path, doc_folder):
+            continue
+        doc_rows.append(document_row_payload(doc, db, path_cache, locks))
+
+    folder_rows.sort(key=lambda item: str(item["name"]).lower())
+    doc_rows.sort(key=lambda item: str(item["name"]).lower())
+    return {
+        "folder": normalized_folder,
+        "q": search_query,
+        "recursive": bool(recursive),
+        "folders": folder_rows,
+        "documents": doc_rows,
+    }
+
+
+def build_sidebar_payload(db: Session) -> dict[str, object]:
+    ensure_root_folders(db)
+    vault_root = get_root_folder(db, VAULT_ROOT_KEY)
+    archive_root = get_root_folder(db, ARCHIVE_ROOT_KEY)
+    folders = all_folders(db)
+    path_cache = build_folder_path_cache(folders)
+    children = {
+        "": sorted(folder_path(child, path_cache) for child in vault_root.children),
+        ARCHIVE_ROOT: sorted(folder_path(child, path_cache) for child in archive_root.children),
+    }
+    return {"folder_children": children}
+
+
+def build_my_edits_payload(user: UserContext, db: Session) -> dict[str, object]:
+    ensure_root_folders(db)
+    folders = all_folders(db)
+    path_cache = build_folder_path_cache(folders)
+    locks = active_locks_by_document(db)
+    docs = (
+        db.execute(
+            select(Document)
+            .join(DocumentLock)
+            .where(
+                DocumentLock.locked_by == user["id"],
+                DocumentLock.is_active == True,  # noqa: E712
             ),
         )
         .scalars()
         .all()
     )
+    return {
+        "documents": [
+            document_row_payload(doc, db, path_cache, locks)
+            for doc in sorted(docs, key=lambda item: document_path(item, path_cache).lower())
+        ],
+    }
 
-    versions_by_document: dict[int, list[DocumentVersion]] = defaultdict(list)
-    events_by_document: dict[int, list[DocumentEvent]] = defaultdict(list)
-    for version in versions:
-        versions_by_document[version.document_id].append(version)
-    for event in events:
-        events_by_document[event.document_id].append(event)
 
-    doc_payloads: list[dict[str, object]] = []
-    doc_stats: list[DocStat] = []
-    for doc in docs:
-        doc_folder = document_folder_path(doc, path_cache)
-        doc_path = document_path(doc, path_cache)
-        doc_versions = versions_by_document.get(doc.id, [])
-        filtered_versions = dedupe_versions_by_checksum(doc_versions)
-        latest_version = current_version(doc, db)
-        latest_size_bytes = latest_version.blob.size_bytes if latest_version else None
-        latest_updated_at = normalize_timestamp(doc.latest_modified_at)
-        lock = locks.get(doc.id)
-        history_items: list[dict[str, object]] = []
-        version_signatures = {version_signature(version) for version in filtered_versions}
-        for version in filtered_versions:
-            history_items.append(
-                {
-                    "id": version.id,
-                    "type": "version",
-                    "timestamp": version.committed_at.isoformat() if version.committed_at else None,
-                    "display": version.committed_at.strftime("%b %d, %Y %H:%M")
-                    if version.committed_at
-                    else "Version",
-                    "by": version.committed_by_name or version.committed_by,
-                    "note": version.message,
-                    "version_number": version.version_number,
-                    "created_via": version.created_via,
-                    "checksum": version.blob.hash,
-                    "hash_algo": version.blob.hash_algo,
-                    "size_bytes": version.blob.size_bytes,
-                    "mime_type": version.mime_type,
-                    "original_filename": version.original_filename,
-                    "download_url": f"/documents/{doc.id}/versions/{version.id}/download",
-                },
-            )
-        for event in events_by_document.get(doc.id, []):
-            if event_signature(event) in version_signatures:
-                continue
-            history_items.append(
-                {
-                    "id": f"event-{event.id}",
-                    "type": event.event_type,
-                    "timestamp": event.created_at.isoformat() if event.created_at else None,
-                    "display": event.created_at.strftime("%b %d, %Y %H:%M")
-                    if event.created_at
-                    else event.event_type.title(),
-                    "by": event.actor_name or event.actor,
-                    "note": event.message,
-                    "result": event.result,
-                    "download_url": None,
-                },
-            )
-        history_items.sort(key=lambda item: str(item["timestamp"] or ""), reverse=True)
-        doc_payloads.append(
-            {
-                "id": doc.id,
-                "name": doc.name,
-                "path": doc_path,
-                "folder": doc_folder,
-                "latest_updated_at": latest_updated_at.isoformat() if latest_updated_at else None,
-                "latest_updated_display": format_mtime(latest_updated_at),
-                "latest_by": (latest_version.committed_by_name or latest_version.committed_by)
-                if latest_version
-                else None,
-                "latest_message": latest_version.message if latest_version else None,
-                "latest_version_number": latest_version.version_number
-                if latest_version
-                else doc.latest_version_number,
-                "version_count": doc.version_count or len(filtered_versions),
-                "created_by": doc.created_by,
-                "created_by_name": doc.created_by_name,
-                "created_at": doc.created_at.isoformat() if doc.created_at else None,
-                "size_bytes": latest_size_bytes,
-                "size_display": format_size(latest_size_bytes),
-                "lock": {
-                    "by": lock.locked_by if lock else None,
-                    "name": lock.locked_by_name if lock else None,
-                    "at": lock.locked_at.isoformat() if lock and lock.locked_at else None,
-                    "ip": lock.locked_ip if lock else None,
-                    "user_agent": lock.locked_user_agent if lock else None,
-                    "force_acquired": lock.force_acquired if lock else None,
-                },
-                "archived": document_is_archive(doc),
-                "versions": history_items,
-            },
-        )
-        doc_stats.append(DocStat(doc_folder, latest_size_bytes or 0, latest_updated_at))
-
-    folder_children: dict[str, list[str]] = defaultdict(list)
-    folder_payloads: dict[str, dict[str, object]] = {}
-    folder_children.setdefault("", [])
-    folder_children.setdefault(ARCHIVE_ROOT, [])
-    for folder in folders:
-        path = path_cache.get(folder.id, "")
-        folder_children.setdefault(path, [])
-        if folder.is_root or folder.parent_id is None:
-            continue
-        parent_path = path_cache.get(folder.parent_id, "")
-        folder_children[parent_path].append(path)
-
-    all_folder_paths = set(folder_children.keys())
-    for child_paths in folder_children.values():
-        all_folder_paths.update(child_paths)
-    for path in all_folder_paths:
-        latest: dt.datetime | None = None
-        size = 0
-        for stat in doc_stats:
-            if not folder_contains_doc_folder(path, stat.folder):
-                continue
-            size += stat.size_bytes
-            if stat.mtime and (latest is None or stat.mtime > latest):
-                latest = stat.mtime
-        folder_payloads[path] = {
-            "name": path.split("/")[-1] if path else "Vault",
-            "latest_updated_at": latest.isoformat() if latest else None,
-            "latest_updated_display": format_mtime(latest),
-            "size_bytes": size,
-            "size_display": format_size(size),
-        }
-    folder_payloads[ARCHIVE_ROOT]["name"] = ARCHIVE_ROOT
-
+def build_bootstrap_payload(user: UserContext, folder: str, db: Session) -> dict[str, object]:
+    ensure_root_folders(db)
+    current = get_folder_by_path(db, folder) or get_root_folder(db, VAULT_ROOT_KEY)
     return {
         "base_domain": BASE_DOMAIN,
         "user": user,
-        "current_folder": normalize_folder(current_folder),
-        "doc_payloads": doc_payloads,
-        "folder_children": {key: sorted(value) for key, value in folder_children.items()},
-        "folder_payloads": folder_payloads,
+        "current_folder": folder_path(current),
     }
+
+
+def record_state_change(db: Session, event_type: str, resources: tuple[str, ...]) -> None:
+    normalized_resources = sorted(set(resources))
+    if not normalized_resources:
+        return
+    payload = {
+        "type": event_type,
+        "resources": normalized_resources,
+    }
+    db.add(StateEvent(event_type=event_type, payload=payload))
+
+
+def record_folder_change(
+    db: Session,
+    event_type: str,
+    include_document_updates: bool = False,
+) -> None:
+    resources = ["contents", "sidebar"]
+    if include_document_updates:
+        resources.extend(["document_detail", "my_edits"])
+    record_state_change(db, f"folder.{event_type}", tuple(resources))
+
+
+def record_document_deleted(db: Session) -> None:
+    record_state_change(
+        db,
+        "document.deleted",
+        ("contents", "sidebar", "document_detail", "my_edits"),
+    )
+
+
+def latest_state_event_id() -> int:
+    db = SessionLocal()
+    try:
+        return db.execute(select(StateEvent.id).order_by(StateEvent.id.desc()).limit(1)).scalar() or 0
+    finally:
+        db.close()
+
+
+def state_events_after(last_id: int) -> list[StateEvent]:
+    db = SessionLocal()
+    try:
+        return list(
+            db.execute(
+                select(StateEvent).where(StateEvent.id > last_id).order_by(StateEvent.id).limit(100),
+            )
+            .scalars()
+            .all(),
+        )
+    finally:
+        db.close()
 
 
 def commit_state(db: Session) -> None:
@@ -903,19 +1108,109 @@ def index(
 ) -> HTMLResponse:
     ensure_root_folders(db)
     commit_state(db)
-    state = build_state(user, normalize_folder(folder), db)
+    normalized = normalize_folder(folder)
+    state = {
+        "bootstrap": build_bootstrap_payload(user, normalized, db),
+        "contents": build_contents_payload(db, normalized),
+        "sidebar": build_sidebar_payload(db),
+        "my_edits": build_my_edits_payload(user, db),
+    }
     return templates.TemplateResponse("index.html", {"request": request, "state": state})
 
 
-@router.get("/api/state")
-def api_state(
+@router.get("/api/bootstrap")
+def api_bootstrap(
     folder: str = "",
     user: UserContext = Depends(current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
     ensure_root_folders(db)
     commit_state(db)
-    return build_state(user, normalize_folder(folder), db)
+    return build_bootstrap_payload(user, normalize_folder(folder), db)
+
+
+@router.get("/api/folders/sidebar")
+def api_sidebar(
+    user: UserContext = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    del user
+    ensure_root_folders(db)
+    commit_state(db)
+    return build_sidebar_payload(db)
+
+
+@router.get("/api/folders/contents")
+def api_folder_contents(
+    folder: str = "",
+    q: str = "",
+    recursive: bool = False,
+    user: UserContext = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    del user
+    ensure_root_folders(db)
+    commit_state(db)
+    return build_contents_payload(db, normalize_folder(folder), q, recursive)
+
+
+@router.get("/api/documents/{doc_id}/detail")
+def api_document_detail(
+    doc_id: int,
+    user: UserContext = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    del user
+    ensure_root_folders(db)
+    commit_state(db)
+    doc = get_document_or_404(doc_id, db)
+    return document_detail_payload(doc, db)
+
+
+@router.get("/api/my-edits")
+def api_my_edits(
+    user: UserContext = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    ensure_root_folders(db)
+    commit_state(db)
+    return build_my_edits_payload(user, db)
+
+
+@router.get("/api/events/stream")
+async def api_events_stream(
+    request: Request,
+    user: UserContext = Depends(current_user),
+) -> StreamingResponse:
+    del user
+    header_value = request.headers.get("last-event-id") or request.headers.get("Last-Event-ID")
+    try:
+        last_id = int(header_value) if header_value else latest_state_event_id()
+    except ValueError:
+        last_id = latest_state_event_id()
+
+    async def event_generator() -> object:
+        nonlocal last_id
+        heartbeat_interval = 25.0
+        last_heartbeat = dt.datetime.now(tz=dt.UTC)
+        while not await request.is_disconnected():
+            events = state_events_after(last_id)
+            if events:
+                for event in events:
+                    last_id = event.id
+                    yield (
+                        f"id: {event.id}\n"
+                        "event: state\n"
+                        f"data: {json.dumps(event.payload)}\n\n"
+                    )
+                last_heartbeat = dt.datetime.now(tz=dt.UTC)
+            now = dt.datetime.now(tz=dt.UTC)
+            if (now - last_heartbeat).total_seconds() >= heartbeat_interval:
+                yield ": heartbeat\n\n"
+                last_heartbeat = now
+            await asyncio.sleep(0.5)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
 @router.post("/folders")
@@ -936,6 +1231,7 @@ def create_folder(
     ensure_unique_folder_name(db, parent.id, name)
     created = Folder(root_key=parent.root_key, parent_id=parent.id, name=name, is_root=False)
     db.add(created)
+    record_folder_change(db, "created")
     db.commit()
     return {"folder": normalized}
 
@@ -972,6 +1268,7 @@ def rename_folder(
     source.parent = target_parent
     source.parent_id = target_parent.id
     source.name = target_name
+    record_folder_change(db, "renamed")
     db.commit()
     return {"folder": target_path}
 
@@ -994,14 +1291,24 @@ def archive_folder(
     target_name = normalize_item_name(target_path.split("/")[-1], "Folder name")
     ensure_unique_folder_name(db, target_parent.id, target_name, source.id)
     meta = client_meta(request)
-    for doc in docs_in_folder_subtree(db, source):
+    affected_docs = docs_in_folder_subtree(db, source)
+    for doc in affected_docs:
         release_lock(get_active_lock(doc, db), user)
-        record_event(doc, user, "archive", f"Archived from {document_path(doc)}", db, meta=meta)
+        record_event(
+            doc,
+            user,
+            "archive",
+            f"Archived from {document_path(doc)}",
+            db,
+            meta=meta,
+            publish_state=False,
+        )
         doc.latest_modified_at = now_utc()
     source.parent = target_parent
     source.parent_id = target_parent.id
     source.name = target_name
     set_subtree_root_key(db, source, ARCHIVE_ROOT_KEY)
+    record_folder_change(db, "archived", include_document_updates=bool(affected_docs))
     db.commit()
     return {"archive_folder": target_path}
 
@@ -1023,7 +1330,8 @@ def unarchive_folder(
     ensure_unique_folder_name(db, target_parent.id, target_name, source.id)
     archive_parent = source.parent
     meta = client_meta(request)
-    for doc in docs_in_folder_subtree(db, source):
+    affected_docs = docs_in_folder_subtree(db, source)
+    for doc in affected_docs:
         record_event(
             doc,
             user,
@@ -1031,6 +1339,7 @@ def unarchive_folder(
             f"Restored to Vault from {document_path(doc)}",
             db,
             meta=meta,
+            publish_state=False,
         )
         doc.latest_modified_at = now_utc()
     source.parent = target_parent
@@ -1038,6 +1347,7 @@ def unarchive_folder(
     source.name = target_name
     set_subtree_root_key(db, source, VAULT_ROOT_KEY)
     prune_empty_archive_folders(db, archive_parent)
+    record_folder_change(db, "unarchived", include_document_updates=bool(affected_docs))
     db.commit()
     return {"folder": target_path}
 
@@ -1055,10 +1365,12 @@ def permanent_delete_folder(
     if not target or target.is_root or not folder_is_archive(target):
         raise HTTPException(status_code=400, detail="Delete forever is only available in Archive")
     archive_parent = target.parent
-    for doc in docs_in_folder_subtree(db, target):
+    affected_docs = docs_in_folder_subtree(db, target)
+    for doc in affected_docs:
         db.delete(doc)
     db.delete(target)
     prune_empty_archive_folders(db, archive_parent)
+    record_folder_change(db, "deleted", include_document_updates=bool(affected_docs))
     db.commit()
     return {"folder": normalized}
 
@@ -1407,5 +1719,6 @@ def permanent_delete_document(
     archive_folder = doc.folder
     db.delete(doc)
     prune_empty_archive_folders(db, archive_folder)
+    record_document_deleted(db)
     db.commit()
     return {"deleted": deleted_path}

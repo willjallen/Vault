@@ -12,6 +12,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    JSON,
     text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -237,3 +238,12 @@ class DocumentEvent(Base):
     user_agent: Mapped[str | None] = mapped_column(String, nullable=True)
 
     document: Mapped[Document] = relationship("Document", back_populates="events")
+
+
+class StateEvent(Base):
+    __tablename__ = "state_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    event_type: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    payload: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)

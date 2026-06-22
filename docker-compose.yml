@@ -5,7 +5,7 @@ services:
     image: vault-service:local
     container_name: vault-service
     ports:
-      - "0.0.0.0:8000:8000"
+      - "127.0.0.1:8000:8000"
     environment:
       BASE_DOMAIN: localhost
       VAULT_DB_PATH: /vault-metadata/vault-metadata.db
@@ -28,13 +28,13 @@ services:
       VAULT_R2_SECRET_ACCESS_KEY: ${VAULT_R2_SECRET_ACCESS_KEY:-}
       VAULT_R2_ENDPOINT_URL: ${VAULT_R2_ENDPOINT_URL:-}
       VAULT_PUBLIC_URL: ${VAULT_PUBLIC_URL:-http://localhost:8000}
-      VAULT_AUTH_MODE: ${VAULT_AUTH_MODE:-dev}
+      VAULT_AUTH_MODE: ${VAULT_AUTH_MODE:-headers}
       VAULT_SESSION_SECRET: ${VAULT_SESSION_SECRET:-dev-insecure-session-secret}
       VAULT_SESSION_MAX_AGE_SECONDS: ${VAULT_SESSION_MAX_AGE_SECONDS:-604800}
       VAULT_BOOTSTRAP_ADMIN_EMAILS: ${VAULT_BOOTSTRAP_ADMIN_EMAILS:-admin@example.com}
       VAULT_ADMIN_GROUPS: ${VAULT_ADMIN_GROUPS:-admin,vault-admin}
       VAULT_HEADER_AUTH_ISSUER: ${VAULT_HEADER_AUTH_ISSUER:-headers}
-      VAULT_DEV_AUTH: ${VAULT_DEV_AUTH:-1}
+      VAULT_DEV_AUTH: ${VAULT_DEV_AUTH:-0}
       VAULT_DEV_AUTH_ISSUER: ${VAULT_DEV_AUTH_ISSUER:-dev}
       VAULT_DEV_USER: ${VAULT_DEV_USER:-local-admin}
       VAULT_DEV_NAME: ${VAULT_DEV_NAME:-Local Admin}

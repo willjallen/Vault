@@ -4,6 +4,27 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Family Vault</title>
+    <script>
+      (() => {
+        const key = "vault.themePreference";
+        const allowed = new Set(["system", "light", "dark"]);
+        let preference = "system";
+        try {
+          preference = window.localStorage.getItem(key) || "system";
+        } catch (_err) {
+          preference = "system";
+        }
+        if (!allowed.has(preference)) {
+          preference = "system";
+        }
+        const prefersDark =
+          window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+        const resolved = preference === "system" ? (prefersDark ? "dark" : "light") : preference;
+        document.documentElement.dataset.themePreference = preference;
+        document.documentElement.dataset.theme = resolved;
+        document.documentElement.style.colorScheme = resolved;
+      })();
+    </script>
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body class="app-root-page">

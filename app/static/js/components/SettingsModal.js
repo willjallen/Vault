@@ -49,6 +49,30 @@ function SegmentedMock({ options, active }) {
   );
 }
 
+function ThemeSegmented({ value, onChange }) {
+  const options = [
+    { id: "system", label: "System" },
+    { id: "light", label: "Light" },
+    { id: "dark", label: "Dark" },
+  ];
+  return h(
+    "div",
+    { className: "settings-segmented theme-choice", role: "group", "aria-label": "Theme" },
+    options.map((option) =>
+      h(
+        "button",
+        {
+          className: classNames(value === option.id ? "active" : ""),
+          key: option.id,
+          onClick: () => onChange(option.id),
+          type: "button",
+        },
+        option.label
+      )
+    )
+  );
+}
+
 function SliderMock({ value }) {
   return h(
     "div",
@@ -577,7 +601,13 @@ function AdminPanel({ apiFetch, currentUser }) {
   ]);
 }
 
-function SectionPanel({ activeSection, apiFetch, currentUser }) {
+function SectionPanel({
+  activeSection,
+  apiFetch,
+  currentUser,
+  onThemePreferenceChange,
+  themePreference,
+}) {
   if (activeSection === "admin") {
     return h(AdminPanel, { apiFetch, currentUser });
   }
@@ -685,8 +715,14 @@ function SectionPanel({ activeSection, apiFetch, currentUser }) {
     h("div", { className: "settings-card", key: "card" }, [
       SettingsRow({
         title: "Theme",
-        copy: "Follow the system appearance.",
-        control: SegmentedMock({ options: ["Light", "Auto", "Dark"], active: "Auto" }),
+        copy:
+          themePreference === "system"
+            ? "Follows your operating system appearance."
+            : "Overrides system appearance on this device.",
+        control: ThemeSegmented({
+          onChange: onThemePreferenceChange,
+          value: themePreference || "system",
+        }),
       }),
       SettingsRow({
         title: "Sidebar labels",
@@ -702,7 +738,13 @@ function SectionPanel({ activeSection, apiFetch, currentUser }) {
   ]);
 }
 
-export function SettingsModal({ apiFetch, currentUser, onClose }) {
+export function SettingsModal({
+  apiFetch,
+  currentUser,
+  onClose,
+  onThemePreferenceChange,
+  themePreference = "system",
+}) {
   const sections = currentUser?.is_admin ? [...personalSections, adminSection] : personalSections;
   const [activeSection, setActiveSection] = useState(sections[0].id);
   const [phase, setPhase] = useState("entering");
@@ -797,7 +839,14 @@ export function SettingsModal({ apiFetch, currentUser, onClose }) {
               })
             )
           ),
-          h(SectionPanel, { activeSection, apiFetch, currentUser, key: "panel" }),
+          h(SectionPanel, {
+            activeSection,
+            apiFetch,
+            currentUser,
+            key: "panel",
+            onThemePreferenceChange,
+            themePreference,
+          }),
         ]),
       ]
     ),

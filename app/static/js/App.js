@@ -23,6 +23,11 @@ import {
 import { folderBaseName, folderParent, isArchivePath, toBreadcrumbs } from "./lib/utils.js";
 import { useMouseNavigation } from "./lib/useMouseNavigation.js";
 import { useMoveDialog } from "./lib/useMoveDialog.js";
+import {
+  applyThemePreference,
+  readStoredThemePreference,
+  storeThemePreference,
+} from "./lib/theme.js";
 import { useTransfers } from "./lib/useTransfers.js";
 import { useVaultResources } from "./lib/useVaultResources.js";
 
@@ -51,6 +56,7 @@ export function App({ initial }) {
   const [contextMenu, setContextMenu] = useState(null);
   const [draggingFolderPath, setDraggingFolderPath] = useState(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [themePreference, setThemePreference] = useState(readStoredThemePreference);
   const [folderPropertiesTarget, setFolderPropertiesTarget] = useState(null);
   const [toast, setToast] = useState("");
   const [confirmRequest, setConfirmRequest] = useState(null);
@@ -61,6 +67,26 @@ export function App({ initial }) {
   const settingsButtonRef = useRef(null);
   const confirmResolver = useRef(null);
   const closeContextMenu = useCallback(() => setContextMenu(null), []);
+
+  useEffect(() => {
+    applyThemePreference(themePreference);
+    const media = window.matchMedia?.("(prefers-color-scheme: dark)");
+    if (!media) {
+      return undefined;
+    }
+    function handleSystemThemeChange() {
+      if (themePreference === "system") {
+        applyThemePreference("system");
+      }
+    }
+    media.addEventListener("change", handleSystemThemeChange);
+    return () => media.removeEventListener("change", handleSystemThemeChange);
+  }, [themePreference]);
+
+  const handleThemePreferenceChange = useCallback((preference) => {
+    storeThemePreference(preference);
+    setThemePreference(preference);
+  }, []);
 
   const resolveConfirm = useCallback((confirmed) => {
     const resolver = confirmResolver.current;
@@ -892,7 +918,15 @@ export function App({ initial }) {
     }),
     h(TransferDock, { transfers }),
     h(BulkDragPreview, { drag: dragBundle }),
-    settingsOpen ? h(SettingsModal, { apiFetch, currentUser, onClose: closeSettings }) : null,
+    settingsOpen
+      ? h(SettingsModal, {
+          apiFetch,
+          currentUser,
+          onClose: closeSettings,
+          onThemePreferenceChange: handleThemePreferenceChange,
+          themePreference,
+        })
+      : null,
     folderPropertiesTarget
       ? h(FolderPropertiesModal, {
           apiFetch,

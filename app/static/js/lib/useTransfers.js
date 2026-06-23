@@ -2,7 +2,7 @@ import { downloadBlob, uploadForm } from "./transferClient.js";
 
 const { useCallback, useEffect, useRef, useState } = React;
 
-const COMPLETE_HOLD_MS = 950;
+const COMPLETE_HOLD_MS = 1400;
 const ERROR_HOLD_MS = 2600;
 const EXIT_MS = 260;
 

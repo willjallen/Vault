@@ -31,6 +31,7 @@ if REQUIRE_SESSION_SECRET and not _SESSION_SECRET_ENV:
     raise RuntimeError("VAULT_SESSION_SECRET is required when VAULT_REQUIRE_SESSION_SECRET=1")
 SESSION_SECRET = _SESSION_SECRET_ENV or _OIDC_CLIENT_SECRET_ENV or "dev-insecure-session-secret"
 SESSION_MAX_AGE_SECONDS = int(os.getenv("VAULT_SESSION_MAX_AGE_SECONDS", "604800"))
+TTL_SWEEP_INTERVAL_SECONDS = max(10, int(os.getenv("VAULT_TTL_SWEEP_INTERVAL_SECONDS", "60")))
 BOOTSTRAP_ADMIN_EMAILS = {
     item.strip().lower()
     for item in os.getenv("VAULT_BOOTSTRAP_ADMIN_EMAILS", "").split(",")

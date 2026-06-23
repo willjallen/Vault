@@ -1,5 +1,6 @@
-import { classNames } from "../../lib/utils.js";
+import { classNames, expiryStatusLabel, formatDate } from "../../lib/utils.js";
 import { FileIcon } from "../common/FileIcon.js";
+import { Icon } from "../common/Icon.js";
 import { LockGlyph } from "../common/LockGlyph.js";
 
 const { useEffect, useRef } = React;
@@ -40,6 +41,8 @@ export function FileRow({
   const lockHolderName = locked
     ? lock.name || (lock.by === currentUser.id ? currentUser.name : lock.by)
     : "";
+  const expiryLabel = expiryStatusLabel(doc.expires_at, doc.expiry_action);
+  const expiryTitle = doc.expires_at ? formatDate(doc.expires_at) : "";
 
   useEffect(() => {
     if (!editing || !inputRef.current) {
@@ -150,6 +153,16 @@ export function FileRow({
         "div",
         { className: "file-cell size" },
         h("span", { className: "muted tiny" }, doc.size_display || "-")
+      ),
+      h(
+        "div",
+        { className: "file-cell ttl" },
+        expiryLabel
+          ? h("span", { className: "ttl-chip applied", title: expiryTitle }, [
+              h(Icon, { icon: "clock", key: "icon", size: 11 }),
+              h("span", { key: "label" }, expiryLabel),
+            ])
+          : h("span", { className: "muted tiny" }, "-")
       ),
       h("div", { className: "file-cell status-col" }, [
         h(

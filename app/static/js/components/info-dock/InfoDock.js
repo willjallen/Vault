@@ -1,4 +1,4 @@
-import { classNames, formatBytes } from "../../lib/utils.js";
+import { classNames, expiryStatusLabel, formatBytes } from "../../lib/utils.js";
 import { Icon } from "../common/Icon.js";
 import { LockGlyph } from "../common/LockGlyph.js";
 
@@ -161,6 +161,7 @@ export function InfoDock({
   const versionCount = doc?.version_count || Math.max(versionEntries.length || 0, 1);
   const filteredHistoryItems = useMemo(() => filterHistoryItems(historyItems), [historyItems]);
   const historyCount = filteredHistoryItems.length;
+  const expiryLabel = expiryStatusLabel(doc?.expires_at, doc?.expiry_action);
   const versionPositions = useMemo(() => {
     const map = new Map();
     versionEntries.forEach((item, idx) => {
@@ -399,6 +400,13 @@ export function InfoDock({
             doc.latest_updated_display ? ` · Last updated ${doc.latest_updated_display}` : "",
             doc.latest_by ? ` · ${doc.latest_by}` : "",
           ]),
+          doc.expires_at
+            ? h(
+                "div",
+                { className: "muted tiny" },
+                `${expiryLabel} · ${formatTimestamp(doc.expires_at)}`
+              )
+            : null,
         ]),
       ])
     ),

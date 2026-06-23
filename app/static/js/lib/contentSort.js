@@ -16,6 +16,18 @@ function parseSortDate(value) {
   return Number.isFinite(timestamp) ? timestamp : null;
 }
 
+function ttlSortValue(item) {
+  if (item.type === "document") {
+    return parseSortDate(item.expires_at);
+  }
+  const action = (item.default_ttl_action || "").toLowerCase();
+  const days = Number(item.default_ttl_days);
+  if (!["archive", "delete"].includes(action) || !Number.isFinite(days) || days < 1) {
+    return null;
+  }
+  return days * (action === "delete" ? 1 : 2);
+}
+
 function sortValueForItem(item, key) {
   if (key === "date") {
     return parseSortDate(item.latest_updated_at);
@@ -25,6 +37,9 @@ function sortValueForItem(item, key) {
   }
   if (key === "size") {
     return Number(item.size_bytes || 0);
+  }
+  if (key === "ttl") {
+    return ttlSortValue(item);
   }
   return (item.name || "").toLocaleLowerCase();
 }

@@ -81,6 +81,42 @@ export function formatDate(iso) {
   return d.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
 }
 
+export function retentionPolicyLabel(action, days) {
+  const normalized = (action || "").toLowerCase();
+  const ttlDays = Number(days);
+  if (!Number.isFinite(ttlDays) || ttlDays < 1 || !["archive", "delete"].includes(normalized)) {
+    return "";
+  }
+  const verb = normalized === "delete" ? "Delete" : "Archive";
+  return `${verb} after ${ttlDays}d`;
+}
+
+export function expiryStatusLabel(expiresAt, action) {
+  const normalized = (action || "").toLowerCase();
+  const expires = new Date(expiresAt || "");
+  if (
+    !expiresAt ||
+    Number.isNaN(expires.getTime()) ||
+    !["archive", "delete"].includes(normalized)
+  ) {
+    return "";
+  }
+  const verb = normalized === "delete" ? "Delete" : "Archive";
+  const remainingMs = expires.getTime() - Date.now();
+  if (remainingMs <= 0) {
+    return `${verb} due`;
+  }
+  const minutes = Math.ceil(remainingMs / 60000);
+  if (minutes < 60) {
+    return `${verb} in ${minutes}m`;
+  }
+  const hours = Math.ceil(remainingMs / 3600000);
+  if (hours < 48) {
+    return `${verb} in ${hours}h`;
+  }
+  return `${verb} in ${Math.ceil(remainingMs / 86400000)}d`;
+}
+
 export function isArchivePath(path) {
   return typeof path === "string" && (path === "Archive" || path.startsWith("Archive/"));
 }

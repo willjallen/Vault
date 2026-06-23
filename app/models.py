@@ -56,6 +56,8 @@ class Folder(Base):
     created_by_name: Mapped[str | None] = mapped_column(String, nullable=True)
     color: Mapped[str | None] = mapped_column(String, nullable=True)
     icon: Mapped[str | None] = mapped_column(String, nullable=True)
+    default_ttl_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    default_ttl_action: Mapped[str | None] = mapped_column(String, nullable=True)
 
     parent: Mapped["Folder | None"] = relationship(
         "Folder",
@@ -257,6 +259,12 @@ class Document(Base):
     latest_version_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
     version_count: Mapped[int] = mapped_column(Integer, default=0)
     current_version_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    expires_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime,
+        nullable=True,
+        index=True,
+    )
+    expiry_action: Mapped[str | None] = mapped_column(String, nullable=True)
 
     folder: Mapped[Folder] = relationship("Folder", back_populates="documents")
     locks: Mapped[list["DocumentLock"]] = relationship(

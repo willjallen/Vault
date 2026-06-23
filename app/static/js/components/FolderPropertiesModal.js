@@ -48,11 +48,42 @@ function sortPermissions(items) {
   return [...items].sort((a, b) => a.group_name.localeCompare(b.group_name));
 }
 
+function RetentionSegmented({ disabled, value, onChange }) {
+  const options = [
+    { id: "none", label: "None" },
+    { id: "archive", label: "Archive" },
+    { id: "delete", label: "Delete" },
+  ];
+  return h(
+    "div",
+    {
+      "aria-label": "Expiration action",
+      className: "settings-segmented folder-retention-mode",
+      role: "group",
+    },
+    options.map((option) =>
+      h(
+        "button",
+        {
+          className: classNames(value === option.id ? "active" : ""),
+          disabled,
+          key: option.id,
+          onClick: () => onChange(option.id),
+          type: "button",
+        },
+        option.label
+      )
+    )
+  );
+}
+
 export function FolderPropertiesModal({ apiFetch, folder, onClose, onUpdated }) {
   const [phase, setPhase] = useState("entering");
   const [detail, setDetail] = useState(null);
   const [color, setColor] = useState("");
   const [icon, setIcon] = useState("");
+  const [ttlAction, setTtlAction] = useState("none");
+  const [ttlDays, setTtlDays] = useState("30");
   const [permissions, setPermissions] = useState([]);
   const [selectedGroupId, setSelectedGroupId] = useState("");
   const [loading, setLoading] = useState(true);
@@ -83,6 +114,8 @@ export function FolderPropertiesModal({ apiFetch, folder, onClose, onUpdated }) 
       setDetail(data);
       setColor(data.color || "");
       setIcon(data.icon || "");
+      setTtlAction(data.default_ttl_action || "none");
+      setTtlDays(data.default_ttl_days ? String(data.default_ttl_days) : "30");
       setPermissions(sortPermissions(data.permissions || []));
     } catch (err) {
       setError(err.message || "Could not load folder properties");
@@ -168,6 +201,8 @@ export function FolderPropertiesModal({ apiFetch, folder, onClose, onUpdated }) 
       setDetail(data);
       setColor(data.color || "");
       setIcon(data.icon || "");
+      setTtlAction(data.default_ttl_action || "none");
+      setTtlDays(data.default_ttl_days ? String(data.default_ttl_days) : "30");
       setPermissions(sortPermissions(data.permissions || []));
       onUpdated?.();
     } catch (err) {
@@ -176,6 +211,40 @@ export function FolderPropertiesModal({ apiFetch, folder, onClose, onUpdated }) 
       setSaving("");
     }
   }, [apiFetch, color, detail?.path, icon, onUpdated]);
+
+  const saveRetention = useCallback(async () => {
+    const action = ttlAction || "none";
+    const parsedDays = Number(ttlDays);
+    if (action !== "none" && (!Number.isFinite(parsedDays) || parsedDays < 1)) {
+      setError("TTL days must be at least 1");
+      return;
+    }
+    setSaving("retention");
+    setError("");
+    try {
+      const res = await apiFetch("/api/folders/retention", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          path: detail.path,
+          default_ttl_action: action,
+          default_ttl_days: action === "none" ? null : Math.round(parsedDays),
+        }),
+      });
+      if (!res.ok) {
+        throw new Error(await responseError(res));
+      }
+      const data = await res.json();
+      setDetail(data);
+      setTtlAction(data.default_ttl_action || "none");
+      setTtlDays(data.default_ttl_days ? String(data.default_ttl_days) : "30");
+      onUpdated?.();
+    } catch (err) {
+      setError(err.message || "Could not save folder retention");
+    } finally {
+      setSaving("");
+    }
+  }, [apiFetch, detail?.path, onUpdated, ttlAction, ttlDays]);
 
   const savePermissions = useCallback(async () => {
     setSaving("permissions");
@@ -306,6 +375,42 @@ export function FolderPropertiesModal({ apiFetch, folder, onClose, onUpdated }) 
                       setColor(nextColor || "");
                     },
                   }),
+                ]),
+              ]),
+              h("section", { className: "folder-properties-card", key: "retention" }, [
+                h("div", { className: "folder-card-headline" }, [
+                  h("h3", null, "Retention"),
+                  h(
+                    "button",
+                    {
+                      className: "confirm-toast-button primary",
+                      disabled: Boolean(saving),
+                      onClick: saveRetention,
+                      type: "button",
+                    },
+                    saving === "retention" ? "Saving..." : "Save"
+                  ),
+                ]),
+                h("div", { className: "folder-retention-controls" }, [
+                  h(RetentionSegmented, {
+                    disabled: Boolean(saving),
+                    key: "mode",
+                    onChange: setTtlAction,
+                    value: ttlAction || "none",
+                  }),
+                  h("label", { className: "folder-retention-days", key: "days" }, [
+                    h("span", { className: "muted tiny" }, "After"),
+                    h("input", {
+                      disabled: Boolean(saving) || ttlAction === "none",
+                      max: "3650",
+                      min: "1",
+                      onChange: (evt) => setTtlDays(evt.target.value),
+                      step: "1",
+                      type: "number",
+                      value: ttlDays,
+                    }),
+                    h("span", { className: "muted tiny" }, "days"),
+                  ]),
                 ]),
               ]),
               h("section", { className: "folder-properties-card", key: "permissions" }, [

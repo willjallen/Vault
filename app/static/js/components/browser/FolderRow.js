@@ -1,4 +1,4 @@
-import { classNames, isArchivePath } from "../../lib/utils.js";
+import { classNames, isArchivePath, retentionPolicyLabel } from "../../lib/utils.js";
 import { FileIcon } from "../common/FileIcon.js";
 import { Icon } from "../common/Icon.js";
 
@@ -42,6 +42,7 @@ export function FolderRow({
   const inputRef = useRef(null);
   const isArchived = isArchivePath(folder.path || "");
   const parentLabel = parentLabelForFolder(folder);
+  const retentionLabel = retentionPolicyLabel(folder.default_ttl_action, folder.default_ttl_days);
 
   useEffect(() => {
     if (!editing || !inputRef.current) {
@@ -168,6 +169,16 @@ export function FolderRow({
         "div",
         { className: "file-cell size" },
         h("span", { className: "muted tiny" }, folder.size_display || "0 B")
+      ),
+      h(
+        "div",
+        { className: "file-cell ttl" },
+        retentionLabel
+          ? h("span", { className: "ttl-chip policy", title: retentionLabel }, [
+              h(Icon, { icon: "clock", key: "icon", size: 11 }),
+              h("span", { key: "label" }, retentionLabel),
+            ])
+          : h("span", { className: "muted tiny" }, "-")
       ),
       h(
         "div",

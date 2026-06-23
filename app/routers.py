@@ -4,6 +4,7 @@ import asyncio
 import datetime as dt
 import io
 import json
+import logging
 import mimetypes
 import re
 import zipfile
@@ -27,7 +28,7 @@ from .auth import (
     oidc_login_response,
     require_admin,
 )
-from .config import AUTH_MODE, BASE_DOMAIN, SITE_NAME
+from .config import AUTH_MODE, BASE_DOMAIN, SITE_NAME, TTL_SWEEP_INTERVAL_SECONDS
 from .db import SessionLocal, get_db
 from .models import (
     Blob,
@@ -55,6 +56,7 @@ from .storage import (
 from .version import APP_VERSION
 
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 ARCHIVE_ROOT = "Archive"
@@ -63,6 +65,19 @@ ARCHIVE_ROOT_KEY = "archive"
 ROOT_NAMES = {VAULT_ROOT_KEY: "Vault", ARCHIVE_ROOT_KEY: "Archive"}
 FOLDER_COLOR_TOKENS = {"blue", "teal", "green", "amber", "rose", "violet", "slate"}
 FOLDER_ICON_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+TTL_ACTIONS = {"archive", "delete"}
+SYSTEM_USER: UserContext = {
+    "id": "system",
+    "vault_user_id": 0,
+    "issuer": "system",
+    "subject": "system",
+    "name": "System",
+    "email": "",
+    "groups": [],
+    "is_admin": True,
+}
+SYSTEM_META = {"ip": None, "user_agent": None}
+_ttl_sweeper_task: asyncio.Task[None] | None = None
 
 
 @dataclass(frozen=True)
@@ -109,6 +124,12 @@ class FolderPropertiesPayload(BaseModel):
     path: str
     color: str | None = None
     icon: str | None = None
+
+
+class FolderRetentionPayload(BaseModel):
+    path: str
+    default_ttl_days: int | None = None
+    default_ttl_action: str | None = None
 
 
 class FolderPermissionPayload(BaseModel):
@@ -525,6 +546,50 @@ def sanitize_folder_icon(value: str | None) -> str | None:
     if not FOLDER_ICON_PATTERN.fullmatch(normalized):
         raise HTTPException(status_code=400, detail="Invalid folder icon")
     return normalized
+
+
+def sanitize_ttl_policy(days: int | None, action: str | None) -> tuple[int | None, str | None]:
+    normalized_action = (action or "").strip().lower()
+    if not normalized_action or normalized_action == "none":
+        return None, None
+    if normalized_action not in TTL_ACTIONS:
+        raise HTTPException(status_code=400, detail="Invalid TTL action")
+    if days is None:
+        raise HTTPException(status_code=400, detail="TTL days are required")
+    if days < 1 or days > 3650:
+        raise HTTPException(status_code=400, detail="TTL days must be between 1 and 3650")
+    return days, normalized_action
+
+
+def ttl_policy_payload(folder: Folder) -> dict[str, object | None]:
+    return {
+        "default_ttl_days": folder.default_ttl_days,
+        "default_ttl_action": folder.default_ttl_action or "none",
+    }
+
+
+def apply_folder_ttl(doc: Document, folder: Folder, timestamp: dt.datetime | None = None) -> None:
+    days = folder.default_ttl_days
+    action = (folder.default_ttl_action or "").strip().lower()
+    if action not in TTL_ACTIONS or not days:
+        doc.expires_at = None
+        doc.expiry_action = None
+        return
+    if action == "archive" and folder_is_archive(folder):
+        doc.expires_at = None
+        doc.expiry_action = None
+        return
+    base = timestamp or now_utc()
+    doc.expires_at = base + dt.timedelta(days=days)
+    doc.expiry_action = action
+
+
+def document_expiry_payload(doc: Document) -> dict[str, object | None]:
+    expires_at = normalize_timestamp(doc.expires_at)
+    return {
+        "expires_at": expires_at.isoformat() if expires_at else None,
+        "expiry_action": doc.expiry_action,
+    }
 
 
 def record_folder_event(
@@ -1097,7 +1162,8 @@ def archive_folder_item(source: Folder, request: Request, user: UserContext, db:
     remove_empty_folder_conflict(db, target_parent.id, target_name, source.id)
     ensure_unique_folder_name(db, target_parent.id, target_name, source.id)
     meta = client_meta(request)
-    for doc in docs_in_folder_subtree(db, source):
+    docs = docs_in_folder_subtree(db, source)
+    for doc in docs:
         release_lock(get_active_lock(doc, db), user)
         record_event(
             doc,
@@ -1113,6 +1179,8 @@ def archive_folder_item(source: Folder, request: Request, user: UserContext, db:
     source.parent_id = target_parent.id
     source.name = target_name
     set_subtree_root_key(db, source, ARCHIVE_ROOT_KEY)
+    for doc in docs:
+        apply_folder_ttl(doc, doc.folder, doc.latest_modified_at)
     record_folder_event(source, user, "archive", f"Moved to Archive from {source_path}", db)
     return target_path
 
@@ -1130,7 +1198,8 @@ def restore_folder_item(source: Folder, request: Request, user: UserContext, db:
     ensure_unique_folder_name(db, target_parent.id, target_name, source.id)
     archive_parent = source.parent
     meta = client_meta(request)
-    for doc in docs_in_folder_subtree(db, source):
+    docs = docs_in_folder_subtree(db, source)
+    for doc in docs:
         record_event(
             doc,
             user,
@@ -1145,6 +1214,8 @@ def restore_folder_item(source: Folder, request: Request, user: UserContext, db:
     source.parent_id = target_parent.id
     source.name = target_name
     set_subtree_root_key(db, source, VAULT_ROOT_KEY)
+    for doc in docs:
+        apply_folder_ttl(doc, doc.folder, doc.latest_modified_at)
     prune_empty_archive_folders(db, archive_parent)
     record_folder_event(source, user, "restore", f"Restored to Vault from {source_path}", db)
     return target_path
@@ -1315,6 +1386,7 @@ def document_row_payload(
         "lock": lock_payload(lock),
         "archived": document_is_archive(doc),
     }
+    payload.update(document_expiry_payload(doc))
     if user is not None:
         level = document_access_level(doc, user, db)
         payload["access"] = {
@@ -1435,6 +1507,8 @@ def folder_summary_payload(folder: Folder, path: str, stats: list[DocStat]) -> d
         "name": path.split("/")[-1] if path else "Vault",
         "color": folder.color or "",
         "icon": folder.icon or "",
+        "default_ttl_days": folder.default_ttl_days,
+        "default_ttl_action": folder.default_ttl_action or "none",
         "latest_by": latest_by,
         "latest_updated_at": latest.isoformat() if latest else None,
         "latest_updated_display": format_mtime(latest),
@@ -1504,6 +1578,7 @@ def folder_properties_payload(folder: Folder, db: Session) -> dict[str, object]:
             "created_at": folder.created_at.isoformat() if folder.created_at else None,
             "created_by": folder.created_by,
             "created_by_name": folder.created_by_name or folder.created_by or "System",
+            **ttl_policy_payload(folder),
             "counts": folder_counts_payload(folder, db),
             "history": [
                 {
@@ -1848,11 +1923,144 @@ def mutate_doc_location(
     publish_state: bool = True,
 ) -> None:
     ensure_unique_document_path(db, target_folder.id, target_name, doc.id)
+    folder_changed = doc.folder_id != target_folder.id
     doc.folder = target_folder
     doc.folder_id = target_folder.id
     doc.name = target_name
     doc.latest_modified_at = now_utc()
+    if folder_changed:
+        apply_folder_ttl(doc, target_folder, doc.latest_modified_at)
     record_event(doc, user, event_type, message, db, meta=meta, publish_state=publish_state)
+
+
+def unique_document_name(
+    db: Session,
+    folder_id: int,
+    desired_name: str,
+    exclude_doc_id: int | None = None,
+) -> str:
+    if not document_in_folder(db, folder_id, desired_name, exclude_doc_id):
+        return desired_name
+    stem, dot, suffix = desired_name.rpartition(".")
+    base = stem if dot else desired_name
+    extension = f".{suffix}" if dot else ""
+    for index in range(1, 1000):
+        candidate = f"{base} (expired {index}){extension}"
+        if not document_in_folder(db, folder_id, candidate, exclude_doc_id):
+            return candidate
+    raise HTTPException(status_code=400, detail="Could not choose an archive name")
+
+
+def archive_expired_document(doc: Document, db: Session, timestamp: dt.datetime) -> str:
+    source_path = document_path(doc)
+    target_folder_path = public_folder_path(ARCHIVE_ROOT_KEY, folder_relative_path(doc.folder))
+    target_folder = get_or_create_folder_path(db, target_folder_path)
+    target_name = unique_document_name(db, target_folder.id, doc.name, doc.id)
+    mutate_doc_location(
+        doc,
+        target_folder,
+        target_name,
+        SYSTEM_USER,
+        db,
+        SYSTEM_META,
+        "archive",
+        f"Expired at {timestamp.strftime('%Y-%m-%d %H:%M UTC')}; archived from {source_path}",
+        publish_state=False,
+    )
+    return document_path(doc)
+
+
+def delete_expired_document(doc: Document, db: Session) -> str:
+    deleted_path = document_path(doc)
+    archive_folder = doc.folder if document_is_archive(doc) else None
+    db.delete(doc)
+    if archive_folder is not None:
+        prune_empty_archive_folders(db, archive_folder)
+    return deleted_path
+
+
+def sweep_expired_documents(limit: int = 250) -> dict[str, list[str]]:
+    result: dict[str, list[str]] = {"archived": [], "deleted": [], "skipped": []}
+    with storage_write_lock():
+        db = SessionLocal()
+        try:
+            ensure_root_folders(db)
+            timestamp = now_utc()
+            docs = list(
+                db.execute(
+                    select(Document)
+                    .where(
+                        Document.expires_at.is_not(None),
+                        Document.expires_at <= timestamp,
+                    )
+                    .order_by(Document.expires_at)
+                    .limit(limit),
+                )
+                .scalars()
+                .all(),
+            )
+            if not docs:
+                return result
+            locks = active_locks_by_document(db)
+            for doc in docs:
+                if locks.get(doc.id):
+                    result["skipped"].append(document_path(doc))
+                    continue
+                action = (doc.expiry_action or "").strip().lower()
+                if action == "archive":
+                    if document_is_archive(doc):
+                        doc.expires_at = None
+                        doc.expiry_action = None
+                    else:
+                        result["archived"].append(archive_expired_document(doc, db, timestamp))
+                    continue
+                if action == "delete":
+                    result["deleted"].append(delete_expired_document(doc, db))
+                    continue
+                doc.expires_at = None
+                doc.expiry_action = None
+            if result["archived"] or result["deleted"]:
+                record_state_change(
+                    db,
+                    "retention.expired",
+                    ("contents", "sidebar", "document_detail", "my_edits"),
+                )
+            db.commit()
+            return result
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+
+async def _ttl_sweeper_loop() -> None:
+    while True:
+        await asyncio.sleep(TTL_SWEEP_INTERVAL_SECONDS)
+        try:
+            sweep_expired_documents()
+        except Exception:
+            logger.exception("TTL sweep failed")
+
+
+def start_ttl_sweeper() -> None:
+    global _ttl_sweeper_task
+    if _ttl_sweeper_task and not _ttl_sweeper_task.done():
+        return
+    _ttl_sweeper_task = asyncio.create_task(_ttl_sweeper_loop())
+
+
+async def stop_ttl_sweeper() -> None:
+    global _ttl_sweeper_task
+    task = _ttl_sweeper_task
+    _ttl_sweeper_task = None
+    if not task:
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        return
 
 
 def storage_reconciliation_report(db: Session, apply: bool = False) -> dict[str, object]:
@@ -2153,6 +2361,29 @@ def api_update_folder_properties(
         folder.icon = sanitize_folder_icon(payload.icon)
         record_folder_event(folder, user, "metadata", "Updated folder appearance", db)
         record_folder_change(db, "properties")
+        commit_state(db)
+        return folder_properties_payload(folder, db)
+
+
+@router.put("/api/folders/retention")
+def api_update_folder_retention(
+    payload: FolderRetentionPayload,
+    user: UserContext = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    ensure_root_folders(db)
+    days, action = sanitize_ttl_policy(payload.default_ttl_days, payload.default_ttl_action)
+    with storage_write_lock():
+        folder = get_folder_by_path(db, payload.path)
+        if not folder:
+            raise HTTPException(status_code=404, detail="Folder not found")
+        require_folder_access(folder, user, db, 3)
+        if action == "delete" and not user["is_admin"]:
+            raise HTTPException(status_code=403, detail="Admin access required for delete TTL")
+        folder.default_ttl_days = days
+        folder.default_ttl_action = action
+        record_folder_event(folder, user, "retention", "Updated folder retention policy", db)
+        record_folder_change(db, "retention")
         commit_state(db)
         return folder_properties_payload(folder, db)
 
@@ -2672,6 +2903,7 @@ async def create_document(
             latest_modified_by=user["id"],
             latest_modified_at=now_utc(),
         )
+        apply_folder_ttl(doc, target_folder, doc.latest_modified_at)
         db.add(doc)
         db.flush()
         create_document_version(

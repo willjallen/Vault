@@ -633,7 +633,8 @@ header {
 }
 
 .finder-browser {
-  --contents-grid-template: 46px minmax(0, 1fr) minmax(112px, 138px) minmax(96px, 128px) 90px 58px;
+  --contents-grid-template: 46px minmax(0, 1fr) minmax(112px, 138px) minmax(96px, 128px) 90px
+    minmax(116px, 142px) 58px;
 
   background: var(--surface-panel);
   border: 1px solid var(--outline);
@@ -744,6 +745,10 @@ header {
 .contents-sort-size {
   justify-content: flex-end;
   text-align: right;
+}
+
+.contents-sort-ttl {
+  justify-content: flex-start;
 }
 
 .file-list {
@@ -1108,6 +1113,43 @@ header {
   text-overflow: ellipsis;
 }
 
+.ttl-chip {
+  max-width: 100%;
+  min-width: 0;
+  height: 22px;
+  display: inline-grid;
+  grid-template-columns: 12px minmax(0, 1fr);
+  align-items: center;
+  gap: 4px;
+  border: 1px solid var(--border-extra-subtle);
+  border-radius: 999px;
+  padding: 0 6px;
+  background: var(--surface-field-muted);
+  color: var(--text-secondary);
+  font-size: 0.68rem;
+  font-weight: 780;
+  line-height: 1;
+}
+
+.ttl-chip span:last-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ttl-chip.applied {
+  border-color: var(--warning-border);
+  background: var(--warning-soft);
+  color: var(--warning-text);
+}
+
+.ttl-chip.policy {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+  color: var(--accent-text);
+}
+
 .inline-name-editor {
   width: 100%;
   min-width: 0;
@@ -1133,6 +1175,11 @@ header {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.file-cell.ttl {
+  min-width: 0;
+  color: var(--muted);
 }
 
 .file-cell.size {
@@ -2638,6 +2685,56 @@ input[type="file"]::file-selector-button:hover {
   background: var(--surface-swatch-empty);
 }
 
+.folder-retention-controls {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.folder-retention-mode {
+  width: min(310px, 100%);
+}
+
+.folder-retention-days {
+  min-width: 0;
+  min-height: 42px;
+  display: inline-grid;
+  grid-template-columns: auto minmax(84px, 104px) auto;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--border-extra-subtle);
+  border-radius: 14px;
+  padding: 6px 10px;
+  background: var(--surface-raised);
+}
+
+.folder-retention-days input {
+  appearance: textfield;
+  min-width: 0;
+  height: 30px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px;
+  outline: 0;
+  background: var(--surface-panel);
+  color: var(--text);
+  font: inherit;
+  font-size: 0.86rem;
+  font-weight: 780;
+  padding: 0 8px;
+}
+
+.folder-retention-days input:focus {
+  border-color: var(--accent-border);
+  box-shadow: var(--shadow-focus);
+}
+
+.folder-retention-days input:disabled {
+  color: var(--text-muted);
+  opacity: 0.65;
+}
+
 .folder-permission-add {
   display: flex;
   gap: 8px;
@@ -3658,6 +3755,7 @@ input[type="file"]::file-selector-button:hover {
   .contents-sort-date,
   .contents-sort-user,
   .contents-sort-size,
+  .contents-sort-ttl,
   .contents-sort-status {
     display: none;
   }
@@ -3667,6 +3765,7 @@ input[type="file"]::file-selector-button:hover {
   }
 
   .file-cell.meta,
+  .file-cell.ttl,
   .file-cell.user,
   .file-cell.size,
   .file-cell.status-col {
@@ -3821,6 +3920,11 @@ input[type="file"]::file-selector-button:hover {
 
   .folder-permission-add {
     flex-direction: column;
+  }
+
+  .folder-retention-controls,
+  .folder-retention-days {
+    width: 100%;
   }
 
   .admin-card-head {

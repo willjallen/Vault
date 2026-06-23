@@ -5,11 +5,12 @@ import { FileRow } from "./FileRow.js";
 import { EmptyState } from "./EmptyState.js";
 
 const h = React.createElement;
-const SORT_COLUMNS = [
-  { key: "name", label: "Name", className: "name", defaultDirection: "asc" },
+const NAME_COLUMN = { key: "name", label: "Name", className: "name", defaultDirection: "asc" };
+const DETAIL_SORT_COLUMNS = [
   { key: "date", label: "Date", className: "date", defaultDirection: "desc" },
   { key: "user", label: "User", className: "user", defaultDirection: "asc" },
   { key: "size", label: "Size", className: "size", defaultDirection: "desc" },
+  { key: "ttl", label: "TTL", className: "ttl", defaultDirection: "asc" },
 ];
 
 function ContentsSortButton({ column, sort, onSortChange }) {
@@ -230,7 +231,13 @@ export function VaultFileList({
         },
         [
           h("span", { className: "contents-sort-spacer", key: "spacer" }),
-          ...SORT_COLUMNS.map((column) =>
+          h(ContentsSortButton, {
+            column: NAME_COLUMN,
+            key: NAME_COLUMN.key,
+            onSortChange,
+            sort,
+          }),
+          ...DETAIL_SORT_COLUMNS.map((column) =>
             h(ContentsSortButton, {
               column,
               key: column.key,

@@ -110,6 +110,10 @@ class DockerDeployTests(unittest.TestCase):
         self.assertIn("vault-data:", compose)
         self.assertEqual(compose.count(":/data"), 1)
         self.assertIn("VAULT_SITE_NAME: ${VAULT_SITE_NAME:-Vault}", compose)
+        self.assertIn(
+            "VAULT_TTL_SWEEP_INTERVAL_SECONDS: ${VAULT_TTL_SWEEP_INTERVAL_SECONDS:-60}",
+            compose,
+        )
         self.assertNotIn("/vault-metadata", compose)
         self.assertNotIn("/vault-objects", compose)
         self.assertIn("VAULT_DOCKER_RUNTIME: ${VAULT_DOCKER_RUNTIME:-1}", compose)
@@ -126,6 +130,10 @@ class DockerDeployTests(unittest.TestCase):
         self.assertIn("build:", dev_compose)
         self.assertIn("VAULT_AUTH_MODE: dev", dev_compose)
         self.assertIn("VAULT_SITE_NAME: ${VAULT_SITE_NAME:-Vault}", dev_compose)
+        self.assertIn(
+            "VAULT_TTL_SWEEP_INTERVAL_SECONDS: ${VAULT_TTL_SWEEP_INTERVAL_SECONDS:-60}",
+            dev_compose,
+        )
         self.assertIn('VAULT_DEV_AUTH: "1"', dev_compose)
         self.assertIn("dev-insecure-session-secret-change-me", dev_compose)
 

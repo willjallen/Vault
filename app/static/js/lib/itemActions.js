@@ -19,6 +19,8 @@ export function docToItem(doc) {
     lock: doc.lock || {},
     name: doc.name,
     path: doc.path || (doc.folder ? `${doc.folder}/${doc.name}` : doc.name),
+    expires_at: doc.expires_at || null,
+    expiry_action: doc.expiry_action || "",
     size_bytes: doc.size_bytes || 0,
     size_display: doc.size_display || "",
     type: "document",
@@ -31,6 +33,8 @@ export function folderToItem(folderItem) {
   return {
     archived: isArchivePath(folderItem.path || ""),
     color: folderItem.color || "",
+    default_ttl_action: folderItem.default_ttl_action || "none",
+    default_ttl_days: folderItem.default_ttl_days || null,
     icon: folderItem.icon || "",
     latest_by: folderItem.latest_by || "",
     latest_updated_at: folderItem.latest_updated_at || null,

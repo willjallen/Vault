@@ -1,4 +1,4 @@
-import { classNames } from "../lib/utils.js";
+import { classNames, formatDate } from "../lib/utils.js";
 import { Icon } from "./common/Icon.js";
 import { IconPicker } from "./common/IconPicker.js";
 
@@ -6,17 +6,7 @@ const { useCallback, useEffect, useMemo, useRef, useState } = React;
 const h = React.createElement;
 
 function formatTimestamp(timestamp) {
-  if (!timestamp) {
-    return "Unknown";
-  }
-  const date = new Date(timestamp);
-  if (Number.isNaN(date.getTime())) {
-    return timestamp;
-  }
-  return date.toLocaleString(undefined, {
-    dateStyle: "medium",
-    timeStyle: "short",
-  });
+  return formatDate(timestamp, "Unknown");
 }
 
 async function responseError(res) {

@@ -8,20 +8,7 @@ function formatTimestamp(timestamp) {
   if (!timestamp) {
     return "";
   }
-  const dt = new Date(timestamp);
-  if (Number.isNaN(dt.getTime())) {
-    return timestamp;
-  }
-  const date = dt.toLocaleDateString(undefined, {
-    month: "short",
-    day: "2-digit",
-    year: "numeric",
-  });
-  const time = dt.toLocaleTimeString(undefined, {
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-  return `${date} at ${time}`;
+  return formatDate(timestamp, timestamp);
 }
 
 function describeEvent(entry, versionNumber) {

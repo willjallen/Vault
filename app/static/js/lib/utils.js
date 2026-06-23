@@ -73,7 +73,43 @@ export function buildTree(childrenMap, nodePath = "") {
   }));
 }
 
-export function formatDate(iso, fallback = "Not updated yet") {
+function sameLocalDay(a, b) {
+  return (
+    a.getFullYear() === b.getFullYear() &&
+    a.getMonth() === b.getMonth() &&
+    a.getDate() === b.getDate()
+  );
+}
+
+function formatClock(date) {
+  return date
+    .toLocaleTimeString(undefined, {
+      hour: "numeric",
+      minute: "2-digit",
+    })
+    .toLowerCase();
+}
+
+function formatSemanticDate(date, now) {
+  if (sameLocalDay(date, now)) {
+    return "Today";
+  }
+  const yesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  yesterday.setDate(yesterday.getDate() - 1);
+  if (sameLocalDay(date, yesterday)) {
+    return "Yesterday";
+  }
+  const options = {
+    day: "numeric",
+    month: "short",
+  };
+  if (date.getFullYear() !== now.getFullYear()) {
+    options.year = "numeric";
+  }
+  return date.toLocaleDateString(undefined, options);
+}
+
+export function formatDate(iso, fallback = "Not updated yet", now = new Date()) {
   if (!iso) {
     return fallback;
   }
@@ -81,18 +117,7 @@ export function formatDate(iso, fallback = "Not updated yet") {
   if (Number.isNaN(d.getTime())) {
     return fallback;
   }
-  const date = d.toLocaleDateString(undefined, {
-    day: "numeric",
-    month: "short",
-    year: "numeric",
-  });
-  const time = d
-    .toLocaleTimeString(undefined, {
-      hour: "numeric",
-      minute: "2-digit",
-    })
-    .toLowerCase();
-  return `${date} at ${time}`;
+  return `${formatSemanticDate(d, now)} at ${formatClock(d)}`;
 }
 
 export function retentionPolicyLabel(action, days) {

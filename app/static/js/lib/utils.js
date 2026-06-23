@@ -73,12 +73,26 @@ export function buildTree(childrenMap, nodePath = "") {
   }));
 }
 
-export function formatDate(iso) {
+export function formatDate(iso, fallback = "Not updated yet") {
   if (!iso) {
-    return "Not updated yet";
+    return fallback;
   }
   const d = new Date(iso);
-  return d.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+  if (Number.isNaN(d.getTime())) {
+    return fallback;
+  }
+  const date = d.toLocaleDateString(undefined, {
+    day: "numeric",
+    month: "short",
+    year: "numeric",
+  });
+  const time = d
+    .toLocaleTimeString(undefined, {
+      hour: "numeric",
+      minute: "2-digit",
+    })
+    .toLowerCase();
+  return `${date} at ${time}`;
 }
 
 export function retentionPolicyLabel(action, days) {

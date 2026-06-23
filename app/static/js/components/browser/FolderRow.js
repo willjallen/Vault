@@ -1,4 +1,4 @@
-import { classNames, isArchivePath, retentionPolicyLabel } from "../../lib/utils.js";
+import { classNames, formatDate, isArchivePath, retentionPolicyLabel } from "../../lib/utils.js";
 import { Icon } from "../common/Icon.js";
 import { RowSelectionIcon } from "./RowSelectionIcon.js";
 
@@ -158,7 +158,7 @@ export function FolderRow({
       h(
         "div",
         { className: "file-cell meta" },
-        h("span", { className: "muted tiny" }, folder.latest_updated_display || "Not updated yet")
+        h("span", { className: "muted tiny" }, formatDate(folder.latest_updated_at))
       ),
       h(
         "div",

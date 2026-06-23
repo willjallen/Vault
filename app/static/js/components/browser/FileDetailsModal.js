@@ -258,7 +258,7 @@ export function FileDetailsModal({ actions, doc, onClose }) {
               h("div", null, [h("span", null, "Version"), h("strong", null, `v${versionCount}`)]),
               h("div", null, [
                 h("span", null, "Updated"),
-                h("strong", null, doc.latest_updated_display || "No updates yet"),
+                h("strong", null, formatDate(doc.latest_updated_at, "No updates yet")),
               ]),
               h("div", null, [h("span", null, "User"), h("strong", null, doc.latest_by || "-")]),
               h("div", null, [h("span", null, "Size"), h("strong", null, doc.size_display || "-")]),

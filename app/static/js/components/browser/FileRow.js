@@ -149,9 +149,7 @@ export function FileRow({
             ]),
       ]),
       h("div", { className: "file-cell meta" }, [
-        doc.latest_updated_display
-          ? h("div", { className: "muted tiny" }, doc.latest_updated_display)
-          : h("div", { className: "muted tiny" }, "No updates yet"),
+        h("div", { className: "muted tiny" }, formatDate(doc.latest_updated_at, "No updates yet")),
       ]),
       h(
         "div",

@@ -67,6 +67,46 @@ class UserContext(TypedDict):
 _DISCOVERY_CACHE: dict[str, object] = {"expires_at": 0.0, "config": None}
 
 
+def configure_auth(
+    *,
+    auth_mode: str = "headers",
+    admin_groups: set[str] | None = None,
+    bootstrap_admin_emails: set[str] | None = None,
+    session_secret: str | None = None,
+    session_cookie_name: str | None = None,
+    session_max_age_seconds: int | None = None,
+) -> None:
+    """Configure process-local auth globals."""
+    global ADMIN_GROUPS, AUTH_MODE, BOOTSTRAP_ADMIN_EMAILS
+    global SESSION_COOKIE_NAME, SESSION_MAX_AGE_SECONDS, SESSION_SECRET
+
+    from . import config
+
+    AUTH_MODE = auth_mode.strip().lower() or "headers"
+    if admin_groups is not None:
+        ADMIN_GROUPS = {group.strip().lower() for group in admin_groups if group.strip()}
+    if bootstrap_admin_emails is not None:
+        BOOTSTRAP_ADMIN_EMAILS = {
+            email.strip().lower() for email in bootstrap_admin_emails if email.strip()
+        }
+    if session_secret is not None:
+        SESSION_SECRET = session_secret
+    if session_cookie_name is not None:
+        SESSION_COOKIE_NAME = session_cookie_name.strip() or "vault_session"
+    if session_max_age_seconds is not None:
+        SESSION_MAX_AGE_SECONDS = session_max_age_seconds
+
+    _DISCOVERY_CACHE["expires_at"] = 0.0
+    _DISCOVERY_CACHE["config"] = None
+
+    config.AUTH_MODE = AUTH_MODE
+    config.ADMIN_GROUPS = ADMIN_GROUPS
+    config.BOOTSTRAP_ADMIN_EMAILS = BOOTSTRAP_ADMIN_EMAILS
+    config.SESSION_SECRET = SESSION_SECRET
+    config.SESSION_COOKIE_NAME = SESSION_COOKIE_NAME
+    config.SESSION_MAX_AGE_SECONDS = SESSION_MAX_AGE_SECONDS
+
+
 def _env_flag(name: str) -> bool:
     value = (os.getenv(name) or "").strip().lower()
     return value in {"1", "true", "yes", "on"}
@@ -116,7 +156,7 @@ def _verify_payload(value: str | None) -> dict[str, object] | None:
     except (ValueError, json.JSONDecodeError):
         return None
     expires_at = payload.get("exp")
-    if isinstance(expires_at, (int, float)) and expires_at < time.time():
+    if isinstance(expires_at, int | float) and expires_at < time.time():
         return None
     return payload if isinstance(payload, dict) else None
 
@@ -191,7 +231,9 @@ def _ensure_group_root_permissions(db: Session, group: VaultGroup) -> None:
 
 def _sync_vault_groups(db: Session, user: VaultUser, groups: set[str]) -> None:
     normalized = {group.strip().lower() for group in groups if group.strip()}
-    existing_groups = {group.name.lower(): group for group in db.execute(select(VaultGroup)).scalars()}
+    existing_groups = {
+        group.name.lower(): group for group in db.execute(select(VaultGroup)).scalars()
+    }
     for group_name in normalized:
         if group_name not in existing_groups:
             group = VaultGroup(name=group_name)
@@ -388,11 +430,18 @@ def _oidc_discovery() -> dict[str, object]:
     return config
 
 
-def _http_json(url: str, data: dict[str, str] | None = None, headers: dict[str, str] | None = None) -> dict[str, object]:
+def _http_json(
+    url: str,
+    data: dict[str, str] | None = None,
+    headers: dict[str, str] | None = None,
+) -> dict[str, object]:
+    parsed_url = urllib.parse.urlparse(url)
+    if parsed_url.scheme not in {"http", "https"}:
+        raise HTTPException(status_code=502, detail="OIDC provider URL is invalid")
     body = urllib.parse.urlencode(data).encode("utf-8") if data is not None else None
-    request = urllib.request.Request(url, data=body, headers=headers or {})
+    request = urllib.request.Request(url, data=body, headers=headers or {})  # noqa: S310
     try:
-        with urllib.request.urlopen(request, timeout=OIDC_HTTP_TIMEOUT_SECONDS) as response:
+        with urllib.request.urlopen(request, timeout=OIDC_HTTP_TIMEOUT_SECONDS) as response:  # noqa: S310
             parsed = json.loads(response.read().decode("utf-8"))
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=502, detail="OIDC provider request failed") from exc
@@ -412,7 +461,9 @@ def oidc_login_response(request: Request) -> RedirectResponse:
     state = new_token_urlsafe()
     nonce = new_token_urlsafe()
     rd = _safe_redirect(request.query_params.get("rd"))
-    state_cookie = _sign_payload({"state": state, "nonce": nonce, "rd": rd, "exp": time.time() + 600})
+    state_cookie = _sign_payload(
+        {"state": state, "nonce": nonce, "rd": rd, "exp": time.time() + 600},
+    )
     params = {
         "client_id": OIDC_CLIENT_ID,
         "redirect_uri": _oidc_redirect_uri(request),
@@ -436,7 +487,11 @@ def oidc_login_response(request: Request) -> RedirectResponse:
     return response
 
 
-def _exchange_code_for_token(request: Request, code: str, discovery: dict[str, object]) -> dict[str, object]:
+def _exchange_code_for_token(
+    request: Request,
+    code: str,
+    discovery: dict[str, object],
+) -> dict[str, object]:
     token_endpoint = str(discovery.get("token_endpoint") or "")
     if not token_endpoint:
         raise HTTPException(status_code=500, detail="OIDC token endpoint is missing")
@@ -450,12 +505,16 @@ def _exchange_code_for_token(request: Request, code: str, discovery: dict[str, o
     if OIDC_CLIENT_AUTH == "client_secret_post":
         form["client_secret"] = OIDC_CLIENT_SECRET
     elif OIDC_CLIENT_SECRET:
-        credentials = f"{OIDC_CLIENT_ID}:{OIDC_CLIENT_SECRET}".encode("utf-8")
+        credentials = f"{OIDC_CLIENT_ID}:{OIDC_CLIENT_SECRET}".encode()
         headers["Authorization"] = f"Basic {base64.b64encode(credentials).decode('ascii')}"
     return _http_json(token_endpoint, form, headers)
 
 
-def _verified_id_claims(id_token: str, nonce: str, discovery: dict[str, object]) -> dict[str, object]:
+def _verified_id_claims(
+    id_token: str,
+    nonce: str,
+    discovery: dict[str, object],
+) -> dict[str, object]:
     jwks_uri = str(discovery.get("jwks_uri") or "")
     if not jwks_uri:
         raise HTTPException(status_code=500, detail="OIDC JWKS endpoint is missing")
@@ -509,7 +568,7 @@ def oidc_callback_response(request: Request, db: Session) -> RedirectResponse:
     raw_groups = identity.get(OIDC_GROUPS_CLAIM, [])
     if isinstance(raw_groups, str):
         groups = _split_groups(raw_groups)
-    elif isinstance(raw_groups, (list, tuple, set)):
+    elif isinstance(raw_groups, list | tuple | set):
         groups = {str(group).lower() for group in raw_groups if str(group).strip()}
     else:
         groups = set()
@@ -531,7 +590,10 @@ def oidc_callback_response(request: Request, db: Session) -> RedirectResponse:
         admin_hint=_admin_hint(email, groups),
         mark_login=True,
     )
-    response = RedirectResponse(url=_safe_redirect(str(state_payload.get("rd") or "/")), status_code=303)
+    response = RedirectResponse(
+        url=_safe_redirect(str(state_payload.get("rd") or "/")),
+        status_code=303,
+    )
     response.set_cookie(
         SESSION_COOKIE_NAME,
         _sign_payload({"uid": user.id, "exp": time.time() + SESSION_MAX_AGE_SECONDS}),

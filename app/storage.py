@@ -95,8 +95,8 @@ class LocalBlobStorage(BlobStorageBackend):
     name = "local"
     bucket = ""
 
-    def __init__(self, root: Path = OBJECTS_PATH) -> None:
-        self.root = root
+    def __init__(self, root: Path | None = None) -> None:
+        self.root = root or OBJECTS_PATH
 
     def ensure(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -253,6 +253,64 @@ def _build_backend(name: str) -> BlobStorageBackend:
 
 
 _backend_cache: dict[str, BlobStorageBackend] = {}
+
+
+def configure_storage(
+    *,
+    backend: str = "local",
+    objects_path: str | Path | None = None,
+    prefix: str = "objects",
+    s3_bucket: str = "",
+    s3_region: str = "us-east-1",
+    s3_endpoint_url: str | None = None,
+    s3_access_key_id: str = "",
+    s3_secret_access_key: str = "",
+    s3_session_token: str = "",
+    r2_bucket: str = "",
+    r2_endpoint_url: str | None = None,
+    r2_access_key_id: str = "",
+    r2_secret_access_key: str = "",
+) -> None:
+    """Configure process-local blob storage globals."""
+    global FILES_LOCK_PATH
+    global OBJECTS_PATH, STORAGE_BACKEND, STORAGE_PREFIX
+    global S3_ACCESS_KEY_ID, S3_BUCKET, S3_ENDPOINT_URL
+    global S3_REGION, S3_SECRET_ACCESS_KEY, S3_SESSION_TOKEN
+    global R2_ACCESS_KEY_ID, R2_BUCKET, R2_ENDPOINT_URL, R2_SECRET_ACCESS_KEY
+
+    from . import config
+
+    STORAGE_BACKEND = backend.strip().lower() or "local"
+    STORAGE_PREFIX = prefix.strip().strip("/")
+    if objects_path is not None:
+        OBJECTS_PATH = Path(objects_path).resolve()
+    S3_BUCKET = s3_bucket.strip()
+    S3_REGION = s3_region.strip() or "us-east-1"
+    S3_ENDPOINT_URL = s3_endpoint_url.strip() if s3_endpoint_url else None
+    S3_ACCESS_KEY_ID = s3_access_key_id.strip()
+    S3_SECRET_ACCESS_KEY = s3_secret_access_key.strip()
+    S3_SESSION_TOKEN = s3_session_token.strip()
+    R2_BUCKET = r2_bucket.strip()
+    R2_ENDPOINT_URL = r2_endpoint_url.strip() if r2_endpoint_url else None
+    R2_ACCESS_KEY_ID = r2_access_key_id.strip()
+    R2_SECRET_ACCESS_KEY = r2_secret_access_key.strip()
+
+    FILES_LOCK_PATH = OBJECTS_PATH / ".vault-storage.lock"
+    _backend_cache.clear()
+
+    config.STORAGE_BACKEND = STORAGE_BACKEND
+    config.STORAGE_PREFIX = STORAGE_PREFIX
+    config.OBJECTS_PATH = OBJECTS_PATH
+    config.S3_BUCKET = S3_BUCKET
+    config.S3_REGION = S3_REGION
+    config.S3_ENDPOINT_URL = S3_ENDPOINT_URL
+    config.S3_ACCESS_KEY_ID = S3_ACCESS_KEY_ID
+    config.S3_SECRET_ACCESS_KEY = S3_SECRET_ACCESS_KEY
+    config.S3_SESSION_TOKEN = S3_SESSION_TOKEN
+    config.R2_BUCKET = R2_BUCKET
+    config.R2_ENDPOINT_URL = R2_ENDPOINT_URL
+    config.R2_ACCESS_KEY_ID = R2_ACCESS_KEY_ID
+    config.R2_SECRET_ACCESS_KEY = R2_SECRET_ACCESS_KEY
 
 
 def get_storage_backend(name: str | None = None) -> BlobStorageBackend:

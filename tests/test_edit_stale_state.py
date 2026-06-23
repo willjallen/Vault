@@ -1,96 +1,29 @@
-import os
-import subprocess
-import sys
-import tempfile
-import textwrap
 import unittest
-from pathlib import Path
+
+from fastapi import HTTPException
+from tests.support import FAKE_REQUEST, create_versioned_document, user_context, vault_runtime
+
+from app.db import SessionLocal
+from app.models import Document, DocumentLock
+from app.routers import (
+    ActionItem,
+    ActionPayload,
+    archive_doc_item,
+    checkout_document,
+    get_document_or_404,
+    get_or_create_folder_path,
+    lock_items,
+)
 
 
 class EditStaleStateTests(unittest.TestCase):
-    def run_edit_script(self, script: str) -> None:
-        with tempfile.TemporaryDirectory(prefix="vault-stale-edit-") as temp_dir:
-            env = os.environ.copy()
-            env["VAULT_DB_PATH"] = str(Path(temp_dir) / "vault.db")
-            env["VAULT_OBJECTS_PATH"] = str(Path(temp_dir) / "objects")
-
-            completed = subprocess.run(
-                [sys.executable, "-c", textwrap.dedent(script)],
-                check=False,
-                cwd=Path(__file__).resolve().parents[1],
-                env=env,
-                stderr=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                text=True,
-            )
-
-            self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
-
     def test_lock_rechecks_archived_state_inside_write_lock(self) -> None:
-        self.run_edit_script(
-            """
-            from fastapi import HTTPException
+        user = user_context("alice")
 
-            from app.db import SessionLocal, init_db
-            from app.models import Document, DocumentLock
-            from app.routers import (
-                ActionItem,
-                ActionPayload,
-                archive_doc_item,
-                create_document_version,
-                get_document_or_404,
-                get_or_create_blob_for_data,
-                get_or_create_folder_path,
-                lock_items,
-                now_utc,
-            )
-            from app.storage import ensure_storage
-
-
-            class FakeClient:
-                host = "testclient"
-
-
-            class FakeRequest:
-                headers = {}
-                client = FakeClient()
-
-
-            user = {
-                "id": "alice",
-                "name": "Alice",
-                "email": "alice@example.com",
-                "groups": ["vault-users"],
-                "is_admin": True,
-            }
-
-
-            init_db()
-            ensure_storage()
+        with vault_runtime():
             with SessionLocal() as db:
                 folder = get_or_create_folder_path(db, "Project")
-                blob = get_or_create_blob_for_data(db, b"v1", "text/plain")
-                doc = Document(
-                    folder_id=folder.id,
-                    name="plan.txt",
-                    created_by=user["id"],
-                    created_by_name=user["name"],
-                    latest_modified_by=user["id"],
-                    latest_modified_at=now_utc(),
-                )
-                db.add(doc)
-                db.flush()
-                create_document_version(
-                    db,
-                    doc,
-                    blob,
-                    user,
-                    {"ip": None, "user_agent": None},
-                    "plan.txt",
-                    "text/plain",
-                    "Uploaded plan.txt",
-                    "upload",
-                )
+                doc = create_versioned_document(db, folder, actor=user)
                 db.commit()
                 doc_id = doc.id
 
@@ -99,91 +32,40 @@ class EditStaleStateTests(unittest.TestCase):
                 get_document_or_404(doc_id, stale_db)
                 with SessionLocal() as archive_db:
                     doc = archive_db.get(Document, doc_id)
-                    archive_doc_item(doc, FakeRequest(), user, archive_db)
+                    archive_doc_item(doc, FAKE_REQUEST, user, archive_db)
                     archive_db.commit()
 
                 result = lock_items(
                     ActionPayload(items=[ActionItem(type="document", id=doc_id)]),
-                    FakeRequest(),
+                    FAKE_REQUEST,
                     user,
                     stale_db,
                 )
-                assert result["ok"] == []
-                assert result["failed"][0]["detail"] == "Restore this file before editing"
+                self.assertEqual(result["ok"], [])
+                self.assertEqual(
+                    result["failed"][0]["detail"],
+                    "Restore this file before editing",
+                )
             finally:
                 stale_db.close()
 
             with SessionLocal() as db:
                 doc = db.get(Document, doc_id)
-                assert doc is not None
-                assert doc.folder.root_key == "archive"
-                assert db.query(DocumentLock).filter_by(document_id=doc_id, is_active=True).count() == 0
-            """,
-        )
+                self.assertIsNotNone(doc)
+                self.assertEqual(doc.folder.root_key, "archive")
+                active_locks = db.query(DocumentLock).filter_by(
+                    document_id=doc_id,
+                    is_active=True,
+                )
+                self.assertEqual(active_locks.count(), 0)
 
     def test_checkout_rechecks_archived_state_inside_write_lock(self) -> None:
-        self.run_edit_script(
-            """
-            from fastapi import HTTPException
+        user = user_context("alice")
 
-            from app.db import SessionLocal, init_db
-            from app.models import Document, DocumentLock
-            from app.routers import (
-                archive_doc_item,
-                checkout_document,
-                create_document_version,
-                get_document_or_404,
-                get_or_create_blob_for_data,
-                get_or_create_folder_path,
-                now_utc,
-            )
-            from app.storage import ensure_storage
-
-
-            class FakeClient:
-                host = "testclient"
-
-
-            class FakeRequest:
-                headers = {}
-                client = FakeClient()
-
-
-            user = {
-                "id": "alice",
-                "name": "Alice",
-                "email": "alice@example.com",
-                "groups": ["vault-users"],
-                "is_admin": True,
-            }
-
-
-            init_db()
-            ensure_storage()
+        with vault_runtime():
             with SessionLocal() as db:
                 folder = get_or_create_folder_path(db, "Project")
-                blob = get_or_create_blob_for_data(db, b"v1", "text/plain")
-                doc = Document(
-                    folder_id=folder.id,
-                    name="plan.txt",
-                    created_by=user["id"],
-                    created_by_name=user["name"],
-                    latest_modified_by=user["id"],
-                    latest_modified_at=now_utc(),
-                )
-                db.add(doc)
-                db.flush()
-                create_document_version(
-                    db,
-                    doc,
-                    blob,
-                    user,
-                    {"ip": None, "user_agent": None},
-                    "plan.txt",
-                    "text/plain",
-                    "Uploaded plan.txt",
-                    "upload",
-                )
+                doc = create_versioned_document(db, folder, actor=user)
                 db.commit()
                 doc_id = doc.id
 
@@ -192,26 +74,26 @@ class EditStaleStateTests(unittest.TestCase):
                 get_document_or_404(doc_id, stale_db)
                 with SessionLocal() as archive_db:
                     doc = archive_db.get(Document, doc_id)
-                    archive_doc_item(doc, FakeRequest(), user, archive_db)
+                    archive_doc_item(doc, FAKE_REQUEST, user, archive_db)
                     archive_db.commit()
 
-                try:
-                    checkout_document(doc_id, FakeRequest(), user, stale_db)
-                except HTTPException as exc:
-                    assert exc.status_code == 400
-                    assert exc.detail == "Restore this file before editing"
-                else:
-                    raise AssertionError("checkout unexpectedly succeeded on an archived document")
+                with self.assertRaises(HTTPException) as raised:
+                    checkout_document(doc_id, FAKE_REQUEST, user, stale_db)
+
+                self.assertEqual(raised.exception.status_code, 400)
+                self.assertEqual(raised.exception.detail, "Restore this file before editing")
             finally:
                 stale_db.close()
 
             with SessionLocal() as db:
                 doc = db.get(Document, doc_id)
-                assert doc is not None
-                assert doc.folder.root_key == "archive"
-                assert db.query(DocumentLock).filter_by(document_id=doc_id, is_active=True).count() == 0
-            """,
-        )
+                self.assertIsNotNone(doc)
+                self.assertEqual(doc.folder.root_key, "archive")
+                active_locks = db.query(DocumentLock).filter_by(
+                    document_id=doc_id,
+                    is_active=True,
+                )
+                self.assertEqual(active_locks.count(), 0)
 
 
 if __name__ == "__main__":

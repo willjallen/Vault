@@ -1,191 +1,72 @@
-import os
-import subprocess
-import sys
-import tempfile
-import textwrap
+import datetime as dt
 import unittest
-from pathlib import Path
+
+from fastapi import HTTPException
+from tests.support import FAKE_REQUEST, create_versioned_document, user_context, vault_runtime
+
+from app.db import SessionLocal
+from app.models import Document, DocumentEvent
+from app.routers import (
+    all_folders,
+    archive_doc_item,
+    build_folder_path_cache,
+    docs_stats_for_folder_payloads,
+    document_row_payload,
+    folder_path,
+    folder_summary_payload,
+    get_document_or_404,
+    get_folder_by_path,
+    get_or_create_folder_path,
+    move_doc_item,
+    normalize_timestamp,
+    now_utc,
+    restore_doc_item,
+)
 
 
 class LocationStaleStateTests(unittest.TestCase):
-    def run_location_script(self, script: str) -> None:
-        with tempfile.TemporaryDirectory(prefix="vault-stale-location-") as temp_dir:
-            env = os.environ.copy()
-            env["VAULT_DB_PATH"] = str(Path(temp_dir) / "vault.db")
-            env["VAULT_OBJECTS_PATH"] = str(Path(temp_dir) / "objects")
-
-            completed = subprocess.run(
-                [sys.executable, "-c", textwrap.dedent(script)],
-                check=False,
-                cwd=Path(__file__).resolve().parents[1],
-                env=env,
-                stderr=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                text=True,
-            )
-
-            self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
-
     def test_row_modified_time_uses_version_commit_not_location_changes(self) -> None:
-        self.run_location_script(
-            """
-            import datetime as dt
+        user = user_context("alice")
 
-            from app.db import SessionLocal, init_db
-            from app.models import Document
-            from app.routers import (
-                all_folders,
-                archive_doc_item,
-                build_folder_path_cache,
-                create_document_version,
-                docs_stats_for_folder_payloads,
-                document_row_payload,
-                folder_path,
-                folder_summary_payload,
-                get_or_create_blob_for_data,
-                get_or_create_folder_path,
-                normalize_timestamp,
-                now_utc,
-                restore_doc_item,
-            )
-            from app.storage import ensure_storage
-
-
-            class FakeClient:
-                host = "testclient"
-
-
-            class FakeRequest:
-                headers = {}
-                client = FakeClient()
-
-
-            user = {
-                "id": "alice",
-                "name": "Alice",
-                "email": "alice@example.com",
-                "groups": ["vault-users"],
-                "is_admin": True,
-            }
-
-
-            init_db()
-            ensure_storage()
+        with vault_runtime():
             content_modified_at = now_utc() - dt.timedelta(days=7)
             expected_modified_at = normalize_timestamp(content_modified_at).isoformat()
             with SessionLocal() as db:
                 folder = get_or_create_folder_path(db, "Project")
-                blob = get_or_create_blob_for_data(db, b"v1", "text/plain")
-                doc = Document(
-                    folder_id=folder.id,
-                    name="plan.txt",
-                    created_by=user["id"],
-                    created_by_name=user["name"],
-                    latest_modified_by=user["id"],
-                    latest_modified_at=content_modified_at,
-                )
-                db.add(doc)
-                db.flush()
-                version = create_document_version(
+                doc = create_versioned_document(
                     db,
-                    doc,
-                    blob,
-                    user,
-                    {"ip": None, "user_agent": None},
-                    "plan.txt",
-                    "text/plain",
-                    "Uploaded plan.txt",
-                    "upload",
+                    folder,
+                    actor=user,
+                    committed_at=content_modified_at,
                 )
-                version.committed_at = content_modified_at
-                doc.latest_modified_at = content_modified_at
                 db.commit()
                 doc_id = doc.id
 
             with SessionLocal() as db:
                 doc = db.get(Document, doc_id)
-                archive_doc_item(doc, FakeRequest(), user, db)
+                archive_doc_item(doc, FAKE_REQUEST, user, db)
                 db.flush()
-                assert normalize_timestamp(doc.latest_modified_at) > content_modified_at
+                self.assertGreater(normalize_timestamp(doc.latest_modified_at), content_modified_at)
                 cache = build_folder_path_cache(all_folders(db))
                 row = document_row_payload(doc, db, cache)
-                assert row["modified_at"] == expected_modified_at
+                self.assertEqual(row["modified_at"], expected_modified_at)
                 stats = docs_stats_for_folder_payloads([doc], db, cache)
                 summary = folder_summary_payload(doc.folder, folder_path(doc.folder, cache), stats)
-                assert summary["modified_at"] == expected_modified_at
+                self.assertEqual(summary["modified_at"], expected_modified_at)
 
-                restore_doc_item(doc, FakeRequest(), user, db)
+                restore_doc_item(doc, FAKE_REQUEST, user, db)
                 db.flush()
                 cache = build_folder_path_cache(all_folders(db))
                 row = document_row_payload(doc, db, cache)
-                assert row["modified_at"] == expected_modified_at
-            """,
-        )
+                self.assertEqual(row["modified_at"], expected_modified_at)
 
     def test_stale_move_cannot_restore_archived_document_as_plain_move(self) -> None:
-        self.run_location_script(
-            """
-            from fastapi import HTTPException
+        user = user_context("alice")
 
-            from app.db import SessionLocal, init_db
-            from app.models import Document, DocumentEvent
-            from app.routers import (
-                archive_doc_item,
-                create_document_version,
-                get_folder_by_path,
-                get_document_or_404,
-                get_or_create_blob_for_data,
-                get_or_create_folder_path,
-                move_doc_item,
-                now_utc,
-            )
-            from app.storage import ensure_storage
-
-
-            class FakeClient:
-                host = "testclient"
-
-
-            class FakeRequest:
-                headers = {}
-                client = FakeClient()
-
-
-            user = {
-                "id": "alice",
-                "name": "Alice",
-                "email": "alice@example.com",
-                "groups": ["vault-users"],
-                "is_admin": True,
-            }
-
-
-            init_db()
-            ensure_storage()
+        with vault_runtime():
             with SessionLocal() as db:
                 folder = get_or_create_folder_path(db, "Project")
-                blob = get_or_create_blob_for_data(db, b"v1", "text/plain")
-                doc = Document(
-                    folder_id=folder.id,
-                    name="plan.txt",
-                    created_by=user["id"],
-                    created_by_name=user["name"],
-                    latest_modified_by=user["id"],
-                    latest_modified_at=now_utc(),
-                )
-                db.add(doc)
-                db.flush()
-                create_document_version(
-                    db,
-                    doc,
-                    blob,
-                    user,
-                    {"ip": None, "user_agent": None},
-                    "plan.txt",
-                    "text/plain",
-                    "Uploaded plan.txt",
-                    "upload",
-                )
+                doc = create_versioned_document(db, folder, actor=user)
                 db.commit()
                 doc_id = doc.id
 
@@ -194,92 +75,36 @@ class LocationStaleStateTests(unittest.TestCase):
                 stale_doc = get_document_or_404(doc_id, stale_db)
                 with SessionLocal() as archive_db:
                     doc = archive_db.get(Document, doc_id)
-                    archive_doc_item(doc, FakeRequest(), user, archive_db)
+                    archive_doc_item(doc, FAKE_REQUEST, user, archive_db)
                     archive_db.commit()
 
-                try:
-                    move_doc_item(stale_doc, "Other", FakeRequest(), user, stale_db, name="plan.txt")
-                except HTTPException as exc:
-                    assert exc.status_code == 400
-                    assert exc.detail == "Use archive or restore for Archive moves"
-                else:
-                    raise AssertionError("stale move unexpectedly restored the archived document")
+                with self.assertRaises(HTTPException) as raised:
+                    move_doc_item(stale_doc, "Other", FAKE_REQUEST, user, stale_db, name="plan.txt")
+
+                self.assertEqual(raised.exception.status_code, 400)
+                self.assertEqual(
+                    raised.exception.detail,
+                    "Use archive or restore for Archive moves",
+                )
             finally:
                 stale_db.close()
 
             with SessionLocal() as db:
                 doc = db.get(Document, doc_id)
-                assert doc is not None
-                assert doc.folder.root_key == "archive"
-                assert doc.folder.name == "Project"
-                assert get_folder_by_path(db, "Other") is None
+                self.assertIsNotNone(doc)
+                self.assertEqual(doc.folder.root_key, "archive")
+                self.assertEqual(doc.folder.name, "Project")
+                self.assertIsNone(get_folder_by_path(db, "Other"))
                 events = db.query(DocumentEvent).filter_by(document_id=doc_id).all()
-                assert [event.event_type for event in events] == ["archive"]
-            """,
-        )
+                self.assertEqual([event.event_type for event in events], ["archive"])
 
     def test_stale_archive_does_not_record_duplicate_archive_transition(self) -> None:
-        self.run_location_script(
-            """
-            from fastapi import HTTPException
+        user = user_context("alice")
 
-            from app.db import SessionLocal, init_db
-            from app.models import Document, DocumentEvent
-            from app.routers import (
-                archive_doc_item,
-                create_document_version,
-                get_document_or_404,
-                get_or_create_blob_for_data,
-                get_or_create_folder_path,
-                now_utc,
-            )
-            from app.storage import ensure_storage
-
-
-            class FakeClient:
-                host = "testclient"
-
-
-            class FakeRequest:
-                headers = {}
-                client = FakeClient()
-
-
-            user = {
-                "id": "alice",
-                "name": "Alice",
-                "email": "alice@example.com",
-                "groups": ["vault-users"],
-                "is_admin": True,
-            }
-
-
-            init_db()
-            ensure_storage()
+        with vault_runtime():
             with SessionLocal() as db:
                 folder = get_or_create_folder_path(db, "Project")
-                blob = get_or_create_blob_for_data(db, b"v1", "text/plain")
-                doc = Document(
-                    folder_id=folder.id,
-                    name="plan.txt",
-                    created_by=user["id"],
-                    created_by_name=user["name"],
-                    latest_modified_by=user["id"],
-                    latest_modified_at=now_utc(),
-                )
-                db.add(doc)
-                db.flush()
-                create_document_version(
-                    db,
-                    doc,
-                    blob,
-                    user,
-                    {"ip": None, "user_agent": None},
-                    "plan.txt",
-                    "text/plain",
-                    "Uploaded plan.txt",
-                    "upload",
-                )
+                doc = create_versioned_document(db, folder, actor=user)
                 db.commit()
                 doc_id = doc.id
 
@@ -288,24 +113,20 @@ class LocationStaleStateTests(unittest.TestCase):
                 stale_doc = get_document_or_404(doc_id, stale_db)
                 with SessionLocal() as archive_db:
                     doc = archive_db.get(Document, doc_id)
-                    archive_doc_item(doc, FakeRequest(), user, archive_db)
+                    archive_doc_item(doc, FAKE_REQUEST, user, archive_db)
                     archive_db.commit()
 
-                try:
-                    archive_doc_item(stale_doc, FakeRequest(), user, stale_db)
-                except HTTPException as exc:
-                    assert exc.status_code == 400
-                    assert exc.detail == "Document is already archived"
-                else:
-                    raise AssertionError("stale archive unexpectedly succeeded twice")
+                with self.assertRaises(HTTPException) as raised:
+                    archive_doc_item(stale_doc, FAKE_REQUEST, user, stale_db)
+
+                self.assertEqual(raised.exception.status_code, 400)
+                self.assertEqual(raised.exception.detail, "Document is already archived")
             finally:
                 stale_db.close()
 
             with SessionLocal() as db:
                 events = db.query(DocumentEvent).filter_by(document_id=doc_id).all()
-                assert [event.event_type for event in events] == ["archive"]
-            """,
-        )
+                self.assertEqual([event.event_type for event in events], ["archive"])
 
 
 if __name__ == "__main__":

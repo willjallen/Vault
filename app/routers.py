@@ -83,6 +83,32 @@ SYSTEM_META = {"ip": None, "user_agent": None}
 _ttl_sweeper_task: asyncio.Task[None] | None = None
 
 
+def configure_router_runtime(
+    *,
+    auth_mode: str | None = None,
+    base_domain: str | None = None,
+    site_name: str | None = None,
+    ttl_sweep_interval_seconds: int | None = None,
+) -> None:
+    """Configure process-local route globals that are normally loaded from env."""
+    global AUTH_MODE, BASE_DOMAIN, SITE_NAME, TTL_SWEEP_INTERVAL_SECONDS
+
+    from . import config
+
+    if auth_mode is not None:
+        AUTH_MODE = auth_mode.strip().lower() or "headers"
+        config.AUTH_MODE = AUTH_MODE
+    if base_domain is not None:
+        BASE_DOMAIN = base_domain.strip() or "localhost"
+        config.BASE_DOMAIN = BASE_DOMAIN
+    if site_name is not None:
+        SITE_NAME = site_name.strip() or "Vault"
+        config.SITE_NAME = SITE_NAME
+    if ttl_sweep_interval_seconds is not None:
+        TTL_SWEEP_INTERVAL_SECONDS = max(10, ttl_sweep_interval_seconds)
+        config.TTL_SWEEP_INTERVAL_SECONDS = TTL_SWEEP_INTERVAL_SECONDS
+
+
 @dataclass(frozen=True)
 class DocStat:
     folder: str
@@ -1095,7 +1121,10 @@ def normalize_action_items(items: list[ActionItem], db: Session) -> list[ActionI
         if item.type == "document":
             doc = get_document_or_404(item.id or 0, db)
             doc_path = document_folder_path(doc)
-            if any(doc_path == parent or doc_path.startswith(f"{parent}/") for parent in folder_paths):
+            if any(
+                doc_path == parent or doc_path.startswith(f"{parent}/")
+                for parent in folder_paths
+            ):
                 continue
         pruned.append(item)
     return pruned
@@ -1293,7 +1322,11 @@ def move_folder_item(
     source.parent = target_parent
     source.parent_id = target_parent.id
     source.name = target_name
-    event_type = "rename" if source_parent_path == folder_path(target_parent) and target_name != source_name else "move"
+    event_type = (
+        "rename"
+        if source_parent_path == folder_path(target_parent) and target_name != source_name
+        else "move"
+    )
     message = (
         f"Renamed from {source_name} to {target_name}"
         if event_type == "rename"
@@ -1347,7 +1380,9 @@ def folder_contains_doc_folder(folder: str, doc_folder: str) -> bool:
 def active_locks_by_document(db: Session) -> dict[int, DocumentLock]:
     return {
         lock.document_id: lock
-        for lock in db.execute(select(DocumentLock).where(DocumentLock.is_active == True)).scalars()  # noqa: E712
+        for lock in db.execute(
+            select(DocumentLock).where(DocumentLock.is_active == True),  # noqa: E712
+        ).scalars()
     }
 
 
@@ -1948,7 +1983,13 @@ def resolved_share_payload(link: ShareLink, user: UserContext, db: Session) -> d
             "target_type": "document",
             "document_id": doc.id,
             "folder": document_folder_path(doc, path_cache),
-            "document": document_row_payload(doc, db, path_cache, active_locks_by_document(db), user),
+            "document": document_row_payload(
+                doc,
+                db,
+                path_cache,
+                active_locks_by_document(db),
+                user,
+            ),
         }
 
     if link.target_type == "folder" and link.folder_id is not None:
@@ -2006,7 +2047,10 @@ def record_document_deleted(db: Session) -> None:
 def latest_state_event_id() -> int:
     db = SessionLocal()
     try:
-        return db.execute(select(StateEvent.id).order_by(StateEvent.id.desc()).limit(1)).scalar() or 0
+        return (
+            db.execute(select(StateEvent.id).order_by(StateEvent.id.desc()).limit(1)).scalar()
+            or 0
+        )
     finally:
         db.close()
 
@@ -2016,7 +2060,10 @@ def state_events_after(last_id: int) -> list[StateEvent]:
     try:
         return list(
             db.execute(
-                select(StateEvent).where(StateEvent.id > last_id).order_by(StateEvent.id).limit(100),
+                select(StateEvent)
+                .where(StateEvent.id > last_id)
+                .order_by(StateEvent.id)
+                .limit(100),
             )
             .scalars()
             .all(),

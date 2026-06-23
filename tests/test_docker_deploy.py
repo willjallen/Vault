@@ -1,12 +1,11 @@
 import json
 import os
-import subprocess
+import subprocess  # noqa: S404 - isolated config import checks need subprocesses
 import sys
 import tempfile
 import textwrap
 import unittest
 from pathlib import Path
-
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -40,13 +39,12 @@ class DockerDeployTests(unittest.TestCase):
             "site_name": config.SITE_NAME,
         }))
         """
-        completed = subprocess.run(
+        completed = subprocess.run(  # noqa: S603 - fixed interpreter and repo-local script
             [sys.executable, "-c", textwrap.dedent(script)],
             cwd=ROOT,
             env=env,
             check=False,
-            stderr=subprocess.PIPE,
-            stdout=subprocess.PIPE,
+            capture_output=True,
             text=True,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
@@ -89,13 +87,12 @@ class DockerDeployTests(unittest.TestCase):
         env.pop("VAULT_SESSION_SECRET", None)
         script = "import app.config"
 
-        completed = subprocess.run(
+        completed = subprocess.run(  # noqa: S603 - fixed interpreter and repo-local import check
             [sys.executable, "-c", script],
             cwd=ROOT,
             env=env,
             check=False,
-            stderr=subprocess.PIPE,
-            stdout=subprocess.PIPE,
+            capture_output=True,
             text=True,
         )
 
@@ -162,7 +159,10 @@ class DockerDeployTests(unittest.TestCase):
         self.assertIn("docker/build-push-action@v6", workflow)
         self.assertIn("push: true", workflow)
         self.assertIn("type=semver,pattern={{version}}", workflow)
-        self.assertIn("type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}", workflow)
+        self.assertIn(
+            "type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}",
+            workflow,
+        )
 
 
 if __name__ == "__main__":

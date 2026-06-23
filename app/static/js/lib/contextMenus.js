@@ -24,6 +24,7 @@ export function buildFileMenuItems(actions) {
     actions.openFileDetails
       ? { label: "Details", action: () => actions.openFileDetails(doc) }
       : null,
+    { label: "Rename", action: () => actions.handleRenameFile(doc), disabled: busy },
     { label: "Download", action: () => actions.handleView(doc) },
     !doc.archived && !lockedByOther
       ? {
@@ -33,7 +34,6 @@ export function buildFileMenuItems(actions) {
           disabled: busy,
         }
       : null,
-    { label: "Rename", action: () => actions.handleRenameFile(doc), disabled: busy },
     {
       label: "Move...",
       action: () => actions.openMoveDialogForDoc(doc),
@@ -86,14 +86,14 @@ export function buildFolderMenuItems(actions) {
   const canPermanentDeleteFolder = isAdmin && hasPath && isArchivedFolder && !isRoot;
   return compactMenuItems([
     { label: "Open", action: () => actions.navigateToFolder(folderPath) },
+    hasPath && !isRoot
+      ? { label: "Rename", action: () => actions.beginRenameFolder(folderPath), disabled: busy }
+      : null,
     {
       label: "Properties",
       action: () => actions.openFolderProperties(folderItem),
       disabled: busy,
     },
-    hasPath && !isRoot
-      ? { label: "Rename", action: () => actions.beginRenameFolder(folderPath), disabled: busy }
-      : null,
     hasPath && !isRoot
       ? {
           label: "Move...",

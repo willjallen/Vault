@@ -1529,6 +1529,12 @@ header {
   pointer-events: none;
 }
 
+.file-row.file.archived .row-action-button:disabled:not(.more) {
+  color: var(--text-muted);
+  opacity: 0.42;
+  pointer-events: none;
+}
+
 .file-row.file:hover .row-action-button:not(.more),
 .file-row.file.selected .row-action-button:not(.more),
 .file-row.file:focus-within .row-action-button:not(.more),

@@ -632,7 +632,7 @@ header {
 }
 
 .finder-browser {
-  --contents-grid-template: 26px 38px minmax(170px, 1fr) minmax(168px, 210px) minmax(86px, 126px)
+  --contents-grid-template: 32px minmax(196px, 1fr) minmax(168px, 210px) minmax(86px, 126px)
     minmax(72px, 96px) minmax(196px, 236px) minmax(138px, 162px);
 
   background: var(--surface-panel);
@@ -1141,16 +1141,16 @@ header {
   min-width: 0;
 }
 
-.file-cell.select {
+.contents-select-all {
   display: flex;
   align-items: center;
   justify-content: center;
 }
 
-.row-checkbox {
+.contents-select-checkbox {
   appearance: none;
-  width: 14px;
-  height: 14px;
+  width: 15px;
+  height: 15px;
   margin: 0;
   border: 1px solid var(--border-subtle);
   border-radius: 5px;
@@ -1164,12 +1164,13 @@ header {
     transform 0.12s cubic-bezier(0.2, 1.25, 0.35, 1);
 }
 
-.row-checkbox:hover {
+.contents-select-checkbox:hover {
   border-color: var(--accent-border);
   transform: scale(1.04);
 }
 
-.row-checkbox:checked {
+.contents-select-checkbox:checked,
+.contents-select-checkbox:indeterminate {
   border-color: var(--accent-border-strong);
   background: var(--accent-fill);
   box-shadow:
@@ -1177,9 +1178,14 @@ header {
     var(--shadow-inset-highlight-soft);
 }
 
-.row-checkbox:focus-visible {
+.contents-select-checkbox:focus-visible {
   outline: 2px solid var(--focus-ring-strong);
   outline-offset: 2px;
+}
+
+.contents-select-checkbox:disabled {
+  cursor: not-allowed;
+  opacity: 0.35;
 }
 
 .file-cell.icon {
@@ -1188,6 +1194,98 @@ header {
   justify-content: center;
   font-size: 1.4rem;
   line-height: 1;
+}
+
+.row-select-button {
+  position: relative;
+  width: 27px;
+  height: 27px;
+  border: 0;
+  border-radius: 8px;
+  padding: 0;
+  background: transparent;
+  color: inherit;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.row-select-button.static {
+  cursor: default;
+  pointer-events: none;
+}
+
+.row-select-button:focus-visible {
+  outline: 2px solid var(--focus-ring-strong);
+  outline-offset: 2px;
+}
+
+.row-select-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.row-select-icon,
+.row-select-check {
+  position: absolute;
+  inset: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  transition:
+    opacity 0.14s ease,
+    transform 0.16s cubic-bezier(0.2, 1.25, 0.35, 1);
+}
+
+.row-select-icon {
+  color: inherit;
+  opacity: 1;
+  transform: scale(1);
+}
+
+.row-select-check {
+  border: 1px solid var(--border-subtle);
+  background: var(--surface-panel);
+  box-shadow: var(--shadow-inset-highlight-soft);
+  opacity: 0;
+  transform: scale(0.82);
+}
+
+.row-select-button:hover:not(:disabled) .row-select-icon,
+.row-select-button.selected .row-select-icon {
+  opacity: 0;
+  transform: scale(0.82);
+}
+
+.row-select-button:hover:not(:disabled) .row-select-check,
+.row-select-button.selected .row-select-check {
+  opacity: 1;
+  transform: scale(1);
+}
+
+.row-select-button.selected .row-select-check {
+  border-color: var(--accent-border-strong);
+  background: var(--accent-fill);
+}
+
+.row-select-check::after {
+  width: 8px;
+  height: 4px;
+  border-bottom: 2px solid var(--surface-panel);
+  border-left: 2px solid var(--surface-panel);
+  content: "";
+  opacity: 0;
+  transform: translateY(-1px) rotate(-45deg) scale(0.82);
+  transition:
+    opacity 0.12s ease,
+    transform 0.14s cubic-bezier(0.2, 1.25, 0.35, 1);
+}
+
+.row-select-button.selected .row-select-check::after {
+  opacity: 1;
+  transform: translateY(-1px) rotate(-45deg) scale(1);
 }
 
 .file-cell.main {
@@ -3895,7 +3993,7 @@ input[type="file"]::file-selector-button:hover {
   }
 
   .finder-browser {
-    --contents-grid-template: 32px 48px minmax(0, 1fr) auto;
+    --contents-grid-template: 32px minmax(0, 1fr) auto;
   }
 
   .browser-head {

@@ -1,6 +1,6 @@
 import { classNames, expiryStatusLabel, formatDate } from "../../lib/utils.js";
-import { FileIcon } from "../common/FileIcon.js";
 import { Icon } from "../common/Icon.js";
+import { RowSelectionIcon } from "./RowSelectionIcon.js";
 
 const { useEffect, useRef } = React;
 const h = React.createElement;
@@ -108,21 +108,16 @@ export function FileRow({
     [
       h(
         "div",
-        { className: "file-cell select" },
-        h("input", {
-          "aria-label": selected ? `Deselect ${doc.name}` : `Select ${doc.name}`,
-          checked: Boolean(selected),
-          className: "row-checkbox",
-          disabled: editing,
-          onChange: () => {},
-          onClick: (e) => stopRowAction(e, onToggleSelect),
-          type: "checkbox",
-        })
-      ),
-      h(
-        "div",
         { className: "file-cell icon" },
-        h(FileIcon, { fileName: doc.name, kind: "file", size: 13 })
+        h(RowSelectionIcon, {
+          disabled: editing,
+          fileName: doc.name,
+          kind: "file",
+          label: selected ? `Deselect ${doc.name}` : `Select ${doc.name}`,
+          onSelect: onToggleSelect,
+          selected,
+          size: 13,
+        })
       ),
       h("div", { className: "file-cell main" }, [
         editing

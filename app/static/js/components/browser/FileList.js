@@ -145,6 +145,7 @@ export function VaultFileList({
   const marqueeFrameRef = useRef(null);
   const rowGestureRef = useRef(null);
   const suppressClickRef = useRef(false);
+  const selectAllRef = useRef(null);
   const [marquee, setMarquee] = useState(null);
   const inArchive = isArchivePath(folder);
   const draftInFolder = inlineFolderDraft && inlineFolderDraft.parent === (folder || "");
@@ -161,6 +162,16 @@ export function VaultFileList({
     selectedItems.reduce((sum, item) => sum + (item.size_bytes || 0), 0),
     { emptyForZero: false }
   );
+  const visibleKeys = orderedKeys;
+  const allVisibleSelected =
+    visibleKeys.length > 0 && visibleKeys.every((key) => selectedSet.has(key));
+  const someVisibleSelected = visibleKeys.some((key) => selectedSet.has(key));
+
+  useEffect(() => {
+    if (selectAllRef.current) {
+      selectAllRef.current.indeterminate = someVisibleSelected && !allVisibleSelected;
+    }
+  }, [allVisibleSelected, someVisibleSelected]);
 
   const updateMarqueeSelection = useCallback(() => {
     marqueeFrameRef.current = null;
@@ -462,7 +473,7 @@ export function VaultFileList({
     }
   }
 
-  function checkboxSelectionEvent(e) {
+  function selectionControlEvent(e) {
     return {
       ctrlKey: !e.shiftKey,
       metaKey: false,
@@ -472,7 +483,15 @@ export function VaultFileList({
 
   function handleToggleSelect(item, type, e) {
     if (onSelectItem) {
-      onSelectItem(item, type, checkboxSelectionEvent(e), orderedItems);
+      onSelectItem(item, type, selectionControlEvent(e), orderedItems);
+    }
+  }
+
+  function handleSelectAllChange(e) {
+    e.stopPropagation();
+    const nextKeys = allVisibleSelected ? [] : visibleKeys.slice();
+    if (onMarqueeSelectionChange) {
+      onMarqueeSelectionChange(nextKeys, nextKeys[nextKeys.length - 1] || "");
     }
   }
 
@@ -654,8 +673,21 @@ export function VaultFileList({
           onMouseDown: (e) => e.stopPropagation(),
         },
         [
-          h("span", { className: "contents-sort-spacer select", key: "select-spacer" }),
-          h("span", { className: "contents-sort-spacer icon", key: "icon-spacer" }),
+          h(
+            "label",
+            { className: "contents-select-all", key: "select-all", title: "Select all visible" },
+            h("input", {
+              "aria-label": allVisibleSelected
+                ? "Deselect all visible items"
+                : "Select all visible items",
+              checked: allVisibleSelected,
+              className: "contents-select-checkbox",
+              disabled: visibleKeys.length === 0,
+              onChange: handleSelectAllChange,
+              ref: selectAllRef,
+              type: "checkbox",
+            })
+          ),
           h(ContentsSortButton, {
             column: NAME_COLUMN,
             key: NAME_COLUMN.key,

@@ -1,6 +1,6 @@
 import { classNames, isArchivePath, retentionPolicyLabel } from "../../lib/utils.js";
-import { FileIcon } from "../common/FileIcon.js";
 import { Icon } from "../common/Icon.js";
+import { RowSelectionIcon } from "./RowSelectionIcon.js";
 
 const { useEffect, useRef } = React;
 const h = React.createElement;
@@ -115,23 +115,18 @@ export function FolderRow({
     [
       h(
         "div",
-        { className: "file-cell select" },
-        isDraft
-          ? null
-          : h("input", {
-              "aria-label": selected ? `Deselect ${folder.name}` : `Select ${folder.name}`,
-              checked: Boolean(selected),
-              className: "row-checkbox",
-              disabled: editing,
-              onChange: () => {},
-              onClick: (e) => stopRowAction(e, onToggleSelect),
-              type: "checkbox",
-            })
-      ),
-      h(
-        "div",
         { className: "file-cell icon" },
-        h(FileIcon, { color: folder.color, folderIcon: folder.icon, kind: "folder", size: 14 })
+        h(RowSelectionIcon, {
+          color: folder.color,
+          disabled: editing,
+          folderIcon: folder.icon,
+          interactive: !isDraft,
+          kind: "folder",
+          label: selected ? `Deselect ${folder.name}` : `Select ${folder.name}`,
+          onSelect: onToggleSelect,
+          selected,
+          size: 14,
+        })
       ),
       h("div", { className: "file-cell main" }, [
         editing

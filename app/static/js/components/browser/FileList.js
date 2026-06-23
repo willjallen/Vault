@@ -16,7 +16,6 @@ const DETAIL_SORT_COLUMNS = [
 const MARQUEE_MIN_DISTANCE = 4;
 const MARQUEE_AUTO_SCROLL_EDGE = 48;
 const MARQUEE_AUTO_SCROLL_MAX = 18;
-const ROW_DRAG_HOLD_MS = 180;
 
 function itemSelectionKey(item) {
   return item.type === "document" ? `document:${item.id}` : `folder:${item.path || ""}`;
@@ -144,7 +143,6 @@ export function VaultFileList({
   const fileListRef = useRef(null);
   const marqueeDragRef = useRef(null);
   const marqueeFrameRef = useRef(null);
-  const rowGestureRef = useRef(null);
   const suppressClickRef = useRef(false);
   const selectAllRef = useRef(null);
   const [marquee, setMarquee] = useState(null);
@@ -258,6 +256,7 @@ export function VaultFileList({
     return {
       active: false,
       baseSelection: selectedKeys.slice(),
+      captured: false,
       currentX: evt.clientX,
       currentY: evt.clientY,
       mode: marqueeModeFromEvent(evt),
@@ -269,90 +268,41 @@ export function VaultFileList({
     };
   }
 
-  function rowGestureShouldMoveSingle(selectionKey) {
-    const gesture = rowGestureRef.current;
-    return (
-      gesture &&
-      gesture.selectionKey === selectionKey &&
-      performance.now() - gesture.startedAt >= ROW_DRAG_HOLD_MS
-    );
-  }
-
-  function singleDragItemFor(item, type) {
-    return [
-      type === "document"
-        ? {
-            archived: Boolean(item.archived),
-            folder: item.folder || "",
-            id: item.id,
-            lock: item.lock || {},
-            name: item.name,
-            path: item.path || (item.folder ? `${item.folder}/${item.name}` : item.name),
-            size_bytes: item.size_bytes || 0,
-            type: "document",
-          }
-        : {
-            archived: isArchivePath(item.path || ""),
-            name: item.name,
-            path: item.path || "",
-            size_bytes: item.size_bytes || 0,
-            type: "folder",
-          },
-    ];
-  }
-
   function handleMarqueePointerDown(e) {
     if (e.button !== 0 || e.pointerType === "touch" || shouldIgnoreMarqueeTarget(e.target)) {
       return;
     }
-    clearNativeSelection();
     const row = e.target.closest?.(".file-row[data-selection-key]");
-    if (row) {
-      if (selectedKeys.length) {
-        return;
-      }
-      rowGestureRef.current = {
-        ...createMarqueeDrag(e),
-        selectionKey: row.dataset.selectionKey,
-        startedAt: performance.now(),
-      };
+    const modifierSelection = e.ctrlKey || e.metaKey || e.shiftKey;
+    if (row && selectedSet.has(row.dataset.selectionKey) && !modifierSelection) {
       return;
     }
-    marqueeDragRef.current = createMarqueeDrag(e);
+    const rowOrigin = Boolean(row);
+    if (!rowOrigin) {
+      clearNativeSelection();
+    }
+    marqueeDragRef.current = createMarqueeDrag(e, { rowOrigin });
     setMarquee(null);
-    e.currentTarget.setPointerCapture?.(e.pointerId);
-    e.preventDefault();
+    if (!rowOrigin) {
+      marqueeDragRef.current.captured = true;
+      e.currentTarget.setPointerCapture?.(e.pointerId);
+      e.preventDefault();
+    }
   }
 
   function handleMarqueePointerMove(e) {
-    let drag = marqueeDragRef.current;
-    const rowGesture = rowGestureRef.current;
-    if (!drag && rowGesture && rowGesture.pointerId === e.pointerId) {
-      const distance = Math.hypot(e.clientX - rowGesture.startX, e.clientY - rowGesture.startY);
-      if (distance < MARQUEE_MIN_DISTANCE) {
-        return;
-      }
-      if (performance.now() - rowGesture.startedAt >= ROW_DRAG_HOLD_MS) {
-        return;
-      }
-      drag = {
-        ...rowGesture,
-        currentX: e.clientX,
-        currentY: e.clientY,
-      };
-      marqueeDragRef.current = drag;
-      rowGestureRef.current = null;
-      setMarquee(null);
-      e.currentTarget.setPointerCapture?.(e.pointerId);
-      clearNativeSelection();
-      e.preventDefault();
-    }
+    const drag = marqueeDragRef.current;
     if (!drag || drag.pointerId !== e.pointerId) {
       return;
     }
     drag.currentX = e.clientX;
     drag.currentY = e.clientY;
-    if (drag.active) {
+    const distance = Math.hypot(drag.currentX - drag.startX, drag.currentY - drag.startY);
+    if (drag.active || distance >= MARQUEE_MIN_DISTANCE) {
+      if (!drag.captured) {
+        drag.captured = true;
+        e.currentTarget.setPointerCapture?.(e.pointerId);
+      }
       clearNativeSelection();
       e.preventDefault();
     }
@@ -362,9 +312,6 @@ export function VaultFileList({
   function finishMarquee(e) {
     const drag = marqueeDragRef.current;
     if (!drag || drag.pointerId !== e.pointerId) {
-      if (rowGestureRef.current?.pointerId === e.pointerId) {
-        rowGestureRef.current = null;
-      }
       return;
     }
     drag.currentX = e.clientX;
@@ -379,9 +326,10 @@ export function VaultFileList({
       }, 0);
       e.preventDefault();
     }
-    e.currentTarget.releasePointerCapture?.(e.pointerId);
+    if (drag.captured) {
+      e.currentTarget.releasePointerCapture?.(e.pointerId);
+    }
     marqueeDragRef.current = null;
-    rowGestureRef.current = null;
     setMarquee(null);
   }
 
@@ -395,13 +343,7 @@ export function VaultFileList({
   }
 
   function handleMarqueeDragStartCapture(e) {
-    const gesture = rowGestureRef.current;
-    if (!marqueeDragRef.current && gesture) {
-      if (performance.now() - gesture.startedAt >= ROW_DRAG_HOLD_MS) {
-        return;
-      }
-    }
-    if (marqueeDragRef.current || gesture) {
+    if (marqueeDragRef.current) {
       e.preventDefault();
       e.stopPropagation();
     }
@@ -445,13 +387,6 @@ export function VaultFileList({
             type: "folder",
           },
     ];
-  }
-
-  function dragItemsForRow(item, type, selectionKey) {
-    if (rowGestureShouldMoveSingle(selectionKey)) {
-      return singleDragItemFor(item, type);
-    }
-    return dragItemsFor(item, type);
   }
 
   function handleBackgroundClick(e) {
@@ -536,9 +471,8 @@ export function VaultFileList({
       onDropLeave: onClearDropHint,
       onDragStart: (e) =>
         onFolderDragStart &&
-        onFolderDragStart(e, folderItem.path, dragItemsForRow(folderItem, "folder", selectionKey)),
+        onFolderDragStart(e, folderItem.path, dragItemsFor(folderItem, "folder")),
       onDragEnd: (e) => {
-        rowGestureRef.current = null;
         if (onFolderDragEnd) {
           onFolderDragEnd(e);
         }
@@ -577,10 +511,8 @@ export function VaultFileList({
       onMore: (e) => openContextMenuForItem(e, doc, { select: false }),
       onSelect: (e) => onSelectItem && onSelectItem(doc, "document", e, orderedItems),
       onOpen: onOpenFile,
-      onDragStart: (e) =>
-        onFileDragStart(e, doc.id, dragItemsForRow(doc, "document", selectionKey)),
+      onDragStart: (e) => onFileDragStart(e, doc.id, dragItemsFor(doc, "document")),
       onDragEnd: (e) => {
-        rowGestureRef.current = null;
         if (onFileDragEnd) {
           onFileDragEnd(e);
         }

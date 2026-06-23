@@ -91,7 +91,7 @@ export function FileRow({
         editing ? "editing" : ""
       ),
       "data-selection-key": selectionKey || undefined,
-      draggable: !editing,
+      draggable: !editing && selected,
       onClick: editing ? undefined : onSelect,
       onDoubleClick: editing || !doubleClickDownload ? undefined : () => onOpen(doc),
       onDragStart: editing ? undefined : (e) => onDragStart(e, doc.id),

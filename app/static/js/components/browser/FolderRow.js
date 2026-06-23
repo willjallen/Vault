@@ -158,7 +158,7 @@ export function FolderRow({
       h(
         "div",
         { className: "file-cell meta" },
-        h("span", { className: "muted tiny" }, formatDate(folder.latest_updated_at))
+        h("span", { className: "muted tiny" }, formatDate(folder.modified_at))
       ),
       h(
         "div",

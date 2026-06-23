@@ -4032,7 +4032,7 @@ input[type="file"]::file-selector-button:hover {
     padding-right: 10px;
   }
 
-  .contents-sort-date,
+  .contents-sort-modified,
   .contents-sort-user,
   .contents-sort-size,
   .contents-sort-status {

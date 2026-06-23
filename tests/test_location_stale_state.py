@@ -26,6 +26,102 @@ class LocationStaleStateTests(unittest.TestCase):
 
             self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
 
+    def test_row_modified_time_uses_version_commit_not_location_changes(self) -> None:
+        self.run_location_script(
+            """
+            import datetime as dt
+
+            from app.db import SessionLocal, init_db
+            from app.models import Document
+            from app.routers import (
+                all_folders,
+                archive_doc_item,
+                build_folder_path_cache,
+                create_document_version,
+                docs_stats_for_folder_payloads,
+                document_row_payload,
+                folder_path,
+                folder_summary_payload,
+                get_or_create_blob_for_data,
+                get_or_create_folder_path,
+                normalize_timestamp,
+                now_utc,
+                restore_doc_item,
+            )
+            from app.storage import ensure_storage
+
+
+            class FakeClient:
+                host = "testclient"
+
+
+            class FakeRequest:
+                headers = {}
+                client = FakeClient()
+
+
+            user = {
+                "id": "alice",
+                "name": "Alice",
+                "email": "alice@example.com",
+                "groups": ["vault-users"],
+                "is_admin": True,
+            }
+
+
+            init_db()
+            ensure_storage()
+            content_modified_at = now_utc() - dt.timedelta(days=7)
+            expected_modified_at = normalize_timestamp(content_modified_at).isoformat()
+            with SessionLocal() as db:
+                folder = get_or_create_folder_path(db, "Project")
+                blob = get_or_create_blob_for_data(db, b"v1", "text/plain")
+                doc = Document(
+                    folder_id=folder.id,
+                    name="plan.txt",
+                    created_by=user["id"],
+                    created_by_name=user["name"],
+                    latest_modified_by=user["id"],
+                    latest_modified_at=content_modified_at,
+                )
+                db.add(doc)
+                db.flush()
+                version = create_document_version(
+                    db,
+                    doc,
+                    blob,
+                    user,
+                    {"ip": None, "user_agent": None},
+                    "plan.txt",
+                    "text/plain",
+                    "Uploaded plan.txt",
+                    "upload",
+                )
+                version.committed_at = content_modified_at
+                doc.latest_modified_at = content_modified_at
+                db.commit()
+                doc_id = doc.id
+
+            with SessionLocal() as db:
+                doc = db.get(Document, doc_id)
+                archive_doc_item(doc, FakeRequest(), user, db)
+                db.flush()
+                assert normalize_timestamp(doc.latest_modified_at) > content_modified_at
+                cache = build_folder_path_cache(all_folders(db))
+                row = document_row_payload(doc, db, cache)
+                assert row["modified_at"] == expected_modified_at
+                stats = docs_stats_for_folder_payloads([doc], db, cache)
+                summary = folder_summary_payload(doc.folder, folder_path(doc.folder, cache), stats)
+                assert summary["modified_at"] == expected_modified_at
+
+                restore_doc_item(doc, FakeRequest(), user, db)
+                db.flush()
+                cache = build_folder_path_cache(all_folders(db))
+                row = document_row_payload(doc, db, cache)
+                assert row["modified_at"] == expected_modified_at
+            """,
+        )
+
     def test_stale_move_cannot_restore_archived_document_as_plain_move(self) -> None:
         self.run_location_script(
             """

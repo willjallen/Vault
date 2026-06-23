@@ -1361,7 +1361,7 @@ def document_row_payload(
 ) -> dict[str, object]:
     latest_version = current_version(doc, db)
     latest_size_bytes = latest_version.blob.size_bytes if latest_version else None
-    latest_updated_at = normalize_timestamp(doc.latest_modified_at)
+    modified_at = normalize_timestamp(latest_version.committed_at if latest_version else None)
     doc_folder = document_folder_path(doc, path_cache)
     doc_path = document_path(doc, path_cache)
     lock = (locks or {}).get(doc.id)
@@ -1370,8 +1370,8 @@ def document_row_payload(
         "name": doc.name,
         "path": doc_path,
         "folder": doc_folder,
-        "latest_updated_at": latest_updated_at.isoformat() if latest_updated_at else None,
-        "latest_updated_display": format_mtime(latest_updated_at),
+        "modified_at": modified_at.isoformat() if modified_at else None,
+        "modified_display": format_mtime(modified_at),
         "latest_by": (latest_version.committed_by_name or latest_version.committed_by)
         if latest_version
         else None,
@@ -1484,7 +1484,7 @@ def docs_stats_for_folder_payloads(
             DocStat(
                 document_folder_path(doc, path_cache),
                 latest_version.blob.size_bytes if latest_version else 0,
-                normalize_timestamp(doc.latest_modified_at),
+                normalize_timestamp(latest_version.committed_at if latest_version else None),
                 (latest_version.committed_by_name or latest_version.committed_by)
                 if latest_version
                 else None,
@@ -1512,8 +1512,8 @@ def folder_summary_payload(folder: Folder, path: str, stats: list[DocStat]) -> d
         "default_ttl_days": folder.default_ttl_days,
         "default_ttl_action": folder.default_ttl_action or "none",
         "latest_by": latest_by,
-        "latest_updated_at": latest.isoformat() if latest else None,
-        "latest_updated_display": format_mtime(latest),
+        "modified_at": latest.isoformat() if latest else None,
+        "modified_display": format_mtime(latest),
         "size_bytes": size,
         "size_display": format_size(size),
     }

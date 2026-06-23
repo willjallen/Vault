@@ -2,7 +2,7 @@ import { keyForItem } from "./itemActions.js";
 
 export const DEFAULT_CONTENTS_SORT = { key: "name", direction: "asc" };
 
-const DESC_FIRST_SORT_KEYS = new Set(["date", "size"]);
+const DESC_FIRST_SORT_KEYS = new Set(["modified", "size"]);
 
 export function nextContentsSort(current, key) {
   if (current.key === key) {
@@ -29,8 +29,8 @@ function ttlSortValue(item) {
 }
 
 function sortValueForItem(item, key) {
-  if (key === "date") {
-    return parseSortDate(item.latest_updated_at);
+  if (key === "modified") {
+    return parseSortDate(item.modified_at);
   }
   if (key === "user") {
     return (item.latest_by || "").toLocaleLowerCase();

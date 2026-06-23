@@ -8,7 +8,7 @@ const { useCallback, useEffect, useRef, useState } = React;
 const h = React.createElement;
 const NAME_COLUMN = { key: "name", label: "Name", className: "name", defaultDirection: "asc" };
 const DETAIL_SORT_COLUMNS = [
-  { key: "date", label: "Date", className: "date", defaultDirection: "desc" },
+  { key: "modified", label: "Modified", className: "modified", defaultDirection: "desc" },
   { key: "user", label: "User", className: "user", defaultDirection: "asc" },
   { key: "size", label: "Size", className: "size", defaultDirection: "desc" },
   { key: "ttl", label: "Status", className: "status", defaultDirection: "asc" },

@@ -1073,6 +1073,8 @@ header {
 
 .file-cell.main .name {
   font-weight: 700;
+  font-size: 0.92rem;
+  line-height: 1.25;
   color: var(--text);
   min-width: 0;
   overflow-wrap: anywhere;

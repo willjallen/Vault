@@ -5,20 +5,6 @@ import { Icon } from "../common/Icon.js";
 const { useEffect, useRef } = React;
 const h = React.createElement;
 
-function parentLabelForFolder(folder) {
-  const folderPath = folder.path || "";
-  const parentPath = folderPath.split("/").slice(0, -1).join("/");
-  const parentWithinArchive = isArchivePath(parentPath);
-  const trimmedParent = parentWithinArchive ? parentPath.replace(/^Archive\/?/, "") : parentPath;
-  if (trimmedParent) {
-    return `In ${parentWithinArchive ? `Archive / ${trimmedParent}` : trimmedParent}`;
-  }
-  if (parentWithinArchive || isArchivePath(folderPath)) {
-    return "In Archive";
-  }
-  return "In Vault";
-}
-
 export function FolderRow({
   folder,
   editing,
@@ -41,7 +27,6 @@ export function FolderRow({
 }) {
   const inputRef = useRef(null);
   const isArchived = isArchivePath(folder.path || "");
-  const parentLabel = parentLabelForFolder(folder);
   const retentionLabel = retentionPolicyLabel(folder.default_ttl_action, folder.default_ttl_days);
 
   useEffect(() => {
@@ -147,13 +132,6 @@ export function FolderRow({
               { className: classNames("name", isArchived ? "archived-text" : "") },
               folder.name || "Folder"
             ),
-        h(
-          "div",
-          {
-            className: classNames("muted", "tiny", "quiet-text", isArchived ? "archived-text" : ""),
-          },
-          parentLabel
-        ),
       ]),
       h(
         "div",

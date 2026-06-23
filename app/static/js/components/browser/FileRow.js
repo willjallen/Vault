@@ -27,14 +27,6 @@ export function FileRow({
   const lock = doc.lock || {};
   const locked = Boolean(lock && lock.by);
   const isArchived = doc.archived;
-  const folderPath = doc.folder || "";
-  const relativeFolder = isArchived ? folderPath.replace(/^Archive\/?/, "") : folderPath;
-  const locationLabel = isArchived
-    ? `Archive${relativeFolder ? ` / ${relativeFolder}` : ""}`
-    : relativeFolder
-      ? `Vault / ${relativeFolder}`
-      : "Vault";
-  const metaLabel = isArchived ? `Archived · ${locationLabel}` : locationLabel;
   const versionCount =
     doc.version_count ||
     Math.max((doc.versions || []).filter((item) => item.type === "version").length || 0, 1);
@@ -131,13 +123,6 @@ export function FileRow({
                   )
                 : null,
             ]),
-        h(
-          "div",
-          {
-            className: classNames("muted", "tiny", "quiet-text", isArchived ? "archived-text" : ""),
-          },
-          metaLabel
-        ),
       ]),
       h("div", { className: "file-cell meta" }, [
         doc.latest_updated_display

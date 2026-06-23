@@ -4,11 +4,11 @@ from collections.abc import Generator
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import MetaData, create_engine, event, inspect, select
+from sqlalchemy import create_engine, event, inspect, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
-from .config import DB_PATH, RESET_DB_ON_START
+from .config import DB_PATH
 
 
 class Base(DeclarativeBase):
@@ -38,17 +38,15 @@ engine = create_database_engine(DB_PATH)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 
-def configure_database(db_path: str | Path, *, reset_on_start: bool = False) -> None:
+def configure_database(db_path: str | Path) -> None:
     """Point the process-local database globals at a new SQLite database."""
-    global DB_PATH, RESET_DB_ON_START, engine
+    global DB_PATH, engine
 
     from . import config
 
     old_engine = engine
     DB_PATH = Path(db_path).resolve()
-    RESET_DB_ON_START = reset_on_start
     config.DB_PATH = DB_PATH
-    config.RESET_DB_ON_START = RESET_DB_ON_START
 
     engine = create_database_engine(DB_PATH)
     SessionLocal.configure(bind=engine)
@@ -60,13 +58,10 @@ def init_db() -> None:
     # Import models so SQLAlchemy is aware of them before creating tables
     from . import models
 
-    if RESET_DB_ON_START:
-        _drop_existing_schema()
-    elif _schema_needs_reset():
+    if _schema_needs_reset():
         raise RuntimeError(
             "Database schema is incompatible with this app version. "
-            "Refusing to reset metadata automatically; migrate or back up the database before "
-            "setting VAULT_RESET_DB_ON_START=1."
+            "Startup refused to alter or drop existing metadata automatically."
         )
     Base.metadata.create_all(bind=engine)
     _bootstrap_root_folders(models.Folder)
@@ -85,12 +80,6 @@ def _schema_needs_reset() -> bool:
         if not expected_columns.issubset(existing_columns):
             return True
     return False
-
-
-def _drop_existing_schema() -> None:
-    metadata = MetaData()
-    metadata.reflect(bind=engine)
-    metadata.drop_all(bind=engine)
 
 
 def _bootstrap_root_folders(folder_model: type[Any]) -> None:

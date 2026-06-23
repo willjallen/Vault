@@ -9,7 +9,7 @@ from app import db as db_module, models
 
 
 class DatabaseInitTests(unittest.TestCase):
-    def test_incompatible_schema_is_not_dropped_without_explicit_reset(self) -> None:
+    def test_incompatible_schema_is_not_dropped_on_startup(self) -> None:
         with tempfile.TemporaryDirectory(prefix="vault-db-init-") as temp_dir:
             db_path = Path(temp_dir) / "vault.db"
             with sqlite3.connect(db_path) as conn:
@@ -23,7 +23,7 @@ class DatabaseInitTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError) as raised:
                     db_module.init_db()
 
-                self.assertIn("Refusing to reset metadata automatically", str(raised.exception))
+                self.assertIn("Startup refused to alter or drop", str(raised.exception))
                 with sqlite3.connect(db_path) as conn:
                     row = conn.execute("SELECT path FROM documents").fetchone()
                 self.assertEqual(row, ("keep-me",))
@@ -45,7 +45,7 @@ class DatabaseInitTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError) as raised:
                     db_module.init_db()
 
-                self.assertIn("Refusing to reset metadata automatically", str(raised.exception))
+                self.assertIn("Startup refused to alter or drop", str(raised.exception))
                 with sqlite3.connect(db_path) as conn:
                     columns = {
                         row[1] for row in conn.execute("PRAGMA table_info(documents)").fetchall()

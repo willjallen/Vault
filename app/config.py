@@ -22,7 +22,11 @@ REQUIRE_SESSION_SECRET = (
 
 AUTH_MODE = os.getenv(
     "VAULT_AUTH_MODE",
-    "dev" if os.getenv("VAULT_DEV_AUTH", "").strip().lower() in {"1", "true", "yes", "on"} else "headers",
+    (
+        "dev"
+        if os.getenv("VAULT_DEV_AUTH", "").strip().lower() in {"1", "true", "yes", "on"}
+        else "headers"
+    ),
 ).strip().lower()
 SESSION_COOKIE_NAME = os.getenv("VAULT_SESSION_COOKIE_NAME", "vault_session").strip()
 _SESSION_SECRET_ENV = os.getenv("VAULT_SESSION_SECRET", "").strip()
@@ -69,6 +73,7 @@ if OIDC_NONCE_BYTES < 16:
 def new_token_urlsafe() -> str:
     return secrets.token_urlsafe(OIDC_NONCE_BYTES)
 
+
 STORAGE_BACKEND = os.getenv("VAULT_STORAGE_BACKEND", "local").strip().lower()
 STORAGE_PREFIX = os.getenv("VAULT_STORAGE_PREFIX", "objects").strip().strip("/")
 OBJECTS_PATH = Path(
@@ -99,9 +104,3 @@ R2_ENDPOINT_URL = (
     os.getenv("VAULT_R2_ENDPOINT_URL", "").strip()
     or (f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com" if R2_ACCOUNT_ID else None)
 )
-RESET_DB_ON_START = os.getenv("VAULT_RESET_DB_ON_START", "0").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}

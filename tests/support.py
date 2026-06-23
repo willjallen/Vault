@@ -30,7 +30,6 @@ ENV_KEYS = (
 @dataclass(frozen=True)
 class RuntimeSnapshot:
     db_path: Path
-    reset_db_on_start: bool
     storage_backend: str
     storage_prefix: str
     objects_path: Path
@@ -187,7 +186,6 @@ def create_versioned_document(
 def snapshot_runtime() -> RuntimeSnapshot:
     return RuntimeSnapshot(
         db_path=db_module.DB_PATH,
-        reset_db_on_start=db_module.RESET_DB_ON_START,
         storage_backend=storage_module.STORAGE_BACKEND,
         storage_prefix=storage_module.STORAGE_PREFIX,
         objects_path=storage_module.OBJECTS_PATH,
@@ -215,7 +213,7 @@ def snapshot_runtime() -> RuntimeSnapshot:
 
 
 def restore_runtime(snapshot: RuntimeSnapshot) -> None:
-    db_module.configure_database(snapshot.db_path, reset_on_start=snapshot.reset_db_on_start)
+    db_module.configure_database(snapshot.db_path)
     storage_module.configure_storage(
         backend=snapshot.storage_backend,
         objects_path=snapshot.objects_path,

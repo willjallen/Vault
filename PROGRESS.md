@@ -10,8 +10,8 @@
   - `POST /documents/{id}/move` with `new_path=bad\nname.txt` succeeds and persists the newline in `documents.name`.
   - `GET /documents/{id}/download` through a real Uvicorn socket disconnects because the newline reaches `Content-Disposition` and Uvicorn raises `RuntimeError: Invalid HTTP header value`.
 - Added validation/tests to reject control characters in folder paths and item names, and made download headers strip legacy control characters so existing bad rows do not keep breaking downloads.
-- Found deploy-time data-loss risk in `init_db()`: an incompatible existing schema triggered an automatic full schema drop even when `VAULT_RESET_DB_ON_START` was not enabled.
-- Changed incompatible schema startup behavior to fail closed with a clear error unless explicit reset is enabled, and added a subprocess-backed DB init test proving pre-existing rows survive the failed startup.
+- Found deploy-time data-loss risk in `init_db()`: an incompatible existing schema triggered an automatic full schema drop.
+- Changed incompatible schema startup behavior to fail closed with a clear error, and added a subprocess-backed DB init test proving pre-existing rows survive the failed startup.
 - Reproduced direct upload into `Archive/...` as a normal user: the server created an archived document with no archive event, checkout rejected it as archived, and non-admin delete hit the permanent-delete admin gate.
 - Added an upload-folder guard so new documents can only be created in Vault paths before any Archive folder rows are created.
 - User clarified locks are advisory only and users may unlock each other's files; do not treat cross-user unlock/archive behavior as a permissions bug by itself.

@@ -146,10 +146,21 @@ function labelFromIconName(iconName) {
 
 function iconEntry(icon, label = "", keywords = "") {
   return {
+    kind: "fontawesome",
     icon,
     id: icon.iconName,
     keywords,
     label: label || labelFromIconName(icon.iconName),
+  };
+}
+
+function imageIconEntry(id, label, src, keywords = "") {
+  return {
+    id,
+    kind: "image",
+    keywords,
+    label,
+    src,
   };
 }
 
@@ -258,6 +269,18 @@ const folderIconEntries = [
   iconEntry(faAnchor, "Nautical", "water ship prop"),
   iconEntry(faTableCells, "Tables", "spreadsheet tuning"),
   iconEntry(faRulerCombined, "Scale", "measurement dimensions"),
+  imageIconEntry(
+    "app-blender",
+    "Blender",
+    "/static/assets/icons/apps/blender.png",
+    "blender dcc 3d modeling sculpt rig animation"
+  ),
+  imageIconEntry(
+    "app-plasticity",
+    "Plasticity",
+    "/static/assets/icons/apps/plasticity.png",
+    "plasticity cad nurbs surfacing modeling industrial design"
+  ),
   iconEntry(faUnity, "Unity", "engine project"),
   iconEntry(faSteam, "Steam", "store publishing platform"),
   iconEntry(faPlaystation, "PlayStation", "platform console"),
@@ -275,32 +298,41 @@ const folderIconEntries = [
 ];
 
 const utilityIcons = new Map([
-  ["arrow-down", faArrowDown],
-  ["arrow-left", faArrowLeft],
-  ["arrow-right", faArrowRight],
-  ["arrow-up", faArrowUp],
-  ["chevron-down", faChevronDown],
-  ["chevron-right", faChevronRight],
-  ["clock", faClock],
-  ["close", faXmark],
-  ["download", faCloudArrowDown],
-  ["file", faFile],
-  ["gear", faGear],
-  ["lock", faLock],
-  ["logout", faRightFromBracket],
-  ["pen", faPen],
-  ["refresh", faRotate],
-  ["search", faMagnifyingGlass],
-  ["upload", faCloudArrowUp],
+  ["arrow-down", iconEntry(faArrowDown)],
+  ["arrow-left", iconEntry(faArrowLeft)],
+  ["arrow-right", iconEntry(faArrowRight)],
+  ["arrow-up", iconEntry(faArrowUp)],
+  ["chevron-down", iconEntry(faChevronDown)],
+  ["chevron-right", iconEntry(faChevronRight)],
+  ["clock", iconEntry(faClock)],
+  ["close", iconEntry(faXmark)],
+  ["download", iconEntry(faCloudArrowDown)],
+  ["file", iconEntry(faFile)],
+  ["gear", iconEntry(faGear)],
+  ["lock", iconEntry(faLock)],
+  ["logout", iconEntry(faRightFromBracket)],
+  ["pen", iconEntry(faPen)],
+  ["refresh", iconEntry(faRotate)],
+  ["search", iconEntry(faMagnifyingGlass)],
+  ["upload", iconEntry(faCloudArrowUp)],
 ]);
 
 export const iconLibrary = folderIconEntries;
 export const folderIconOptions = iconLibrary;
 
-const iconsById = new Map(iconLibrary.map((item) => [item.id, item.icon]));
+const iconsById = new Map(iconLibrary.map((item) => [item.id, item]));
+
+export function findIconEntry(iconId, fallback = "folder") {
+  return (
+    iconsById.get(iconId) ||
+    utilityIcons.get(iconId) ||
+    iconsById.get(fallback) ||
+    iconEntry(faFolder)
+  );
+}
 
 export function findIconDefinition(iconId, fallback = "folder") {
-  return iconsById.get(iconId) || utilityIcons.get(iconId) || iconsById.get(fallback) || faFolder;
+  return findIconEntry(iconId, fallback).icon || faFolder;
 }
 
 export function findIconByKeyword(keyword) {

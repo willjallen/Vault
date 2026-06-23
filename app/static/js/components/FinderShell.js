@@ -2,7 +2,6 @@ import { Toolbar } from "./toolbar/Toolbar.js";
 import { SidebarNav } from "./sidebar/SidebarNav.js";
 import { MyEdits } from "./sidebar/MyEdits.js";
 import { VaultFileList } from "./browser/FileList.js";
-import { InfoDock } from "./info-dock/InfoDock.js";
 
 const h = React.createElement;
 
@@ -19,8 +18,6 @@ export function FinderShell({
   contentsSelection,
   folderItems,
   folderSelection,
-  selectedDoc,
-  selectionItems,
   searchQuery,
   recursiveSearch,
   dropHint,
@@ -28,7 +25,6 @@ export function FinderShell({
   draggingId,
   draggingFolderPath,
   currentUser,
-  isAdmin,
   canGoBack,
   canGoForward,
   canGoUp,
@@ -66,26 +62,7 @@ export function FinderShell({
   logoutUrl,
   onOpenSettings,
   settingsButtonRef,
-  onDownload,
-  onDownloadSelection,
-  onDownloadVersion,
-  onLock,
-  onLockSelection,
-  onRename,
-  onMove,
-  onMoveSelection,
-  onStartEdit,
-  onRelease,
-  onReleaseSelection,
-  onSave,
-  onArchive,
-  onArchiveSelection,
-  onUnarchive,
-  onRestoreSelection,
-  onPermanentDelete,
-  onDeleteSelection,
-  onOpenFolder,
-  busy,
+  actions,
 }) {
   return h(
     "div",
@@ -142,6 +119,7 @@ export function FinderShell({
         subfolders,
         files,
         currentUser,
+        actions,
         selectedKeys: contentsSelection,
         orderedItems: contentsItems,
         sort: contentsSort,
@@ -175,32 +153,6 @@ export function FinderShell({
         onCanvasDragOver,
         onCanvasDragLeave,
         onUploadClick: onTriggerUpload,
-      }),
-      h(InfoDock, {
-        doc: selectedDoc,
-        selectionItems,
-        currentUserId: currentUser.id,
-        onDownload,
-        onDownloadSelection,
-        onDownloadVersion,
-        onLock,
-        onLockSelection,
-        onRename,
-        onMove,
-        onMoveSelection,
-        onStartEdit,
-        onRelease,
-        onReleaseSelection,
-        onSave,
-        onArchive,
-        onArchiveSelection,
-        onUnarchive,
-        onRestoreSelection,
-        onPermanentDelete,
-        onDeleteSelection,
-        onOpenFolder,
-        busy,
-        isAdmin,
       })
     )
   );

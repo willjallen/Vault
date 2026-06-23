@@ -5,6 +5,7 @@ import { FolderPropertiesModal } from "./components/FolderPropertiesModal.js";
 import { SettingsModal } from "./components/SettingsModal.js";
 import { TransferDock } from "./components/TransferDock.js";
 import { ContextMenu } from "./components/browser/ContextMenu.js";
+import { FileDetailsModal } from "./components/browser/FileDetailsModal.js";
 import { MoveDialog } from "./components/browser/MoveDialog.js";
 import {
   buildMyEditMenuItems,
@@ -58,6 +59,7 @@ export function App({ initial }) {
   const [draggingFolderPath, setDraggingFolderPath] = useState(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [folderPropertiesTarget, setFolderPropertiesTarget] = useState(null);
+  const [fileDetailsTarget, setFileDetailsTarget] = useState(null);
   const [contentsSort, setContentsSort] = useState(DEFAULT_CONTENTS_SORT);
   const [toast, setToast] = useState("");
   const [confirmRequest, setConfirmRequest] = useState(null);
@@ -114,6 +116,18 @@ export function App({ initial }) {
 
   const closeFolderProperties = useCallback(() => {
     setFolderPropertiesTarget(null);
+  }, []);
+
+  const openFileDetails = useCallback(
+    (doc) => {
+      setFileDetailsTarget(doc);
+      closeContextMenu();
+    },
+    [closeContextMenu]
+  );
+
+  const closeFileDetails = useCallback(() => {
+    setFileDetailsTarget(null);
   }, []);
 
   const baseDomain =
@@ -292,6 +306,12 @@ export function App({ initial }) {
     () => new Map(contentsItems.map((item) => [keyForItem(item), item])),
     [contentsItems]
   );
+  const activeFileDetailsDoc = useMemo(() => {
+    if (!fileDetailsTarget) {
+      return null;
+    }
+    return docs.find((doc) => doc.id === fileDetailsTarget.id) || fileDetailsTarget;
+  }, [docs, fileDetailsTarget]);
   const folderPaneItems = useMemo(() => {
     const childrenFor = (parentPath, predicate) =>
       // eslint-disable-next-line security/detect-object-injection
@@ -713,13 +733,16 @@ export function App({ initial }) {
       handleRestoreItems,
       handleRenameFile,
       handleRenameFolder,
+      handleSave,
       handleStartEdit,
       handleUnarchive,
       handleUnarchiveFolder,
       handleUnlockItems,
       handleUploadClick,
       openFolderProperties,
+      openFileDetails,
       handleView,
+      handleVersionDownload,
       handleVersionUploadClick,
       isAdmin,
       openMoveDialogForDoc,
@@ -732,7 +755,7 @@ export function App({ initial }) {
     };
   }
 
-  function handleFileContextMenu(evt, doc) {
+  function handleFileContextMenu(evt, doc, options = {}) {
     evt.preventDefault();
     evt.stopPropagation();
     if (!doc) {
@@ -741,7 +764,7 @@ export function App({ initial }) {
     const item = docToItem(doc);
     const key = keyForItem(item);
     const selectedItems = contentsSelection.includes(key) ? selectedContentsItems : [item];
-    if (!contentsSelection.includes(key)) {
+    if (options.select !== false && !contentsSelection.includes(key)) {
       setContentsSelection([key]);
       setContentsAnchor(key);
     }
@@ -760,7 +783,7 @@ export function App({ initial }) {
     setContextMenu({ x: evt.clientX, y: evt.clientY, items });
   }
 
-  function handleFolderContextMenu(evt, folderItem) {
+  function handleFolderContextMenu(evt, folderItem, options = {}) {
     evt.preventDefault();
     evt.stopPropagation();
     if (!folderItem) {
@@ -772,7 +795,7 @@ export function App({ initial }) {
     const paneSelection = useFolderPane ? folderSelection : contentsSelection;
     const paneItems = useFolderPane ? selectedFolderItems : selectedContentsItems;
     const selectedItems = paneSelection.includes(key) ? paneItems : [item];
-    if (!paneSelection.includes(key)) {
+    if (options.select !== false && !paneSelection.includes(key)) {
       if (useFolderPane) {
         setFolderSelection([key]);
         setFolderAnchor(key);
@@ -790,10 +813,6 @@ export function App({ initial }) {
     const items = buildPageMenuItems(contextActions());
     setContextMenu({ x: evt.clientX, y: evt.clientY, items });
   }
-
-  const infoSelectionItems = selectedContentsItems.length
-    ? selectedContentsItems
-    : selectedFolderItems;
 
   return h(
     React.Fragment,
@@ -831,7 +850,6 @@ export function App({ initial }) {
       contentsSelection,
       folderItems: folderPaneItems,
       folderSelection,
-      selectedDoc,
       searchQuery,
       recursiveSearch,
       dropHint,
@@ -882,27 +900,7 @@ export function App({ initial }) {
       logoutUrl,
       onOpenSettings: openSettings,
       settingsButtonRef,
-      onDownload: handleView,
-      selectionItems: infoSelectionItems,
-      onDownloadSelection: handleDownloadSelection,
-      onDownloadVersion: handleVersionDownload,
-      onLock: handleLock,
-      onLockSelection: handleLockItems,
-      onRename: handleRenameFile,
-      onMove: openMoveDialogForDoc,
-      onMoveSelection: openMoveDialogForSelection,
-      onStartEdit: handleStartEdit,
-      onRelease: handleRelease,
-      onReleaseSelection: handleUnlockItems,
-      onSave: handleSave,
-      onArchive: handleArchive,
-      onArchiveSelection: handleArchiveItems,
-      onUnarchive: handleUnarchive,
-      onRestoreSelection: handleRestoreItems,
-      onPermanentDelete: handlePermanentDelete,
-      onDeleteSelection: handleDeleteForeverItems,
-      onOpenFolder: navigateToFolder,
-      busy,
+      actions: contextActions(),
     }),
     moveTarget
       ? h(MoveDialog, {
@@ -951,6 +949,13 @@ export function App({ initial }) {
           folder: folderPropertiesTarget,
           onClose: closeFolderProperties,
           onUpdated: () => refresh(folder, { invalidateContents: true, sidebar: true }),
+        })
+      : null,
+    activeFileDetailsDoc
+      ? h(FileDetailsModal, {
+          actions: contextActions(),
+          doc: activeFileDetailsDoc,
+          onClose: closeFileDetails,
         })
       : null,
     h(ConfirmToast, { request: confirmRequest, onResolve: resolveConfirm }),

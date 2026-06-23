@@ -1,4 +1,4 @@
-import { classNames, isArchivePath } from "../../lib/utils.js";
+import { classNames, formatBytes, isArchivePath } from "../../lib/utils.js";
 import { Icon } from "../common/Icon.js";
 import { FolderRow } from "./FolderRow.js";
 import { FileRow } from "./FileRow.js";
@@ -11,7 +11,7 @@ const DETAIL_SORT_COLUMNS = [
   { key: "date", label: "Date", className: "date", defaultDirection: "desc" },
   { key: "user", label: "User", className: "user", defaultDirection: "asc" },
   { key: "size", label: "Size", className: "size", defaultDirection: "desc" },
-  { key: "ttl", label: "TTL", className: "ttl", defaultDirection: "asc" },
+  { key: "ttl", label: "Status", className: "status", defaultDirection: "asc" },
 ];
 const MARQUEE_MIN_DISTANCE = 4;
 const MARQUEE_AUTO_SCROLL_EDGE = 48;
@@ -36,7 +36,7 @@ function shouldIgnoreMarqueeTarget(target) {
   return Boolean(
     target.closest &&
       target.closest(
-        ".contents-table-head, .contents-search, button, input, textarea, select, a, [role='button'], [contenteditable='true']"
+        ".contents-table-head, .contents-toolbar, .contents-selection-readout, button, input, textarea, select, a, [role='button'], [contenteditable='true']"
       )
   );
 }
@@ -103,6 +103,7 @@ export function VaultFileList({
   subfolders,
   files,
   currentUser,
+  actions = {},
   selectedKeys = [],
   orderedItems = [],
   sort,
@@ -150,6 +151,13 @@ export function VaultFileList({
   const emptyState = !hasRows;
   const selectedSet = new Set(selectedKeys);
   const orderedKeys = orderedItems.map(itemSelectionKey);
+  const selectedItems = orderedItems.filter((item) => selectedSet.has(itemSelectionKey(item)));
+  const selectedFiles = selectedItems.filter((item) => item.type === "document");
+  const selectedFolders = selectedItems.filter((item) => item.type === "folder");
+  const selectedSizeDisplay = formatBytes(
+    selectedItems.reduce((sum, item) => sum + (item.size_bytes || 0), 0),
+    { emptyForZero: false }
+  );
 
   const updateMarqueeSelection = useCallback(() => {
     marqueeFrameRef.current = null;
@@ -438,11 +446,47 @@ export function VaultFileList({
       e.stopPropagation();
       return;
     }
-    if (e.target.closest && e.target.closest(".file-row, .contents-table-head")) {
+    if (
+      e.target.closest &&
+      e.target.closest(
+        ".file-row, .contents-table-head, .contents-toolbar, .contents-selection-readout"
+      )
+    ) {
       return;
     }
     if (onBackgroundClick) {
       onBackgroundClick();
+    }
+  }
+
+  function checkboxSelectionEvent(e) {
+    return {
+      ctrlKey: !e.shiftKey,
+      metaKey: false,
+      shiftKey: e.shiftKey,
+    };
+  }
+
+  function handleToggleSelect(item, type, e) {
+    if (onSelectItem) {
+      onSelectItem(item, type, checkboxSelectionEvent(e), orderedItems);
+    }
+  }
+
+  function openContextMenuForItem(e, item, options = {}) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!item) {
+      return;
+    }
+    if (item.type === "folder") {
+      if (onFolderContextMenu) {
+        onFolderContextMenu(e, item, options);
+      }
+      return;
+    }
+    if (onFileContextMenu) {
+      onFileContextMenu(e, item, options);
     }
   }
 
@@ -460,6 +504,8 @@ export function VaultFileList({
       isDragging: draggingFolderPath === folderItem.path,
       selectionKey,
       selected: selectedSet.has(selectionKey),
+      onToggleSelect: (e) => handleToggleSelect(folderItem, "folder", e),
+      onMore: (e) => openContextMenuForItem(e, folderItem, { select: false }),
       onSelect: (e) => onSelectItem && onSelectItem(folderItem, "folder", e, orderedItems),
       onOpen: () => onSelectFolder(folderItem.path),
       onDropEnter: (e) => onDropOnFolder(folderItem.path, e, true),
@@ -487,6 +533,7 @@ export function VaultFileList({
       inlineFolderDraft.mode === "renameFile" &&
       inlineFolderDraft.docId === doc.id;
     const selectionKey = `document:${doc.id}`;
+    const lockedByMe = doc.lock?.by === currentUser.id;
     return h(FileRow, {
       key: selectionKey,
       doc,
@@ -496,6 +543,14 @@ export function VaultFileList({
       selectionKey,
       selected: selectedSet.has(selectionKey),
       draggingId,
+      busy: actions.busy,
+      onToggleSelect: (e) => handleToggleSelect(doc, "document", e),
+      onDownload: () => actions.handleView?.(doc),
+      onUpload: () =>
+        actions.handleVersionUploadClick?.(doc, { renameToUploadedName: !lockedByMe }),
+      onCheckout: () => actions.handleStartEdit?.(doc),
+      onLock: () => (lockedByMe ? actions.handleRelease?.(doc.id) : actions.handleLock?.(doc)),
+      onMore: (e) => openContextMenuForItem(e, doc, { select: false }),
       onSelect: (e) => onSelectItem && onSelectItem(doc, "document", e, orderedItems),
       onOpen: onOpenFile,
       onDragStart: (e) =>
@@ -529,7 +584,7 @@ export function VaultFileList({
     },
     [
       h("div", { className: "browser-head" }, [
-        h("div", null, [
+        h("div", { className: "contents-heading" }, [
           h(
             "p",
             { className: classNames("eyebrow", "tiny", inArchive ? "archived-text" : "") },
@@ -548,9 +603,45 @@ export function VaultFileList({
             `Folders: ${subfolders.length} · Files: ${files.length}`
           ),
         ]),
-        emptyState
-          ? h("div", { className: "muted tiny" }, "Drop files here to start this folder.")
-          : h("div", { className: "muted tiny quiet-text" }, "Select an item to see details."),
+        h("div", { className: "contents-toolbar" }, [
+          h(
+            "div",
+            {
+              className: "contents-search",
+              onClick: (e) => e.stopPropagation(),
+              onMouseDown: (e) => e.stopPropagation(),
+            },
+            [
+              h(
+                "span",
+                { className: "contents-search-icon" },
+                h(Icon, { icon: "search", size: 15 })
+              ),
+              h("input", {
+                "aria-label": "Search contents",
+                onChange: (e) => onSearchQueryChange && onSearchQueryChange(e.target.value),
+                placeholder: "Search assets...",
+                type: "search",
+                value: searchQuery,
+              }),
+              h(
+                "button",
+                {
+                  "aria-label": recursiveSearch
+                    ? "Disable recursive search"
+                    : "Enable recursive search",
+                  "aria-pressed": recursiveSearch,
+                  className: classNames("recursive-search-button", recursiveSearch ? "active" : ""),
+                  onClick: () =>
+                    onRecursiveSearchChange && onRecursiveSearchChange(!recursiveSearch),
+                  title: recursiveSearch ? "Searching subfolders" : "Search subfolders",
+                  type: "button",
+                },
+                h(Icon, { icon: "circle-nodes", size: 15 })
+              ),
+            ]
+          ),
+        ]),
       ]),
       h(
         "div",
@@ -560,7 +651,8 @@ export function VaultFileList({
           onMouseDown: (e) => e.stopPropagation(),
         },
         [
-          h("span", { className: "contents-sort-spacer", key: "spacer" }),
+          h("span", { className: "contents-sort-spacer select", key: "select-spacer" }),
+          h("span", { className: "contents-sort-spacer icon", key: "icon-spacer" }),
           h(ContentsSortButton, {
             column: NAME_COLUMN,
             key: NAME_COLUMN.key,
@@ -575,7 +667,6 @@ export function VaultFileList({
               sort,
             })
           ),
-          h("span", { className: "contents-sort-status", key: "status" }),
         ]
       ),
       h(
@@ -633,32 +724,20 @@ export function VaultFileList({
       h(
         "div",
         {
-          className: "contents-search",
+          className: "contents-selection-readout",
           onClick: (e) => e.stopPropagation(),
           onMouseDown: (e) => e.stopPropagation(),
         },
         [
-          h("span", { className: "contents-search-icon" }, h(Icon, { icon: "search", size: 15 })),
-          h("input", {
-            type: "search",
-            value: searchQuery,
-            placeholder: "Search",
-            "aria-label": "Search contents",
-            onChange: (e) => onSearchQueryChange && onSearchQueryChange(e.target.value),
-          }),
           h(
-            "button",
-            {
-              type: "button",
-              className: classNames("recursive-search-button", recursiveSearch ? "active" : ""),
-              title: recursiveSearch ? "Searching subfolders" : "Search subfolders",
-              "aria-label": recursiveSearch
-                ? "Disable recursive search"
-                : "Enable recursive search",
-              "aria-pressed": recursiveSearch,
-              onClick: () => onRecursiveSearchChange && onRecursiveSearchChange(!recursiveSearch),
-            },
-            h(Icon, { icon: "circle-nodes", size: 15 })
+            "span",
+            { className: "selection-count", key: "count" },
+            `${selectedItems.length} selected`
+          ),
+          h(
+            "span",
+            { key: "meta" },
+            `${selectedFiles.length} files · ${selectedFolders.length} folders · ${selectedSizeDisplay}`
           ),
         ]
       ),

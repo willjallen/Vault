@@ -14,11 +14,11 @@ function iconForFileName(fileName = "") {
   return fileIconByExtension.get(extension) || "file";
 }
 
-export function FileIcon({ color = "", fileName = "", folderIcon = "", kind }) {
+export function FileIcon({ color = "", fileName = "", folderIcon = "", kind, size = null }) {
   const icon = kind === "folder" ? folderIcon || "folder" : iconForFileName(fileName);
   return Icon({
     className: `file-icon ${color ? `folder-color-${color}` : ""}`,
     icon,
-    size: kind === "folder" || icon.startsWith("app-") ? 18 : 16,
+    size: size || (kind === "folder" || icon.startsWith("app-") ? 18 : 16),
   });
 }

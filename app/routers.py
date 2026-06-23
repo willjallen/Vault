@@ -263,7 +263,9 @@ def format_mtime(timestamp: dt.datetime | None) -> str:
     normalized = normalize_timestamp(timestamp)
     if not normalized:
         return "Not updated yet"
-    return normalized.strftime("%b %d, %Y")
+    hour = normalized.hour % 12 or 12
+    meridiem = "am" if normalized.hour < 12 else "pm"
+    return f"{normalized:%b} {normalized.day}, {normalized:%Y} at {hour}:{normalized:%M} {meridiem}"
 
 
 def all_folders(db: Session) -> list[Folder]:

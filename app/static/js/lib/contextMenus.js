@@ -21,6 +21,9 @@ export function buildFileMenuItems(actions) {
   const lockedByMe = lock && lock.by === currentUser.id;
   const lockedByOther = lock && lock.by && lock.by !== currentUser.id;
   return compactMenuItems([
+    actions.openFileDetails
+      ? { label: "Details", action: () => actions.openFileDetails(doc) }
+      : null,
     { label: "Download", action: () => actions.handleView(doc) },
     !doc.archived && !lockedByOther
       ? {

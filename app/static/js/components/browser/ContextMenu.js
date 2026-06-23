@@ -11,7 +11,7 @@ export function ContextMenu({ menu, onClose }) {
       return undefined;
     }
 
-    function handleClick(evt) {
+    function handleOutsidePointer(evt) {
       if (menuRef.current && !menuRef.current.contains(evt.target)) {
         onClose();
       }
@@ -27,12 +27,14 @@ export function ContextMenu({ menu, onClose }) {
       onClose();
     }
 
-    window.addEventListener("mousedown", handleClick);
+    window.addEventListener("pointerdown", handleOutsidePointer, true);
+    window.addEventListener("mousedown", handleOutsidePointer, true);
     window.addEventListener("wheel", handleWheel, true);
     window.addEventListener("keydown", handleEscape);
 
     return () => {
-      window.removeEventListener("mousedown", handleClick);
+      window.removeEventListener("pointerdown", handleOutsidePointer, true);
+      window.removeEventListener("mousedown", handleOutsidePointer, true);
       window.removeEventListener("wheel", handleWheel, true);
       window.removeEventListener("keydown", handleEscape);
     };

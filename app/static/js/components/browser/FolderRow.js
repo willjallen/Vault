@@ -14,6 +14,8 @@ export function FolderRow({
   selected,
   isDropTarget,
   isDragging,
+  onToggleSelect,
+  onMore,
   onOpen,
   onSelect,
   onDropEnter,
@@ -47,6 +49,14 @@ export function FolderRow({
   function cancelEdit() {
     if (onEditCancel) {
       onEditCancel();
+    }
+  }
+
+  function stopRowAction(e, action) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (action) {
+      action(e);
     }
   }
 
@@ -105,8 +115,23 @@ export function FolderRow({
     [
       h(
         "div",
+        { className: "file-cell select" },
+        isDraft
+          ? null
+          : h("input", {
+              "aria-label": selected ? `Deselect ${folder.name}` : `Select ${folder.name}`,
+              checked: Boolean(selected),
+              className: "row-checkbox",
+              disabled: editing,
+              onChange: () => {},
+              onClick: (e) => stopRowAction(e, onToggleSelect),
+              type: "checkbox",
+            })
+      ),
+      h(
+        "div",
         { className: "file-cell icon" },
-        h(FileIcon, { color: folder.color, folderIcon: folder.icon, kind: "folder" })
+        h(FileIcon, { color: folder.color, folderIcon: folder.icon, kind: "folder", size: 14 })
       ),
       h("div", { className: "file-cell main" }, [
         editing
@@ -150,20 +175,32 @@ export function FolderRow({
         { className: "file-cell size" },
         h("span", { className: "muted tiny" }, folder.size_display || "0 B")
       ),
-      h(
-        "div",
-        { className: "file-cell ttl" },
+      h("div", { className: "file-cell status-col" }, [
+        h("span", { className: "status-pill subtle status-version" }, "Folder"),
+        h("span", { "aria-hidden": "true", className: "status-empty status-lock" }),
         retentionLabel
-          ? h("span", { className: "ttl-chip policy", title: retentionLabel }, [
+          ? h("span", { className: "ttl-chip policy status-ttl", title: retentionLabel }, [
               h(Icon, { icon: "clock", key: "icon", size: 11 }),
               h("span", { key: "label" }, retentionLabel),
             ])
-          : h("span", { className: "muted tiny" }, "-")
-      ),
+          : h("span", { "aria-hidden": "true", className: "status-empty status-ttl" }),
+      ]),
       h(
         "div",
-        { className: "file-cell status-col" },
-        h("span", { className: "row-chevron" }, h(Icon, { icon: "chevron-right", size: 12 }))
+        { className: "file-cell row-actions" },
+        isDraft
+          ? null
+          : h(
+              "button",
+              {
+                "aria-label": `More actions for ${folder.name}`,
+                className: "row-action-button more",
+                onClick: (e) => stopRowAction(e, onMore),
+                title: "More actions",
+                type: "button",
+              },
+              h(Icon, { icon: "ellipsis", size: 14 })
+            )
       ),
     ]
   );

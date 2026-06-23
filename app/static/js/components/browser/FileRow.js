@@ -12,6 +12,7 @@ export function FileRow({
   currentUser,
   editing,
   editValue,
+  selectionKey = "",
   selected,
   draggingId,
   onSelect,
@@ -67,6 +68,7 @@ export function FileRow({
         draggingId === doc.id ? "dragging" : "",
         editing ? "editing" : ""
       ),
+      "data-selection-key": selectionKey || undefined,
       draggable: !editing,
       onClick: editing ? undefined : onSelect,
       onDoubleClick: editing ? undefined : () => onOpen(doc),

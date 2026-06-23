@@ -10,6 +10,7 @@ export function FolderRow({
   editing,
   editValue,
   isDraft,
+  selectionKey = "",
   selected,
   isDropTarget,
   isDragging,
@@ -61,6 +62,7 @@ export function FolderRow({
         isDragging ? "dragging" : "",
         editing ? "editing" : ""
       ),
+      "data-selection-key": selectionKey || undefined,
       draggable: !editing && !isDraft,
       tabIndex: editing ? undefined : 0,
       onClick: editing ? undefined : onSelect,

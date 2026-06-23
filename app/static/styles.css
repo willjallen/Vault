@@ -72,12 +72,11 @@ body.app-root-page .finder-sidebar {
 }
 
 body.app-root-page .finder-browser {
-  display: flex;
-  flex-direction: column;
   overflow: hidden;
 }
 
 body.app-root-page .file-list {
+  flex: 1 1 auto;
   min-height: 0;
   overflow: auto;
   padding: 0 2px 72px 0;
@@ -651,6 +650,8 @@ header {
   box-shadow: var(--shadow-soft);
   min-height: 560px;
   min-width: 0;
+  display: flex;
+  flex-direction: column;
   position: relative;
 }
 
@@ -760,10 +761,38 @@ header {
 }
 
 .file-list {
+  flex: 1 1 auto;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   gap: 6px;
   padding-bottom: 72px;
+}
+
+.file-list,
+.file-list * {
+  user-select: none;
+}
+
+.file-list input,
+.file-list textarea {
+  user-select: text;
+}
+
+.file-list.selecting {
+  cursor: crosshair;
+}
+
+.selection-marquee {
+  position: fixed;
+  z-index: 4;
+  pointer-events: none;
+  border: 1px solid var(--accent-border-strong);
+  border-radius: 8px;
+  background: var(--focus-ring);
+  box-shadow:
+    0 0 0 1px var(--focus-ring-strong),
+    var(--shadow-subtle);
 }
 
 .contents-search {

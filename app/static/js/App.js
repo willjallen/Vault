@@ -381,6 +381,10 @@ export function App({ initial }) {
     return Boolean(pointerEvent?.ctrlKey || pointerEvent?.metaKey || pointerEvent?.shiftKey);
   }
 
+  function sameKeys(left, right) {
+    return left.length === right.length && left.join("\u0000") === right.join("\u0000");
+  }
+
   useEffect(() => {
     const docItems = selectedContentsItems.filter((item) => item.type === "document");
     setSelectedId(
@@ -412,6 +416,14 @@ export function App({ initial }) {
     setFolderSelection([]);
     setFolderAnchor(null);
     applyPaneSelection("contents", item, pointerEvent, orderedItems);
+  }
+
+  function handleContentsMarqueeSelectionChange(nextKeys, anchorKey) {
+    setFolderSelection((current) => (current.length ? [] : current));
+    setFolderAnchor(null);
+    setContentsSelection((current) => (sameKeys(current, nextKeys) ? current : nextKeys));
+    setContentsAnchor(anchorKey || null);
+    closeContextMenu();
   }
 
   function handleSelectFolderItem(item, pointerEvent, orderedItems) {
@@ -851,6 +863,7 @@ export function App({ initial }) {
         setFolderSelection([]);
         setFolderAnchor(null);
       },
+      onContentsMarqueeSelectionChange: handleContentsMarqueeSelectionChange,
       onOpenDoc: handleView,
       onDropOnFolder: handleDropOnFolder,
       onClearDropHint: clearDropState,

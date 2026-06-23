@@ -15,6 +15,16 @@ export function normalizePalettePreference(value) {
   return PALETTE_OPTIONS.includes(value) ? value : "cozy";
 }
 
+function readHostThemeOverride() {
+  const value = document.documentElement.dataset.themeOverride;
+  return THEME_OPTIONS.includes(value) ? value : "";
+}
+
+function readHostPaletteOverride() {
+  const value = document.documentElement.dataset.paletteOverride;
+  return PALETTE_OPTIONS.includes(value) ? value : "";
+}
+
 function normalizeBooleanPreference(value, fallback) {
   if (value === true || value === "true") {
     return true;
@@ -93,7 +103,7 @@ export function readStoredDoubleClickDownloadPreference() {
 
 export function applyThemePreference(preference) {
   const normalized = normalizeThemePreference(preference);
-  const resolved = resolveThemePreference(normalized);
+  const resolved = resolveThemePreference(readHostThemeOverride() || normalized);
   document.documentElement.dataset.themePreference = normalized;
   document.documentElement.dataset.theme = resolved;
   document.documentElement.style.colorScheme = resolved;
@@ -103,7 +113,7 @@ export function applyThemePreference(preference) {
 export function applyPalettePreference(preference) {
   const normalized = normalizePalettePreference(preference);
   document.documentElement.dataset.palettePreference = normalized;
-  document.documentElement.dataset.palette = normalized;
+  document.documentElement.dataset.palette = readHostPaletteOverride() || normalized;
   return normalized;
 }
 
@@ -200,8 +210,8 @@ export function useAppearancePreferences() {
       return undefined;
     }
     function handleSystemThemeChange() {
-      if (themePreference === "system") {
-        applyThemePreference("system");
+      if (themePreference === "system" || readHostThemeOverride() === "system") {
+        applyThemePreference(themePreference);
       }
     }
     media.addEventListener("change", handleSystemThemeChange);

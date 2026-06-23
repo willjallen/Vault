@@ -69,6 +69,8 @@ FOLDER_COLOR_TOKENS = {"blue", "teal", "green", "amber", "rose", "violet", "slat
 FOLDER_ICON_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 SHARE_CODE_PATTERN = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 TTL_ACTIONS = {"archive", "delete"}
+APPEARANCE_PALETTES = {"cozy", "winui"}
+APPEARANCE_THEMES = {"system", "light", "dark"}
 SYSTEM_USER: UserContext = {
     "id": "system",
     "vault_user_id": 0,
@@ -1920,6 +1922,32 @@ def build_initial_state(
     return state
 
 
+def normalize_appearance_header(value: str | None, allowed: set[str]) -> str | None:
+    normalized = (value or "").strip().lower()
+    return normalized if normalized in allowed else None
+
+
+def build_appearance_override(request: Request) -> dict[str, str | None]:
+    return {
+        "palette": normalize_appearance_header(
+            request.headers.get("x-vault-palette"),
+            APPEARANCE_PALETTES,
+        ),
+        "theme": normalize_appearance_header(
+            request.headers.get("x-vault-theme"),
+            APPEARANCE_THEMES,
+        ),
+    }
+
+
+def index_template_context(request: Request, state: dict[str, object]) -> dict[str, object]:
+    return {
+        "appearance_override": build_appearance_override(request),
+        "request": request,
+        "state": state,
+    }
+
+
 def generate_share_code(db: Session) -> str:
     for _ in range(20):
         code = secrets.token_urlsafe(9)
@@ -2451,7 +2479,7 @@ def index(
     ensure_root_folders(db)
     commit_state(db)
     state = build_initial_state(user, "", db)
-    return templates.TemplateResponse("index.html", {"request": request, "state": state})
+    return templates.TemplateResponse("index.html", index_template_context(request, state))
 
 
 @router.get("/s/{code}", response_class=HTMLResponse, name="share_entry")
@@ -2466,7 +2494,7 @@ def share_entry(
     ensure_root_folders(db)
     commit_state(db)
     state = build_initial_state(user, "", db, share_code=code)
-    return templates.TemplateResponse("index.html", {"request": request, "state": state})
+    return templates.TemplateResponse("index.html", index_template_context(request, state))
 
 
 @router.get("/api/bootstrap")

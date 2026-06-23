@@ -86,9 +86,13 @@ class ShareLinkTests(unittest.TestCase):
             self.assertEqual(resolved_folder.json()["target_type"], "folder")
             self.assertEqual(resolved_folder.json()["folder"], "Concepts")
 
-            entry = ctx.client.get(f"/s/{doc_share['code']}", headers=artist_headers)
+            entry = ctx.client.get(
+                f"/s/{doc_share['code']}",
+                headers={**artist_headers, "X-Vault-Palette": "winui"},
+            )
             self.assertEqual(entry.status_code, 200, entry.text)
             self.assertIn(f'"share_code": "{doc_share["code"]}"', entry.text)
+            self.assertIn('"palette": "winui"', entry.text)
             self.assertNotIn("?folder=", entry.text)
 
             hidden = ctx.client.get(

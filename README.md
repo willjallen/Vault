@@ -19,3 +19,5 @@ docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 ```
 
 Do not use the dev override for production. Production deployments should set a strong `VAULT_SESSION_SECRET` and either run behind a trusted header-auth proxy or configure `VAULT_AUTH_MODE=oidc` with the OIDC variables in `.env.example`.
+
+Embedded hosts can force the first-paint appearance without changing the user's stored browser preference by sending `X-Vault-Palette: winui` and, if needed, `X-Vault-Theme: light|dark|system` on the HTML request.

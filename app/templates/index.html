@@ -11,6 +11,7 @@
         const openFoldersKey = "vault.openFoldersOnClick";
         const alternateRowsKey = "vault.alternateRows";
         const doubleClickDownloadKey = "vault.doubleClickDownload";
+        const appearanceOverride = {{ appearance_override | tojson }};
         const allowed = new Set(["system", "light", "dark"]);
         const allowedPalettes = new Set(["cozy", "winui"]);
         const normalizeBoolean = (value, fallback) => {
@@ -45,13 +46,29 @@
         if (!allowedPalettes.has(palette)) {
           palette = "cozy";
         }
+        const hostTheme =
+          appearanceOverride && allowed.has(appearanceOverride.theme)
+            ? appearanceOverride.theme
+            : "";
+        const hostPalette =
+          appearanceOverride && allowedPalettes.has(appearanceOverride.palette)
+            ? appearanceOverride.palette
+            : "";
         const prefersDark =
           window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
-        const resolved = preference === "system" ? (prefersDark ? "dark" : "light") : preference;
+        const effectiveTheme = hostTheme || preference;
+        const resolved = effectiveTheme === "system" ? (prefersDark ? "dark" : "light") : effectiveTheme;
+        const effectivePalette = hostPalette || palette;
         document.documentElement.dataset.themePreference = preference;
+        if (hostTheme) {
+          document.documentElement.dataset.themeOverride = hostTheme;
+        }
         document.documentElement.dataset.theme = resolved;
         document.documentElement.dataset.palettePreference = palette;
-        document.documentElement.dataset.palette = palette;
+        if (hostPalette) {
+          document.documentElement.dataset.paletteOverride = hostPalette;
+        }
+        document.documentElement.dataset.palette = effectivePalette;
         document.documentElement.dataset.openFoldersOnClick = String(openFoldersOnClick);
         document.documentElement.dataset.alternateRows = String(alternateRows);
         document.documentElement.dataset.doubleClickDownload = String(doubleClickDownload);

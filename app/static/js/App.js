@@ -127,6 +127,7 @@ export function App({ initial }) {
   const openFileDetails = useCallback(
     (doc) => {
       setFileDetailsTarget(doc);
+      setSelectedId(doc.id);
       closeContextMenu();
     },
     [closeContextMenu]
@@ -318,8 +319,11 @@ export function App({ initial }) {
     if (!fileDetailsTarget) {
       return null;
     }
+    if (selectedDoc?.id === fileDetailsTarget.id) {
+      return selectedDoc;
+    }
     return docs.find((doc) => doc.id === fileDetailsTarget.id) || fileDetailsTarget;
-  }, [docs, fileDetailsTarget]);
+  }, [docs, fileDetailsTarget, selectedDoc]);
   const folderPaneItems = useMemo(() => {
     const childrenFor = (parentPath, predicate) =>
       // eslint-disable-next-line security/detect-object-injection

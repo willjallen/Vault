@@ -268,7 +268,33 @@ export function VaultFileList({
     };
   }
 
+  function suppressNextClick() {
+    suppressClickRef.current = true;
+    window.setTimeout(() => {
+      suppressClickRef.current = false;
+    }, 0);
+  }
+
+  function commitInlineEditBeforePointer(e) {
+    if (
+      !inlineFolderDraft ||
+      !onCommitInlineFolder ||
+      (e.target.closest && e.target.closest(".inline-name-editor"))
+    ) {
+      return false;
+    }
+    const editor = fileListRef.current?.querySelector(".inline-name-editor");
+    onCommitInlineFolder(editor ? editor.value : inlineFolderDraft.value || "");
+    suppressNextClick();
+    e.preventDefault();
+    e.stopPropagation();
+    return true;
+  }
+
   function handleMarqueePointerDown(e) {
+    if (commitInlineEditBeforePointer(e)) {
+      return;
+    }
     if (e.button !== 0 || e.pointerType === "touch" || shouldIgnoreMarqueeTarget(e.target)) {
       return;
     }
@@ -320,10 +346,7 @@ export function VaultFileList({
     updateMarqueeSelection();
     if (drag.active) {
       clearNativeSelection();
-      suppressClickRef.current = true;
-      window.setTimeout(() => {
-        suppressClickRef.current = false;
-      }, 0);
+      suppressNextClick();
       e.preventDefault();
     }
     if (drag.captured) {

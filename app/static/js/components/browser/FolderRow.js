@@ -29,6 +29,7 @@ export function FolderRow({
   onEditCancel,
 }) {
   const inputRef = useRef(null);
+  const committingRef = useRef(false);
   const isArchived = isArchivePath(folder.path || "");
   const retentionLabel = retentionPolicyLabel(folder.default_ttl_action, folder.default_ttl_days);
 
@@ -41,8 +42,19 @@ export function FolderRow({
   }, [editing]);
 
   function commitEdit() {
-    if (onEditCommit) {
-      onEditCommit(editValue);
+    if (!onEditCommit || committingRef.current) {
+      return;
+    }
+    committingRef.current = true;
+    const value = inputRef.current ? inputRef.current.value : editValue;
+    try {
+      const result = onEditCommit(value);
+      Promise.resolve(result).finally(() => {
+        committingRef.current = false;
+      });
+    } catch (err) {
+      committingRef.current = false;
+      throw err;
     }
   }
 

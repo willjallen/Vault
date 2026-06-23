@@ -1382,18 +1382,6 @@ header {
   color: var(--danger-text);
 }
 
-.inline-name-editor {
-  width: 100%;
-  min-width: 0;
-  border: 1px solid var(--accent-border);
-  border-radius: 8px;
-  background: var(--surface-panel);
-  color: var(--text);
-  font: inherit;
-  font-weight: 700;
-  padding: 4px 8px;
-}
-
 .file-cell.meta {
   color: var(--muted);
   font-size: 0.66rem;
@@ -1656,6 +1644,27 @@ input[type="file"] {
 input[type="text"]:focus,
 input[type="file"]:focus {
   outline: 2px solid var(--focus-ring-strong);
+  border-color: var(--accent-border);
+}
+
+.file-row .inline-name-editor {
+  width: 100%;
+  min-width: 0;
+  height: 24px;
+  padding: 2px 6px;
+  border: 1px solid var(--accent-border);
+  border-radius: 7px;
+  background: var(--surface-panel);
+  color: var(--text);
+  font: inherit;
+  font-size: 0.74rem;
+  font-weight: 700;
+  line-height: 1.25;
+}
+
+.file-row .inline-name-editor:focus {
+  outline: 1px solid var(--focus-ring-strong);
+  outline-offset: 0;
   border-color: var(--accent-border);
 }
 

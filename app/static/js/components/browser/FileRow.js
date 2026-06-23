@@ -32,6 +32,7 @@ export function FileRow({
   onEditCancel,
 }) {
   const inputRef = useRef(null);
+  const committingRef = useRef(false);
   const lock = doc.lock || {};
   const locked = Boolean(lock && lock.by);
   const lockedByMe = locked && lock.by === currentUser.id;
@@ -60,8 +61,19 @@ export function FileRow({
   }, [editing]);
 
   function commitEdit() {
-    if (onEditCommit) {
-      onEditCommit(editValue);
+    if (!onEditCommit || committingRef.current) {
+      return;
+    }
+    committingRef.current = true;
+    const value = inputRef.current ? inputRef.current.value : editValue;
+    try {
+      const result = onEditCommit(value);
+      Promise.resolve(result).finally(() => {
+        committingRef.current = false;
+      });
+    } catch (err) {
+      committingRef.current = false;
+      throw err;
     }
   }
 

@@ -9,6 +9,7 @@ const h = React.createElement;
 export function FileRow({
   doc,
   currentUser,
+  doubleClickDownload = false,
   busy,
   editing,
   editValue,
@@ -92,7 +93,7 @@ export function FileRow({
       "data-selection-key": selectionKey || undefined,
       draggable: !editing,
       onClick: editing ? undefined : onSelect,
-      onDoubleClick: editing ? undefined : () => onOpen(doc),
+      onDoubleClick: editing || !doubleClickDownload ? undefined : () => onOpen(doc),
       onDragStart: editing ? undefined : (e) => onDragStart(e, doc.id),
       onDragEnd: editing ? undefined : onDragEnd,
       onContextMenu: (e) => {

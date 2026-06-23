@@ -1000,6 +1000,12 @@ header {
   color: var(--muted);
 }
 
+:root[data-alternate-rows="true"]
+  .file-list
+  > .file-row:nth-of-type(even):not(:hover, .selected, .drop-target, .editing) {
+  background: var(--surface-overlay-muted);
+}
+
 .context-menu {
   position: fixed;
   z-index: 1200;
@@ -2405,12 +2411,17 @@ input[type="file"]::file-selector-button:hover {
 .settings-toggle {
   width: 44px;
   height: 26px;
+  border: 0;
   border-radius: 999px;
   padding: 3px;
   display: inline-flex;
   align-items: center;
   background: var(--border-strong);
   box-shadow: var(--shadow-inset-control);
+  cursor: pointer;
+  transition:
+    background 0.14s ease,
+    box-shadow 0.14s ease;
 }
 
 .settings-toggle span {
@@ -2424,6 +2435,11 @@ input[type="file"]::file-selector-button:hover {
 .settings-toggle.active {
   justify-content: flex-end;
   background: var(--accent-fill);
+}
+
+.settings-toggle:focus-visible {
+  outline: none;
+  box-shadow: var(--shadow-focus);
 }
 
 .settings-segmented {

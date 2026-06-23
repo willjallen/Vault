@@ -76,6 +76,7 @@ export function FolderRow({
       draggable: !editing && !isDraft,
       tabIndex: editing ? undefined : 0,
       onClick: editing ? undefined : onSelect,
+      onDoubleClick: editing || isDraft ? undefined : onOpen,
       onKeyDown: editing
         ? undefined
         : (e) => {

@@ -71,8 +71,14 @@ export function App({ initial }) {
   const confirmResolver = useRef(null);
   const closeContextMenu = useCallback(() => setContextMenu(null), []);
   const {
+    alternateRows,
+    doubleClickDownload,
+    handleAlternateRowsChange,
+    handleDoubleClickDownloadChange,
+    handleOpenFoldersOnClickChange,
     handlePalettePreferenceChange,
     handleThemePreferenceChange,
+    openFoldersOnClick,
     palettePreference,
     themePreference,
   } = useAppearancePreferences();
@@ -431,8 +437,14 @@ export function App({ initial }) {
       return;
     }
     if (item.type === "folder") {
-      clearAllSelections();
-      navigateToFolder(item.path || "");
+      if (openFoldersOnClick) {
+        clearAllSelections();
+        navigateToFolder(item.path || "");
+        return;
+      }
+      setFolderSelection([]);
+      setFolderAnchor(null);
+      applyPaneSelection("contents", item, pointerEvent, orderedItems);
       return;
     }
     setFolderSelection([]);
@@ -460,8 +472,14 @@ export function App({ initial }) {
       clearAllSelections();
       return;
     }
-    clearAllSelections();
-    navigateToFolder(item.path || "");
+    if (openFoldersOnClick) {
+      clearAllSelections();
+      navigateToFolder(item.path || "");
+      return;
+    }
+    setContentsSelection([]);
+    setContentsAnchor(null);
+    applyPaneSelection("folders", item, pointerEvent, orderedItems);
   }
 
   function handleContentsSortChange(key) {
@@ -861,7 +879,9 @@ export function App({ initial }) {
       draggingId,
       draggingFolderPath,
       currentUser,
+      doubleClickDownload,
       isAdmin,
+      openFoldersOnClick,
       canGoBack,
       canGoForward,
       canGoUp,
@@ -939,9 +959,15 @@ export function App({ initial }) {
           apiFetch,
           appVersion: initialBootstrap.version,
           currentUser,
+          doubleClickDownload,
+          onAlternateRowsChange: handleAlternateRowsChange,
+          onDoubleClickDownloadChange: handleDoubleClickDownloadChange,
+          onOpenFoldersOnClickChange: handleOpenFoldersOnClickChange,
           onClose: closeSettings,
           onPalettePreferenceChange: handlePalettePreferenceChange,
           onThemePreferenceChange: handleThemePreferenceChange,
+          openFoldersOnClick,
+          alternateRows,
           palettePreference,
           siteName: initialBootstrap.site_name || "Vault",
           themePreference,

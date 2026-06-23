@@ -29,24 +29,6 @@ function SectionButton({ active, section, onSelect }) {
   );
 }
 
-function ToggleMock({ active }) {
-  return h(
-    "span",
-    { className: classNames("settings-toggle", active ? "active" : ""), "aria-hidden": true },
-    h("span", null)
-  );
-}
-
-function SegmentedMock({ options, active }) {
-  return h(
-    "div",
-    { className: "settings-segmented", "aria-hidden": true },
-    options.map((option) =>
-      h("span", { className: classNames(option === active ? "active" : ""), key: option }, option)
-    )
-  );
-}
-
 function ThemeSegmented({ value, onChange }) {
   const options = [
     { id: "system", label: "System" },
@@ -94,11 +76,17 @@ function PaletteSegmented({ value, onChange }) {
   );
 }
 
-function SliderMock({ value }) {
+function SettingsToggle({ checked, label, onChange }) {
   return h(
-    "div",
-    { className: "settings-slider", "aria-hidden": true },
-    h("span", { style: { width: `${value}%` } })
+    "button",
+    {
+      "aria-label": label,
+      "aria-pressed": checked,
+      className: classNames("settings-toggle", checked ? "active" : ""),
+      onClick: () => onChange(!checked),
+      type: "button",
+    },
+    h("span", null)
   );
 }
 
@@ -627,11 +615,17 @@ function AdminPanel({ apiFetch, currentUser }) {
 }
 
 function SectionPanel({
+  alternateRows,
   activeSection,
   apiFetch,
   currentUser,
+  doubleClickDownload,
+  onAlternateRowsChange,
+  onDoubleClickDownloadChange,
+  onOpenFoldersOnClickChange,
   onPalettePreferenceChange,
   onThemePreferenceChange,
+  openFoldersOnClick,
   palettePreference,
   themePreference,
 }) {
@@ -649,18 +643,25 @@ function SectionPanel({
       h("div", { className: "settings-card", key: "card" }, [
         SettingsRow({
           title: "Open folders on click",
-          copy: "Folder rows prioritize fast navigation from Browse.",
-          control: ToggleMock({ active: true }),
+          copy: openFoldersOnClick
+            ? "Left click opens folders. Ctrl or Shift click selects them."
+            : "Left click selects folders. Double click or press Enter to open.",
+          control: SettingsToggle({
+            checked: openFoldersOnClick,
+            label: "Toggle open folders on click",
+            onChange: onOpenFoldersOnClickChange,
+          }),
         }),
         SettingsRow({
-          title: "Details density",
-          copy: "Controls how much metadata appears in each row.",
-          control: SegmentedMock({ options: ["Quiet", "Standard", "Dense"], active: "Standard" }),
-        }),
-        SettingsRow({
-          title: "Archive reminders",
-          copy: "Surface extra confirmation before permanent deletion.",
-          control: ToggleMock({ active: true }),
+          title: "Double click downloads files",
+          copy: doubleClickDownload
+            ? "Double clicking a file starts a download."
+            : "Double clicking a file is disabled. Use the row download action instead.",
+          control: SettingsToggle({
+            checked: doubleClickDownload,
+            label: "Toggle double click file download",
+            onChange: onDoubleClickDownloadChange,
+          }),
         }),
       ]),
     ]);
@@ -705,14 +706,15 @@ function SectionPanel({
         }),
       }),
       SettingsRow({
-        title: "Sidebar labels",
-        copy: "Keep folder names readable in the left pane.",
-        control: ToggleMock({ active: true }),
-      }),
-      SettingsRow({
-        title: "Motion",
-        copy: "Use soft spring animations for overlays and progress.",
-        control: SliderMock({ value: 72 }),
+        title: "Alternate row colors",
+        copy: alternateRows
+          ? "Contents rows use a subtle alternating background."
+          : "Contents rows use flat dividers only.",
+        control: SettingsToggle({
+          checked: alternateRows,
+          label: "Toggle alternate row colors",
+          onChange: onAlternateRowsChange,
+        }),
       }),
     ]),
   ]);
@@ -721,10 +723,16 @@ function SectionPanel({
 export function SettingsModal({
   apiFetch,
   appVersion = "0.0.0-dev",
+  alternateRows = false,
   currentUser,
+  doubleClickDownload = false,
+  onAlternateRowsChange,
   onClose,
+  onDoubleClickDownloadChange,
+  onOpenFoldersOnClickChange,
   onPalettePreferenceChange,
   onThemePreferenceChange,
+  openFoldersOnClick = true,
   palettePreference = "cozy",
   siteName = "Vault",
   themePreference = "system",
@@ -830,12 +838,18 @@ export function SettingsModal({
             ]),
           ]),
           h(SectionPanel, {
+            alternateRows,
             activeSection,
             apiFetch,
             currentUser,
+            doubleClickDownload,
             key: "panel",
+            onAlternateRowsChange,
+            onDoubleClickDownloadChange,
+            onOpenFoldersOnClickChange,
             onPalettePreferenceChange,
             onThemePreferenceChange,
+            openFoldersOnClick,
             palettePreference,
             themePreference,
           }),

@@ -77,6 +77,7 @@ function SidebarFolderShortcut({
       draggable: Boolean(item.path && item.path !== "Archive"),
       title: item.path || item.name,
       onClick: (e) => onSelectItem && onSelectItem(item, e),
+      onDoubleClick: () => onSelect(item.path),
       onContextMenu: (e) => onContextMenu && onContextMenu(e, { ...item, sourcePane: "folders" }),
       onDragStart: (e) => onFolderDragStart && onFolderDragStart(e, item.path),
       onDragEnd: onFolderDragEnd,

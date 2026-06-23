@@ -2,6 +2,9 @@ export const THEME_STORAGE_KEY = "vault.themePreference";
 export const THEME_OPTIONS = ["system", "light", "dark"];
 export const PALETTE_STORAGE_KEY = "vault.palettePreference";
 export const PALETTE_OPTIONS = ["cozy", "winui"];
+export const OPEN_FOLDERS_ON_CLICK_STORAGE_KEY = "vault.openFoldersOnClick";
+export const ALTERNATE_ROWS_STORAGE_KEY = "vault.alternateRows";
+export const DOUBLE_CLICK_DOWNLOAD_STORAGE_KEY = "vault.doubleClickDownload";
 const { useCallback, useEffect, useState } = React;
 
 export function normalizeThemePreference(value) {
@@ -10,6 +13,16 @@ export function normalizeThemePreference(value) {
 
 export function normalizePalettePreference(value) {
   return PALETTE_OPTIONS.includes(value) ? value : "cozy";
+}
+
+function normalizeBooleanPreference(value, fallback) {
+  if (value === true || value === "true") {
+    return true;
+  }
+  if (value === false || value === "false") {
+    return false;
+  }
+  return fallback;
 }
 
 export function systemPrefersDark() {
@@ -46,6 +59,38 @@ export function readStoredPalettePreference() {
   }
 }
 
+function readStoredBooleanPreference(key, datasetValue, fallback) {
+  try {
+    return normalizeBooleanPreference(window.localStorage.getItem(key) || datasetValue, fallback);
+  } catch (_err) {
+    return normalizeBooleanPreference(datasetValue, fallback);
+  }
+}
+
+export function readStoredOpenFoldersOnClickPreference() {
+  return readStoredBooleanPreference(
+    OPEN_FOLDERS_ON_CLICK_STORAGE_KEY,
+    document.documentElement.dataset.openFoldersOnClick,
+    true
+  );
+}
+
+export function readStoredAlternateRowsPreference() {
+  return readStoredBooleanPreference(
+    ALTERNATE_ROWS_STORAGE_KEY,
+    document.documentElement.dataset.alternateRows,
+    false
+  );
+}
+
+export function readStoredDoubleClickDownloadPreference() {
+  return readStoredBooleanPreference(
+    DOUBLE_CLICK_DOWNLOAD_STORAGE_KEY,
+    document.documentElement.dataset.doubleClickDownload,
+    false
+  );
+}
+
 export function applyThemePreference(preference) {
   const normalized = normalizeThemePreference(preference);
   const resolved = resolveThemePreference(normalized);
@@ -59,6 +104,24 @@ export function applyPalettePreference(preference) {
   const normalized = normalizePalettePreference(preference);
   document.documentElement.dataset.palettePreference = normalized;
   document.documentElement.dataset.palette = normalized;
+  return normalized;
+}
+
+export function applyOpenFoldersOnClickPreference(preference) {
+  const normalized = normalizeBooleanPreference(preference, true);
+  document.documentElement.dataset.openFoldersOnClick = String(normalized);
+  return normalized;
+}
+
+export function applyAlternateRowsPreference(preference) {
+  const normalized = normalizeBooleanPreference(preference, false);
+  document.documentElement.dataset.alternateRows = String(normalized);
+  return normalized;
+}
+
+export function applyDoubleClickDownloadPreference(preference) {
+  const normalized = normalizeBooleanPreference(preference, false);
+  document.documentElement.dataset.doubleClickDownload = String(normalized);
   return normalized;
 }
 
@@ -82,9 +145,53 @@ export function storePalettePreference(preference) {
   return applyPalettePreference(normalized);
 }
 
+function storeBooleanPreference(key, preference, fallback, applyPreference) {
+  const normalized = normalizeBooleanPreference(preference, fallback);
+  try {
+    window.localStorage.setItem(key, String(normalized));
+  } catch (_err) {
+    // localStorage can be disabled; data attributes still keep the current tab correct.
+  }
+  return applyPreference(normalized);
+}
+
+export function storeOpenFoldersOnClickPreference(preference) {
+  return storeBooleanPreference(
+    OPEN_FOLDERS_ON_CLICK_STORAGE_KEY,
+    preference,
+    true,
+    applyOpenFoldersOnClickPreference
+  );
+}
+
+export function storeAlternateRowsPreference(preference) {
+  return storeBooleanPreference(
+    ALTERNATE_ROWS_STORAGE_KEY,
+    preference,
+    false,
+    applyAlternateRowsPreference
+  );
+}
+
+export function storeDoubleClickDownloadPreference(preference) {
+  return storeBooleanPreference(
+    DOUBLE_CLICK_DOWNLOAD_STORAGE_KEY,
+    preference,
+    false,
+    applyDoubleClickDownloadPreference
+  );
+}
+
 export function useAppearancePreferences() {
   const [themePreference, setThemePreference] = useState(readStoredThemePreference);
   const [palettePreference, setPalettePreference] = useState(readStoredPalettePreference);
+  const [openFoldersOnClick, setOpenFoldersOnClick] = useState(
+    readStoredOpenFoldersOnClickPreference
+  );
+  const [alternateRows, setAlternateRows] = useState(readStoredAlternateRowsPreference);
+  const [doubleClickDownload, setDoubleClickDownload] = useState(
+    readStoredDoubleClickDownloadPreference
+  );
 
   useEffect(() => {
     applyThemePreference(themePreference);
@@ -105,6 +212,18 @@ export function useAppearancePreferences() {
     applyPalettePreference(palettePreference);
   }, [palettePreference]);
 
+  useEffect(() => {
+    applyOpenFoldersOnClickPreference(openFoldersOnClick);
+  }, [openFoldersOnClick]);
+
+  useEffect(() => {
+    applyAlternateRowsPreference(alternateRows);
+  }, [alternateRows]);
+
+  useEffect(() => {
+    applyDoubleClickDownloadPreference(doubleClickDownload);
+  }, [doubleClickDownload]);
+
   const handleThemePreferenceChange = useCallback((preference) => {
     storeThemePreference(preference);
     setThemePreference(preference);
@@ -115,9 +234,30 @@ export function useAppearancePreferences() {
     setPalettePreference(preference);
   }, []);
 
+  const handleOpenFoldersOnClickChange = useCallback((preference) => {
+    storeOpenFoldersOnClickPreference(preference);
+    setOpenFoldersOnClick(preference);
+  }, []);
+
+  const handleAlternateRowsChange = useCallback((preference) => {
+    storeAlternateRowsPreference(preference);
+    setAlternateRows(preference);
+  }, []);
+
+  const handleDoubleClickDownloadChange = useCallback((preference) => {
+    storeDoubleClickDownloadPreference(preference);
+    setDoubleClickDownload(preference);
+  }, []);
+
   return {
+    alternateRows,
+    doubleClickDownload,
+    handleAlternateRowsChange,
+    handleDoubleClickDownloadChange,
+    handleOpenFoldersOnClickChange,
     handlePalettePreferenceChange,
     handleThemePreferenceChange,
+    openFoldersOnClick,
     palettePreference,
     themePreference,
   };

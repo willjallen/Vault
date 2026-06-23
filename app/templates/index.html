@@ -8,16 +8,36 @@
       (() => {
         const key = "vault.themePreference";
         const paletteKey = "vault.palettePreference";
+        const openFoldersKey = "vault.openFoldersOnClick";
+        const alternateRowsKey = "vault.alternateRows";
+        const doubleClickDownloadKey = "vault.doubleClickDownload";
         const allowed = new Set(["system", "light", "dark"]);
         const allowedPalettes = new Set(["cozy", "winui"]);
+        const normalizeBoolean = (value, fallback) => {
+          if (value === "true") return true;
+          if (value === "false") return false;
+          return fallback;
+        };
         let preference = "system";
         let palette = "cozy";
+        let openFoldersOnClick = true;
+        let alternateRows = false;
+        let doubleClickDownload = false;
         try {
           preference = window.localStorage.getItem(key) || "system";
           palette = window.localStorage.getItem(paletteKey) || "cozy";
+          openFoldersOnClick = normalizeBoolean(window.localStorage.getItem(openFoldersKey), true);
+          alternateRows = normalizeBoolean(window.localStorage.getItem(alternateRowsKey), false);
+          doubleClickDownload = normalizeBoolean(
+            window.localStorage.getItem(doubleClickDownloadKey),
+            false
+          );
         } catch (_err) {
           preference = "system";
           palette = "cozy";
+          openFoldersOnClick = true;
+          alternateRows = false;
+          doubleClickDownload = false;
         }
         if (!allowed.has(preference)) {
           preference = "system";
@@ -32,6 +52,9 @@
         document.documentElement.dataset.theme = resolved;
         document.documentElement.dataset.palettePreference = palette;
         document.documentElement.dataset.palette = palette;
+        document.documentElement.dataset.openFoldersOnClick = String(openFoldersOnClick);
+        document.documentElement.dataset.alternateRows = String(alternateRows);
+        document.documentElement.dataset.doubleClickDownload = String(doubleClickDownload);
         document.documentElement.style.colorScheme = resolved;
       })();
     </script>

@@ -26,11 +26,19 @@ import {
   folderToItem,
   keyForItem,
 } from "./lib/itemActions.js";
-import { folderBaseName, folderParent, isArchivePath, toBreadcrumbs } from "./lib/utils.js";
-import { useMouseNavigation } from "./lib/useMouseNavigation.js";
+import { folderBaseName, isArchivePath } from "./lib/utils.js";
+import {
+  initialFolderForApp,
+  shareCodeFromLocation,
+  useFolderHistory,
+  useShareActions,
+  useShareLinkResolution,
+} from "./lib/shareLinks.js";
+import { useAuthFetch } from "./lib/useAuthFetch.js";
+import { useFolderNavigation } from "./lib/useFolderNavigation.js";
 import { useMoveDialog } from "./lib/useMoveDialog.js";
 import { useAppearancePreferences } from "./lib/theme.js";
-import { useTransfers } from "./lib/useTransfers.js";
+import { useToastMessage } from "./lib/useToastMessage.js";
 import { useVaultResources } from "./lib/useVaultResources.js";
 
 const { useEffect, useMemo, useState, useCallback, useRef } = React;
@@ -38,7 +46,11 @@ const h = React.createElement;
 
 export function App({ initial }) {
   const initialBootstrap = initial.bootstrap || initial;
-  const [folder, setFolder] = useState(initialBootstrap.current_folder || "");
+  const initialShareCode = initial.share_code || shareCodeFromLocation();
+  const [shareResolving, setShareResolving] = useState(Boolean(initialShareCode));
+  const [folder, setFolder] = useState(() =>
+    initialFolderForApp(initialBootstrap.current_folder || "", initialShareCode)
+  );
   const [folderBackStack, setFolderBackStack] = useState([]);
   const [folderForwardStack, setFolderForwardStack] = useState([]);
   const [selectedId, setSelectedId] = useState(null);
@@ -61,7 +73,6 @@ export function App({ initial }) {
   const [folderPropertiesTarget, setFolderPropertiesTarget] = useState(null);
   const [fileDetailsTarget, setFileDetailsTarget] = useState(null);
   const [contentsSort, setContentsSort] = useState(DEFAULT_CONTENTS_SORT);
-  const [toast, setToast] = useState("");
   const [confirmRequest, setConfirmRequest] = useState(null);
   const uploadInput = useRef(null);
   const versionUploadInput = useRef(null);
@@ -69,7 +80,10 @@ export function App({ initial }) {
   const versionUploadOptions = useRef({});
   const settingsButtonRef = useRef(null);
   const confirmResolver = useRef(null);
+  const shareCodeRef = useRef(initialShareCode);
+  const historyModeRef = useRef("replace");
   const closeContextMenu = useCallback(() => setContextMenu(null), []);
+  const { setToast, showToast, toast } = useToastMessage();
   const {
     alternateRows,
     doubleClickDownload,
@@ -137,139 +151,54 @@ export function App({ initial }) {
     setFileDetailsTarget(null);
   }, []);
 
-  const baseDomain =
-    initialBootstrap.base_domain ||
-    (window.location.hostname.includes(".")
-      ? window.location.hostname.split(".").slice(1).join(".")
-      : "");
-  const authMode = initialBootstrap.auth_mode || "headers";
-  const logoutUrl = useMemo(() => {
-    const rd = encodeURIComponent(window.location.href);
-    if (authMode === "headers" && baseDomain) {
-      return `https://auth.${baseDomain}/logout?rd=${rd}`;
+  const { apiFetch, downloadWithProgress, logoutUrl, transfers, uploadWithProgress } = useAuthFetch(
+    {
+      initialBootstrap,
+      setToast,
     }
-    return `/logout?rd=${rd}`;
-  }, [authMode, baseDomain]);
-  const redirectingRef = useRef(false);
-
-  const redirectToLogin = useCallback(() => {
-    if (redirectingRef.current) {
-      return;
-    }
-    redirectingRef.current = true;
-    setToast("Session expired. Redirecting to login…");
-    const rd = encodeURIComponent(window.location.href);
-    const loginUrl =
-      authMode === "headers" && baseDomain
-        ? `https://auth.${baseDomain}/?rd=${rd}`
-        : `/login?rd=${rd}`;
-    window.location.href = loginUrl;
-  }, [authMode, baseDomain]);
-  const { downloadWithProgress, transfers, uploadWithProgress } = useTransfers({
-    onUnauthorized: redirectToLogin,
-  });
-
-  const apiFetch = useCallback(
-    async (url, options = {}) => {
-      try {
-        const res = await fetch(url, { credentials: "include", ...options });
-        const redirectedToAuth =
-          res.redirected && res.url && res.url.includes("auth.") && res.url.includes("://auth.");
-        if (res.type === "opaqueredirect" || res.status === 401 || redirectedToAuth) {
-          redirectToLogin();
-          throw new Error("Redirecting to login");
-        }
-        return res;
-      } catch (err) {
-        // Network-level failures (CORS when session expired, etc.) should trigger login redirect.
-        redirectToLogin();
-        throw err;
-      }
-    },
-    [redirectToLogin]
   );
 
   const currentUser = initialBootstrap.user || {};
   const isAdmin = Boolean(currentUser.is_admin);
 
-  const breadcrumbs = useMemo(() => toBreadcrumbs(folder || ""), [folder]);
-  const canGoBack = folderBackStack.length > 0;
-  const canGoForward = folderForwardStack.length > 0;
-  const canGoUp = Boolean(folder);
+  const {
+    breadcrumbs,
+    canGoBack,
+    canGoForward,
+    canGoUp,
+    navigateBack,
+    navigateForward,
+    navigateToFolder,
+    navigateUp,
+    replaceFolder,
+  } = useFolderNavigation({
+    closeContextMenu,
+    folder,
+    folderBackStack,
+    folderForwardStack,
+    historyModeRef,
+    setContentsAnchor,
+    setContentsSelection,
+    setFolder,
+    setFolderBackStack,
+    setFolderForwardStack,
+    setSelectedId,
+  });
 
-  function navigateToFolder(nextFolder) {
-    const normalized = nextFolder || "";
-    if (normalized === folder) {
-      return;
-    }
-    setFolderBackStack((prev) => [...prev, folder || ""]);
-    setFolderForwardStack([]);
-    setSelectedId(null);
-    setContentsSelection([]);
-    setContentsAnchor(null);
-    setFolder(normalized);
-    closeContextMenu();
-  }
-
-  function replaceFolder(nextFolder) {
-    const normalized = nextFolder || "";
-    if (normalized === folder) {
-      return;
-    }
-    setSelectedId(null);
-    setContentsSelection([]);
-    setContentsAnchor(null);
-    setFolder(normalized);
-    closeContextMenu();
-  }
-
-  function navigateBack() {
-    if (!folderBackStack.length) {
-      return;
-    }
-    const nextFolder = folderBackStack[folderBackStack.length - 1] || "";
-    setFolderBackStack(folderBackStack.slice(0, -1));
-    setFolderForwardStack([folder || "", ...folderForwardStack]);
-    setSelectedId(null);
-    setContentsSelection([]);
-    setContentsAnchor(null);
-    setFolder(nextFolder);
-    closeContextMenu();
-  }
-
-  function navigateForward() {
-    if (!folderForwardStack.length) {
-      return;
-    }
-    const nextFolder = folderForwardStack[0] || "";
-    setFolderForwardStack(folderForwardStack.slice(1));
-    setFolderBackStack([...folderBackStack, folder || ""]);
-    setSelectedId(null);
-    setContentsSelection([]);
-    setContentsAnchor(null);
-    setFolder(nextFolder);
-    closeContextMenu();
-  }
-
-  function navigateUp() {
-    if (!folder) {
-      return;
-    }
-    navigateToFolder(folderParent(folder));
-  }
-
-  useMouseNavigation({ onBack: navigateBack, onForward: navigateForward });
-
-  useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    if (folder) {
-      params.set("folder", folder);
-    } else {
-      params.delete("folder");
-    }
-    const newUrl = `${window.location.pathname}${params.toString() ? "?" + params.toString() : ""}`;
-    window.history.replaceState({}, "", newUrl);
-  }, [folder]);
+  useFolderHistory({
+    closeContextMenu,
+    folder,
+    historyModeRef,
+    setContentsAnchor,
+    setContentsSelection,
+    setFolder,
+    setFolderAnchor,
+    setFolderBackStack,
+    setFolderForwardStack,
+    setFolderSelection,
+    setSelectedId,
+    shareResolving,
+  });
 
   useEffect(() => {
     closeContextMenu();
@@ -297,6 +226,24 @@ export function App({ initial }) {
     selectedId,
     setError,
     setSelectedId,
+  });
+
+  useShareLinkResolution({
+    apiFetch,
+    historyModeRef,
+    setContentsAnchor,
+    setContentsSelection,
+    setFolder,
+    setFolderAnchor,
+    setFolderBackStack,
+    setFolderForwardStack,
+    setFolderSelection,
+    setRecursiveSearch,
+    setSearchQuery,
+    setSelectedId,
+    setShareResolving,
+    shareCodeRef,
+    showToast,
   });
 
   const unsortedContentsItems = useMemo(
@@ -712,6 +659,8 @@ export function App({ initial }) {
     }
   }
 
+  const handleShareItem = useShareActions({ apiFetch, setError, showToast });
+
   const {
     moveTarget,
     moveDestination,
@@ -758,6 +707,7 @@ export function App({ initial }) {
       handleRenameFile,
       handleRenameFolder,
       handleSave,
+      handleShareItem,
       handleStartEdit,
       handleUnarchive,
       handleUnarchiveFolder,
@@ -846,17 +796,6 @@ export function App({ initial }) {
           "div",
           {
             className: "toast",
-            style: {
-              position: "fixed",
-              top: 12,
-              right: 12,
-              background: "rgba(0,0,0,0.85)",
-              color: "#fff",
-              padding: "10px 14px",
-              borderRadius: "6px",
-              zIndex: 9999,
-              boxShadow: "0 2px 8px rgba(0,0,0,0.3)",
-            },
           },
           toast
         )

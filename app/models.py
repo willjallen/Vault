@@ -378,3 +378,40 @@ class StateEvent(Base):
     event_type: Mapped[str] = mapped_column(String, nullable=False, index=True)
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=utcnow, index=True)
     payload: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
+
+
+class ShareLink(Base):
+    __tablename__ = "share_links"
+    __table_args__ = (
+        Index("ix_share_links_code", "code", unique=True),
+        Index("ix_share_links_document", "document_id"),
+        Index("ix_share_links_folder", "folder_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    code: Mapped[str] = mapped_column(String, nullable=False, unique=True)
+    target_type: Mapped[str] = mapped_column(String, nullable=False)
+    document_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("documents.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    folder_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("folders.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    access_mode: Mapped[str] = mapped_column(String, default="internal", nullable=False)
+    created_by: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_by_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_by_user_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("vault_users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=utcnow)
+    expires_at: Mapped[datetime.datetime | None] = mapped_column(DateTime, nullable=True)
+    disabled_at: Mapped[datetime.datetime | None] = mapped_column(DateTime, nullable=True)
+
+    document: Mapped[Document | None] = relationship("Document")
+    folder: Mapped[Folder | None] = relationship("Folder")

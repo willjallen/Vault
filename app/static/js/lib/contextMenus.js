@@ -25,6 +25,7 @@ export function buildFileMenuItems(actions) {
       ? { label: "Details", action: () => actions.openFileDetails(doc) }
       : null,
     { label: "Rename", action: () => actions.handleRenameFile(doc), disabled: busy },
+    { label: "Share", action: () => actions.handleShareItem(doc), disabled: busy },
     { label: "Download", action: () => actions.handleView(doc) },
     !doc.archived && !lockedByOther
       ? {
@@ -89,6 +90,7 @@ export function buildFolderMenuItems(actions) {
     hasPath && !isRoot
       ? { label: "Rename", action: () => actions.beginRenameFolder(folderPath), disabled: busy }
       : null,
+    { label: "Share", action: () => actions.handleShareItem(folderItem), disabled: busy },
     {
       label: "Properties",
       action: () => actions.openFolderProperties(folderItem),

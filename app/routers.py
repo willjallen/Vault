@@ -7,6 +7,7 @@ import json
 import logging
 import mimetypes
 import re
+import secrets
 import zipfile
 from collections import defaultdict
 from dataclasses import dataclass
@@ -40,6 +41,7 @@ from .models import (
     Folder,
     FolderEvent,
     FolderPermission,
+    ShareLink,
     StateEvent,
     VaultGroup,
     VaultGroupMembership,
@@ -65,6 +67,7 @@ ARCHIVE_ROOT_KEY = "archive"
 ROOT_NAMES = {VAULT_ROOT_KEY: "Vault", ARCHIVE_ROOT_KEY: "Archive"}
 FOLDER_COLOR_TOKENS = {"blue", "teal", "green", "amber", "rose", "violet", "slate"}
 FOLDER_ICON_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+SHARE_CODE_PATTERN = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 TTL_ACTIONS = {"archive", "delete"}
 SYSTEM_USER: UserContext = {
     "id": "system",
@@ -142,6 +145,13 @@ class FolderPermissionPayload(BaseModel):
 class FolderPermissionsPayload(BaseModel):
     path: str
     permissions: list[FolderPermissionPayload] = Field(default_factory=list)
+
+
+class ShareLinkPayload(BaseModel):
+    target_type: str
+    document_id: int | None = None
+    folder_id: int | None = None
+    path: str | None = None
 
 
 DOCUMENT_EVENT_RESOURCES: dict[str, tuple[str, ...]] = {
@@ -1857,6 +1867,112 @@ def build_bootstrap_payload(user: UserContext, folder: str, db: Session) -> dict
     }
 
 
+def build_initial_state(
+    user: UserContext,
+    folder: str,
+    db: Session,
+    share_code: str | None = None,
+) -> dict[str, object]:
+    normalized = normalize_folder(folder)
+    state = {
+        "bootstrap": build_bootstrap_payload(user, normalized, db),
+        "contents": build_contents_payload(db, normalized, user),
+        "sidebar": build_sidebar_payload(db, user),
+        "my_edits": build_my_edits_payload(user, db),
+    }
+    if share_code:
+        state["share_code"] = share_code
+    return state
+
+
+def generate_share_code(db: Session) -> str:
+    for _ in range(20):
+        code = secrets.token_urlsafe(9)
+        exists = db.execute(select(ShareLink.id).where(ShareLink.code == code)).first()
+        if not exists:
+            return code
+    raise HTTPException(status_code=500, detail="Could not create share link")
+
+
+def share_url(request: Request, code: str) -> str:
+    return str(request.url_for("share_entry", code=code))
+
+
+def normalize_share_target_type(value: str) -> str:
+    normalized = (value or "").strip().lower()
+    if normalized in {"document", "file"}:
+        return "document"
+    if normalized == "folder":
+        return "folder"
+    raise HTTPException(status_code=400, detail="Invalid share target")
+
+
+def create_share_target(
+    payload: ShareLinkPayload,
+    user: UserContext,
+    db: Session,
+) -> tuple[str, int | None, int | None]:
+    target_type = normalize_share_target_type(payload.target_type)
+    if target_type == "document":
+        if payload.document_id is None:
+            raise HTTPException(status_code=400, detail="Document id is required")
+        doc = get_document_or_404(payload.document_id, db)
+        require_document_access(doc, user, db, 1)
+        return target_type, doc.id, None
+
+    folder: Folder | None = None
+    if payload.folder_id is not None:
+        folder = db.get(Folder, payload.folder_id)
+    else:
+        folder = get_folder_by_path(db, payload.path)
+    if not folder:
+        raise HTTPException(status_code=404, detail="Folder not found")
+    require_folder_access(folder, user, db, 1)
+    return target_type, None, folder.id
+
+
+def resolved_share_payload(link: ShareLink, user: UserContext, db: Session) -> dict[str, object]:
+    if link.disabled_at:
+        raise HTTPException(status_code=404, detail="Share link not found")
+    if link.expires_at and normalize_timestamp(link.expires_at) <= now_utc():
+        raise HTTPException(status_code=404, detail="Share link expired")
+
+    path_cache = build_folder_path_cache(all_folders(db))
+    if link.target_type == "document" and link.document_id is not None:
+        doc = db.get(Document, link.document_id)
+        if not doc:
+            raise HTTPException(status_code=404, detail="Document not found")
+        require_document_access(doc, user, db, 1)
+        return {
+            "code": link.code,
+            "target_type": "document",
+            "document_id": doc.id,
+            "folder": document_folder_path(doc, path_cache),
+            "document": document_row_payload(doc, db, path_cache, active_locks_by_document(db), user),
+        }
+
+    if link.target_type == "folder" and link.folder_id is not None:
+        folder = db.get(Folder, link.folder_id)
+        if not folder:
+            raise HTTPException(status_code=404, detail="Folder not found")
+        require_folder_access(folder, user, db, 1)
+        path = folder_path(folder, path_cache)
+        stats = docs_stats_for_folder_payloads(
+            list(db.execute(select(Document)).scalars().all()),
+            db,
+            path_cache,
+        )
+        return {
+            "code": link.code,
+            "target_type": "folder",
+            "folder_id": folder.id,
+            "folder": path,
+            "folder_item": folder_summary_payload(folder, path, stats),
+        }
+
+    raise HTTPException(status_code=404, detail="Share target not found")
+
+
 def record_state_change(db: Session, event_type: str, resources: tuple[str, ...]) -> None:
     normalized_resources = sorted(set(resources))
     if not normalized_resources:
@@ -2282,19 +2398,27 @@ def api_admin_remove_group_member(
 @router.get("/", response_class=HTMLResponse)
 def index(
     request: Request,
-    folder: str = "",
     user: UserContext = Depends(current_user),
     db: Session = Depends(get_db),
 ) -> HTMLResponse:
     ensure_root_folders(db)
     commit_state(db)
-    normalized = normalize_folder(folder)
-    state = {
-        "bootstrap": build_bootstrap_payload(user, normalized, db),
-        "contents": build_contents_payload(db, normalized, user),
-        "sidebar": build_sidebar_payload(db, user),
-        "my_edits": build_my_edits_payload(user, db),
-    }
+    state = build_initial_state(user, "", db)
+    return templates.TemplateResponse("index.html", {"request": request, "state": state})
+
+
+@router.get("/s/{code}", response_class=HTMLResponse, name="share_entry")
+def share_entry(
+    code: str,
+    request: Request,
+    user: UserContext = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> HTMLResponse:
+    if not SHARE_CODE_PATTERN.fullmatch(code):
+        raise HTTPException(status_code=404, detail="Share link not found")
+    ensure_root_folders(db)
+    commit_state(db)
+    state = build_initial_state(user, "", db, share_code=code)
     return templates.TemplateResponse("index.html", {"request": request, "state": state})
 
 
@@ -2330,6 +2454,51 @@ def api_folder_contents(
     ensure_root_folders(db)
     commit_state(db)
     return build_contents_payload(db, normalize_folder(folder), user, q, recursive)
+
+
+@router.post("/api/share-links")
+def api_create_share_link(
+    payload: ShareLinkPayload,
+    request: Request,
+    user: UserContext = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    target_type, document_id, folder_id = create_share_target(payload, user, db)
+    created_by_user_id = user["vault_user_id"] if user.get("vault_user_id") else None
+    link = ShareLink(
+        code=generate_share_code(db),
+        target_type=target_type,
+        document_id=document_id,
+        folder_id=folder_id,
+        access_mode="internal",
+        created_by=user["id"],
+        created_by_name=user["name"],
+        created_by_user_id=created_by_user_id,
+    )
+    db.add(link)
+    db.commit()
+    return {
+        "code": link.code,
+        "url": share_url(request, link.code),
+        "target_type": target_type,
+        "document_id": document_id,
+        "folder_id": folder_id,
+        "access_mode": link.access_mode,
+    }
+
+
+@router.get("/api/share-links/{code}")
+def api_resolve_share_link(
+    code: str,
+    user: UserContext = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    if not SHARE_CODE_PATTERN.fullmatch(code):
+        raise HTTPException(status_code=404, detail="Share link not found")
+    link = db.execute(select(ShareLink).where(ShareLink.code == code)).scalars().first()
+    if not link:
+        raise HTTPException(status_code=404, detail="Share link not found")
+    return resolved_share_payload(link, user, db)
 
 
 @router.get("/api/folders/properties")
@@ -2931,8 +3100,7 @@ def document_detail(
 ) -> RedirectResponse:
     doc = get_document_or_404(doc_id, db)
     require_document_access(doc, user, db, 1)
-    folder_value = document_folder_path(doc)
-    return RedirectResponse(url=f"/?folder={quote(folder_value)}", status_code=303)
+    return RedirectResponse(url="/", status_code=303)
 
 
 @router.get("/documents/{doc_id}/checkout")

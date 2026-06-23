@@ -1,9 +1,24 @@
 import { Icon } from "./Icon.js";
 
-export function FileIcon({ color = "", folderIcon = "", kind }) {
+const fileIconByExtension = new Map([
+  ["blend", "app-blender"],
+  ["fbx", "cube"],
+  ["obj", "cube"],
+  ["plasticity", "app-plasticity"],
+  ["step", "cube"],
+  ["stp", "cube"],
+]);
+
+function iconForFileName(fileName = "") {
+  const extension = fileName.toLowerCase().split(".").pop();
+  return fileIconByExtension.get(extension) || "file";
+}
+
+export function FileIcon({ color = "", fileName = "", folderIcon = "", kind }) {
+  const icon = kind === "folder" ? folderIcon || "folder" : iconForFileName(fileName);
   return Icon({
     className: `file-icon ${color ? `folder-color-${color}` : ""}`,
-    icon: kind === "folder" ? folderIcon || "folder" : "file",
-    size: kind === "folder" ? 18 : 16,
+    icon,
+    size: kind === "folder" || icon.startsWith("app-") ? 18 : 16,
   });
 }

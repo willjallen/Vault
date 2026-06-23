@@ -84,7 +84,7 @@ export function FileRow({
       },
     },
     [
-      h("div", { className: "file-cell icon" }, h(FileIcon, { kind: "file" })),
+      h("div", { className: "file-cell icon" }, h(FileIcon, { fileName: doc.name, kind: "file" })),
       h("div", { className: "file-cell main" }, [
         editing
           ? h("input", {

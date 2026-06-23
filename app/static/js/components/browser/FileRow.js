@@ -116,7 +116,7 @@ export function FileRow({
           label: selected ? `Deselect ${doc.name}` : `Select ${doc.name}`,
           onSelect: onToggleSelect,
           selected,
-          size: 13,
+          size: 12,
         })
       ),
       h("div", { className: "file-cell main" }, [

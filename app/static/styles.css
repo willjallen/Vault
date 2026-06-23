@@ -795,7 +795,7 @@ header {
   min-height: 0;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 0;
   padding-bottom: 58px;
 }
 
@@ -920,39 +920,44 @@ header {
   grid-template-columns: var(--contents-grid-template);
   gap: 12px;
   align-items: center;
-  padding: 8px 10px;
-  min-height: 48px;
-  border-radius: 12px;
-  border: 1px solid transparent;
-  background: var(--surface-raised);
+  padding: 5px 10px;
+  min-height: 40px;
+  border: 0;
+  border-bottom: 1px solid var(--border-extra-subtle);
+  border-radius: 0;
+  background: transparent;
   cursor: pointer;
   min-width: 0;
-  transition: all 0.12s ease;
+  transition:
+    background 0.12s ease,
+    border-color 0.12s ease,
+    box-shadow 0.12s ease;
 }
 
 .file-row.folder {
   font-weight: 600;
-  background: var(--surface-panel-soft);
+  background: transparent;
 }
 
 .file-row.editing {
-  border-color: var(--accent-border);
+  border-bottom-color: var(--accent-border);
   background: var(--accent-soft-hover);
 }
 
 .file-row:hover {
-  border-color: var(--border-hover);
-  box-shadow: var(--shadow-item-hover);
+  border-bottom-color: var(--border-extra-subtle);
+  background: var(--accent-soft);
+  box-shadow: none;
 }
 
 .file-row.selected {
-  border-color: var(--accent-border);
+  border-bottom-color: var(--accent-border);
   background: var(--surface-selected);
-  box-shadow: var(--shadow-selection);
+  box-shadow: none;
 }
 
 .file-row.drop-target {
-  border-color: var(--accent);
+  border-bottom-color: var(--accent);
   background: var(--accent-drop);
 }
 
@@ -961,30 +966,29 @@ header {
 }
 
 .file-row.archived {
-  background: var(--archive-soft);
-  border: 1px solid var(--archive-border);
+  background: transparent;
+  border-bottom-color: var(--archive-border);
 }
 
 .file-row.archived:hover {
-  border-color: var(--accent-border);
-  box-shadow: var(--shadow-item-hover);
+  border-bottom-color: var(--archive-border);
+  background: var(--accent-soft);
+  box-shadow: none;
 }
 
 .file-row.archived.drop-target {
-  border-color: var(--accent-border-strong);
+  border-bottom-color: var(--accent-border-strong);
   background: var(--surface-selected);
-  box-shadow: 0 0 0 2px var(--focus-ring);
+  box-shadow: none;
 }
 
 .file-row.archived.selected {
-  border-color: var(--accent-border);
+  border-bottom-color: var(--accent-border);
   background: var(--accent-soft-hover);
-  box-shadow: var(--shadow-selection);
+  box-shadow: none;
 }
 
 .file-row.archived .file-icon {
-  border-radius: 8px;
-  background: var(--accent-soft-hover);
   color: var(--accent-text);
 }
 
@@ -1149,8 +1153,8 @@ header {
 
 .contents-select-checkbox {
   appearance: none;
-  width: 15px;
-  height: 15px;
+  width: 13px;
+  height: 13px;
   margin: 0;
   border: 1px solid var(--border-subtle);
   border-radius: 5px;
@@ -1174,7 +1178,7 @@ header {
   border-color: var(--accent-border-strong);
   background: var(--accent-fill);
   box-shadow:
-    inset 0 0 0 3px var(--surface-panel),
+    inset 0 0 0 2px var(--surface-panel),
     var(--shadow-inset-highlight-soft);
 }
 
@@ -1198,10 +1202,10 @@ header {
 
 .row-select-button {
   position: relative;
-  width: 27px;
-  height: 27px;
+  width: 24px;
+  height: 24px;
   border: 0;
-  border-radius: 8px;
+  border-radius: 7px;
   padding: 0;
   background: transparent;
   color: inherit;
@@ -1233,7 +1237,7 @@ header {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border-radius: 8px;
+  border-radius: 7px;
   transition:
     opacity 0.14s ease,
     transform 0.16s cubic-bezier(0.2, 1.25, 0.35, 1);
@@ -1271,7 +1275,7 @@ header {
 }
 
 .row-select-check::after {
-  width: 8px;
+  width: 7px;
   height: 4px;
   border-bottom: 2px solid var(--surface-panel);
   border-left: 2px solid var(--surface-panel);
@@ -1479,10 +1483,10 @@ header {
 }
 
 .row-action-button {
-  width: 26px;
-  height: 26px;
+  width: 24px;
+  height: 24px;
   border: 1px solid transparent;
-  border-radius: 8px;
+  border-radius: 7px;
   padding: 0;
   background: transparent;
   color: var(--text-muted);
@@ -1562,8 +1566,8 @@ header {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 27px;
-  height: 27px;
+  width: 24px;
+  height: 24px;
   color: var(--text-muted);
 }
 

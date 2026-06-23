@@ -125,7 +125,7 @@ export function FolderRow({
           label: selected ? `Deselect ${folder.name}` : `Select ${folder.name}`,
           onSelect: onToggleSelect,
           selected,
-          size: 14,
+          size: 12,
         })
       ),
       h("div", { className: "file-cell main" }, [

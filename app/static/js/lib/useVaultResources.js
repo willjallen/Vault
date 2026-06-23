@@ -30,6 +30,33 @@ function emptyContents(folder, q, recursive) {
   };
 }
 
+function isContentsPending({
+  activeContentsCached,
+  activeContentsKey,
+  contents,
+  folder,
+  recursiveSearch,
+  searchQuery,
+  storedContentsKey,
+}) {
+  return Boolean(
+    (searchQuery || recursiveSearch) &&
+      storedContentsKey !== activeContentsKey &&
+      !activeContentsCached &&
+      (contents.folder || "") === (folder || "")
+  );
+}
+
+function isPendingEmptySearch({ contents, contentsPending, recursiveSearch, searchQuery }) {
+  return Boolean(
+    contentsPending &&
+      (searchQuery || recursiveSearch) &&
+      (contents.q || contents.recursive) &&
+      !(contents.documents || []).length &&
+      !(contents.folders || []).length
+  );
+}
+
 export function useVaultResources({
   initial,
   apiFetch,
@@ -78,15 +105,43 @@ export function useVaultResources({
     contents.q || "",
     contents.recursive
   );
+  const activeContentsCached = contentsCacheRef.current.has(activeContentsKey);
+  const contentsPending = isContentsPending({
+    activeContentsCached,
+    activeContentsKey,
+    contents,
+    folder,
+    recursiveSearch,
+    searchQuery,
+    storedContentsKey,
+  });
+  const contentsPendingEmptySearch = isPendingEmptySearch({
+    contents,
+    contentsPending,
+    recursiveSearch,
+    searchQuery,
+  });
   const displayedContents = useMemo(() => {
     if (storedContentsKey === activeContentsKey) {
       return contents;
     }
-    return (
-      contentsCacheRef.current.get(activeContentsKey) ||
-      emptyContents(folder, searchQuery, recursiveSearch)
-    );
-  }, [activeContentsKey, contents, folder, recursiveSearch, searchQuery, storedContentsKey]);
+    const cached = contentsCacheRef.current.get(activeContentsKey);
+    if (cached) {
+      return cached;
+    }
+    if (contentsPending) {
+      return contents;
+    }
+    return emptyContents(folder, searchQuery, recursiveSearch);
+  }, [
+    activeContentsKey,
+    contents,
+    contentsPending,
+    folder,
+    recursiveSearch,
+    searchQuery,
+    storedContentsKey,
+  ]);
 
   const docs = useMemo(() => displayedContents.documents || [], [displayedContents.documents]);
   const subfolders = useMemo(() => displayedContents.folders || [], [displayedContents.folders]);
@@ -280,7 +335,8 @@ export function useVaultResources({
     if (cached) {
       setContents(cached);
       return undefined;
-    } else {
+    }
+    if (!searchQuery && !recursiveSearch) {
       setContents(emptyContents(folder, searchQuery, recursiveSearch));
     }
     const timer = setTimeout(() => {
@@ -375,6 +431,8 @@ export function useVaultResources({
     docs,
     folderChildren,
     folderMetadata,
+    contentsPending,
+    contentsPendingEmptySearch,
     myEdits,
     recursiveSearch,
     refresh,

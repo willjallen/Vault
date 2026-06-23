@@ -837,15 +837,15 @@ header {
   padding: 5px 5px 5px 12px;
   border: 1px solid var(--border-subtle);
   border-radius: 12px;
-  background: var(--surface-overlay-soft);
+  background: var(--surface-field-muted);
   color: var(--muted);
-  box-shadow: var(--shadow-raised);
-  backdrop-filter: blur(10px);
+  box-shadow: none;
+  backdrop-filter: none;
 }
 
 .contents-search:focus-within {
   border-color: var(--accent-border);
-  box-shadow: var(--shadow-focus), var(--shadow-raised);
+  box-shadow: 0 0 0 1px var(--focus-ring);
 }
 
 .contents-search-icon {
@@ -887,18 +887,28 @@ header {
     background 0.14s ease,
     border 0.14s ease,
     color 0.14s ease,
+    opacity 0.14s ease,
     transform 0.14s ease;
 }
 
+.recursive-search-button .app-icon-wrap {
+  opacity: 0.32;
+  transition: opacity 0.14s ease;
+}
+
 .recursive-search-button:hover {
-  background: var(--accent-soft-hover);
-  color: var(--accent-strong);
+  color: var(--text-secondary);
 }
 
 .recursive-search-button.active {
-  border-color: var(--accent-border);
-  background: var(--surface-selected);
+  border-color: transparent;
+  background: transparent;
   color: var(--accent-strong);
+}
+
+.recursive-search-button.active .app-icon-wrap,
+.recursive-search-button:hover .app-icon-wrap {
+  opacity: 1;
 }
 
 .recursive-search-button:active {

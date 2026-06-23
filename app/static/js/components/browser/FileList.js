@@ -109,6 +109,8 @@ export function VaultFileList({
   sort,
   searchQuery = "",
   recursiveSearch = false,
+  contentsPending = false,
+  contentsPendingEmptySearch = false,
   draggingId,
   draggingFolderPath,
   dropHint,
@@ -148,7 +150,8 @@ export function VaultFileList({
   const draftInFolder = inlineFolderDraft && inlineFolderDraft.parent === (folder || "");
   const createDraft = draftInFolder && inlineFolderDraft.mode === "create";
   const hasRows = files.length > 0 || subfolders.length > 0 || createDraft;
-  const emptyState = !hasRows;
+  const searchActive = Boolean(searchQuery || recursiveSearch);
+  const emptyState = !hasRows && (!contentsPending || contentsPendingEmptySearch);
   const selectedSet = new Set(selectedKeys);
   const orderedKeys = orderedItems.map(itemSelectionKey);
   const selectedItems = orderedItems.filter((item) => selectedSet.has(itemSelectionKey(item)));
@@ -620,7 +623,7 @@ export function VaultFileList({
               h("input", {
                 "aria-label": "Search contents",
                 onChange: (e) => onSearchQueryChange && onSearchQueryChange(e.target.value),
-                placeholder: "Search assets...",
+                placeholder: recursiveSearch ? "Search assets in folders..." : "Search assets...",
                 type: "search",
                 value: searchQuery,
               }),
@@ -637,7 +640,7 @@ export function VaultFileList({
                   title: recursiveSearch ? "Searching subfolders" : "Search subfolders",
                   type: "button",
                 },
-                h(Icon, { icon: "circle-nodes", size: 15 })
+                h(Icon, { icon: "folder-tree", size: 15 })
               ),
             ]
           ),
@@ -707,7 +710,7 @@ export function VaultFileList({
           ...orderedItems.map((item) =>
             item.type === "folder" ? renderFolderRow(item) : renderFileRow(item)
           ),
-          emptyState ? h(EmptyState, { onUpload: onUploadClick }) : null,
+          emptyState ? h(EmptyState, { onUpload: onUploadClick, search: searchActive }) : null,
         ]
       ),
       marquee

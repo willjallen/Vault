@@ -1519,6 +1519,16 @@ header {
   color: var(--accent-fill);
 }
 
+.row-action-button.checked-out-upload {
+  color: var(--success-fill);
+}
+
+.row-action-button.checked-out-upload:hover:not(:disabled) {
+  border-color: var(--success-border);
+  background: var(--success-soft);
+  color: var(--success-fill);
+}
+
 .row-action-button:disabled {
   opacity: 0.35;
   cursor: not-allowed;
@@ -1538,6 +1548,7 @@ header {
 .file-row.file:hover .row-action-button:not(.more),
 .file-row.file.selected .row-action-button:not(.more),
 .file-row.file:focus-within .row-action-button:not(.more),
+.file-row.file .row-action-button.checked-out-upload,
 .file-row.file .row-action-button.row-lock-button.locked {
   opacity: 1;
   pointer-events: auto;

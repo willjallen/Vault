@@ -33,6 +33,7 @@ export function FileRow({
   const inputRef = useRef(null);
   const lock = doc.lock || {};
   const locked = Boolean(lock && lock.by);
+  const lockedByMe = locked && lock.by === currentUser.id;
   const lockedByOther = locked && lock.by !== currentUser.id;
   const isArchived = doc.archived;
   const versionCount =
@@ -208,7 +209,7 @@ export function FileRow({
             "aria-label": locked
               ? `Upload checked-out version for ${doc.name}`
               : `Upload replacement for ${doc.name}`,
-            className: "row-action-button",
+            className: classNames("row-action-button", lockedByMe ? "checked-out-upload" : ""),
             disabled: busy || isArchived || lockedByOther,
             onClick: (e) => stopRowAction(e, onUpload),
             title: locked ? "Upload checked-out version" : "Upload replacement",

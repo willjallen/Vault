@@ -1063,7 +1063,7 @@ header {
   pointer-events: none;
 }
 
-.bulk-drag-preview {
+.drag-preview {
   position: fixed;
   z-index: 2500;
   display: grid;
@@ -1085,18 +1085,18 @@ header {
     transform 0.24s cubic-bezier(0.18, 1.32, 0.28, 1);
 }
 
-.bulk-drag-preview.visible {
+.drag-preview.visible {
   opacity: 1;
   transform: translate3d(0, 0, 0) scale(1);
 }
 
-.bulk-drag-stack {
+.drag-preview-stack {
   position: relative;
   width: 38px;
   height: 34px;
 }
 
-.bulk-drag-card {
+.drag-preview-card {
   position: absolute;
   inset: 5px 4px 3px 4px;
   border: 1px solid var(--accent-border);
@@ -1105,43 +1105,48 @@ header {
   transition: transform 0.24s cubic-bezier(0.18, 1.32, 0.28, 1);
 }
 
-.bulk-drag-card.two {
+.drag-preview.single .drag-preview-card.two,
+.drag-preview.single .drag-preview-card.three {
+  opacity: 0;
+}
+
+.drag-preview-card.two {
   transform: translate(-5px, -4px) rotate(-8deg);
 }
 
-.bulk-drag-card.three {
+.drag-preview-card.three {
   transform: translate(5px, 4px) rotate(7deg);
 }
 
-.bulk-drag-preview.visible .bulk-drag-card.two {
+.drag-preview.visible .drag-preview-card.two {
   transform: translate(-3px, -3px) rotate(-4deg);
 }
 
-.bulk-drag-preview.visible .bulk-drag-card.three {
+.drag-preview.visible .drag-preview-card.three {
   transform: translate(3px, 3px) rotate(4deg);
 }
 
-.bulk-drag-copy {
+.drag-preview-copy {
   min-width: 0;
   display: flex;
   flex-direction: column;
   gap: 1px;
 }
 
-.bulk-drag-copy strong,
-.bulk-drag-copy span {
+.drag-preview-copy strong,
+.drag-preview-copy span {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.bulk-drag-copy strong {
+.drag-preview-copy strong {
   font-size: 0.88rem;
   line-height: 1.2;
 }
 
-.bulk-drag-copy span {
+.drag-preview-copy span {
   color: var(--muted);
   font-size: 0.76rem;
   line-height: 1.2;

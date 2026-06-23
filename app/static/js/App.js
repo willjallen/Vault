@@ -1,5 +1,5 @@
 import { FinderShell } from "./components/FinderShell.js";
-import { BulkDragPreview } from "./components/BulkDragPreview.js";
+import { DragPreview } from "./components/DragPreview.js";
 import { ConfirmToast } from "./components/ConfirmToast.js";
 import { FolderPropertiesModal } from "./components/FolderPropertiesModal.js";
 import { SettingsModal } from "./components/SettingsModal.js";
@@ -659,7 +659,7 @@ export function App({ initial }) {
   });
 
   function beginDragPreview(evt, items) {
-    if (!items || items.length <= 1) {
+    if (!items || items.length === 0) {
       setDragBundle(null);
       return;
     }
@@ -957,7 +957,7 @@ export function App({ initial }) {
       onChange: (e) => handleVersionUploadInput(e.target.files[0]),
     }),
     h(TransferDock, { transfers }),
-    h(BulkDragPreview, { drag: dragBundle }),
+    h(DragPreview, { drag: dragBundle }),
     settingsOpen
       ? h(SettingsModal, {
           apiFetch,

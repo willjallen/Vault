@@ -1,4 +1,5 @@
 import { isArchivePath } from "./utils.js";
+import { canDeleteForeverItem } from "./siteSettings.js";
 
 function compactMenuItems(items) {
   const compacted = items.filter(Boolean).reduce((acc, item) => {
@@ -16,7 +17,7 @@ function compactMenuItems(items) {
 }
 
 export function buildFileMenuItems(actions) {
-  const { doc, currentUser, busy, isAdmin } = actions;
+  const { doc, currentUser, busy } = actions;
   const lock = doc.lock || {};
   const lockedByMe = lock && lock.by === currentUser.id;
   const lockedByOther = lock && lock.by && lock.by !== currentUser.id;
@@ -50,7 +51,7 @@ export function buildFileMenuItems(actions) {
           disabled: busy,
         }
       : null,
-    isAdmin && doc.archived
+    canDeleteForeverItem(doc, actions)
       ? {
           label: "Delete forever",
           action: () => actions.handlePermanentDelete(doc.id),
@@ -79,12 +80,13 @@ export function buildMyEditMenuItems(actions) {
 }
 
 export function buildFolderMenuItems(actions) {
-  const { folderItem, busy, isAdmin } = actions;
+  const { folderItem, busy } = actions;
   const folderPath = folderItem.path || "";
   const hasPath = Boolean(folderPath);
   const isArchivedFolder = Boolean(folderItem.archived) || isArchivePath(folderPath);
   const isRoot = !folderPath || folderPath === "Archive";
-  const canPermanentDeleteFolder = isAdmin && hasPath && isArchivedFolder && !isRoot;
+  const canPermanentDeleteFolder =
+    hasPath && isArchivedFolder && !isRoot && canDeleteForeverItem(folderItem, actions);
   return compactMenuItems([
     { label: "Open", action: () => actions.navigateToFolder(folderPath) },
     hasPath && !isRoot
@@ -164,7 +166,8 @@ export function buildSelectionMenuItems(actions) {
     selectedItems.every((item) => item.type === "folder" || !isLockedByOther(item, currentUser));
   const canLock = allDocs && docs.every((doc) => !doc.archived && !doc.lock?.by);
   const canUnlock = allDocs && docs.every((doc) => isLockedByMeOrAdmin(doc, currentUser, isAdmin));
-  const canDelete = isAdmin && allArchived && noRoots;
+  const canDelete =
+    allArchived && noRoots && selectedItems.every((item) => canDeleteForeverItem(item, actions));
 
   return compactMenuItems([
     {

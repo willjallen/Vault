@@ -10,6 +10,7 @@ export function docToItem(doc) {
   }
   return {
     archived: Boolean(doc.archived),
+    access: doc.access || {},
     folder: doc.folder || "",
     id: doc.id,
     latest_by: doc.latest_by || "",
@@ -32,6 +33,7 @@ export function docToItem(doc) {
 export function folderToItem(folderItem) {
   return {
     archived: isArchivePath(folderItem.path || ""),
+    access: folderItem.access || {},
     color: folderItem.color || "",
     default_ttl_action: folderItem.default_ttl_action || "none",
     default_ttl_days: folderItem.default_ttl_days || null,

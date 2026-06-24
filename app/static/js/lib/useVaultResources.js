@@ -13,6 +13,7 @@ function metadataFromContents(contents) {
     (contents.folders || []).map((item) => [
       item.path || "",
       {
+        access: item.access || {},
         color: item.color || "",
         icon: item.icon || "",
       },
@@ -61,6 +62,7 @@ export function useVaultResources({
   initial,
   apiFetch,
   folder,
+  onSiteSettingsChange,
   selectedId,
   setSelectedId,
   setError,
@@ -252,6 +254,19 @@ export function useVaultResources({
     return data;
   }, [apiFetch]);
 
+  const fetchSettings = useCallback(async () => {
+    if (!onSiteSettingsChange) {
+      return null;
+    }
+    const res = await apiFetch("/api/settings");
+    if (!res.ok) {
+      throw new Error("Could not refresh settings");
+    }
+    const data = await res.json();
+    onSiteSettingsChange(data.settings || {});
+    return data;
+  }, [apiFetch, onSiteSettingsChange]);
+
   const fetchDocumentDetail = useCallback(
     async (docId) => {
       if (!docId) {
@@ -389,6 +404,9 @@ export function useVaultResources({
       if (resources.has("my_edits")) {
         fetchMyEdits().catch(() => setError("Could not refresh edits."));
       }
+      if (resources.has("settings")) {
+        fetchSettings().catch(() => setError("Could not refresh settings."));
+      }
       if (resources.has("document_detail") && selectedIdRef.current) {
         fetchDocumentDetail(selectedIdRef.current).catch(() =>
           setError("Could not refresh document.")
@@ -422,6 +440,7 @@ export function useVaultResources({
     fetchContents,
     fetchDocumentDetail,
     fetchMyEdits,
+    fetchSettings,
     fetchSidebar,
     invalidateContentsCache,
     setError,

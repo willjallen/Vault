@@ -52,6 +52,11 @@ from .preferences import (
     merge_user_preferences,
     normalize_user_preferences,
 )
+from .site_settings import (
+    archive_permanent_delete_admin_only,
+    merge_site_settings,
+    site_settings_for_db,
+)
 from .storage import (
     StorageConfigurationError,
     StorageError,
@@ -189,6 +194,10 @@ class ShareLinkPayload(BaseModel):
 
 class UserPreferencesPayload(BaseModel):
     preferences: dict[str, object] = Field(default_factory=dict)
+
+
+class AdminSettingsPayload(BaseModel):
+    settings: dict[str, object] = Field(default_factory=dict)
 
 
 DOCUMENT_EVENT_RESOURCES: dict[str, tuple[str, ...]] = {
@@ -1575,6 +1584,15 @@ def folder_summary_payload(folder: Folder, path: str, stats: list[DocStat]) -> d
     }
 
 
+def folder_access_payload(folder: Folder, user: UserContext, db: Session) -> dict[str, bool]:
+    level = folder_access_level(folder, user, db)
+    return {
+        "visible": level >= 1,
+        "read": level >= 2,
+        "write": level >= 3,
+    }
+
+
 def folder_counts_payload(folder: Folder, db: Session) -> dict[str, int]:
     folder_ids = subtree_folder_ids(folder, all_folders(db))
     document_count = (
@@ -1711,7 +1729,9 @@ def build_contents_payload(
         path = folder_path(item, path_cache)
         if search_query and not matches_query(search_query, item.name, path):
             continue
-        folder_rows.append(folder_summary_payload(item, path, stats))
+        row = folder_summary_payload(item, path, stats)
+        row["access"] = folder_access_payload(item, user, db)
+        folder_rows.append(row)
     if normalized_folder == ARCHIVE_ROOT:
         for row in folder_rows:
             if row["path"] == ARCHIVE_ROOT:
@@ -1762,6 +1782,7 @@ def build_sidebar_payload(db: Session, user: UserContext) -> dict[str, object]:
         folder_path(item, path_cache): {
             "color": item.color or "",
             "icon": item.icon or "",
+            "access": folder_access_payload(item, user, db),
         }
         for item in folders
         if folder_access_level(item, user, db) >= 1
@@ -1865,6 +1886,7 @@ def build_admin_directory_payload(db: Session) -> dict[str, object]:
             }
             for group in groups
         ],
+        "settings": site_settings_for_db(db),
     }
 
 
@@ -1893,8 +1915,12 @@ def find_group_by_normalized_name(db: Session, name: str) -> VaultGroup | None:
     return None
 
 
-def commit_admin_change(db: Session, event_type: str) -> dict[str, object]:
-    record_state_change(db, f"admin.{event_type}", ("admin",))
+def commit_admin_change(
+    db: Session,
+    event_type: str,
+    resources: tuple[str, ...] = ("admin",),
+) -> dict[str, object]:
+    record_state_change(db, f"admin.{event_type}", resources)
     commit_state(db)
     return build_admin_directory_payload(db)
 
@@ -1909,6 +1935,7 @@ def build_bootstrap_payload(user: UserContext, folder: str, db: Session) -> dict
         "site_name": SITE_NAME,
         "user": user,
         "preferences": preferences_for_user(user, db),
+        "settings": site_settings_for_db(db),
         "version": APP_VERSION,
         "current_folder": folder_path(current),
     }
@@ -2378,6 +2405,20 @@ def api_admin_directory(
     return build_admin_directory_payload(db)
 
 
+@router.patch("/api/admin/settings")
+def api_admin_update_settings(
+    payload: AdminSettingsPayload,
+    user: UserContext = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    del user
+    try:
+        merge_site_settings(db, payload.settings)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return commit_admin_change(db, "settings.updated", ("admin", "settings"))
+
+
 @router.patch("/api/admin/users/{user_id}")
 def api_admin_update_user(
     user_id: int,
@@ -2534,6 +2575,15 @@ def api_bootstrap(
     ensure_root_folders(db)
     commit_state(db)
     return build_bootstrap_payload(user, normalize_folder(folder), db)
+
+
+@router.get("/api/settings")
+def api_settings(
+    user: UserContext = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    del user
+    return {"settings": site_settings_for_db(db)}
 
 
 @router.get("/api/preferences")
@@ -2981,7 +3031,7 @@ def delete_items_forever(
     user: UserContext = Depends(current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, list[dict[str, object]]]:
-    if not user["is_admin"]:
+    if archive_permanent_delete_admin_only(db) and not user["is_admin"]:
         raise HTTPException(status_code=403, detail="Admin access required")
     items = normalize_action_items(require_action_items(payload), db)
     result = bulk_result()
@@ -2992,6 +3042,8 @@ def delete_items_forever(
                 if item.type == "document":
                     doc = get_document_or_404(item.id or 0, db)
                     refresh_document_location(doc, db)
+                    if not user["is_admin"]:
+                        require_document_access(doc, user, db, 3)
                     if not document_is_archive(doc):
                         raise HTTPException(
                             status_code=400,
@@ -3008,6 +3060,8 @@ def delete_items_forever(
                             status_code=400,
                             detail="Delete forever is only available in Archive",
                         )
+                    if not user["is_admin"]:
+                        require_folder_access(folder_item, user, db, 3)
                     deleted = folder_path(folder_item)
                     archive_parent = folder_item.parent
                     db.delete(folder_item)

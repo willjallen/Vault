@@ -37,6 +37,7 @@ import {
 import { useAuthFetch } from "./lib/useAuthFetch.js";
 import { useFolderNavigation } from "./lib/useFolderNavigation.js";
 import { useMoveDialog } from "./lib/useMoveDialog.js";
+import { normalizeSiteSettings } from "./lib/siteSettings.js";
 import { useAppearancePreferences } from "./lib/theme.js";
 import { useToastMessage } from "./lib/useToastMessage.js";
 import { useVaultResources } from "./lib/useVaultResources.js";
@@ -74,6 +75,9 @@ export function App({ initial }) {
   const [fileDetailsTarget, setFileDetailsTarget] = useState(null);
   const [contentsSort, setContentsSort] = useState(DEFAULT_CONTENTS_SORT);
   const [confirmRequest, setConfirmRequest] = useState(null);
+  const [siteSettings, setSiteSettings] = useState(() =>
+    normalizeSiteSettings(initialBootstrap.settings)
+  );
   const uploadInput = useRef(null);
   const versionUploadInput = useRef(null);
   const versionUploadDoc = useRef(null);
@@ -226,6 +230,7 @@ export function App({ initial }) {
     initial,
     apiFetch,
     folder,
+    onSiteSettingsChange: setSiteSettings,
     selectedId,
     setError,
     setSelectedId,
@@ -283,6 +288,7 @@ export function App({ initial }) {
           // eslint-disable-next-line security/detect-object-injection
           const metadata = folderMetadata[path] || {};
           return folderToItem({
+            access: metadata.access,
             color: metadata.color,
             icon: metadata.icon,
             name: folderBaseName(path, path === "Archive" ? "Archive" : "Folder"),
@@ -294,6 +300,7 @@ export function App({ initial }) {
     const archiveMetadata = folderMetadata.Archive || {};
     return [
       folderToItem({
+        access: vaultMetadata.access,
         color: vaultMetadata.color,
         icon: vaultMetadata.icon || "house",
         name: initialBootstrap.site_name || "Vault",
@@ -301,6 +308,7 @@ export function App({ initial }) {
       }),
       ...childrenFor("", (path) => !isArchivePath(path)),
       folderToItem({
+        access: archiveMetadata.access,
         color: archiveMetadata.color,
         icon: archiveMetadata.icon || "box-archive",
         name: "Archive",
@@ -726,6 +734,7 @@ export function App({ initial }) {
       openMoveDialogForFolder,
       openMoveDialogForSelection,
       selectedDoc,
+      siteSettings,
       navigateToFolder,
       uploading,
       ...extra,
@@ -911,11 +920,13 @@ export function App({ initial }) {
           onOpenFoldersOnClickChange: handleOpenFoldersOnClickChange,
           onClose: closeSettings,
           onPalettePreferenceChange: handlePalettePreferenceChange,
+          onSiteSettingsChange: setSiteSettings,
           onThemePreferenceChange: handleThemePreferenceChange,
           openFoldersOnClick,
           alternateRows,
           palettePreference,
           siteName: initialBootstrap.site_name || "Vault",
+          siteSettings,
           themePreference,
         })
       : null,

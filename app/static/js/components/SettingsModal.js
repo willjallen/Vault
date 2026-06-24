@@ -1,4 +1,5 @@
 import { classNames } from "../lib/utils.js";
+import { normalizeSiteSettings } from "../lib/siteSettings.js";
 import { Icon } from "./common/Icon.js";
 
 const h = React.createElement;
@@ -333,7 +334,7 @@ function UserRow({
   ]);
 }
 
-function AdminPanel({ apiFetch, currentUser }) {
+function AdminPanel({ apiFetch, currentUser, onSiteSettingsChange, siteSettings }) {
   const [directory, setDirectory] = useState({ users: [], groups: [] });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -346,6 +347,18 @@ function AdminPanel({ apiFetch, currentUser }) {
 
   const users = useMemo(() => directory.users || [], [directory.users]);
   const groups = useMemo(() => directory.groups || [], [directory.groups]);
+  const settings = normalizeSiteSettings(directory.settings || siteSettings);
+  const archivePermanentDeleteAdminOnly = settings.archivePermanentDeleteAdminOnly;
+
+  const applyDirectory = useCallback(
+    (payload) => {
+      setDirectory(payload);
+      if (payload?.settings) {
+        onSiteSettingsChange?.(normalizeSiteSettings(payload.settings));
+      }
+    },
+    [onSiteSettingsChange]
+  );
 
   const loadDirectory = useCallback(async () => {
     if (!apiFetch) {
@@ -358,13 +371,13 @@ function AdminPanel({ apiFetch, currentUser }) {
       if (!res.ok) {
         throw new Error(await responseError(res));
       }
-      setDirectory(await res.json());
+      applyDirectory(await res.json());
     } catch (err) {
       setError(err.message || "Could not load admin settings");
     } finally {
       setLoading(false);
     }
-  }, [apiFetch]);
+  }, [apiFetch, applyDirectory]);
 
   const commitAdminChange = useCallback(
     async (label, url, options = {}) => {
@@ -385,7 +398,7 @@ function AdminPanel({ apiFetch, currentUser }) {
           throw new Error(await responseError(res));
         }
         const nextDirectory = await res.json();
-        setDirectory(nextDirectory);
+        applyDirectory(nextDirectory);
         return nextDirectory;
       } catch (err) {
         setError(err.message || "Admin change failed");
@@ -394,7 +407,7 @@ function AdminPanel({ apiFetch, currentUser }) {
         setPendingAction("");
       }
     },
-    [apiFetch]
+    [apiFetch, applyDirectory]
   );
 
   useEffect(() => {
@@ -517,6 +530,20 @@ function AdminPanel({ apiFetch, currentUser }) {
     setOpenGroupPickerUserId((current) => (current === userId ? null : userId));
   }, []);
 
+  const handleArchivePermanentDeleteAdminOnlyChange = useCallback(
+    (checked) => {
+      commitAdminChange("settings-archive-delete-policy", "/api/admin/settings", {
+        method: "PATCH",
+        body: JSON.stringify({
+          settings: {
+            archivePermanentDeleteAdminOnly: checked,
+          },
+        }),
+      });
+    },
+    [commitAdminChange]
+  );
+
   return h("div", { className: "settings-panel" }, [
     h("div", { className: "settings-panel-head", key: "head" }, [
       h("p", { className: "eyebrow tiny", key: "eyebrow" }, "Admin"),
@@ -529,6 +556,29 @@ function AdminPanel({ apiFetch, currentUser }) {
     ]),
     error ? h("div", { className: "admin-error", key: "error" }, error) : null,
     h("div", { className: "admin-settings-grid", key: "grid" }, [
+      h("section", { className: "admin-card", key: "policy" }, [
+        h("div", { className: "admin-card-head compact", key: "head" }, [
+          h("div", null, [
+            h("h3", { key: "title" }, "Archive Policy"),
+            h(
+              "p",
+              { className: "muted tiny", key: "note" },
+              "Controls destructive actions in Archive."
+            ),
+          ]),
+        ]),
+        SettingsRow({
+          title: "Admin-only permanent delete",
+          copy: archivePermanentDeleteAdminOnly
+            ? "Only admins can delete archived files and folders forever."
+            : "Users with write access can delete archived files and folders forever.",
+          control: SettingsToggle({
+            checked: archivePermanentDeleteAdminOnly,
+            label: "Toggle admin-only permanent delete",
+            onChange: handleArchivePermanentDeleteAdminOnlyChange,
+          }),
+        }),
+      ]),
       h("section", { className: "admin-card", key: "groups" }, [
         h("div", { className: "admin-card-head", key: "head" }, [
           h("div", { key: "copy" }, [
@@ -624,13 +674,15 @@ function SectionPanel({
   onDoubleClickDownloadChange,
   onOpenFoldersOnClickChange,
   onPalettePreferenceChange,
+  onSiteSettingsChange,
   onThemePreferenceChange,
   openFoldersOnClick,
   palettePreference,
+  siteSettings,
   themePreference,
 }) {
   if (activeSection === "admin") {
-    return h(AdminPanel, { apiFetch, currentUser });
+    return h(AdminPanel, { apiFetch, currentUser, onSiteSettingsChange, siteSettings });
   }
 
   if (activeSection === "files") {
@@ -730,11 +782,13 @@ export function SettingsModal({
   onClose,
   onDoubleClickDownloadChange,
   onOpenFoldersOnClickChange,
+  onSiteSettingsChange,
   onPalettePreferenceChange,
   onThemePreferenceChange,
   openFoldersOnClick = true,
   palettePreference = "cozy",
   siteName = "Vault",
+  siteSettings = {},
   themePreference = "system",
 }) {
   const sections = currentUser?.is_admin ? [...personalSections, adminSection] : personalSections;
@@ -848,9 +902,11 @@ export function SettingsModal({
             onDoubleClickDownloadChange,
             onOpenFoldersOnClickChange,
             onPalettePreferenceChange,
+            onSiteSettingsChange,
             onThemePreferenceChange,
             openFoldersOnClick,
             palettePreference,
+            siteSettings,
             themePreference,
           }),
         ]),

@@ -69,8 +69,12 @@ def init_db() -> None:
 
 
 def _apply_known_additive_migrations() -> None:
+    from . import models
+
     inspector = inspect(engine)
     tables = set(inspector.get_table_names())
+    if "vault_users" in tables and "vault_settings" not in tables:
+        models.VaultSetting.__table__.create(bind=engine, checkfirst=True)
     if "vault_users" not in tables:
         return
     vault_user_columns = {column["name"] for column in inspector.get_columns("vault_users")}

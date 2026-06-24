@@ -202,6 +202,14 @@ class VaultGroupMembership(Base):
     group: Mapped[VaultGroup] = relationship("VaultGroup", back_populates="memberships")
 
 
+class VaultSetting(Base):
+    __tablename__ = "vault_settings"
+
+    key: Mapped[str] = mapped_column(String, primary_key=True)
+    value: Mapped[object] = mapped_column(JSON, nullable=False)
+    updated_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=utcnow)
+
+
 class Blob(Base):
     __tablename__ = "blobs"
     __table_args__ = (UniqueConstraint("hash_algo", "hash", "size_bytes", name="uq_blob_identity"),)

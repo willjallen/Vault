@@ -88,6 +88,60 @@ class DatabaseInitTests(unittest.TestCase):
                 db_module.engine.dispose()
                 restore_runtime(snapshot)
 
+    def test_missing_vault_settings_table_is_added_without_dropping_data(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="vault-db-init-") as temp_dir:
+            db_path = Path(temp_dir) / "vault.db"
+            snapshot = snapshot_runtime()
+            try:
+                db_module.configure_database(db_path)
+                db_module.Base.metadata.create_all(bind=db_module.engine)
+                with sqlite3.connect(db_path) as conn:
+                    conn.execute("DROP TABLE vault_settings")
+                    conn.execute(
+                        """
+                        INSERT INTO vault_users
+                            (
+                                issuer,
+                                subject,
+                                email,
+                                name,
+                                is_admin,
+                                is_active,
+                                preferences,
+                                created_at
+                            )
+                        VALUES
+                            (
+                                'test',
+                                'alice',
+                                'alice@example.com',
+                                'Alice',
+                                0,
+                                1,
+                                '{}',
+                                CURRENT_TIMESTAMP
+                            )
+                        """,
+                    )
+
+                db_module.init_db()
+
+                with sqlite3.connect(db_path) as conn:
+                    tables = {
+                        row[0]
+                        for row in conn.execute(
+                            "SELECT name FROM sqlite_master WHERE type = 'table'",
+                        ).fetchall()
+                    }
+                    row = conn.execute(
+                        "SELECT subject FROM vault_users WHERE subject = 'alice'",
+                    ).fetchone()
+                self.assertIn("vault_settings", tables)
+                self.assertEqual(row, ("alice",))
+            finally:
+                db_module.engine.dispose()
+                restore_runtime(snapshot)
+
 
 if __name__ == "__main__":
     unittest.main()

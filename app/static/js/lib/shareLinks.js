@@ -1,7 +1,7 @@
 import { normalizeFolderName } from "./utils.js";
+import { readLocalPreference, writeLocalPreference } from "./localPreferences.js";
 
 const { useCallback, useEffect } = React;
-const LAST_FOLDER_STORAGE_KEY = "vault.lastFolder";
 
 export function shareCodeFromLocation() {
   const match = window.location.pathname.match(/^\/s\/([^/]+)\/?$/);
@@ -9,19 +9,11 @@ export function shareCodeFromLocation() {
 }
 
 function readStoredFolder(fallback = "") {
-  try {
-    return normalizeFolderName(window.localStorage.getItem(LAST_FOLDER_STORAGE_KEY) || fallback);
-  } catch {
-    return fallback;
-  }
+  return normalizeFolderName(readLocalPreference("lastFolder", fallback) || fallback);
 }
 
 function writeStoredFolder(folder) {
-  try {
-    window.localStorage.setItem(LAST_FOLDER_STORAGE_KEY, folder || "");
-  } catch {
-    // Local storage only restores refresh location; navigation still works without it.
-  }
+  writeLocalPreference("lastFolder", folder || "");
 }
 
 function writeClipboard(text) {

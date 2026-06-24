@@ -47,6 +47,11 @@ from .models import (
     VaultGroupMembership,
     VaultUser,
 )
+from .preferences import (
+    clean_user_preference_patch,
+    merge_user_preferences,
+    normalize_user_preferences,
+)
 from .storage import (
     StorageConfigurationError,
     StorageError,
@@ -180,6 +185,10 @@ class ShareLinkPayload(BaseModel):
     document_id: int | None = None
     folder_id: int | None = None
     path: str | None = None
+
+
+class UserPreferencesPayload(BaseModel):
+    preferences: dict[str, object] = Field(default_factory=dict)
 
 
 DOCUMENT_EVENT_RESOURCES: dict[str, tuple[str, ...]] = {
@@ -1899,6 +1908,7 @@ def build_bootstrap_payload(user: UserContext, folder: str, db: Session) -> dict
         "base_domain": BASE_DOMAIN,
         "site_name": SITE_NAME,
         "user": user,
+        "preferences": preferences_for_user(user, db),
         "version": APP_VERSION,
         "current_folder": folder_path(current),
     }
@@ -1946,6 +1956,24 @@ def index_template_context(request: Request, state: dict[str, object]) -> dict[s
         "request": request,
         "state": state,
     }
+
+
+def preferences_for_user(user: UserContext, db: Session) -> dict[str, object]:
+    user_id = int(user.get("vault_user_id") or 0)
+    if not user_id:
+        return normalize_user_preferences({})
+    vault_user = db.get(VaultUser, user_id)
+    return normalize_user_preferences(vault_user.preferences if vault_user else {})
+
+
+def require_vault_user(user: UserContext, db: Session) -> VaultUser:
+    user_id = int(user.get("vault_user_id") or 0)
+    if not user_id:
+        raise HTTPException(status_code=400, detail="User preferences require a vault user")
+    vault_user = db.get(VaultUser, user_id)
+    if not vault_user:
+        raise HTTPException(status_code=404, detail="Vault user not found")
+    return vault_user
 
 
 def generate_share_code(db: Session) -> str:
@@ -2506,6 +2534,30 @@ def api_bootstrap(
     ensure_root_folders(db)
     commit_state(db)
     return build_bootstrap_payload(user, normalize_folder(folder), db)
+
+
+@router.get("/api/preferences")
+def api_preferences(
+    user: UserContext = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    return {"preferences": preferences_for_user(user, db)}
+
+
+@router.patch("/api/preferences")
+def api_update_preferences(
+    payload: UserPreferencesPayload,
+    user: UserContext = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    vault_user = require_vault_user(user, db)
+    try:
+        patch = clean_user_preference_patch(payload.preferences)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    vault_user.preferences = merge_user_preferences(vault_user.preferences, patch)
+    db.commit()
+    return {"preferences": normalize_user_preferences(vault_user.preferences)}
 
 
 @router.get("/api/folders/sidebar")

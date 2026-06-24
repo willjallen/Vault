@@ -58,6 +58,7 @@ def init_db() -> None:
     # Import models so SQLAlchemy is aware of them before creating tables
     from . import models
 
+    _apply_known_additive_migrations()
     if _schema_needs_reset():
         raise RuntimeError(
             "Database schema is incompatible with this app version. "
@@ -65,6 +66,20 @@ def init_db() -> None:
         )
     Base.metadata.create_all(bind=engine)
     _bootstrap_root_folders(models.Folder)
+
+
+def _apply_known_additive_migrations() -> None:
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names())
+    if "vault_users" not in tables:
+        return
+    vault_user_columns = {column["name"] for column in inspector.get_columns("vault_users")}
+    if "preferences" not in vault_user_columns:
+        with engine.begin() as connection:
+            connection.exec_driver_sql(
+                "ALTER TABLE vault_users "
+                "ADD COLUMN preferences JSON NOT NULL DEFAULT '{}'",
+            )
 
 
 def _schema_needs_reset() -> bool:

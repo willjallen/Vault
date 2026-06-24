@@ -3,12 +3,12 @@
 import datetime
 
 from sqlalchemy import (
+    JSON,
     Boolean,
     DateTime,
     ForeignKey,
     Index,
     Integer,
-    JSON,
     String,
     Text,
     UniqueConstraint,
@@ -146,6 +146,12 @@ class VaultUser(Base):
     name: Mapped[str] = mapped_column(String, nullable=False)
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    preferences: Mapped[dict[str, object]] = mapped_column(
+        JSON,
+        default=dict,
+        server_default=text("'{}'"),
+        nullable=False,
+    )
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=utcnow)
     last_login_at: Mapped[datetime.datetime | None] = mapped_column(DateTime, nullable=True)
     last_seen_at: Mapped[datetime.datetime | None] = mapped_column(DateTime, nullable=True)

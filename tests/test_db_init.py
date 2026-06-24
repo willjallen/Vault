@@ -55,6 +55,39 @@ class DatabaseInitTests(unittest.TestCase):
                 db_module.engine.dispose()
                 restore_runtime(snapshot)
 
+    def test_missing_user_preferences_column_is_added_without_dropping_data(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="vault-db-init-") as temp_dir:
+            db_path = Path(temp_dir) / "vault.db"
+            snapshot = snapshot_runtime()
+            try:
+                db_module.configure_database(db_path)
+                db_module.Base.metadata.create_all(bind=db_module.engine)
+                with sqlite3.connect(db_path) as conn:
+                    conn.execute("ALTER TABLE vault_users DROP COLUMN preferences")
+                    conn.execute(
+                        """
+                        INSERT INTO vault_users
+                            (issuer, subject, email, name, is_admin, is_active, created_at)
+                        VALUES
+                            ('test', 'alice', 'alice@example.com', 'Alice', 0, 1, CURRENT_TIMESTAMP)
+                        """,
+                    )
+
+                db_module.init_db()
+
+                with sqlite3.connect(db_path) as conn:
+                    columns = {
+                        row[1] for row in conn.execute("PRAGMA table_info(vault_users)").fetchall()
+                    }
+                    row = conn.execute(
+                        "SELECT subject, preferences FROM vault_users WHERE subject = 'alice'",
+                    ).fetchone()
+                self.assertIn("preferences", columns)
+                self.assertEqual(row, ("alice", "{}"))
+            finally:
+                db_module.engine.dispose()
+                restore_runtime(snapshot)
+
 
 if __name__ == "__main__":
     unittest.main()

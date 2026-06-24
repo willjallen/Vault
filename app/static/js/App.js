@@ -84,18 +84,6 @@ export function App({ initial }) {
   const historyModeRef = useRef("replace");
   const closeContextMenu = useCallback(() => setContextMenu(null), []);
   const { setToast, showToast, toast } = useToastMessage();
-  const {
-    alternateRows,
-    doubleClickDownload,
-    handleAlternateRowsChange,
-    handleDoubleClickDownloadChange,
-    handleOpenFoldersOnClickChange,
-    handlePalettePreferenceChange,
-    handleThemePreferenceChange,
-    openFoldersOnClick,
-    palettePreference,
-    themePreference,
-  } = useAppearancePreferences();
 
   const resolveConfirm = useCallback((confirmed) => {
     const resolver = confirmResolver.current;
@@ -157,6 +145,21 @@ export function App({ initial }) {
       setToast,
     }
   );
+  const {
+    alternateRows,
+    doubleClickDownload,
+    handleAlternateRowsChange,
+    handleDoubleClickDownloadChange,
+    handleOpenFoldersOnClickChange,
+    handlePalettePreferenceChange,
+    handleThemePreferenceChange,
+    openFoldersOnClick,
+    palettePreference,
+    themePreference,
+  } = useAppearancePreferences({
+    apiFetch,
+    initialPreferences: initialBootstrap.preferences,
+  });
 
   const currentUser = initialBootstrap.user || {};
   const isAdmin = Boolean(currentUser.is_admin);

@@ -6,46 +6,44 @@
     <title>{{ state.bootstrap.site_name or "Vault" }}</title>
     <script>
       (() => {
-        const key = "vault.themePreference";
-        const paletteKey = "vault.palettePreference";
-        const openFoldersKey = "vault.openFoldersOnClick";
-        const alternateRowsKey = "vault.alternateRows";
-        const doubleClickDownloadKey = "vault.doubleClickDownload";
         const appearanceOverride = {{ appearance_override | tojson }};
+        const syncedPreferences = {{ state.bootstrap.preferences | tojson }};
+        const defaultPreferences = {
+          themePreference: "system",
+          palettePreference: "cozy",
+          openFoldersOnClick: true,
+          alternateRows: false,
+          doubleClickDownload: false,
+        };
         const allowed = new Set(["system", "light", "dark"]);
         const allowedPalettes = new Set(["cozy", "winui"]);
         const normalizeBoolean = (value, fallback) => {
           if (value === "true") return true;
           if (value === "false") return false;
+          if (value === true || value === false) return value;
           return fallback;
         };
-        let preference = "system";
-        let palette = "cozy";
-        let openFoldersOnClick = true;
-        let alternateRows = false;
-        let doubleClickDownload = false;
-        try {
-          preference = window.localStorage.getItem(key) || "system";
-          palette = window.localStorage.getItem(paletteKey) || "cozy";
-          openFoldersOnClick = normalizeBoolean(window.localStorage.getItem(openFoldersKey), true);
-          alternateRows = normalizeBoolean(window.localStorage.getItem(alternateRowsKey), false);
-          doubleClickDownload = normalizeBoolean(
-            window.localStorage.getItem(doubleClickDownloadKey),
-            false
-          );
-        } catch (_err) {
-          preference = "system";
-          palette = "cozy";
-          openFoldersOnClick = true;
-          alternateRows = false;
-          doubleClickDownload = false;
-        }
-        if (!allowed.has(preference)) {
-          preference = "system";
-        }
-        if (!allowedPalettes.has(palette)) {
-          palette = "cozy";
-        }
+        const normalizePreferences = (value) => {
+          const source = value && typeof value === "object" ? value : {};
+          return {
+            themePreference: allowed.has(source.themePreference)
+              ? source.themePreference
+              : defaultPreferences.themePreference,
+            palettePreference: allowedPalettes.has(source.palettePreference)
+              ? source.palettePreference
+              : defaultPreferences.palettePreference,
+            openFoldersOnClick: normalizeBoolean(
+              source.openFoldersOnClick,
+              defaultPreferences.openFoldersOnClick
+            ),
+            alternateRows: normalizeBoolean(source.alternateRows, defaultPreferences.alternateRows),
+            doubleClickDownload: normalizeBoolean(
+              source.doubleClickDownload,
+              defaultPreferences.doubleClickDownload
+            ),
+          };
+        };
+        const preferences = normalizePreferences(syncedPreferences);
         const hostTheme =
           appearanceOverride && allowed.has(appearanceOverride.theme)
             ? appearanceOverride.theme
@@ -56,22 +54,22 @@
             : "";
         const prefersDark =
           window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
-        const effectiveTheme = hostTheme || preference;
+        const effectiveTheme = hostTheme || preferences.themePreference;
         const resolved = effectiveTheme === "system" ? (prefersDark ? "dark" : "light") : effectiveTheme;
-        const effectivePalette = hostPalette || palette;
-        document.documentElement.dataset.themePreference = preference;
+        const effectivePalette = hostPalette || preferences.palettePreference;
+        document.documentElement.dataset.themePreference = preferences.themePreference;
         if (hostTheme) {
           document.documentElement.dataset.themeOverride = hostTheme;
         }
         document.documentElement.dataset.theme = resolved;
-        document.documentElement.dataset.palettePreference = palette;
+        document.documentElement.dataset.palettePreference = preferences.palettePreference;
         if (hostPalette) {
           document.documentElement.dataset.paletteOverride = hostPalette;
         }
         document.documentElement.dataset.palette = effectivePalette;
-        document.documentElement.dataset.openFoldersOnClick = String(openFoldersOnClick);
-        document.documentElement.dataset.alternateRows = String(alternateRows);
-        document.documentElement.dataset.doubleClickDownload = String(doubleClickDownload);
+        document.documentElement.dataset.openFoldersOnClick = String(preferences.openFoldersOnClick);
+        document.documentElement.dataset.alternateRows = String(preferences.alternateRows);
+        document.documentElement.dataset.doubleClickDownload = String(preferences.doubleClickDownload);
         document.documentElement.style.colorScheme = resolved;
       })();
     </script>

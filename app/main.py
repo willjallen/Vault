@@ -1,5 +1,6 @@
 """FastAPI entrypoint for the vault service."""
 
+import logging
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -12,6 +13,8 @@ from .routers import router, start_ttl_sweeper, stop_ttl_sweeper, sweep_expired_
 from .storage import ensure_storage
 from .version import APP_VERSION
 
+logger = logging.getLogger(__name__)
+
 
 def create_app(*, enable_ttl_sweeper: bool = True) -> FastAPI:
     application = FastAPI(title=config.SITE_NAME, version=APP_VERSION)
@@ -23,6 +26,11 @@ def create_app(*, enable_ttl_sweeper: bool = True) -> FastAPI:
 
     @application.on_event("startup")
     async def startup_event() -> None:
+        if config.DEV_MODE:
+            logger.warning("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+            logger.warning("VAULT IS RUNNING IN DEVELOPMENT MODE. DEBUG TOOLS ARE ENABLED.")
+            logger.warning("DO NOT USE THIS CONTAINER WITH REAL OR PRODUCTION DATA.")
+            logger.warning("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
         init_db()
         ensure_storage()
         sweep_expired_documents()

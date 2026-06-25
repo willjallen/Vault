@@ -107,6 +107,7 @@ class DockerDeployTests(unittest.TestCase):
         self.assertIn("vault-data:", compose)
         self.assertEqual(compose.count(":/data"), 1)
         self.assertIn("VAULT_SITE_NAME: ${VAULT_SITE_NAME:-Vault}", compose)
+        self.assertIn("VAULT_DEV_MODE: ${VAULT_DEV_MODE:-0}", compose)
         self.assertIn(
             "VAULT_TTL_SWEEP_INTERVAL_SECONDS: ${VAULT_TTL_SWEEP_INTERVAL_SECONDS:-60}",
             compose,
@@ -127,6 +128,7 @@ class DockerDeployTests(unittest.TestCase):
         self.assertIn("build:", dev_compose)
         self.assertIn("VAULT_AUTH_MODE: dev", dev_compose)
         self.assertIn("VAULT_SITE_NAME: ${VAULT_SITE_NAME:-Vault}", dev_compose)
+        self.assertIn('VAULT_DEV_MODE: "1"', dev_compose)
         self.assertIn(
             "VAULT_TTL_SWEEP_INTERVAL_SECONDS: ${VAULT_TTL_SWEEP_INTERVAL_SECONDS:-60}",
             dev_compose,

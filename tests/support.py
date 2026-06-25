@@ -21,6 +21,7 @@ ENV_KEYS = (
     "BASE_DOMAIN",
     "VAULT_AUTH_MODE",
     "VAULT_DEV_AUTH",
+    "VAULT_DEV_MODE",
     "VAULT_DB_PATH",
     "VAULT_OBJECTS_PATH",
     "VAULT_STORAGE_BACKEND",
@@ -50,6 +51,7 @@ class RuntimeSnapshot:
     session_cookie_name: str
     session_max_age_seconds: int
     base_domain: str
+    dev_mode: bool
     site_name: str
     ttl_sweep_interval_seconds: int
     env: dict[str, str | None]
@@ -206,6 +208,7 @@ def snapshot_runtime() -> RuntimeSnapshot:
         session_cookie_name=auth_module.SESSION_COOKIE_NAME,
         session_max_age_seconds=auth_module.SESSION_MAX_AGE_SECONDS,
         base_domain=routers_module.BASE_DOMAIN,
+        dev_mode=routers_module.DEV_MODE,
         site_name=routers_module.SITE_NAME,
         ttl_sweep_interval_seconds=routers_module.TTL_SWEEP_INTERVAL_SECONDS,
         env={key: os.environ.get(key) for key in ENV_KEYS},
@@ -240,6 +243,7 @@ def restore_runtime(snapshot: RuntimeSnapshot) -> None:
     routers_module.configure_router_runtime(
         auth_mode=snapshot.auth_mode,
         base_domain=snapshot.base_domain,
+        dev_mode=snapshot.dev_mode,
         site_name=snapshot.site_name,
         ttl_sweep_interval_seconds=snapshot.ttl_sweep_interval_seconds,
     )
@@ -251,8 +255,13 @@ def restore_runtime(snapshot: RuntimeSnapshot) -> None:
 
 
 @contextmanager
-def vault_runtime(*, auth_mode: str = "headers") -> Iterator[VaultRuntimeContext]:
+def vault_runtime(
+    *,
+    auth_mode: str = "headers",
+    dev_mode: bool | None = None,
+) -> Iterator[VaultRuntimeContext]:
     snapshot = snapshot_runtime()
+    runtime_dev_mode = auth_mode == "dev" if dev_mode is None else dev_mode
     with tempfile.TemporaryDirectory(prefix="vault-test-client-") as temp_dir_name:
         temp_dir = Path(temp_dir_name)
         db_path = temp_dir / "vault.db"
@@ -262,6 +271,7 @@ def vault_runtime(*, auth_mode: str = "headers") -> Iterator[VaultRuntimeContext
                 "BASE_DOMAIN": "localhost",
                 "VAULT_AUTH_MODE": auth_mode,
                 "VAULT_DEV_AUTH": "1" if auth_mode == "dev" else "0",
+                "VAULT_DEV_MODE": "1" if runtime_dev_mode else "0",
                 "VAULT_DB_PATH": str(db_path),
                 "VAULT_OBJECTS_PATH": str(objects_path),
                 "VAULT_STORAGE_BACKEND": "local",
@@ -278,6 +288,7 @@ def vault_runtime(*, auth_mode: str = "headers") -> Iterator[VaultRuntimeContext
         routers_module.configure_router_runtime(
             auth_mode=auth_mode,
             base_domain="localhost",
+            dev_mode=runtime_dev_mode,
             site_name="Vault",
             ttl_sweep_interval_seconds=10,
         )
@@ -291,8 +302,12 @@ def vault_runtime(*, auth_mode: str = "headers") -> Iterator[VaultRuntimeContext
 
 
 @contextmanager
-def vault_test_client(*, auth_mode: str = "headers") -> Iterator[VaultTestContext]:
-    with vault_runtime(auth_mode=auth_mode) as runtime:
+def vault_test_client(
+    *,
+    auth_mode: str = "headers",
+    dev_mode: bool | None = None,
+) -> Iterator[VaultTestContext]:
+    with vault_runtime(auth_mode=auth_mode, dev_mode=dev_mode) as runtime:
         try:
             app = create_app(enable_ttl_sweeper=False)
             with TestClient(app) as client:

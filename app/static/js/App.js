@@ -250,6 +250,7 @@ export function App({ initial }) {
 
   const currentUser = initialBootstrap.user || {};
   const isAdmin = Boolean(currentUser.is_admin);
+  const devMode = Boolean(initialBootstrap.dev_mode);
 
   const {
     breadcrumbs,
@@ -946,6 +947,12 @@ export function App({ initial }) {
           toast
         )
       : null,
+    devMode
+      ? h("div", { className: "dev-mode-warning", role: "status" }, [
+          h("strong", { key: "title" }, "DEVELOPMENT MODE"),
+          h("span", { key: "copy" }, "Debug tools are enabled. Do not use real data."),
+        ])
+      : null,
     h(FinderShell, {
       folder,
       breadcrumbs,
@@ -1052,11 +1059,13 @@ export function App({ initial }) {
           apiFetch,
           appVersion: initialBootstrap.version,
           currentUser,
+          devMode,
           doubleClickDownload,
           onAlternateRowsChange: handleAlternateRowsChange,
           onDoubleClickDownloadChange: handleDoubleClickDownloadChange,
           onOpenFoldersOnClickChange: handleOpenFoldersOnClickChange,
           onClose: closeSettings,
+          onDebugError: setError,
           onPalettePreferenceChange: handlePalettePreferenceChange,
           onSiteSettingsChange: setSiteSettings,
           onThemePreferenceChange: handleThemePreferenceChange,

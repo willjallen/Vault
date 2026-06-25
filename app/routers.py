@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from . import db as db_runtime
 from .auth import (
     UserContext,
     current_user,
@@ -31,7 +32,7 @@ from .auth import (
     require_admin,
     vault_user_is_effective_admin,
 )
-from .config import AUTH_MODE, BASE_DOMAIN, SITE_NAME, TTL_SWEEP_INTERVAL_SECONDS
+from .config import AUTH_MODE, BASE_DOMAIN, DEV_MODE, SITE_NAME, TTL_SWEEP_INTERVAL_SECONDS
 from .db import SessionLocal, get_db
 from .models import (
     Blob,
@@ -102,17 +103,21 @@ def configure_router_runtime(
     *,
     auth_mode: str | None = None,
     base_domain: str | None = None,
+    dev_mode: bool | None = None,
     site_name: str | None = None,
     ttl_sweep_interval_seconds: int | None = None,
 ) -> None:
     """Configure process-local route globals that are normally loaded from env."""
-    global AUTH_MODE, BASE_DOMAIN, SITE_NAME, TTL_SWEEP_INTERVAL_SECONDS
+    global AUTH_MODE, BASE_DOMAIN, DEV_MODE, SITE_NAME, TTL_SWEEP_INTERVAL_SECONDS
 
     from . import config
 
     if auth_mode is not None:
         AUTH_MODE = auth_mode.strip().lower() or "headers"
         config.AUTH_MODE = AUTH_MODE
+    if dev_mode is not None:
+        DEV_MODE = bool(dev_mode)
+        config.DEV_MODE = DEV_MODE
     if base_domain is not None:
         BASE_DOMAIN = base_domain.strip() or "localhost"
         config.BASE_DOMAIN = BASE_DOMAIN
@@ -209,6 +214,14 @@ class UserPreferencesPayload(BaseModel):
 
 class AdminSettingsPayload(BaseModel):
     settings: dict[str, object] = Field(default_factory=dict)
+
+
+class DebugErrorPayload(BaseModel):
+    kind: str = "server"
+
+
+class DebugStateEventPayload(BaseModel):
+    resources: list[str] = Field(default_factory=lambda: ["contents", "sidebar", "my_edits"])
 
 
 DOCUMENT_EVENT_RESOURCES: dict[str, tuple[str, ...]] = {
@@ -898,9 +911,7 @@ def readable_docs_in_folder_subtree(
     user: UserContext,
 ) -> list[Document]:
     return [
-        doc
-        for doc in docs_in_folder_subtree(db, root)
-        if document_access_level(doc, user, db) >= 2
+        doc for doc in docs_in_folder_subtree(db, root) if document_access_level(doc, user, db) >= 2
     ]
 
 
@@ -1047,9 +1058,7 @@ def record_event(
 def get_document_or_404(doc_id: int, db: Session) -> Document:
     doc = (
         db.execute(
-            select(Document)
-            .where(Document.id == doc_id)
-            .execution_options(populate_existing=True),
+            select(Document).where(Document.id == doc_id).execution_options(populate_existing=True),
         )
         .scalars()
         .first()
@@ -1063,9 +1072,7 @@ def get_document_or_404(doc_id: int, db: Session) -> Document:
 def get_folder_by_id_or_404(folder_id: int, db: Session) -> Folder:
     folder = (
         db.execute(
-            select(Folder)
-            .where(Folder.id == folder_id)
-            .execution_options(populate_existing=True),
+            select(Folder).where(Folder.id == folder_id).execution_options(populate_existing=True),
         )
         .scalars()
         .first()
@@ -1294,14 +1301,17 @@ def read_authorized_version_bytes(
 
 
 def download_response(data: bytes, filename: str, mime_type: str | None = None) -> Response:
-    safe_name = "".join(
-        "_" if ord(char) < 32 or ord(char) == 127 else char
-        for char in filename.replace('"', "")
-    ).strip() or "download"
+    safe_name = (
+        "".join(
+            "_" if ord(char) < 32 or ord(char) == 127 else char
+            for char in filename.replace('"', "")
+        ).strip()
+        or "download"
+    )
     ascii_name = "".join(char if 32 <= ord(char) < 127 else "_" for char in safe_name).strip()
     ascii_name = ascii_name or "download"
     content_type = sanitize_mime_type(mime_type, safe_name)
-    disposition = f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{quote(safe_name)}'
+    disposition = f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(safe_name)}"
     return Response(
         content=data,
         media_type=content_type,
@@ -1427,8 +1437,7 @@ def prune_nested_action_items(
                 continue
             doc_path = document_folder_path(doc)
             if any(
-                doc_path == parent or doc_path.startswith(f"{parent}/")
-                for parent in folder_paths
+                doc_path == parent or doc_path.startswith(f"{parent}/") for parent in folder_paths
             ):
                 continue
         pruned.append(item)
@@ -1936,15 +1945,12 @@ def folder_counts_payload(
 
 
 def folder_permissions_payload(folder: Folder, db: Session) -> list[dict[str, object]]:
-    rows = (
-        db.execute(
-            select(FolderPermission, VaultGroup)
-            .join(VaultGroup, VaultGroup.id == FolderPermission.group_id)
-            .where(FolderPermission.folder_id == folder.id)
-            .order_by(VaultGroup.name),
-        )
-        .all()
-    )
+    rows = db.execute(
+        select(FolderPermission, VaultGroup)
+        .join(VaultGroup, VaultGroup.id == FolderPermission.group_id)
+        .where(FolderPermission.folder_id == folder.id)
+        .order_by(VaultGroup.name),
+    ).all()
     return [
         {
             "id": permission.id,
@@ -2006,9 +2012,7 @@ def folder_properties_payload(
                 }
                 for event in events
             ],
-            "permissions": folder_permissions_payload(folder, db)
-            if can_manage_permissions
-            else [],
+            "permissions": folder_permissions_payload(folder, db) if can_manage_permissions else [],
             "available_groups": [{"id": group.id, "name": group.name} for group in groups],
         },
     )
@@ -2236,6 +2240,7 @@ def build_admin_directory_payload(db: Session) -> dict[str, object]:
             }
             for group in groups
         ],
+        "dev_mode": DEV_MODE,
         "settings": site_settings_for_db(db),
     }
 
@@ -2363,6 +2368,7 @@ def build_bootstrap_payload(user: UserContext, folder: str, db: Session) -> dict
     return {
         "auth_mode": AUTH_MODE,
         "base_domain": BASE_DOMAIN,
+        "dev_mode": DEV_MODE,
         "site_name": SITE_NAME,
         "user": user,
         "preferences": preferences_for_user(user, db),
@@ -2629,8 +2635,7 @@ def latest_state_event_id() -> int:
     db = SessionLocal()
     try:
         return (
-            db.execute(select(StateEvent.id).order_by(StateEvent.id.desc()).limit(1)).scalar()
-            or 0
+            db.execute(select(StateEvent.id).order_by(StateEvent.id.desc()).limit(1)).scalar() or 0
         )
     finally:
         db.close()
@@ -2834,9 +2839,7 @@ def storage_reconciliation_report(db: Session, apply: bool = False) -> dict[str,
         for location in local_locations
         if location.blob_id in referenced_blob_ids
     }
-    local_location_pairs = {
-        (location.blob_id, location.object_key) for location in local_locations
-    }
+    local_location_pairs = {(location.blob_id, location.object_key) for location in local_locations}
     recoverable_referenced_local_locations: set[tuple[int, str]] = set()
     corrupt_local_keys: set[str] = set()
     for blob in referenced_blobs:
@@ -2979,6 +2982,134 @@ def api_admin_directory(
 ) -> dict[str, object]:
     del user
     return build_admin_directory_payload(db)
+
+
+def require_dev_admin(user: UserContext = Depends(require_admin)) -> UserContext:
+    if not DEV_MODE:
+        raise HTTPException(status_code=404, detail="Debug tools are not available")
+    return user
+
+
+def debug_action_result(action: str, **data: object) -> dict[str, object]:
+    return {"action": action, "dev_mode": DEV_MODE, "ok": True, **data}
+
+
+def debug_timestamp() -> str:
+    return now_utc().strftime("%Y%m%d-%H%M%S")
+
+
+@router.post("/api/admin/debug/error")
+def api_admin_debug_error(
+    payload: DebugErrorPayload,
+    user: UserContext = Depends(require_dev_admin),
+) -> dict[str, object]:
+    del user
+    kind = (payload.kind or "server").strip().lower()
+    if kind == "bad-request":
+        raise HTTPException(status_code=400, detail="Debug bad request error")
+    if kind == "forbidden":
+        raise HTTPException(status_code=403, detail="Debug forbidden error")
+    if kind == "not-found":
+        raise HTTPException(status_code=404, detail="Debug not found error")
+    if kind == "unavailable":
+        raise HTTPException(status_code=503, detail="Debug service unavailable")
+    raise HTTPException(status_code=500, detail="Debug server error")
+
+
+@router.post("/api/admin/debug/emit-state")
+def api_admin_debug_emit_state(
+    payload: DebugStateEventPayload,
+    user: UserContext = Depends(require_dev_admin),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    del user
+    allowed = {
+        "admin",
+        "contents",
+        "document_detail",
+        "my_edits",
+        "preferences",
+        "settings",
+        "sidebar",
+    }
+    resources = tuple(resource for resource in payload.resources if resource in allowed)
+    record_state_change(
+        db,
+        "debug.refresh",
+        resources or ("contents", "sidebar", "my_edits"),
+    )
+    commit_state(db)
+    return debug_action_result("emit-state", resources=list(resources))
+
+
+@router.post("/api/admin/debug/sweep-ttl")
+def api_admin_debug_sweep_ttl(
+    user: UserContext = Depends(require_dev_admin),
+) -> dict[str, object]:
+    del user
+    return debug_action_result("sweep-ttl", result=sweep_expired_documents())
+
+
+@router.post("/api/admin/debug/storage-report")
+def api_admin_debug_storage_report(
+    user: UserContext = Depends(require_dev_admin),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    del user
+    return debug_action_result(
+        "storage-report",
+        report=storage_reconciliation_report(db, apply=False),
+    )
+
+
+@router.post("/api/admin/debug/seed")
+def api_admin_debug_seed(
+    user: UserContext = Depends(require_dev_admin),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    folder = get_or_create_folder_path(db, "Debug Samples")
+    name = f"debug-sample-{debug_timestamp()}.txt"
+    blob = get_or_create_blob_for_data(
+        db,
+        f"Debug sample created at {now_utc().isoformat()}\n".encode(),
+        "text/plain",
+    )
+    doc = Document(
+        folder_id=folder.id,
+        name=name,
+        created_by=user["id"],
+        created_by_name=user["name"],
+        latest_modified_by=user["id"],
+    )
+    db.add(doc)
+    db.flush()
+    create_document_version(
+        db,
+        doc,
+        blob,
+        user,
+        SYSTEM_META,
+        name,
+        "text/plain",
+        "Debug seed",
+        "upload",
+    )
+    record_folder_change(db, "debug.seeded")
+    db.commit()
+    return debug_action_result("seed", document_id=doc.id, folder="Debug Samples", name=name)
+
+
+@router.post("/api/admin/debug/reset-database")
+def api_admin_debug_reset_database(
+    user: UserContext = Depends(require_dev_admin),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    del user
+    with storage_write_lock():
+        db.close()
+        db_runtime.Base.metadata.drop_all(bind=db_runtime.engine)
+        db_runtime.init_db()
+    return debug_action_result("reset-database", reload=True)
 
 
 @router.patch("/api/admin/settings")

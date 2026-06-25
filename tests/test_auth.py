@@ -4,7 +4,7 @@ from pathlib import Path
 
 from fastapi import HTTPException
 from sqlalchemy import event
-from starlette.datastructures import Headers, URL
+from starlette.datastructures import URL, Headers
 from tests.support import vault_runtime
 
 import app.auth as auth_module

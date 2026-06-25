@@ -31,6 +31,14 @@
     rgba(239, 246, 255, 0.74),
     rgba(255, 255, 255, 0.98)
   );
+  --surface-dev-warning: repeating-linear-gradient(
+    -45deg,
+    #facc15 0 14px,
+    #f97316 14px 28px,
+    #ef4444 28px 42px,
+    #facc15 42px 56px
+  );
+  --surface-dev-warning-label: rgba(255, 255, 255, 0.86);
   --surface-settings-preview: linear-gradient(135deg, #f8fafc, #eff6ff 46%, #f7fee7);
   --surface-swatch-empty: linear-gradient(135deg, #f8fafc, #cbd5e1);
   --border-subtle: #d7dde8;
@@ -106,6 +114,7 @@
     var(--shadow-inset-highlight-soft);
   --shadow-card: 0 14px 34px rgba(15, 23, 42, 0.06), var(--shadow-inset-highlight-soft);
   --shadow-card-subtle: 0 12px 28px rgba(15, 23, 42, 0.045), var(--shadow-inset-highlight-soft);
+  --shadow-dev-warning: 0 16px 36px rgba(127, 29, 29, 0.38);
   --shadow-popover: 0 18px 44px rgba(15, 23, 42, 0.18), var(--shadow-inset-highlight-soft);
   --shadow-transfer: 0 18px 44px rgba(15, 23, 42, 0.18), var(--shadow-inset-highlight);
   --shadow-inset-control: inset 0 1px 2px rgba(15, 23, 42, 0.12);

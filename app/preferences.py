@@ -55,9 +55,7 @@ def _clean_favorite_item(value: object, *, strict: bool) -> dict[str, object] | 
             "id": folder_id,
         }
     if item_type == "document":
-        document_id = _clean_favorite_id(
-            value.get("id"), label="Favorite document", strict=strict
-        )
+        document_id = _clean_favorite_id(value.get("id"), label="Favorite document", strict=strict)
         if document_id is None:
             return None
         return {

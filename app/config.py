@@ -4,6 +4,11 @@ import os
 import secrets
 from pathlib import Path
 
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
 BASE_DOMAIN = os.getenv("BASE_DOMAIN", "localhost")
 SITE_NAME = os.getenv("VAULT_SITE_NAME", "Vault").strip() or "Vault"
 DATA_DIR = Path(os.getenv("VAULT_DATA_DIR", "/data")).resolve()
@@ -20,14 +25,15 @@ REQUIRE_SESSION_SECRET = (
     "on",
 }
 
-AUTH_MODE = os.getenv(
-    "VAULT_AUTH_MODE",
-    (
-        "dev"
-        if os.getenv("VAULT_DEV_AUTH", "").strip().lower() in {"1", "true", "yes", "on"}
-        else "headers"
-    ),
-).strip().lower()
+AUTH_MODE = (
+    os.getenv(
+        "VAULT_AUTH_MODE",
+        ("dev" if _env_flag("VAULT_DEV_AUTH") else "headers"),
+    )
+    .strip()
+    .lower()
+)
+DEV_MODE = _env_flag("VAULT_DEV_MODE") or AUTH_MODE == "dev" or _env_flag("VAULT_DEV_AUTH")
 SESSION_COOKIE_NAME = os.getenv("VAULT_SESSION_COOKIE_NAME", "vault_session").strip()
 _SESSION_SECRET_ENV = os.getenv("VAULT_SESSION_SECRET", "").strip()
 _OIDC_CLIENT_SECRET_ENV = os.getenv("VAULT_OIDC_CLIENT_SECRET", "").strip()
@@ -100,7 +106,6 @@ R2_BUCKET = os.getenv("VAULT_R2_BUCKET", "").strip()
 R2_ACCOUNT_ID = os.getenv("VAULT_R2_ACCOUNT_ID", "").strip()
 R2_ACCESS_KEY_ID = os.getenv("VAULT_R2_ACCESS_KEY_ID", "").strip()
 R2_SECRET_ACCESS_KEY = os.getenv("VAULT_R2_SECRET_ACCESS_KEY", "").strip()
-R2_ENDPOINT_URL = (
-    os.getenv("VAULT_R2_ENDPOINT_URL", "").strip()
-    or (f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com" if R2_ACCOUNT_ID else None)
+R2_ENDPOINT_URL = os.getenv("VAULT_R2_ENDPOINT_URL", "").strip() or (
+    f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com" if R2_ACCOUNT_ID else None
 )

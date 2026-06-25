@@ -233,9 +233,7 @@ class Blob(Base):
 
 class BlobLocation(Base):
     __tablename__ = "blob_locations"
-    __table_args__ = (
-        UniqueConstraint("backend", "bucket", "object_key", name="uq_blob_location"),
-    )
+    __table_args__ = (UniqueConstraint("backend", "bucket", "object_key", name="uq_blob_location"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     blob_id: Mapped[int] = mapped_column(

@@ -24,8 +24,8 @@ from app.routers import (
     AdminUserUpdate,
     api_admin_delete_group,
     api_admin_remove_group_member,
-    api_admin_update_user,
     api_admin_update_group,
+    api_admin_update_user,
     archive_doc_item,
     archive_folder_item,
     get_folder_by_path,
@@ -38,9 +38,7 @@ def set_group_write_access(db, group_name: str, folder: Folder, *, write: bool) 
     db.flush()
     group = db.query(VaultGroup).filter_by(name=group_name).one()
     permission = (
-        db.query(FolderPermission)
-        .filter_by(folder_id=folder.id, group_id=group.id)
-        .one_or_none()
+        db.query(FolderPermission).filter_by(folder_id=folder.id, group_id=group.id).one_or_none()
     )
     if not permission:
         permission = FolderPermission(folder_id=folder.id, group_id=group.id)
@@ -51,6 +49,67 @@ def set_group_write_access(db, group_name: str, folder: Folder, *, write: bool) 
 
 
 class AdminSettingsTests(unittest.TestCase):
+    def test_debug_tools_are_hidden_outside_dev_mode(self) -> None:
+        admin_headers = auth_headers("admin", ["vault-admin"])
+
+        with vault_test_client() as ctx:
+            bootstrap = ctx.client.get("/api/bootstrap", headers=admin_headers)
+            self.assertEqual(bootstrap.status_code, 200, bootstrap.text)
+            self.assertFalse(bootstrap.json()["dev_mode"])
+
+            directory = ctx.client.get("/api/admin/directory", headers=admin_headers)
+            self.assertEqual(directory.status_code, 200, directory.text)
+            self.assertFalse(directory.json()["dev_mode"])
+
+            denied = ctx.client.post(
+                "/api/admin/debug/error",
+                json={"kind": "server"},
+                headers=admin_headers,
+            )
+            self.assertEqual(denied.status_code, 404)
+
+    def test_dev_mode_exposes_admin_debug_tools(self) -> None:
+        with vault_test_client(auth_mode="dev") as ctx:
+            bootstrap = ctx.client.get("/api/bootstrap")
+            self.assertEqual(bootstrap.status_code, 200, bootstrap.text)
+            self.assertTrue(bootstrap.json()["dev_mode"])
+
+            directory = ctx.client.get("/api/admin/directory")
+            self.assertEqual(directory.status_code, 200, directory.text)
+            self.assertTrue(directory.json()["dev_mode"])
+
+            server_error = ctx.client.post("/api/admin/debug/error", json={"kind": "server"})
+            self.assertEqual(server_error.status_code, 500)
+            self.assertEqual(server_error.json()["detail"], "Debug server error")
+
+            seeded = ctx.client.post("/api/admin/debug/seed")
+            self.assertEqual(seeded.status_code, 200, seeded.text)
+            self.assertEqual(seeded.json()["action"], "seed")
+            self.assertEqual(seeded.json()["folder"], "Debug Samples")
+
+            emitted = ctx.client.post(
+                "/api/admin/debug/emit-state",
+                json={"resources": ["contents", "sidebar", "not-real"]},
+            )
+            self.assertEqual(emitted.status_code, 200, emitted.text)
+            self.assertEqual(emitted.json()["resources"], ["contents", "sidebar"])
+
+            storage_report = ctx.client.post("/api/admin/debug/storage-report")
+            self.assertEqual(storage_report.status_code, 200, storage_report.text)
+            self.assertIn("report", storage_report.json())
+
+            swept = ctx.client.post("/api/admin/debug/sweep-ttl")
+            self.assertEqual(swept.status_code, 200, swept.text)
+            self.assertIn("result", swept.json())
+
+            reset = ctx.client.post("/api/admin/debug/reset-database")
+            self.assertEqual(reset.status_code, 200, reset.text)
+            self.assertTrue(reset.json()["reload"])
+
+            refreshed = ctx.client.get("/api/bootstrap")
+            self.assertEqual(refreshed.status_code, 200, refreshed.text)
+            self.assertTrue(refreshed.json()["dev_mode"])
+
     def test_archive_permanent_delete_policy_defaults_to_admin_only(self) -> None:
         admin_headers = auth_headers("admin", ["vault-admin"])
         writer_headers = auth_headers("writer", ["writers"])
@@ -230,9 +289,7 @@ class AdminSettingsTests(unittest.TestCase):
             with ctx.db() as db:
                 events = db.query(StateEvent).order_by(StateEvent.id.desc()).all()
                 settings_events = [
-                    event
-                    for event in events
-                    if event.event_type == "admin.settings.updated"
+                    event for event in events if event.event_type == "admin.settings.updated"
                 ]
                 self.assertTrue(settings_events)
                 self.assertEqual(

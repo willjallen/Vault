@@ -2303,9 +2303,47 @@ input[type="file"]::file-selector-button:hover {
   color: var(--text-context);
 }
 
+.dev-mode-warning {
+  position: fixed;
+  top: 12px;
+  left: 50%;
+  z-index: 3200;
+  width: min(760px, calc(100vw - 24px));
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  border: 3px solid var(--text-primary);
+  border-radius: 0;
+  padding: 9px 14px;
+  background: var(--surface-dev-warning);
+  color: var(--text-primary);
+  box-shadow: var(--shadow-dev-warning);
+  font-size: 0.9rem;
+  font-weight: 900;
+  letter-spacing: 0;
+  pointer-events: none;
+  text-align: center;
+  text-transform: uppercase;
+}
+
+.dev-mode-warning strong,
+.dev-mode-warning span {
+  min-width: 0;
+  border: 2px solid var(--text-primary);
+  padding: 3px 8px;
+  background: var(--surface-dev-warning-label);
+  overflow-wrap: anywhere;
+}
+
+.dev-mode-warning strong {
+  color: var(--danger-text-strong);
+}
+
 .notification-dock {
   position: fixed;
-  left: 20px;
+  right: 20px;
   bottom: 20px;
   z-index: 2300;
   width: min(390px, calc(100vw - 32px));
@@ -2328,7 +2366,7 @@ input[type="file"]::file-selector-button:hover {
   background: var(--surface-overlay-soft);
   box-shadow: var(--shadow-transfer);
   backdrop-filter: blur(18px);
-  transform-origin: bottom left;
+  transform-origin: bottom right;
   transition:
     opacity 0.16s ease,
     transform 0.3s cubic-bezier(0.18, 1.18, 0.28, 1),
@@ -2339,7 +2377,7 @@ input[type="file"]::file-selector-button:hover {
 
 .notification-row.phase-entering {
   opacity: 0;
-  transform: translate3d(-42px, 20px, 0) scale(0.9) rotate(-1deg);
+  transform: translate3d(42px, 20px, 0) scale(0.9) rotate(1deg);
 }
 
 .notification-row.phase-visible,
@@ -2350,7 +2388,7 @@ input[type="file"]::file-selector-button:hover {
 
 .notification-row.phase-leaving {
   opacity: 0;
-  transform: translate3d(-44px, 18px, 0) scale(0.92) rotate(-0.8deg);
+  transform: translate3d(44px, 18px, 0) scale(0.92) rotate(0.8deg);
   transition:
     opacity 0.18s ease-in,
     transform 0.26s cubic-bezier(0.64, 0, 0.78, 0),
@@ -3714,6 +3752,109 @@ input[type="file"]::file-selector-button:hover {
   overflow-wrap: anywhere;
 }
 
+.debug-panel-grid {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+}
+
+.debug-card {
+  align-self: start;
+}
+
+.debug-card.output {
+  min-height: 260px;
+  display: flex;
+  flex-direction: column;
+}
+
+.debug-card.danger {
+  border-color: var(--danger-border);
+  box-shadow:
+    var(--shadow-card),
+    0 0 0 4px var(--danger-halo);
+}
+
+.debug-action-grid {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  padding: 16px 18px 18px;
+}
+
+.debug-action-button {
+  min-width: 0;
+  min-height: 38px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 8px 10px;
+  background: var(--surface-panel);
+  color: var(--text-secondary);
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.8rem;
+  font-weight: 850;
+  line-height: 1.1;
+  transition:
+    background 0.14s ease,
+    border-color 0.14s ease,
+    color 0.14s ease,
+    box-shadow 0.14s ease,
+    transform 0.14s cubic-bezier(0.2, 1.25, 0.32, 1);
+}
+
+.debug-action-button span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.debug-action-button:hover:not(:disabled) {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  box-shadow: var(--shadow-subtle);
+  transform: translateY(-1px);
+}
+
+.debug-action-button.danger {
+  border-color: var(--danger-border);
+  color: var(--danger-text);
+}
+
+.debug-action-button.danger:hover:not(:disabled) {
+  background: var(--danger-soft);
+  color: var(--danger-text);
+}
+
+.debug-action-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.56;
+}
+
+.debug-output {
+  min-width: 0;
+  min-height: 210px;
+  flex: 1 1 auto;
+  max-height: 440px;
+  overflow: auto;
+  border: 0;
+  border-top: 1px solid var(--border-extra-subtle);
+  border-radius: 0 0 18px 18px;
+  margin: 0;
+  padding: 12px;
+  background: var(--surface-context);
+  color: var(--text-context);
+  font-size: 0.78rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
+
 .admin-list {
   min-width: 0;
 }
@@ -4675,6 +4816,11 @@ input[type="file"]::file-selector-button:hover {
     align-self: center;
     margin-top: 0;
     padding: 8px 10px;
+  }
+
+  .debug-panel-grid,
+  .debug-action-grid {
+    grid-template-columns: 1fr;
   }
 
   .folder-properties-layer,

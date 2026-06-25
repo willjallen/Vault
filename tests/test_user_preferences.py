@@ -93,10 +93,13 @@ class UserPreferenceTests(unittest.TestCase):
             self.assertTrue(updated.json()["preferences"]["alternateRows"])
             self.assertTrue(updated.json()["preferences"]["doubleClickDownload"])
             favorites = updated.json()["preferences"]["favoriteItems"]
-            self.assertEqual([(item["type"], item["id"]) for item in favorites], [
-                ("folder", folder_id),
-                ("document", document_id),
-            ])
+            self.assertEqual(
+                [(item["type"], item["id"]) for item in favorites],
+                [
+                    ("folder", folder_id),
+                    ("document", document_id),
+                ],
+            )
             self.assertEqual(favorites[0]["path"], "Art")
             self.assertEqual(favorites[1]["path"], "Art/chest.fbx")
             with ctx.db() as db:
@@ -180,9 +183,7 @@ class UserPreferenceTests(unittest.TestCase):
                 json={"preferences": {"favoriteItems": [{"type": "folder", "path": "Art"}]}},
                 headers=headers,
             )
-            self.assertEqual(
-                invalid_folder_favorite.status_code, 400, invalid_folder_favorite.text
-            )
+            self.assertEqual(invalid_folder_favorite.status_code, 400, invalid_folder_favorite.text)
 
             invalid_sidebar_size = ctx.client.patch(
                 "/api/preferences",
@@ -258,16 +259,22 @@ class UserPreferenceTests(unittest.TestCase):
             preferences = ctx.client.get("/api/preferences", headers=headers)
             self.assertEqual(preferences.status_code, 200, preferences.text)
             favorites = preferences.json()["preferences"]["favoriteItems"]
-            self.assertEqual([(item["type"], item["id"]) for item in favorites], [
-                ("folder", parent_id),
-                ("folder", child_id),
-                ("document", document_id),
-            ])
-            self.assertEqual([item["path"] for item in favorites], [
-                "Assets",
-                "Assets/Props",
-                "Assets/Props/crate.fbx",
-            ])
+            self.assertEqual(
+                [(item["type"], item["id"]) for item in favorites],
+                [
+                    ("folder", parent_id),
+                    ("folder", child_id),
+                    ("document", document_id),
+                ],
+            )
+            self.assertEqual(
+                [item["path"] for item in favorites],
+                [
+                    "Assets",
+                    "Assets/Props",
+                    "Assets/Props/crate.fbx",
+                ],
+            )
 
             old_contents = ctx.client.get(
                 "/api/folders/contents",

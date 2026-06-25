@@ -83,9 +83,7 @@ class StorageReconciliationTests(unittest.TestCase):
 
             version = db.query(DocumentVersion).filter_by(document_id=doc.id).one()
             location = (
-                db.query(BlobLocation)
-                .filter_by(blob_id=version.blob_id, backend="local")
-                .one()
+                db.query(BlobLocation).filter_by(blob_id=version.blob_id, backend="local").one()
             )
             object_path = ctx.temp_dir / "objects" / location.object_key
             object_path.write_bytes(b"corrupt content")
@@ -112,9 +110,7 @@ class StorageReconciliationTests(unittest.TestCase):
 
             version = db.query(DocumentVersion).filter_by(document_id=doc.id).one()
             location = (
-                db.query(BlobLocation)
-                .filter_by(blob_id=version.blob_id, backend="local")
-                .one()
+                db.query(BlobLocation).filter_by(blob_id=version.blob_id, backend="local").one()
             )
             object_key = location.object_key
 
@@ -142,9 +138,7 @@ class StorageReconciliationTests(unittest.TestCase):
 
             version = db.query(DocumentVersion).filter_by(document_id=doc.id).one()
             location = (
-                db.query(BlobLocation)
-                .filter_by(blob_id=version.blob_id, backend="local")
-                .one()
+                db.query(BlobLocation).filter_by(blob_id=version.blob_id, backend="local").one()
             )
             object_key = location.object_key
             object_path = ctx.temp_dir / "objects" / object_key
@@ -182,9 +176,7 @@ class StorageReconciliationTests(unittest.TestCase):
 
             version = db.query(DocumentVersion).filter_by(document_id=doc.id).one()
             location = (
-                db.query(BlobLocation)
-                .filter_by(blob_id=version.blob_id, backend="local")
-                .one()
+                db.query(BlobLocation).filter_by(blob_id=version.blob_id, backend="local").one()
             )
             object_key = location.object_key
             db.delete(location)

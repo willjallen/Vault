@@ -89,8 +89,7 @@ def _apply_known_additive_migrations() -> None:
     if "preferences" not in vault_user_columns:
         with engine.begin() as connection:
             connection.exec_driver_sql(
-                "ALTER TABLE vault_users "
-                "ADD COLUMN preferences JSON NOT NULL DEFAULT '{}'",
+                "ALTER TABLE vault_users " "ADD COLUMN preferences JSON NOT NULL DEFAULT '{}'",
             )
 
 
@@ -109,9 +108,7 @@ def _schema_needs_reset() -> bool:
     for table in Base.metadata.sorted_tables:
         if table.name not in tables:
             return True
-        existing_columns = {
-            column["name"]: column for column in inspector.get_columns(table.name)
-        }
+        existing_columns = {column["name"]: column for column in inspector.get_columns(table.name)}
         expected_columns = {column.name: column for column in table.columns}
         if set(existing_columns) != set(expected_columns):
             return True
@@ -138,9 +135,7 @@ def _schema_needs_reset() -> bool:
         if existing_primary_key != expected_primary_key:
             return True
         existing_indexes = {
-            index["name"]: index
-            for index in inspector.get_indexes(table.name)
-            if index.get("name")
+            index["name"]: index for index in inspector.get_indexes(table.name) if index.get("name")
         }
         for expected_index in table.indexes:
             if not expected_index.name:

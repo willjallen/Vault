@@ -2190,6 +2190,31 @@ def ensure_not_last_active_admin(db: Session, target: VaultUser) -> None:
         raise HTTPException(status_code=400, detail="At least one active admin is required")
 
 
+def ensure_group_delete_preserves_active_admin(db: Session, group: VaultGroup) -> None:
+    users = list(db.execute(select(VaultUser)).scalars().all())
+    groups = list(db.execute(select(VaultGroup)).scalars().all())
+    groups_by_id = {row.id: row for row in groups if row.id != group.id}
+    group_names_by_user: dict[int, list[str]] = defaultdict(list)
+    memberships = list(
+        db.execute(
+            select(VaultGroupMembership).where(VaultGroupMembership.group_id != group.id),
+        )
+        .scalars()
+        .all(),
+    )
+    for membership in memberships:
+        membership_group = groups_by_id.get(membership.group_id)
+        if membership_group:
+            group_names_by_user[membership.user_id].append(membership_group.name)
+    if any(
+        user.is_active
+        and vault_user_is_effective_admin(user, db, group_names_by_user.get(user.id, []))
+        for user in users
+    ):
+        return
+    raise HTTPException(status_code=400, detail="At least one active admin is required")
+
+
 def find_group_by_normalized_name(db: Session, name: str) -> VaultGroup | None:
     lowered = name.lower()
     for group in db.execute(select(VaultGroup)).scalars().all():
@@ -2878,6 +2903,7 @@ def api_admin_delete_group(
         raise HTTPException(status_code=404, detail="Group not found")
     if db.execute(select(FolderPermission.id).where(FolderPermission.group_id == group.id)).first():
         raise HTTPException(status_code=400, detail="Group is used by folder permissions")
+    ensure_group_delete_preserves_active_admin(db, group)
     db.delete(group)
     return commit_admin_change(db, "group.deleted")
 

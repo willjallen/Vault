@@ -894,9 +894,18 @@ def record_event(
 
 
 def get_document_or_404(doc_id: int, db: Session) -> Document:
-    doc = db.execute(select(Document).where(Document.id == doc_id)).scalars().first()
+    doc = (
+        db.execute(
+            select(Document)
+            .where(Document.id == doc_id)
+            .execution_options(populate_existing=True),
+        )
+        .scalars()
+        .first()
+    )
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
+    db.expire(doc, ["folder"])
     return doc
 
 

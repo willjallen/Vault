@@ -434,6 +434,76 @@ def folder_access_level(folder: Folder, user: UserContext, db: Session) -> int:
     return 0
 
 
+def group_access_context(group: VaultGroup) -> UserContext:
+    return {
+        "id": f"group:{group.id}",
+        "vault_user_id": 0,
+        "issuer": "group",
+        "subject": group.name,
+        "name": group.name,
+        "email": "",
+        "groups": [group.name],
+        "is_admin": False,
+    }
+
+
+def permission_flags_for_level(level: int) -> tuple[bool, bool, bool]:
+    return level >= 1, level >= 2, level >= 3
+
+
+def replace_folder_permissions_with_effective_access(
+    source: Folder,
+    target: Folder,
+    db: Session,
+) -> None:
+    db.flush()
+    groups = list(db.execute(select(VaultGroup)).scalars().all())
+    effective_levels = {
+        group.id: folder_access_level(source, group_access_context(group), db) for group in groups
+    }
+    existing = {
+        permission.group_id: permission
+        for permission in db.execute(
+            select(FolderPermission).where(FolderPermission.folder_id == target.id),
+        )
+        .scalars()
+        .all()
+    }
+    for group in groups:
+        permission = existing.pop(group.id, None)
+        if not permission:
+            permission = FolderPermission(folder_id=target.id, group_id=group.id)
+            db.add(permission)
+        can_view, can_read, can_write = permission_flags_for_level(effective_levels[group.id])
+        permission.can_view = can_view
+        permission.can_read = can_read
+        permission.can_write = can_write
+        permission.updated_at = now_utc()
+    for permission in existing.values():
+        db.delete(permission)
+
+
+def non_root_folder_chain(folder: Folder) -> list[Folder]:
+    chain: list[Folder] = []
+    current: Folder | None = folder
+    seen: set[int] = set()
+    while current and not current.is_root and current.id not in seen:
+        seen.add(current.id)
+        chain.append(current)
+        current = current.parent
+    return list(reversed(chain))
+
+
+def mirror_folder_permission_chain(source: Folder, target: Folder, db: Session) -> None:
+    source_chain = non_root_folder_chain(source)
+    target_chain = non_root_folder_chain(target)
+    if len(source_chain) != len(target_chain):
+        replace_folder_permissions_with_effective_access(source, target, db)
+        return
+    for source_folder, target_folder in zip(source_chain, target_chain, strict=True):
+        replace_folder_permissions_with_effective_access(source_folder, target_folder, db)
+
+
 def document_access_level(doc: Document, user: UserContext, db: Session) -> int:
     return folder_access_level(doc.folder, user, db)
 
@@ -1247,6 +1317,7 @@ def archive_doc_item(doc: Document, request: Request, user: UserContext, db: Ses
     target_folder_path = public_folder_path(ARCHIVE_ROOT_KEY, folder_relative_path(doc.folder))
     require_write_for_folder_path(db, target_folder_path, user)
     target_folder = get_or_create_folder_path(db, target_folder_path)
+    mirror_folder_permission_chain(doc.folder, target_folder, db)
     release_lock(lock, user)
     mutate_doc_location(
         doc,
@@ -1273,6 +1344,7 @@ def restore_doc_item(doc: Document, request: Request, user: UserContext, db: Ses
     target_folder_path = folder_relative_path(doc.folder)
     require_write_for_folder_path(db, target_folder_path, user)
     target_folder = get_or_create_folder_path(db, target_folder_path)
+    mirror_folder_permission_chain(doc.folder, target_folder, db)
     mutate_doc_location(
         doc,
         target_folder,
@@ -1299,6 +1371,9 @@ def archive_folder_item(source: Folder, request: Request, user: UserContext, db:
     require_write_for_folder_path(db, "/".join(target_path.split("/")[:-1]), user)
     target_parent = get_or_create_folder_path(db, "/".join(target_path.split("/")[:-1]))
     target_name = normalize_item_name(target_path.split("/")[-1], "Folder name")
+    if source.parent and not source.parent.is_root and target_parent is not None:
+        mirror_folder_permission_chain(source.parent, target_parent, db)
+    replace_folder_permissions_with_effective_access(source, source, db)
     remove_empty_folder_conflict(db, target_parent.id, target_name, source.id)
     ensure_unique_folder_name(db, target_parent.id, target_name, source.id)
     meta = client_meta(request)
@@ -1334,6 +1409,9 @@ def restore_folder_item(source: Folder, request: Request, user: UserContext, db:
     require_write_for_folder_path(db, "/".join(target_path.split("/")[:-1]), user)
     target_parent = get_or_create_folder_path(db, "/".join(target_path.split("/")[:-1]))
     target_name = normalize_item_name(target_path.split("/")[-1], "Folder name")
+    if source.parent and not source.parent.is_root and target_parent is not None:
+        mirror_folder_permission_chain(source.parent, target_parent, db)
+    replace_folder_permissions_with_effective_access(source, source, db)
     remove_empty_folder_conflict(db, target_parent.id, target_name, source.id)
     ensure_unique_folder_name(db, target_parent.id, target_name, source.id)
     archive_parent = source.parent
@@ -2340,6 +2418,7 @@ def archive_expired_document(doc: Document, db: Session, timestamp: dt.datetime)
     source_path = document_path(doc)
     target_folder_path = public_folder_path(ARCHIVE_ROOT_KEY, folder_relative_path(doc.folder))
     target_folder = get_or_create_folder_path(db, target_folder_path)
+    mirror_folder_permission_chain(doc.folder, target_folder, db)
     target_name = unique_document_name(db, target_folder.id, doc.name, doc.id)
     mutate_doc_location(
         doc,

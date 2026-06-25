@@ -14,6 +14,7 @@ from app.models import DocumentLock, Folder, FolderPermission, VaultGroup
 from app.routers import (
     ActionItem,
     ActionPayload,
+    archive_doc_item,
     build_contents_payload,
     create_document,
     create_folder,
@@ -202,6 +203,41 @@ class AclPermissionTests(unittest.TestCase):
             with ctx.db() as db:
                 with self.assertRaises(HTTPException) as raised:
                     build_contents_payload(db, "Secret/Plans", writer)
+                self.assertEqual(raised.exception.status_code, 404)
+
+    def test_archiving_restricted_document_preserves_folder_acl_in_archive(self) -> None:
+        admin = user_context("admin", groups=["vault-admin"], is_admin=True)
+        outsider = user_context("outsider", groups=["outsiders"], is_admin=False)
+
+        with vault_runtime() as ctx:
+            with ctx.db() as db:
+                vault_root = get_root_folder(db, "vault")
+                archive_root = get_root_folder(db, "archive")
+                outsiders = VaultGroup(name="outsiders")
+                db.add(outsiders)
+                db.flush()
+                add_permission(db, vault_root, outsiders, write=True)
+                add_permission(db, archive_root, outsiders, write=True)
+
+                secret = get_or_create_folder_path(db, "Secret")
+                db.flush()
+                db.query(FolderPermission).filter_by(folder_id=secret.id).delete()
+                db.flush()
+                add_permission(db, secret, outsiders, view=False, read=False, write=False)
+
+                doc = create_versioned_document(
+                    db,
+                    secret,
+                    name="roadmap.txt",
+                    data=b"secret roadmap",
+                    actor=admin,
+                )
+                archive_doc_item(doc, FAKE_REQUEST, admin, db)
+                db.commit()
+
+            with ctx.db() as db:
+                with self.assertRaises(HTTPException) as raised:
+                    build_contents_payload(db, "Archive/Secret", outsider)
                 self.assertEqual(raised.exception.status_code, 404)
 
 

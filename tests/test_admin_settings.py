@@ -20,7 +20,9 @@ from app.models import (
     VaultUser,
 )
 from app.routers import (
+    AdminGroupPayload,
     api_admin_delete_group,
+    api_admin_update_group,
     archive_doc_item,
     archive_folder_item,
     get_folder_by_path,
@@ -319,6 +321,38 @@ class AdminSettingsTests(unittest.TestCase):
             db.rollback()
             self.assertIsNotNone(db.get(VaultGroup, group_id))
             self.assertEqual(db.query(VaultGroupMembership).filter_by(group_id=group_id).count(), 1)
+
+    def test_admin_cannot_rename_only_effective_admin_group(self) -> None:
+        acting_admin = user_context("bob", groups=["vault-admin"], is_admin=True)
+
+        with vault_test_client() as ctx, ctx.db() as db:
+            admin_group = VaultGroup(name="vault-admin")
+            bob = VaultUser(
+                issuer="oidc",
+                subject="bob",
+                email="bob@example.com",
+                name="Bob",
+                is_admin=False,
+                is_active=True,
+            )
+            db.add_all([admin_group, bob])
+            db.flush()
+            db.add(VaultGroupMembership(user_id=bob.id, group_id=admin_group.id))
+            db.commit()
+            group_id = admin_group.id
+
+            with self.assertRaises(HTTPException) as raised:
+                api_admin_update_group(
+                    group_id,
+                    AdminGroupPayload(name="staff", description="Staff"),
+                    acting_admin,
+                    db,
+                )
+
+            self.assertEqual(raised.exception.status_code, 400)
+            self.assertEqual(raised.exception.detail, "At least one active admin is required")
+            db.rollback()
+            self.assertEqual(db.get(VaultGroup, group_id).name, "vault-admin")
 
 
 if __name__ == "__main__":

@@ -2190,22 +2190,11 @@ def ensure_not_last_active_admin(db: Session, target: VaultUser) -> None:
         raise HTTPException(status_code=400, detail="At least one active admin is required")
 
 
-def ensure_group_delete_preserves_active_admin(db: Session, group: VaultGroup) -> None:
+def ensure_active_admin_for_group_names(
+    db: Session,
+    group_names_by_user: dict[int, list[str]],
+) -> None:
     users = list(db.execute(select(VaultUser)).scalars().all())
-    groups = list(db.execute(select(VaultGroup)).scalars().all())
-    groups_by_id = {row.id: row for row in groups if row.id != group.id}
-    group_names_by_user: dict[int, list[str]] = defaultdict(list)
-    memberships = list(
-        db.execute(
-            select(VaultGroupMembership).where(VaultGroupMembership.group_id != group.id),
-        )
-        .scalars()
-        .all(),
-    )
-    for membership in memberships:
-        membership_group = groups_by_id.get(membership.group_id)
-        if membership_group:
-            group_names_by_user[membership.user_id].append(membership_group.name)
     if any(
         user.is_active
         and vault_user_is_effective_admin(user, db, group_names_by_user.get(user.id, []))
@@ -2213,6 +2202,51 @@ def ensure_group_delete_preserves_active_admin(db: Session, group: VaultGroup) -
     ):
         return
     raise HTTPException(status_code=400, detail="At least one active admin is required")
+
+
+def group_names_by_user_after_group_change(
+    db: Session,
+    *,
+    deleted_group_id: int | None = None,
+    renamed_group_id: int | None = None,
+    renamed_group_name: str | None = None,
+) -> dict[int, list[str]]:
+    groups = list(db.execute(select(VaultGroup)).scalars().all())
+    groups_by_id = {row.id: row for row in groups if row.id != deleted_group_id}
+    group_names_by_user: dict[int, list[str]] = defaultdict(list)
+    memberships = list(db.execute(select(VaultGroupMembership)).scalars().all())
+    for membership in memberships:
+        if membership.group_id == deleted_group_id:
+            continue
+        if membership.group_id == renamed_group_id and renamed_group_name is not None:
+            group_names_by_user[membership.user_id].append(renamed_group_name)
+            continue
+        membership_group = groups_by_id.get(membership.group_id)
+        if membership_group:
+            group_names_by_user[membership.user_id].append(membership_group.name)
+    return group_names_by_user
+
+
+def ensure_group_delete_preserves_active_admin(db: Session, group: VaultGroup) -> None:
+    ensure_active_admin_for_group_names(
+        db,
+        group_names_by_user_after_group_change(db, deleted_group_id=group.id),
+    )
+
+
+def ensure_group_rename_preserves_active_admin(
+    db: Session,
+    group: VaultGroup,
+    name: str,
+) -> None:
+    ensure_active_admin_for_group_names(
+        db,
+        group_names_by_user_after_group_change(
+            db,
+            renamed_group_id=group.id,
+            renamed_group_name=name,
+        ),
+    )
 
 
 def find_group_by_normalized_name(db: Session, name: str) -> VaultGroup | None:
@@ -2886,6 +2920,7 @@ def api_admin_update_group(
     existing = find_group_by_normalized_name(db, name)
     if existing and existing.id != group.id:
         raise HTTPException(status_code=409, detail="Group already exists")
+    ensure_group_rename_preserves_active_admin(db, group, name)
     group.name = name
     group.description = (payload.description or "").strip() or None
     return commit_admin_change(db, "group.updated")

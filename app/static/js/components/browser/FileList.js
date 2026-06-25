@@ -526,6 +526,7 @@ export function VaultFileList({
       editing,
       editValue: editing ? inlineFolderDraft.value || "" : "",
       searchQuery,
+      showSearchPath: Boolean(searchQuery && recursiveSearch),
       selectionKey,
       selected: selectedSet.has(selectionKey),
       draggingId,

@@ -43,6 +43,13 @@ function highlightedFileName(fileNameValue, query) {
   return parts;
 }
 
+function recursiveSearchPath(folder) {
+  const path = String(folder || "")
+    .replace(/^Vault\/?/, "")
+    .replace(/^\/+|\/+$/g, "");
+  return path ? `${path}/` : "";
+}
+
 // eslint-disable-next-line complexity
 export function FileRow({
   doc,
@@ -52,6 +59,7 @@ export function FileRow({
   editing,
   editValue,
   searchQuery = "",
+  showSearchPath = false,
   selectionKey = "",
   selected,
   draggingId,
@@ -93,6 +101,7 @@ export function FileRow({
   const expiryDateLabel = doc.expires_at ? formatDate(doc.expires_at) : "";
   const expiryTitle =
     expiryLabel && expiryDateLabel ? `${expiryLabel} · ${expiryDateLabel}` : expiryDateLabel;
+  const searchPath = showSearchPath ? recursiveSearchPath(doc.folder) : "";
 
   useEffect(() => {
     if (!editing || !inputRef.current) {
@@ -202,6 +211,12 @@ export function FileRow({
                 { className: classNames("name", isArchived ? "archived-text" : "") },
                 highlightedFileName(doc.name, searchQuery)
               ),
+              searchPath
+                ? h("span", { className: "file-search-path", key: "search-path" }, [
+                    h("span", { "aria-hidden": "true", key: "arrow" }, ">"),
+                    h("span", { key: "path" }, searchPath),
+                  ])
+                : null,
             ]),
       ]),
       h("div", { className: "file-cell meta" }, [

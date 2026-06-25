@@ -1665,12 +1665,17 @@ body.sidebar-resizing {
   display: flex;
   align-items: center;
   gap: 5px;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
+  width: 100%;
   min-width: 0;
+  overflow: hidden;
 }
 
 .file-name-line .name {
   flex: 0 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .file-name-match {
@@ -1679,6 +1684,27 @@ body.sidebar-resizing {
   background: color-mix(in srgb, var(--info-soft) 82%, transparent);
   color: var(--info-text);
   box-shadow: inset 0 -1px 0 color-mix(in srgb, var(--accent-border) 72%, transparent);
+}
+
+.file-search-path {
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: 1 1 auto;
+  color: color-mix(in srgb, var(--text-muted) 78%, transparent);
+  font-size: 0.68rem;
+  font-weight: 650;
+  line-height: 1.25;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.file-search-path span:last-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .file-lock-indicator {

@@ -1059,6 +1059,22 @@ def get_document_or_404(doc_id: int, db: Session) -> Document:
     return doc
 
 
+def get_folder_by_id_or_404(folder_id: int, db: Session) -> Folder:
+    folder = (
+        db.execute(
+            select(Folder)
+            .where(Folder.id == folder_id)
+            .execution_options(populate_existing=True),
+        )
+        .scalars()
+        .first()
+    )
+    if not folder:
+        raise HTTPException(status_code=404, detail="Folder not found")
+    db.expire(folder, ["parent"])
+    return folder
+
+
 def get_version_or_404(doc: Document, version_id: str, db: Session) -> DocumentVersion:
     version = (
         db.execute(
@@ -2456,7 +2472,7 @@ def create_share_target(
 
     folder: Folder | None = None
     if payload.folder_id is not None:
-        folder = db.get(Folder, payload.folder_id)
+        folder = get_folder_by_id_or_404(payload.folder_id, db)
     else:
         folder = get_folder_by_path(db, payload.path)
     if not folder:
@@ -2471,10 +2487,10 @@ def resolved_share_payload(link: ShareLink, user: UserContext, db: Session) -> d
     if link.expires_at and normalize_timestamp(link.expires_at) <= now_utc():
         raise HTTPException(status_code=404, detail="Share link expired")
 
-    path_cache = build_folder_path_cache(all_folders(db))
     if link.target_type == "document" and link.document_id is not None:
         doc = get_document_or_404(link.document_id, db)
         require_document_access(doc, user, db, 1)
+        path_cache = build_folder_path_cache(all_folders(db))
         return {
             "code": link.code,
             "target_type": "document",
@@ -2490,10 +2506,9 @@ def resolved_share_payload(link: ShareLink, user: UserContext, db: Session) -> d
         }
 
     if link.target_type == "folder" and link.folder_id is not None:
-        folder = db.get(Folder, link.folder_id)
-        if not folder:
-            raise HTTPException(status_code=404, detail="Folder not found")
+        folder = get_folder_by_id_or_404(link.folder_id, db)
         require_folder_access(folder, user, db, 1)
+        path_cache = build_folder_path_cache(all_folders(db))
         path = folder_path(folder, path_cache)
         visible_docs = [
             doc

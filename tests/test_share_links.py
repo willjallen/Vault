@@ -308,6 +308,62 @@ class ShareLinkTests(unittest.TestCase):
             finally:
                 stale_db.close()
 
+    def test_folder_share_resolution_refreshes_stale_folder_parent(self) -> None:
+        artist = user_context("artist", groups=["artists"], is_admin=False)
+
+        with vault_runtime():
+            with SessionLocal() as db:
+                root = get_root_folder(db, "vault")
+                project = create_child_folder(db, root, "Project")
+                secret = create_child_folder(db, root, "Secret")
+
+                artists = VaultGroup(name="artists")
+                confidential = VaultGroup(name="confidential")
+                db.add_all([artists, confidential])
+                db.flush()
+                add_permission(db, root, artists)
+                add_permission(db, secret, confidential)
+
+                create_versioned_document(
+                    db,
+                    project,
+                    name="plan.txt",
+                    data=b"visible before move",
+                )
+                link = ShareLink(
+                    code="stale-folder",
+                    target_type="folder",
+                    folder_id=project.id,
+                    created_by="admin",
+                    created_by_name="Admin",
+                )
+                db.add(link)
+                db.commit()
+                project_id = project.id
+                link_id = link.id
+                secret_id = secret.id
+
+            stale_db = SessionLocal()
+            try:
+                stale_link = stale_db.get(ShareLink, link_id)
+                self.assertIsNotNone(stale_link)
+                stale_folder = stale_db.get(Folder, project_id)
+                self.assertEqual(stale_folder.parent_id, get_root_folder(stale_db, "vault").id)
+
+                with SessionLocal() as move_db:
+                    moved_folder = move_db.get(Folder, project_id)
+                    secret = move_db.get(Folder, secret_id)
+                    moved_folder.parent = secret
+                    moved_folder.parent_id = secret.id
+                    move_db.commit()
+
+                with self.assertRaises(HTTPException) as raised:
+                    resolved_share_payload(stale_link, artist, stale_db)
+
+                self.assertEqual(raised.exception.status_code, 404)
+            finally:
+                stale_db.close()
+
     def test_deleted_targets_resolve_as_not_found(self) -> None:
         admin_headers = auth_headers("admin", ["vault-admin"])
 

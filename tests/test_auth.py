@@ -3,9 +3,10 @@ import unittest
 from pathlib import Path
 
 from fastapi import HTTPException
-from starlette.datastructures import Headers
+from starlette.datastructures import Headers, URL
 from tests.support import vault_runtime
 
+import app.auth as auth_module
 from app.auth import current_user
 from app.config import HEADER_AUTH_ISSUER
 from app.models import Folder, FolderPermission, VaultGroup, VaultGroupMembership, VaultUser
@@ -14,6 +15,14 @@ from app.models import Folder, FolderPermission, VaultGroup, VaultGroupMembershi
 class HeaderRequest:
     def __init__(self, headers: dict[str, str] | None = None) -> None:
         self.headers = Headers(headers or {})
+
+
+class CookieRequest:
+    method = "GET"
+    url = URL("http://testserver/api/bootstrap")
+
+    def __init__(self, cookies: dict[str, str] | None = None) -> None:
+        self.cookies = cookies or {}
 
 
 class AuthTests(unittest.TestCase):
@@ -127,6 +136,27 @@ class AuthTests(unittest.TestCase):
                 .count(),
                 0,
             )
+
+    def test_oidc_session_cookie_requires_expiration(self) -> None:
+        with vault_runtime(auth_mode="oidc") as ctx, ctx.db() as db:
+            user = VaultUser(
+                issuer="issuer",
+                subject="alice",
+                email="alice@example.com",
+                name="Alice",
+                is_active=True,
+            )
+            db.add(user)
+            db.commit()
+
+            cookie = auth_module._sign_payload({"uid": user.id})
+            request = CookieRequest({auth_module.SESSION_COOKIE_NAME: cookie})
+
+            with self.assertRaises(HTTPException) as raised:
+                current_user(request, db)
+
+            self.assertEqual(raised.exception.status_code, 401)
+            self.assertEqual(raised.exception.detail, "Authentication required")
 
     def test_dev_auth_requires_local_base_domain(self) -> None:
         with vault_runtime(auth_mode="dev") as ctx, ctx.db() as db:

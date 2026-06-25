@@ -5,6 +5,7 @@ import datetime as dt
 import hashlib
 import hmac
 import json
+import math
 import os
 import time
 import urllib.error
@@ -156,7 +157,12 @@ def _verify_payload(value: str | None) -> dict[str, object] | None:
     except (ValueError, json.JSONDecodeError):
         return None
     expires_at = payload.get("exp")
-    if isinstance(expires_at, int | float) and expires_at < time.time():
+    if (
+        isinstance(expires_at, bool)
+        or not isinstance(expires_at, int | float)
+        or not math.isfinite(float(expires_at))
+        or float(expires_at) < time.time()
+    ):
         return None
     return payload if isinstance(payload, dict) else None
 

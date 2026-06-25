@@ -36,6 +36,7 @@ logs/
 *.out
 *.err
 FINDINGS.md
+PROGRESS.md
 
 # Local lint cache files
 vault-service/.lint-env.hash

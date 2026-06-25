@@ -12,6 +12,7 @@ __pycache__/
 node_modules/
 tests/
 FINDINGS.md
+PROGRESS.md
 *.log
 *.out
 *.err

@@ -40,6 +40,32 @@ class StorageReconciliationTests(unittest.TestCase):
                 "Current document version metadata is inconsistent",
             )
 
+    def test_current_version_rejects_empty_current_pointer_with_versions(self) -> None:
+        user = user_context("user", groups=[])
+
+        with vault_runtime() as ctx, ctx.db() as db:
+            folder = get_or_create_folder_path(db, "")
+            doc = create_versioned_document(
+                db,
+                folder,
+                name="kept.txt",
+                data=b"trusted content",
+                actor=user,
+            )
+            db.commit()
+
+            doc.current_version_id = None
+            db.commit()
+
+            with self.assertRaises(HTTPException) as raised:
+                current_version(doc, db)
+
+            self.assertEqual(raised.exception.status_code, 500)
+            self.assertEqual(
+                raised.exception.detail,
+                "Current document version metadata is inconsistent",
+            )
+
     def test_read_version_rejects_corrupt_local_object(self) -> None:
         user = user_context("user", groups=[])
         original = b"trusted content"

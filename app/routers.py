@@ -1225,7 +1225,7 @@ def current_version(doc: Document, db: Session) -> DocumentVersion | None:
             status_code=500,
             detail="Current document version metadata is inconsistent",
         )
-    return (
+    latest = (
         db.execute(
             select(DocumentVersion)
             .where(DocumentVersion.document_id == doc.id)
@@ -1235,6 +1235,12 @@ def current_version(doc: Document, db: Session) -> DocumentVersion | None:
         .scalars()
         .first()
     )
+    if latest:
+        raise HTTPException(
+            status_code=500,
+            detail="Current document version metadata is inconsistent",
+        )
+    return None
 
 
 def location_for_blob(blob: Blob) -> BlobLocation:

@@ -41,15 +41,13 @@ import { useAuthFetch } from "./lib/useAuthFetch.js";
 import { useFolderNavigation } from "./lib/useFolderNavigation.js";
 import { useFavoritePreferenceActions } from "./lib/useFavoritePreferenceActions.js";
 import { useMoveDialog } from "./lib/useMoveDialog.js";
+import { useNotifications } from "./lib/useNotifications.js";
 import { normalizeSiteSettings } from "./lib/siteSettings.js";
 import { useAppearancePreferences } from "./lib/theme.js";
-import { useToastMessage } from "./lib/useToastMessage.js";
 import { useVaultResources } from "./lib/useVaultResources.js";
 
 const { useEffect, useMemo, useState, useCallback, useRef } = React;
 const h = React.createElement;
-const ERROR_NOTICE_MS = 4200;
-const NOTICE_EXIT_MS = 260;
 
 export function App({ initial }) {
   const initialBootstrap = initial.bootstrap || initial;
@@ -67,7 +65,6 @@ export function App({ initial }) {
   const [folderAnchor, setFolderAnchor] = useState(null);
   const [uploading, setUploading] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [errorNotice, setErrorNotice] = useState(null);
   const [draggingId, setDraggingId] = useState(null);
   const [dragBundle, setDragBundle] = useState(null);
   const [dropHint, setDropHint] = useState(null);
@@ -90,80 +87,10 @@ export function App({ initial }) {
   const versionUploadOptions = useRef({});
   const settingsButtonRef = useRef(null);
   const confirmResolver = useRef(null);
-  const errorNoticeId = useRef(1);
-  const errorNoticeTimers = useRef([]);
   const shareCodeRef = useRef(initialShareCode);
   const historyModeRef = useRef("replace");
   const closeContextMenu = useCallback(() => setContextMenu(null), []);
-  const { setToast, showToast, toast } = useToastMessage();
-
-  const clearErrorNoticeTimers = useCallback(() => {
-    errorNoticeTimers.current.forEach((timer) => window.clearTimeout(timer));
-    errorNoticeTimers.current = [];
-  }, []);
-
-  const dismissErrorNotice = useCallback(
-    (noticeId) => {
-      clearErrorNoticeTimers();
-      setErrorNotice((current) => {
-        if (!current || (noticeId && current.id !== noticeId)) {
-          return current;
-        }
-        return { ...current, phase: "leaving" };
-      });
-      const removeTimer = window.setTimeout(() => {
-        setErrorNotice((current) =>
-          !current || (noticeId && current.id !== noticeId) ? current : null
-        );
-      }, NOTICE_EXIT_MS);
-      errorNoticeTimers.current = [removeTimer];
-    },
-    [clearErrorNoticeTimers]
-  );
-
-  const setError = useCallback(
-    (message, duration = ERROR_NOTICE_MS) => {
-      clearErrorNoticeTimers();
-      const normalizedMessage = String(message || "").trim();
-      if (!normalizedMessage) {
-        setErrorNotice(null);
-        return;
-      }
-      const id = errorNoticeId.current;
-      errorNoticeId.current += 1;
-      setErrorNotice({
-        dismissible: true,
-        duration,
-        id,
-        kind: "error",
-        message: normalizedMessage,
-        phase: "entering",
-        title: "Error",
-      });
-      const enterTimer = window.setTimeout(() => {
-        setErrorNotice((current) =>
-          current && current.id === id ? { ...current, phase: "visible" } : current
-        );
-      }, 16);
-      const leaveTimer = window.setTimeout(() => {
-        setErrorNotice((current) =>
-          current && current.id === id ? { ...current, phase: "leaving" } : current
-        );
-      }, duration);
-      const removeTimer = window.setTimeout(() => {
-        setErrorNotice((current) => (current && current.id === id ? null : current));
-      }, duration + NOTICE_EXIT_MS);
-      errorNoticeTimers.current = [enterTimer, leaveTimer, removeTimer];
-    },
-    [clearErrorNoticeTimers]
-  );
-
-  useEffect(
-    () => () => {
-      clearErrorNoticeTimers();
-    },
-    [clearErrorNoticeTimers]
-  );
+  const { dismissNotice, notice, showError: setError, showNotice } = useNotifications();
 
   const resolveConfirm = useCallback((confirmed) => {
     const resolver = confirmResolver.current;
@@ -222,7 +149,7 @@ export function App({ initial }) {
   const { apiFetch, downloadWithProgress, logoutUrl, transfers, uploadWithProgress } = useAuthFetch(
     {
       initialBootstrap,
-      setToast,
+      showNotice,
     }
   );
   const {
@@ -342,7 +269,7 @@ export function App({ initial }) {
     setSelectedId,
     setShareResolving,
     shareCodeRef,
-    showToast,
+    showNotice,
   });
 
   const unsortedContentsItems = useMemo(
@@ -779,7 +706,7 @@ export function App({ initial }) {
     }
   }
 
-  const handleShareItem = useShareActions({ apiFetch, setError, showToast });
+  const handleShareItem = useShareActions({ apiFetch, setError, showNotice });
 
   const {
     moveTarget,
@@ -921,7 +848,7 @@ export function App({ initial }) {
   }
 
   const notices = [
-    ...(errorNotice ? [errorNotice] : []),
+    ...(notice ? [notice] : []),
     ...(busy
       ? [
           {
@@ -938,15 +865,6 @@ export function App({ initial }) {
   return h(
     React.Fragment,
     null,
-    toast
-      ? h(
-          "div",
-          {
-            className: "toast",
-          },
-          toast
-        )
-      : null,
     devMode
       ? h("div", { className: "dev-mode-warning", role: "status" }, [
           h("strong", { key: "title" }, "DEVELOPMENT MODE"),
@@ -1052,7 +970,7 @@ export function App({ initial }) {
       onChange: (e) => handleVersionUploadInput(e.target.files[0]),
     }),
     h(TransferDock, { transfers }),
-    h(NotificationDock, { notices, onDismiss: dismissErrorNotice }),
+    h(NotificationDock, { notices, onDismiss: dismissNotice }),
     h(DragPreview, { drag: dragBundle }),
     settingsOpen
       ? h(SettingsModal, {

@@ -8,7 +8,7 @@ function connectionError() {
   return error;
 }
 
-export function useAuthFetch({ initialBootstrap, setToast }) {
+export function useAuthFetch({ initialBootstrap, showNotice }) {
   const baseDomain =
     initialBootstrap.base_domain ||
     (window.location.hostname.includes(".")
@@ -29,14 +29,19 @@ export function useAuthFetch({ initialBootstrap, setToast }) {
       return;
     }
     redirectingRef.current = true;
-    setToast("Session expired. Redirecting to login...");
+    showNotice({
+      detail: "Redirecting to login...",
+      dismissible: false,
+      kind: "info",
+      title: "Session expired",
+    });
     const rd = encodeURIComponent(window.location.href);
     const loginUrl =
       authMode === "headers" && baseDomain
         ? `https://auth.${baseDomain}/?rd=${rd}`
         : `/login?rd=${rd}`;
     window.location.href = loginUrl;
-  }, [authMode, baseDomain, setToast]);
+  }, [authMode, baseDomain, showNotice]);
 
   const transfersApi = useTransfers({ onUnauthorized: redirectToLogin });
 

@@ -2282,27 +2282,6 @@ input[type="file"]::file-selector-button:hover {
   font-size: 0.9rem;
 }
 
-.toast {
-  position: fixed;
-  bottom: 20px;
-  right: 20px;
-  z-index: 2500;
-  padding: 12px 16px;
-  border-radius: 12px;
-  background: var(--surface-context);
-  color: var(--text-inverse);
-  box-shadow: var(--shadow-toast);
-}
-
-.toast.error {
-  background: var(--danger-fill-strong);
-}
-
-.toast.subtle {
-  background: var(--surface-context);
-  color: var(--text-context);
-}
-
 .dev-mode-warning {
   position: fixed;
   top: 12px;
@@ -2403,6 +2382,20 @@ input[type="file"]::file-selector-button:hover {
     0 0 0 4px var(--danger-halo);
 }
 
+.notification-row.success:not(.phase-leaving) {
+  border-color: var(--success-border);
+  box-shadow:
+    var(--shadow-transfer),
+    0 0 0 4px var(--success-soft-alt);
+}
+
+.notification-row.info:not(.phase-leaving) {
+  border-color: var(--accent-border);
+  box-shadow:
+    var(--shadow-transfer),
+    0 0 0 4px var(--focus-ring);
+}
+
 .notification-icon {
   width: 34px;
   height: 34px;
@@ -2413,6 +2406,16 @@ input[type="file"]::file-selector-button:hover {
   color: var(--danger-text);
   background: var(--danger-soft-hover);
   transition: transform 0.22s cubic-bezier(0.18, 1.22, 0.28, 1);
+}
+
+.notification-row.success .notification-icon {
+  color: var(--success-text);
+  background: var(--success-soft);
+}
+
+.notification-row.info .notification-icon {
+  color: var(--info-text);
+  background: var(--info-soft);
 }
 
 .notification-row.busy .notification-icon {
@@ -2426,9 +2429,14 @@ input[type="file"]::file-selector-button:hover {
 
 .notification-copy {
   min-width: 0;
+  align-self: stretch;
   display: flex;
   flex-direction: column;
   gap: 5px;
+}
+
+.notification-row.no-detail .notification-copy {
+  justify-content: center;
 }
 
 .notification-title {
@@ -2441,7 +2449,11 @@ input[type="file"]::file-selector-button:hover {
   white-space: nowrap;
 }
 
-.notification-message {
+.notification-row.no-detail .notification-title {
+  white-space: normal;
+}
+
+.notification-detail {
   min-width: 0;
   overflow: hidden;
   color: var(--text-secondary);
@@ -2451,8 +2463,12 @@ input[type="file"]::file-selector-button:hover {
   white-space: nowrap;
 }
 
-.notification-row.error .notification-message {
+.notification-row.error .notification-detail {
   color: var(--danger-text);
+}
+
+.notification-row.success .notification-detail {
+  color: var(--success-text);
 }
 
 .notification-dismiss {
@@ -2496,6 +2512,14 @@ input[type="file"]::file-selector-button:hover {
   height: 100%;
   border-radius: inherit;
   background: var(--danger-fill);
+}
+
+.notification-row.success .notification-timebar span {
+  background: var(--success-fill);
+}
+
+.notification-row.info .notification-timebar span {
+  background: var(--progress-bar);
 }
 
 .notification-row.phase-visible .notification-timebar span {

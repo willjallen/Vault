@@ -7,6 +7,12 @@ function noticeIcon(kind) {
   if (kind === "busy") {
     return "refresh";
   }
+  if (kind === "success") {
+    return "check";
+  }
+  if (kind === "info") {
+    return "info";
+  }
   return "warning";
 }
 
@@ -17,20 +23,28 @@ function noticeTitle(notice) {
   if (notice.kind === "busy") {
     return "Working";
   }
+  if (notice.kind === "success") {
+    return "Success";
+  }
+  if (notice.kind === "info") {
+    return "Notice";
+  }
   return "Error";
 }
 
 function NotificationRow({ notice, onDismiss }) {
+  const detail = String(notice.detail || "").trim();
+  const hasDetail = Boolean(detail);
   const dismissible = Boolean(onDismiss) && notice.dismissible !== false;
-  const durationStyle = notice.duration
-    ? { "--notification-duration": `${notice.duration}ms` }
-    : {};
+  const showTimebar = Boolean(notice.duration && hasDetail);
+  const durationStyle = showTimebar ? { "--notification-duration": `${notice.duration}ms` } : {};
   return h(
     "div",
     {
       className: classNames(
         "notification-row",
         notice.kind || "error",
+        hasDetail ? "has-detail" : "no-detail",
         `phase-${notice.phase || "visible"}`
       ),
       role: notice.kind === "error" ? "alert" : "status",
@@ -44,10 +58,8 @@ function NotificationRow({ notice, onDismiss }) {
       ),
       h("div", { className: "notification-copy", key: "copy" }, [
         h("div", { className: "notification-title", key: "title" }, noticeTitle(notice)),
-        notice.message
-          ? h("div", { className: "notification-message", key: "message" }, notice.message)
-          : null,
-        notice.duration
+        hasDetail ? h("div", { className: "notification-detail", key: "detail" }, detail) : null,
+        showTimebar
           ? h("div", { className: "notification-timebar", key: "timebar" }, h("span", null))
           : null,
       ]),

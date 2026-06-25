@@ -119,7 +119,7 @@ export function useShareLinkResolution({
   setSelectedId,
   setShareResolving,
   shareCodeRef,
-  showToast,
+  showNotice,
 }) {
   useEffect(() => {
     const code = shareCodeRef.current;
@@ -160,7 +160,11 @@ export function useShareLinkResolution({
         }
       } catch (err) {
         if (!cancelled) {
-          showToast(err.message || "Share link not found.");
+          showNotice({
+            detail: err.message || "Share link not found.",
+            kind: "error",
+            title: "Share link",
+          });
         }
       } finally {
         if (!cancelled) {
@@ -189,11 +193,11 @@ export function useShareLinkResolution({
     setSelectedId,
     setShareResolving,
     shareCodeRef,
-    showToast,
+    showNotice,
   ]);
 }
 
-export function useShareActions({ apiFetch, setError, showToast }) {
+export function useShareActions({ apiFetch, setError, showNotice }) {
   return useCallback(
     async (item) => {
       if (!item) {
@@ -215,11 +219,14 @@ export function useShareActions({ apiFetch, setError, showToast }) {
           throw new Error(payload.detail || "Could not create share link.");
         }
         await writeClipboard(payload.url);
-        showToast("Share link copied");
+        showNotice({
+          kind: "success",
+          title: "Share link copied to clipboard",
+        });
       } catch (err) {
         setError(err.message || "Could not create share link.");
       }
     },
-    [apiFetch, setError, showToast]
+    [apiFetch, setError, showNotice]
   );
 }

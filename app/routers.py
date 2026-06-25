@@ -3637,6 +3637,8 @@ def unlock_items(
                     doc = get_document_or_404(item.id or 0, db)
                     require_document_access(doc, user, db, 3)
                     lock = ensure_not_locked_by_other(doc, user, db)
+                    if lock is None:
+                        raise HTTPException(status_code=400, detail="Document is not locked")
                     release_lock(lock, user)
                     record_event(
                         doc,

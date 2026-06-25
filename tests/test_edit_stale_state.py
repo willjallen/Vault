@@ -10,7 +10,7 @@ from tests.support import (
 )
 
 from app.db import SessionLocal
-from app.models import Document, DocumentLock, FolderPermission, VaultGroup
+from app.models import Document, DocumentEvent, DocumentLock, FolderPermission, VaultGroup
 from app.routers import (
     ActionItem,
     ActionPayload,
@@ -219,6 +219,39 @@ class EditStaleStateTests(unittest.TestCase):
                     is_active=True,
                 )
                 self.assertEqual(active_locks.count(), 1)
+
+    def test_unlock_without_active_lock_does_not_record_release_event(self) -> None:
+        admin = user_context("admin", groups=["vault-admin"], is_admin=True)
+        writer = user_context("writer", groups=["writers"], is_admin=False)
+
+        with vault_runtime() as ctx:
+            with ctx.db() as db:
+                root = get_root_folder(db, "vault")
+                writers = VaultGroup(name="writers")
+                db.add(writers)
+                db.flush()
+                add_permission(db, root, writers, write=True)
+
+                project = get_or_create_folder_path(db, "Project")
+                doc = create_versioned_document(db, project, actor=admin)
+                db.commit()
+                doc_id = doc.id
+
+                result = unlock_items(
+                    ActionPayload(items=[ActionItem(type="document", id=doc_id)]),
+                    FAKE_REQUEST,
+                    writer,
+                    db,
+                )
+
+                self.assertEqual(result["ok"], [])
+                self.assertEqual(result["failed"][0]["detail"], "Document is not locked")
+                self.assertEqual(
+                    db.query(DocumentEvent)
+                    .filter_by(document_id=doc_id, event_type="release")
+                    .count(),
+                    0,
+                )
 
     def test_folder_archive_rejects_descendant_lock_by_other_user(self) -> None:
         admin = user_context("admin", groups=["vault-admin"], is_admin=True)

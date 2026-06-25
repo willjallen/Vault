@@ -142,11 +142,24 @@ def _schema_needs_reset() -> bool:
                 return True
             if _index_signature(existing_index) != _model_index_signature(expected_index):
                 return True
+        expected_index_names = {index.name for index in table.indexes if index.name}
+        for existing_index in existing_indexes.values():
+            if existing_index["name"] not in expected_index_names and bool(
+                existing_index.get("unique"),
+            ):
+                return True
         existing_unique_constraints = {
             constraint["name"]: tuple(constraint.get("column_names") or [])
             for constraint in inspector.get_unique_constraints(table.name)
             if constraint.get("name")
         }
+        expected_unique_constraints = {
+            constraint.name: tuple(column.name for column in constraint.columns)
+            for constraint in table.constraints
+            if isinstance(constraint, UniqueConstraint) and constraint.name
+        }
+        if set(existing_unique_constraints) - set(expected_unique_constraints):
+            return True
         for expected_constraint in table.constraints:
             if not isinstance(expected_constraint, UniqueConstraint):
                 continue

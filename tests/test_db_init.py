@@ -198,6 +198,35 @@ class DatabaseInitTests(unittest.TestCase):
                 db_module.engine.dispose()
                 restore_runtime(snapshot)
 
+    def test_unexpected_unique_index_is_rejected_on_startup(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="vault-db-init-") as temp_dir:
+            db_path = Path(temp_dir) / "vault.db"
+            snapshot = snapshot_runtime()
+            try:
+                db_module.configure_database(db_path)
+                db_module.Base.metadata.create_all(bind=db_module.engine)
+                with sqlite3.connect(db_path) as conn:
+                    conn.execute(
+                        """
+                        CREATE UNIQUE INDEX uq_documents_global_name
+                        ON documents (name)
+                        """,
+                    )
+
+                with self.assertRaises(RuntimeError) as raised:
+                    db_module.init_db()
+
+                self.assertIn("Startup refused to alter or drop", str(raised.exception))
+                with sqlite3.connect(db_path) as conn:
+                    indexes = {
+                        row[1]: row[2]
+                        for row in conn.execute("PRAGMA index_list(documents)").fetchall()
+                    }
+                self.assertEqual(indexes["uq_documents_global_name"], 1)
+            finally:
+                db_module.engine.dispose()
+                restore_runtime(snapshot)
+
     def test_missing_unique_constraint_is_rejected_on_startup(self) -> None:
         with tempfile.TemporaryDirectory(prefix="vault-db-init-") as temp_dir:
             db_path = Path(temp_dir) / "vault.db"

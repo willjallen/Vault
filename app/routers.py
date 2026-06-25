@@ -886,6 +886,13 @@ def docs_in_folder_subtree(db: Session, root: Folder) -> list[Document]:
     return list(db.execute(select(Document).where(Document.folder_id.in_(ids))).scalars().all())
 
 
+def docs_in_unlocked_folder_subtree(db: Session, root: Folder, user: UserContext) -> list[Document]:
+    docs = docs_in_folder_subtree(db, root)
+    for doc in docs:
+        ensure_not_locked_by_other(doc, user, db)
+    return docs
+
+
 def reapply_ttl_for_folder_subtree(folder: Folder, db: Session) -> None:
     for doc in docs_in_folder_subtree(db, folder):
         apply_folder_ttl(doc, doc.folder, doc.latest_modified_at)
@@ -1407,6 +1414,7 @@ def archive_folder_item(source: Folder, request: Request, user: UserContext, db:
         raise HTTPException(status_code=400, detail="Folder is already archived")
     require_folder_access(source, user, db, 3)
     source_path = folder_path(source)
+    docs = docs_in_unlocked_folder_subtree(db, source, user)
     target_path = public_folder_path(ARCHIVE_ROOT_KEY, folder_relative_path(source))
     require_write_for_folder_path(db, "/".join(target_path.split("/")[:-1]), user)
     target_parent = get_or_create_folder_path(db, "/".join(target_path.split("/")[:-1]))
@@ -1417,7 +1425,6 @@ def archive_folder_item(source: Folder, request: Request, user: UserContext, db:
     remove_empty_folder_conflict(db, target_parent.id, target_name, source.id)
     ensure_unique_folder_name(db, target_parent.id, target_name, source.id)
     meta = client_meta(request)
-    docs = docs_in_folder_subtree(db, source)
     for doc in docs:
         release_lock(get_active_lock(doc, db), user)
         record_event(
@@ -1445,6 +1452,7 @@ def restore_folder_item(source: Folder, request: Request, user: UserContext, db:
         raise HTTPException(status_code=400, detail="Choose an archived folder to restore")
     require_folder_access(source, user, db, 3)
     source_path = folder_path(source)
+    docs = docs_in_unlocked_folder_subtree(db, source, user)
     target_path = folder_relative_path(source)
     require_write_for_folder_path(db, "/".join(target_path.split("/")[:-1]), user)
     target_parent, created_parents = get_or_create_folder_path_with_created(
@@ -1459,7 +1467,6 @@ def restore_folder_item(source: Folder, request: Request, user: UserContext, db:
     ensure_unique_folder_name(db, target_parent.id, target_name, source.id)
     archive_parent = source.parent
     meta = client_meta(request)
-    docs = docs_in_folder_subtree(db, source)
     for doc in docs:
         record_event(
             doc,
@@ -1527,6 +1534,7 @@ def move_folder_item(
     target_ref = parse_public_folder_path(destination_folder)
     if source.root_key != target_ref.root_key:
         raise HTTPException(status_code=400, detail="Use archive or restore for Archive moves")
+    docs_in_unlocked_folder_subtree(db, source, user)
     require_write_for_folder_path(db, destination_folder, user)
     target_parent = get_or_create_folder_path(db, destination_folder)
     source_path = folder_path(source)

@@ -15,6 +15,7 @@ from app.routers import (
     ActionItem,
     ActionPayload,
     archive_doc_item,
+    archive_folder_item,
     checkout_document,
     get_document_or_404,
     get_or_create_folder_path,
@@ -170,6 +171,51 @@ class EditStaleStateTests(unittest.TestCase):
                 doc = db.get(Document, doc_id)
                 self.assertIsNotNone(doc)
                 self.assertEqual(doc.folder.name, "Private")
+                active_locks = db.query(DocumentLock).filter_by(
+                    document_id=doc_id,
+                    is_active=True,
+                )
+                self.assertEqual(active_locks.count(), 1)
+
+    def test_folder_archive_rejects_descendant_lock_by_other_user(self) -> None:
+        admin = user_context("admin", groups=["vault-admin"], is_admin=True)
+        writer = user_context("writer", groups=["writers"], is_admin=False)
+
+        with vault_runtime() as ctx:
+            with ctx.db() as db:
+                vault_root = get_root_folder(db, "vault")
+                archive_root = get_root_folder(db, "archive")
+                writers = VaultGroup(name="writers")
+                db.add(writers)
+                db.flush()
+                add_permission(db, vault_root, writers, write=True)
+                add_permission(db, archive_root, writers, write=True)
+
+                project = get_or_create_folder_path(db, "Project")
+                doc = create_versioned_document(db, project, actor=admin)
+                db.add(
+                    DocumentLock(
+                        document_id=doc.id,
+                        locked_by="editor",
+                        locked_by_name="Editor",
+                    ),
+                )
+                db.commit()
+                project_id = project.id
+                doc_id = doc.id
+
+                with self.assertRaises(HTTPException) as raised:
+                    archive_folder_item(project, FAKE_REQUEST, writer, db)
+
+                self.assertEqual(raised.exception.status_code, 403)
+                self.assertEqual(raised.exception.detail, "Document is locked by another user")
+                db.rollback()
+
+            with ctx.db() as db:
+                doc = db.get(Document, doc_id)
+                self.assertIsNotNone(doc)
+                self.assertEqual(doc.folder.root_key, "vault")
+                self.assertEqual(doc.folder_id, project_id)
                 active_locks = db.query(DocumentLock).filter_by(
                     document_id=doc_id,
                     is_active=True,

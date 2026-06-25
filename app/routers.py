@@ -1221,6 +1221,10 @@ def current_version(doc: Document, db: Session) -> DocumentVersion | None:
         )
         if version:
             return version
+        raise HTTPException(
+            status_code=500,
+            detail="Current document version metadata is inconsistent",
+        )
     return (
         db.execute(
             select(DocumentVersion)

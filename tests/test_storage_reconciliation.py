@@ -5,6 +5,7 @@ from tests.support import create_versioned_document, user_context, vault_runtime
 
 from app.models import Blob, BlobLocation, DocumentVersion
 from app.routers import (
+    current_version,
     get_or_create_folder_path,
     read_version_bytes,
     storage_reconciliation_report,
@@ -13,6 +14,32 @@ from app.storage import get_storage_backend
 
 
 class StorageReconciliationTests(unittest.TestCase):
+    def test_current_version_rejects_missing_current_version_pointer(self) -> None:
+        user = user_context("user", groups=[])
+
+        with vault_runtime() as ctx, ctx.db() as db:
+            folder = get_or_create_folder_path(db, "")
+            doc = create_versioned_document(
+                db,
+                folder,
+                name="kept.txt",
+                data=b"trusted content",
+                actor=user,
+            )
+            db.commit()
+
+            doc.current_version_id = "missing-version"
+            db.commit()
+
+            with self.assertRaises(HTTPException) as raised:
+                current_version(doc, db)
+
+            self.assertEqual(raised.exception.status_code, 500)
+            self.assertEqual(
+                raised.exception.detail,
+                "Current document version metadata is inconsistent",
+            )
+
     def test_read_version_rejects_corrupt_local_object(self) -> None:
         user = user_context("user", groups=[])
         original = b"trusted content"

@@ -352,7 +352,7 @@ def get_root_folder(db: Session, root_key: str) -> Folder:
     root = Folder(root_key=root_key, parent_id=None, name=ROOT_NAMES[root_key], is_root=True)
     db.add(root)
     db.flush()
-    default_folder_permissions(db, root)
+    default_root_folder_permissions(db, root)
     return root
 
 
@@ -377,7 +377,7 @@ def access_level(can_view: bool, can_read: bool, can_write: bool) -> int:
     return 0
 
 
-def default_folder_permissions(db: Session, folder: Folder) -> None:
+def default_root_folder_permissions(db: Session, folder: Folder) -> None:
     if folder.id is None:
         db.flush()
     groups = list(db.execute(select(VaultGroup)).scalars().all())
@@ -591,7 +591,6 @@ def get_or_create_folder_path(db: Session, path: str | None) -> Folder:
             folder.parent = current
             db.add(folder)
             db.flush()
-            default_folder_permissions(db, folder)
         current = folder
     return current
 
@@ -3006,7 +3005,6 @@ def create_folder(
         )
         db.add(created)
         db.flush()
-        default_folder_permissions(db, created)
         record_folder_event(created, user, "create", f"Created {normalized}", db)
         record_folder_change(db, "created")
         db.commit()

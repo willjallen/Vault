@@ -134,9 +134,43 @@ class AclPermissionTests(unittest.TestCase):
                 result = asyncio.run(create_document(FAKE_REQUEST, Upload(), "Project", writer, db))
                 self.assertEqual(result["path"], "Project/writer.txt")
 
-    def test_created_folders_default_to_write_for_existing_groups_and_missing_acl_denies(
+    def test_created_folders_inherit_parent_acl_and_missing_acl_denies(
         self,
     ) -> None:
+        admin = user_context("admin", groups=["vault-admin"], is_admin=True)
+        writer = user_context("writer", groups=["writers"], is_admin=False)
+        outsider = user_context("outsider", groups=["outsiders"], is_admin=False)
+
+        with vault_runtime() as ctx:
+            with ctx.db() as db:
+                root = get_root_folder(db, "vault")
+                writers = VaultGroup(name="writers")
+                outsiders = VaultGroup(name="outsiders")
+                db.add_all([writers, outsiders])
+                db.flush()
+                add_permission(db, root, writers, write=True)
+
+                create_folder("Open", admin, db)
+                open_folder = db.query(Folder).filter_by(parent_id=root.id, name="Open").one()
+                rule_count = (
+                    db.query(FolderPermission)
+                    .filter_by(folder_id=open_folder.id, group_id=writers.id)
+                    .count()
+                )
+                self.assertEqual(rule_count, 0)
+
+                locked = Folder(root_key="vault", parent_id=root.id, name="Locked", is_root=False)
+                db.add(locked)
+                db.commit()
+
+            with ctx.db() as db:
+                open_payload = build_contents_payload(db, "Open", writer)
+                self.assertEqual(open_payload["folder"], "Open")
+                with self.assertRaises(HTTPException) as raised:
+                    build_contents_payload(db, "Locked", outsider)
+                self.assertEqual(raised.exception.status_code, 404)
+
+    def test_new_child_folder_inherits_restricted_parent_acl(self) -> None:
         admin = user_context("admin", groups=["vault-admin"], is_admin=True)
         writer = user_context("writer", groups=["writers"], is_admin=False)
 
@@ -146,25 +180,28 @@ class AclPermissionTests(unittest.TestCase):
                 writers = VaultGroup(name="writers")
                 db.add(writers)
                 db.flush()
+                add_permission(db, root, writers, write=True)
 
-                create_folder("Open", admin, db)
-                open_folder = db.query(Folder).filter_by(parent_id=root.id, name="Open").one()
-                rule = (
-                    db.query(FolderPermission)
-                    .filter_by(folder_id=open_folder.id, group_id=writers.id)
-                    .one()
+                secret = get_or_create_folder_path(db, "Secret")
+                db.flush()
+                db.query(FolderPermission).filter_by(folder_id=secret.id).delete()
+                db.flush()
+                add_permission(db, secret, writers, view=False, read=False, write=False)
+
+                create_folder("Secret/Plans", admin, db)
+                plans = db.query(Folder).filter_by(parent_id=secret.id, name="Plans").one()
+                create_versioned_document(
+                    db,
+                    plans,
+                    name="roadmap.txt",
+                    data=b"secret roadmap",
+                    actor=admin,
                 )
-                self.assertTrue(rule.can_view)
-                self.assertTrue(rule.can_read)
-                self.assertTrue(rule.can_write)
-
-                locked = Folder(root_key="vault", parent_id=root.id, name="Locked", is_root=False)
-                db.add(locked)
                 db.commit()
 
             with ctx.db() as db:
                 with self.assertRaises(HTTPException) as raised:
-                    build_contents_payload(db, "Locked", writer)
+                    build_contents_payload(db, "Secret/Plans", writer)
                 self.assertEqual(raised.exception.status_code, 404)
 
 

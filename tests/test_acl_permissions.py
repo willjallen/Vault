@@ -14,6 +14,7 @@ from app.models import DocumentLock, Folder, FolderPermission, VaultGroup
 from app.routers import (
     ActionItem,
     ActionPayload,
+    archive_items,
     archive_doc_item,
     build_contents_payload,
     create_document,
@@ -204,6 +205,64 @@ class AclPermissionTests(unittest.TestCase):
             with ctx.db() as db:
                 with self.assertRaises(HTTPException) as raised:
                     build_contents_payload(db, "Secret/Plans", writer)
+                self.assertEqual(raised.exception.status_code, 404)
+
+    def test_failed_folder_archive_does_not_stamp_stale_source_acl(self) -> None:
+        admin = user_context("admin", groups=["vault-admin"], is_admin=True)
+        outsider = user_context("outsider", groups=["outsiders"], is_admin=False)
+
+        with vault_runtime() as ctx:
+            with ctx.db() as db:
+                vault_root = get_root_folder(db, "vault")
+                archive_root = get_root_folder(db, "archive")
+                outsiders = VaultGroup(name="outsiders")
+                db.add(outsiders)
+                db.flush()
+                add_permission(db, vault_root, outsiders, write=True)
+                add_permission(db, archive_root, outsiders, write=True)
+
+                secret = get_or_create_folder_path(db, "Secret")
+                plans = get_or_create_folder_path(db, "Secret/Plans")
+                create_versioned_document(
+                    db,
+                    plans,
+                    name="roadmap.txt",
+                    data=b"secret roadmap",
+                    actor=admin,
+                )
+
+                archive_conflict = get_or_create_folder_path(db, "Archive/Secret/Plans")
+                create_versioned_document(
+                    db,
+                    archive_conflict,
+                    name="existing.txt",
+                    data=b"existing archive content",
+                    actor=admin,
+                )
+                secret_id = secret.id
+                plans_id = plans.id
+                outsiders_id = outsiders.id
+                db.commit()
+
+                result = archive_items(
+                    ActionPayload(items=[ActionItem(type="folder", id=plans_id)]),
+                    FAKE_REQUEST,
+                    admin,
+                    db,
+                )
+                self.assertEqual(result["ok"], [])
+                self.assertEqual(len(result["failed"]), 1)
+
+                secret = db.get(Folder, secret_id)
+                outsiders = db.get(VaultGroup, outsiders_id)
+                db.query(FolderPermission).filter_by(folder_id=secret.id).delete()
+                db.flush()
+                add_permission(db, secret, outsiders, view=False, read=False, write=False)
+                db.commit()
+
+            with ctx.db() as db:
+                with self.assertRaises(HTTPException) as raised:
+                    build_contents_payload(db, "Secret/Plans", outsider)
                 self.assertEqual(raised.exception.status_code, 404)
 
     def test_archiving_restricted_document_preserves_folder_acl_in_archive(self) -> None:

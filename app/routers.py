@@ -3141,14 +3141,14 @@ def move_items(
     with storage_write_lock():
         for item in items:
             try:
-                if item.type == "document":
-                    doc = get_document_or_404(item.id or 0, db)
-                    moved = move_doc_item(doc, destination, request, user, db)
-                    result["ok"].append(action_result(item, moved))
-                else:
-                    folder_item = get_folder_for_action(item, db)
-                    moved = move_folder_item(folder_item, destination, user, db)
-                    result["ok"].append(action_result(item, moved))
+                with db.begin_nested():
+                    if item.type == "document":
+                        doc = get_document_or_404(item.id or 0, db)
+                        detail = move_doc_item(doc, destination, request, user, db)
+                    else:
+                        folder_item = get_folder_for_action(item, db)
+                        detail = move_folder_item(folder_item, destination, user, db)
+                result["ok"].append(action_result(item, detail))
                 changed = True
             except HTTPException as exc:
                 result["failed"].append(action_result(item, response_detail(exc)))
@@ -3174,38 +3174,38 @@ def rename_item(
     item = items[0]
     with storage_write_lock():
         try:
-            if item.type == "document":
-                doc = get_document_or_404(item.id or 0, db)
-                destination_folder = (
-                    normalize_folder(payload.destination_folder)
-                    if payload.destination_folder is not None
-                    else document_folder_path(doc)
-                )
-                renamed = move_doc_item(
-                    doc,
-                    destination_folder,
-                    request,
-                    user,
-                    db,
-                    name=payload.name,
-                )
-                result["ok"].append(action_result(item, renamed))
-            else:
-                folder_item = get_folder_for_action(item, db)
-                destination_folder = (
-                    normalize_folder(payload.destination_folder)
-                    if payload.destination_folder is not None
-                    else (folder_path(folder_item.parent) if folder_item.parent else "")
-                )
-                renamed = move_folder_item(
-                    folder_item,
-                    destination_folder,
-                    user,
-                    db,
-                    name=payload.name,
-                )
-                result["ok"].append(action_result(item, renamed))
-            batch_state_changed(db, "rename")
+            with db.begin_nested():
+                if item.type == "document":
+                    doc = get_document_or_404(item.id or 0, db)
+                    destination_folder = (
+                        normalize_folder(payload.destination_folder)
+                        if payload.destination_folder is not None
+                        else document_folder_path(doc)
+                    )
+                    detail = move_doc_item(
+                        doc,
+                        destination_folder,
+                        request,
+                        user,
+                        db,
+                        name=payload.name,
+                    )
+                else:
+                    folder_item = get_folder_for_action(item, db)
+                    destination_folder = (
+                        normalize_folder(payload.destination_folder)
+                        if payload.destination_folder is not None
+                        else (folder_path(folder_item.parent) if folder_item.parent else "")
+                    )
+                    detail = move_folder_item(
+                        folder_item,
+                        destination_folder,
+                        user,
+                        db,
+                        name=payload.name,
+                    )
+                batch_state_changed(db, "rename")
+            result["ok"].append(action_result(item, detail))
         except HTTPException as exc:
             result["failed"].append(action_result(item, response_detail(exc)))
         db.commit()
@@ -3225,13 +3225,14 @@ def archive_items(
     with storage_write_lock():
         for item in items:
             try:
-                if item.type == "document":
-                    doc = get_document_or_404(item.id or 0, db)
-                    archived = archive_doc_item(doc, request, user, db)
-                else:
-                    folder_item = get_folder_for_action(item, db)
-                    archived = archive_folder_item(folder_item, request, user, db)
-                result["ok"].append(action_result(item, archived))
+                with db.begin_nested():
+                    if item.type == "document":
+                        doc = get_document_or_404(item.id or 0, db)
+                        detail = archive_doc_item(doc, request, user, db)
+                    else:
+                        folder_item = get_folder_for_action(item, db)
+                        detail = archive_folder_item(folder_item, request, user, db)
+                result["ok"].append(action_result(item, detail))
                 changed = True
             except HTTPException as exc:
                 result["failed"].append(action_result(item, response_detail(exc)))
@@ -3254,13 +3255,14 @@ def restore_items(
     with storage_write_lock():
         for item in items:
             try:
-                if item.type == "document":
-                    doc = get_document_or_404(item.id or 0, db)
-                    restored = restore_doc_item(doc, request, user, db)
-                else:
-                    folder_item = get_folder_for_action(item, db)
-                    restored = restore_folder_item(folder_item, request, user, db)
-                result["ok"].append(action_result(item, restored))
+                with db.begin_nested():
+                    if item.type == "document":
+                        doc = get_document_or_404(item.id or 0, db)
+                        detail = restore_doc_item(doc, request, user, db)
+                    else:
+                        folder_item = get_folder_for_action(item, db)
+                        detail = restore_folder_item(folder_item, request, user, db)
+                result["ok"].append(action_result(item, detail))
                 changed = True
             except HTTPException as exc:
                 result["failed"].append(action_result(item, response_detail(exc)))
@@ -3284,34 +3286,35 @@ def delete_items_forever(
     with storage_write_lock():
         for item in items:
             try:
-                if item.type == "document":
-                    doc = get_document_or_404(item.id or 0, db)
-                    refresh_document_location(doc, db)
-                    if not user["is_admin"]:
-                        require_document_access(doc, user, db, 3)
-                    if not document_is_archive(doc):
-                        raise HTTPException(
-                            status_code=400,
-                            detail="Move the document to Archive before deleting",
-                        )
-                    deleted = document_path(doc)
-                    archive_folder = doc.folder
-                    db.delete(doc)
-                    prune_empty_archive_folders(db, archive_folder)
-                else:
-                    folder_item = get_folder_for_action(item, db)
-                    if folder_item.is_root or not folder_is_archive(folder_item):
-                        raise HTTPException(
-                            status_code=400,
-                            detail="Delete forever is only available in Archive",
-                        )
-                    if not user["is_admin"]:
-                        require_folder_access(folder_item, user, db, 3)
-                    deleted = folder_path(folder_item)
-                    archive_parent = folder_item.parent
-                    db.delete(folder_item)
-                    prune_empty_archive_folders(db, archive_parent)
-                result["ok"].append(action_result(item, deleted))
+                with db.begin_nested():
+                    if item.type == "document":
+                        doc = get_document_or_404(item.id or 0, db)
+                        refresh_document_location(doc, db)
+                        if not user["is_admin"]:
+                            require_document_access(doc, user, db, 3)
+                        if not document_is_archive(doc):
+                            raise HTTPException(
+                                status_code=400,
+                                detail="Move the document to Archive before deleting",
+                            )
+                        detail = document_path(doc)
+                        archive_folder = doc.folder
+                        db.delete(doc)
+                        prune_empty_archive_folders(db, archive_folder)
+                    else:
+                        folder_item = get_folder_for_action(item, db)
+                        if folder_item.is_root or not folder_is_archive(folder_item):
+                            raise HTTPException(
+                                status_code=400,
+                                detail="Delete forever is only available in Archive",
+                            )
+                        if not user["is_admin"]:
+                            require_folder_access(folder_item, user, db, 3)
+                        detail = folder_path(folder_item)
+                        archive_parent = folder_item.parent
+                        db.delete(folder_item)
+                        prune_empty_archive_folders(db, archive_parent)
+                result["ok"].append(action_result(item, detail))
                 changed = True
             except HTTPException as exc:
                 result["failed"].append(action_result(item, response_detail(exc)))
@@ -3334,23 +3337,25 @@ def lock_items(
     with storage_write_lock():
         for item in items:
             try:
-                if item.type != "document":
-                    raise HTTPException(status_code=400, detail="Only files can be locked")
-                doc = get_document_or_404(item.id or 0, db)
-                refresh_editable_document(doc, db)
-                require_document_access(doc, user, db, 3)
-                lock, created = acquire_document_lock(doc, user, client_meta(request), db)
-                if created:
-                    record_event(
-                        doc,
-                        user,
-                        "lock",
-                        f"Locked {document_path(doc)}",
-                        db,
-                        meta=client_meta(request),
-                        publish_state=False,
-                    )
-                result["ok"].append(action_result(item, lock.locked_by_name or lock.locked_by))
+                with db.begin_nested():
+                    if item.type != "document":
+                        raise HTTPException(status_code=400, detail="Only files can be locked")
+                    doc = get_document_or_404(item.id or 0, db)
+                    refresh_editable_document(doc, db)
+                    require_document_access(doc, user, db, 3)
+                    lock, created = acquire_document_lock(doc, user, client_meta(request), db)
+                    if created:
+                        record_event(
+                            doc,
+                            user,
+                            "lock",
+                            f"Locked {document_path(doc)}",
+                            db,
+                            meta=client_meta(request),
+                            publish_state=False,
+                        )
+                    detail = lock.locked_by_name or lock.locked_by
+                result["ok"].append(action_result(item, detail))
                 changed = True
             except HTTPException as exc:
                 result["failed"].append(action_result(item, response_detail(exc)))
@@ -3373,22 +3378,24 @@ def unlock_items(
     with storage_write_lock():
         for item in items:
             try:
-                if item.type != "document":
-                    raise HTTPException(status_code=400, detail="Only files can be unlocked")
-                doc = get_document_or_404(item.id or 0, db)
-                require_document_access(doc, user, db, 3)
-                lock = get_active_lock(doc, db)
-                release_lock(lock, user)
-                record_event(
-                    doc,
-                    user,
-                    "release",
-                    f"Released lock for {document_path(doc)}",
-                    db,
-                    meta=client_meta(request),
-                    publish_state=False,
-                )
-                result["ok"].append(action_result(item, "Unlocked"))
+                with db.begin_nested():
+                    if item.type != "document":
+                        raise HTTPException(status_code=400, detail="Only files can be unlocked")
+                    doc = get_document_or_404(item.id or 0, db)
+                    require_document_access(doc, user, db, 3)
+                    lock = get_active_lock(doc, db)
+                    release_lock(lock, user)
+                    record_event(
+                        doc,
+                        user,
+                        "release",
+                        f"Released lock for {document_path(doc)}",
+                        db,
+                        meta=client_meta(request),
+                        publish_state=False,
+                    )
+                    detail = "Unlocked"
+                result["ok"].append(action_result(item, detail))
                 changed = True
             except HTTPException as exc:
                 result["failed"].append(action_result(item, response_detail(exc)))

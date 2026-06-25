@@ -1,9 +1,15 @@
 import unittest
 
-from tests.support import FAKE_REQUEST, create_versioned_document, user_context, vault_runtime
+from tests.support import (
+    FAKE_REQUEST,
+    add_permission,
+    create_versioned_document,
+    user_context,
+    vault_runtime,
+)
 
 from app.db import SessionLocal
-from app.models import Blob, Document, DocumentEvent, DocumentVersion
+from app.models import Blob, Document, DocumentEvent, DocumentLock, DocumentVersion, VaultGroup
 from app.routers import (
     ActionItem,
     ActionPayload,
@@ -13,14 +19,117 @@ from app.routers import (
     get_document_or_404,
     get_folder_by_path,
     get_or_create_folder_path,
+    get_root_folder,
     restore_doc_item,
     restore_folder_item,
     storage_reconciliation_report,
 )
+from app.site_settings import merge_site_settings
 from app.storage import get_storage_backend
 
 
 class DeleteStaleStateTests(unittest.TestCase):
+    def test_delete_forever_rejects_document_locked_by_other_user(self) -> None:
+        admin = user_context("admin", groups=["vault-admin"], is_admin=True)
+        writer = user_context("writer", groups=["writers"], is_admin=False)
+
+        with vault_runtime() as ctx:
+            with ctx.db() as db:
+                vault_root = get_root_folder(db, "vault")
+                archive_root = get_root_folder(db, "archive")
+                writers = VaultGroup(name="writers")
+                db.add(writers)
+                db.flush()
+                add_permission(db, vault_root, writers, write=True)
+                add_permission(db, archive_root, writers, write=True)
+                merge_site_settings(db, {"archivePermanentDeleteAdminOnly": False})
+
+                folder = get_or_create_folder_path(db, "Project")
+                doc = create_versioned_document(db, folder, actor=admin)
+                archive_doc_item(doc, FAKE_REQUEST, admin, db)
+                db.add(
+                    DocumentLock(
+                        document_id=doc.id,
+                        locked_by="editor",
+                        locked_by_name="Editor",
+                    ),
+                )
+                db.commit()
+                doc_id = doc.id
+
+                result = delete_items_forever(
+                    ActionPayload(items=[ActionItem(type="document", id=doc_id)]),
+                    writer,
+                    db,
+                )
+
+                self.assertEqual(result["ok"], [])
+                self.assertEqual(
+                    result["failed"][0]["detail"],
+                    "Document is locked by another user",
+                )
+
+            with ctx.db() as db:
+                doc = db.get(Document, doc_id)
+                self.assertIsNotNone(doc)
+                self.assertEqual(doc.folder.root_key, "archive")
+                active_locks = db.query(DocumentLock).filter_by(
+                    document_id=doc_id,
+                    is_active=True,
+                )
+                self.assertEqual(active_locks.count(), 1)
+                self.assertEqual(db.query(DocumentVersion).filter_by(document_id=doc_id).count(), 1)
+
+    def test_delete_forever_rejects_folder_with_descendant_lock_by_other_user(self) -> None:
+        admin = user_context("admin", groups=["vault-admin"], is_admin=True)
+        writer = user_context("writer", groups=["writers"], is_admin=False)
+
+        with vault_runtime() as ctx:
+            with ctx.db() as db:
+                vault_root = get_root_folder(db, "vault")
+                archive_root = get_root_folder(db, "archive")
+                writers = VaultGroup(name="writers")
+                db.add(writers)
+                db.flush()
+                add_permission(db, vault_root, writers, write=True)
+                add_permission(db, archive_root, writers, write=True)
+                merge_site_settings(db, {"archivePermanentDeleteAdminOnly": False})
+
+                folder = get_or_create_folder_path(db, "Project")
+                doc = create_versioned_document(db, folder, actor=admin)
+                archive_folder_item(folder, FAKE_REQUEST, admin, db)
+                db.add(
+                    DocumentLock(
+                        document_id=doc.id,
+                        locked_by="editor",
+                        locked_by_name="Editor",
+                    ),
+                )
+                db.commit()
+                folder_id = folder.id
+                doc_id = doc.id
+
+                result = delete_items_forever(
+                    ActionPayload(items=[ActionItem(type="folder", path="Archive/Project")]),
+                    writer,
+                    db,
+                )
+
+                self.assertEqual(result["ok"], [])
+                self.assertEqual(
+                    result["failed"][0]["detail"],
+                    "Document is locked by another user",
+                )
+
+            with ctx.db() as db:
+                self.assertIsNotNone(db.get(Document, doc_id))
+                self.assertEqual(get_folder_by_path(db, "Archive/Project").id, folder_id)
+                active_locks = db.query(DocumentLock).filter_by(
+                    document_id=doc_id,
+                    is_active=True,
+                )
+                self.assertEqual(active_locks.count(), 1)
+
     def test_stale_archive_delete_cannot_permanently_delete_restored_document(self) -> None:
         admin = user_context("alice", groups=["vault-admin"])
 

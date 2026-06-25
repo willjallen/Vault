@@ -3550,6 +3550,7 @@ def delete_items_forever(
                                 status_code=400,
                                 detail="Move the document to Archive before deleting",
                             )
+                        ensure_not_locked_by_other(doc, user, db)
                         detail = document_path(doc)
                         archive_folder = doc.folder
                         db.delete(doc)
@@ -3563,6 +3564,7 @@ def delete_items_forever(
                             )
                         if not user["is_admin"]:
                             require_folder_subtree_access(folder_item, user, db, 3)
+                        docs_in_unlocked_folder_subtree(db, folder_item, user)
                         detail = folder_path(folder_item)
                         archive_parent = folder_item.parent
                         db.delete(folder_item)

@@ -886,6 +886,18 @@ def docs_in_folder_subtree(db: Session, root: Folder) -> list[Document]:
     return list(db.execute(select(Document).where(Document.folder_id.in_(ids))).scalars().all())
 
 
+def readable_docs_in_folder_subtree(
+    db: Session,
+    root: Folder,
+    user: UserContext,
+) -> list[Document]:
+    return [
+        doc
+        for doc in docs_in_folder_subtree(db, root)
+        if document_access_level(doc, user, db) >= 2
+    ]
+
+
 def docs_in_unlocked_folder_subtree(db: Session, root: Folder, user: UserContext) -> list[Document]:
     docs = docs_in_folder_subtree(db, root)
     for doc in docs:
@@ -3447,7 +3459,7 @@ def download_items(
         else:
             folder_item = get_folder_for_action(item, db)
             require_folder_access(folder_item, user, db, 2)
-            docs_to_download.extend(docs_in_folder_subtree(db, folder_item))
+            docs_to_download.extend(readable_docs_in_folder_subtree(db, folder_item, user))
     unique_docs = list({doc.id: doc for doc in docs_to_download}.values())
     for doc in unique_docs:
         require_document_access(doc, user, db, 2)

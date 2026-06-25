@@ -1,5 +1,7 @@
 import asyncio
+import io
 import unittest
+import zipfile
 
 from fastapi import HTTPException
 from tests.support import (
@@ -139,6 +141,54 @@ class AclPermissionTests(unittest.TestCase):
 
                 result = asyncio.run(create_document(FAKE_REQUEST, Upload(), "Project", writer, db))
                 self.assertEqual(result["path"], "Project/writer.txt")
+
+    def test_folder_download_excludes_inaccessible_descendants(self) -> None:
+        admin = user_context("admin", groups=["vault-admin"], is_admin=True)
+        reader = user_context("reader", groups=["readers"], is_admin=False)
+
+        with vault_runtime() as ctx:
+            with ctx.db() as db:
+                root = get_root_folder(db, "vault")
+                readers = VaultGroup(name="readers")
+                confidential = VaultGroup(name="confidential")
+                db.add_all([readers, confidential])
+                db.flush()
+                add_permission(db, root, readers)
+
+                project = get_or_create_folder_path(db, "Project")
+                private = get_or_create_folder_path(db, "Project/Private")
+                db.flush()
+                add_permission(db, project, readers)
+                add_permission(db, private, confidential)
+
+                create_versioned_document(
+                    db,
+                    project,
+                    name="visible.txt",
+                    data=b"visible",
+                    actor=admin,
+                )
+                create_versioned_document(
+                    db,
+                    private,
+                    name="secret.txt",
+                    data=b"secret",
+                    actor=admin,
+                )
+                project_id = project.id
+                db.commit()
+
+            with ctx.db() as db:
+                response = download_items(
+                    ActionPayload(items=[ActionItem(type="folder", id=project_id)]),
+                    FAKE_REQUEST,
+                    reader,
+                    db,
+                )
+
+            with zipfile.ZipFile(io.BytesIO(response.body)) as archive:
+                self.assertEqual(archive.namelist(), ["Project/visible.txt"])
+                self.assertEqual(archive.read("Project/visible.txt"), b"visible")
 
     def test_created_folders_inherit_parent_acl_and_missing_acl_denies(
         self,

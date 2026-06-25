@@ -1,10 +1,19 @@
 import datetime as dt
 import unittest
 
-from tests.support import add_permission, auth_headers, create_versioned_document, vault_test_client
+from fastapi import HTTPException
+from tests.support import (
+    add_permission,
+    auth_headers,
+    create_versioned_document,
+    user_context,
+    vault_runtime,
+    vault_test_client,
+)
 
+from app.db import SessionLocal
 from app.models import Document, Folder, ShareLink, VaultGroup
-from app.routers import get_root_folder, now_utc
+from app.routers import get_root_folder, now_utc, resolved_share_payload
 
 
 def create_child_folder(db, root: Folder, name: str) -> Folder:
@@ -241,6 +250,63 @@ class ShareLinkTests(unittest.TestCase):
             )
             self.assertEqual(resolved.status_code, 200, resolved.text)
             self.assertEqual(resolved.json()["folder_item"]["size_bytes"], len(b"ok"))
+
+    def test_document_share_resolution_refreshes_stale_document_location(self) -> None:
+        artist = user_context("artist", groups=["artists"], is_admin=False)
+
+        with vault_runtime():
+            with SessionLocal() as db:
+                root = get_root_folder(db, "vault")
+                project = create_child_folder(db, root, "Project")
+                secret = create_child_folder(db, root, "Secret")
+
+                artists = VaultGroup(name="artists")
+                confidential = VaultGroup(name="confidential")
+                db.add_all([artists, confidential])
+                db.flush()
+                add_permission(db, root, artists)
+                add_permission(db, project, artists)
+                add_permission(db, secret, confidential)
+
+                doc = create_versioned_document(
+                    db,
+                    project,
+                    name="brief.txt",
+                    data=b"visible before move",
+                )
+                link = ShareLink(
+                    code="stale-doc",
+                    target_type="document",
+                    document_id=doc.id,
+                    created_by="admin",
+                    created_by_name="Admin",
+                )
+                db.add(link)
+                db.commit()
+                doc_id = doc.id
+                link_id = link.id
+                secret_id = secret.id
+
+            stale_db = SessionLocal()
+            try:
+                stale_link = stale_db.get(ShareLink, link_id)
+                self.assertIsNotNone(stale_link)
+                stale_doc = stale_db.get(Document, doc_id)
+                self.assertEqual(stale_doc.folder.name, "Project")
+
+                with SessionLocal() as move_db:
+                    moved_doc = move_db.get(Document, doc_id)
+                    secret = move_db.get(Folder, secret_id)
+                    moved_doc.folder = secret
+                    moved_doc.folder_id = secret.id
+                    move_db.commit()
+
+                with self.assertRaises(HTTPException) as raised:
+                    resolved_share_payload(stale_link, artist, stale_db)
+
+                self.assertEqual(raised.exception.status_code, 404)
+            finally:
+                stale_db.close()
 
     def test_deleted_targets_resolve_as_not_found(self) -> None:
         admin_headers = auth_headers("admin", ["vault-admin"])

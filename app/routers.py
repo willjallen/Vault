@@ -2473,9 +2473,7 @@ def resolved_share_payload(link: ShareLink, user: UserContext, db: Session) -> d
 
     path_cache = build_folder_path_cache(all_folders(db))
     if link.target_type == "document" and link.document_id is not None:
-        doc = db.get(Document, link.document_id)
-        if not doc:
-            raise HTTPException(status_code=404, detail="Document not found")
+        doc = get_document_or_404(link.document_id, db)
         require_document_access(doc, user, db, 1)
         return {
             "code": link.code,

@@ -15,7 +15,9 @@ from app.routers import (
     folder_path,
     get_folder_by_path,
     get_or_create_folder_path,
+    move_doc_item,
     move_folder_item,
+    move_items,
 )
 
 
@@ -93,6 +95,59 @@ class FolderStaleStateTests(unittest.TestCase):
                     [(folder.root_key, folder_path(folder)) for folder in folders],
                     [("vault", "Project")],
                 )
+
+    def test_batch_move_rechecks_document_pruning_after_waiting_for_write_lock(self) -> None:
+        user = user_context("alice")
+
+        with vault_runtime():
+            with SessionLocal() as db:
+                project = get_or_create_folder_path(db, "Project")
+                other = get_or_create_folder_path(db, "Other")
+                doc = create_versioned_document(db, other, actor=user)
+                db.commit()
+                project_id = project.id
+                doc_id = doc.id
+
+            original_lock = routers.storage_write_lock
+            state = {"moved": False}
+
+            @contextmanager
+            def move_doc_before_batch_body():
+                if not state["moved"]:
+                    with SessionLocal() as other_db:
+                        doc = other_db.get(Document, doc_id)
+                        self.assertIsNotNone(doc)
+                        move_doc_item(doc, "Project", FAKE_REQUEST, user, other_db)
+                        other_db.commit()
+                    state["moved"] = True
+                yield
+
+            routers.storage_write_lock = move_doc_before_batch_body
+            with SessionLocal() as db:
+                try:
+                    result = move_items(
+                        ActionPayload(
+                            items=[
+                                ActionItem(type="folder", id=project_id),
+                                ActionItem(type="document", id=doc_id),
+                            ],
+                            destination_folder="Dest",
+                        ),
+                        FAKE_REQUEST,
+                        user,
+                        db,
+                    )
+                    self.assertEqual(result["failed"], [])
+                    self.assertEqual(len(result["ok"]), 1)
+                    self.assertEqual(result["ok"][0]["item"]["type"], "folder")
+                finally:
+                    routers.storage_write_lock = original_lock
+                    db.rollback()
+
+            with SessionLocal() as db:
+                doc = db.get(Document, doc_id)
+                self.assertIsNotNone(doc)
+                self.assertEqual(document_path(doc), "Dest/Project/plan.txt")
 
 
 if __name__ == "__main__":

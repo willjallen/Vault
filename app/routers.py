@@ -1332,8 +1332,6 @@ def require_action_items(payload: ActionPayload) -> list[ActionItem]:
 
 
 def normalize_action_items(items: list[ActionItem], db: Session) -> list[NormalizedActionItem]:
-    folders: list[tuple[NormalizedActionItem, Folder]] = []
-    documents: list[tuple[NormalizedActionItem, Document]] = []
     seen: set[str] = set()
     normalized: list[NormalizedActionItem] = []
     for item in items:
@@ -1347,7 +1345,6 @@ def normalize_action_items(items: list[ActionItem], db: Session) -> list[Normali
             if key not in seen:
                 seen.add(key)
                 normalized.append(normalized_item)
-                documents.append((normalized_item, doc))
             continue
         if item_type == "folder":
             folder: Folder | None = None
@@ -1374,19 +1371,38 @@ def normalize_action_items(items: list[ActionItem], db: Session) -> list[Normali
             if key not in seen:
                 seen.add(key)
                 normalized.append(normalized_item)
-                folders.append((normalized_item, folder))
             continue
         raise HTTPException(status_code=400, detail="Invalid item type")
 
-    folder_paths = [folder_path(folder) for _, folder in folders]
+    return prune_nested_action_items(normalized, db)
+
+
+def prune_nested_action_items(
+    items: list[NormalizedActionItem],
+    db: Session,
+) -> list[NormalizedActionItem]:
+    current_folder_paths: dict[str, str] = {}
+    for item in items:
+        if item.type != "folder" or item.id is None:
+            continue
+        try:
+            folder = get_folder_by_id_or_404(item.id, db)
+        except HTTPException:
+            continue
+        current_folder_paths[item_label(item)] = folder_path(folder)
+    folder_paths = list(current_folder_paths.values())
     pruned: list[NormalizedActionItem] = []
-    for item in normalized:
+    for item in items:
         if item.type == "folder":
-            path = normalize_folder(item.path)
+            path = current_folder_paths.get(item_label(item), normalize_folder(item.path))
             if any(path != parent and path.startswith(f"{parent}/") for parent in folder_paths):
                 continue
         if item.type == "document":
-            doc = get_document_or_404(item.id or 0, db)
+            try:
+                doc = get_document_or_404(item.id or 0, db)
+            except HTTPException:
+                pruned.append(item)
+                continue
             doc_path = document_folder_path(doc)
             if any(
                 doc_path == parent or doc_path.startswith(f"{parent}/")
@@ -3431,6 +3447,7 @@ def move_items(
     result = bulk_result()
     changed = False
     with storage_write_lock():
+        items = prune_nested_action_items(items, db)
         for item in items:
             try:
                 with db.begin_nested():
@@ -3515,6 +3532,7 @@ def archive_items(
     result = bulk_result()
     changed = False
     with storage_write_lock():
+        items = prune_nested_action_items(items, db)
         for item in items:
             try:
                 with db.begin_nested():
@@ -3545,6 +3563,7 @@ def restore_items(
     result = bulk_result()
     changed = False
     with storage_write_lock():
+        items = prune_nested_action_items(items, db)
         for item in items:
             try:
                 with db.begin_nested():
@@ -3576,6 +3595,7 @@ def delete_items_forever(
     result = bulk_result()
     changed = False
     with storage_write_lock():
+        items = prune_nested_action_items(items, db)
         for item in items:
             try:
                 with db.begin_nested():

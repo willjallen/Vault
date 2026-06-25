@@ -22,6 +22,7 @@ from app.models import (
 from app.routers import (
     AdminGroupPayload,
     api_admin_delete_group,
+    api_admin_remove_group_member,
     api_admin_update_group,
     archive_doc_item,
     archive_folder_item,
@@ -353,6 +354,39 @@ class AdminSettingsTests(unittest.TestCase):
             self.assertEqual(raised.exception.detail, "At least one active admin is required")
             db.rollback()
             self.assertEqual(db.get(VaultGroup, group_id).name, "vault-admin")
+
+    def test_admin_cannot_remove_only_effective_admin_group_membership(self) -> None:
+        acting_admin = user_context("bob", groups=["vault-admin"], is_admin=True)
+
+        with vault_test_client() as ctx, ctx.db() as db:
+            admin_group = VaultGroup(name="vault-admin")
+            bob = VaultUser(
+                issuer="oidc",
+                subject="bob",
+                email="bob@example.com",
+                name="Bob",
+                is_admin=False,
+                is_active=True,
+            )
+            db.add_all([admin_group, bob])
+            db.flush()
+            db.add(VaultGroupMembership(user_id=bob.id, group_id=admin_group.id))
+            db.commit()
+            group_id = admin_group.id
+            user_id = bob.id
+
+            with self.assertRaises(HTTPException) as raised:
+                api_admin_remove_group_member(group_id, user_id, acting_admin, db)
+
+            self.assertEqual(raised.exception.status_code, 400)
+            self.assertEqual(raised.exception.detail, "At least one active admin is required")
+            db.rollback()
+            self.assertEqual(
+                db.query(VaultGroupMembership)
+                .filter_by(group_id=group_id, user_id=user_id)
+                .count(),
+                1,
+            )
 
 
 if __name__ == "__main__":

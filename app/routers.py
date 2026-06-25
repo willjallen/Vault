@@ -2210,6 +2210,8 @@ def group_names_by_user_after_group_change(
     deleted_group_id: int | None = None,
     renamed_group_id: int | None = None,
     renamed_group_name: str | None = None,
+    removed_membership_group_id: int | None = None,
+    removed_membership_user_id: int | None = None,
 ) -> dict[int, list[str]]:
     groups = list(db.execute(select(VaultGroup)).scalars().all())
     groups_by_id = {row.id: row for row in groups if row.id != deleted_group_id}
@@ -2217,6 +2219,11 @@ def group_names_by_user_after_group_change(
     memberships = list(db.execute(select(VaultGroupMembership)).scalars().all())
     for membership in memberships:
         if membership.group_id == deleted_group_id:
+            continue
+        if (
+            membership.group_id == removed_membership_group_id
+            and membership.user_id == removed_membership_user_id
+        ):
             continue
         if membership.group_id == renamed_group_id and renamed_group_name is not None:
             group_names_by_user[membership.user_id].append(renamed_group_name)
@@ -2245,6 +2252,20 @@ def ensure_group_rename_preserves_active_admin(
             db,
             renamed_group_id=group.id,
             renamed_group_name=name,
+        ),
+    )
+
+
+def ensure_group_membership_remove_preserves_active_admin(
+    db: Session,
+    membership: VaultGroupMembership,
+) -> None:
+    ensure_active_admin_for_group_names(
+        db,
+        group_names_by_user_after_group_change(
+            db,
+            removed_membership_group_id=membership.group_id,
+            removed_membership_user_id=membership.user_id,
         ),
     )
 
@@ -2990,6 +3011,7 @@ def api_admin_remove_group_member(
     )
     if not membership:
         raise HTTPException(status_code=404, detail="Membership not found")
+    ensure_group_membership_remove_preserves_active_admin(db, membership)
     db.delete(membership)
     return commit_admin_change(db, "group.member.removed")
 

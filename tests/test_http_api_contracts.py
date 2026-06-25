@@ -1,6 +1,6 @@
 import unittest
 
-from tests.support import add_permission, auth_headers, vault_test_client
+from tests.support import add_permission, auth_headers, create_versioned_document, vault_test_client
 
 from app.models import Document, Folder, VaultGroup
 from app.routers import (
@@ -170,6 +170,38 @@ class HttpApiContractTests(unittest.TestCase):
             self.assertIn('"current_folder": ""', root_with_query.text)
             self.assertNotIn('"current_folder": "Project"', root_with_query.text)
             self.assertNotIn("?folder=", root_with_query.text)
+
+    def test_folder_properties_hide_inaccessible_descendant_stats(self) -> None:
+        artist_headers = auth_headers("artist", ["artists"])
+
+        with vault_test_client() as ctx:
+            with ctx.db() as db:
+                root = get_root_folder(db, "vault")
+                project = create_child_folder(db, root, "Project")
+                private = create_child_folder(db, project, "Private")
+
+                artists = VaultGroup(name="artists")
+                confidential = VaultGroup(name="confidential")
+                db.add_all([artists, confidential])
+                db.flush()
+                add_permission(db, root, artists)
+                add_permission(db, project, artists)
+                add_permission(db, private, confidential)
+
+                create_versioned_document(db, private, name="secret.txt", data=b"secret")
+                db.commit()
+
+            properties = ctx.client.get(
+                "/api/folders/properties",
+                params={"path": "Project"},
+                headers=artist_headers,
+            )
+            self.assertEqual(properties.status_code, 200, properties.text)
+            payload = properties.json()
+            self.assertEqual(payload["counts"], {"folders": 0, "documents": 0})
+            self.assertEqual(payload["size_bytes"], 0)
+            self.assertIsNone(payload["latest_by"])
+            self.assertIsNone(payload["modified_at"])
 
 
 if __name__ == "__main__":

@@ -1831,16 +1831,30 @@ def folder_access_payload(folder: Folder, user: UserContext, db: Session) -> dic
     }
 
 
-def folder_counts_payload(folder: Folder, db: Session) -> dict[str, int]:
-    folder_ids = subtree_folder_ids(folder, all_folders(db))
-    document_count = (
-        db.execute(select(Document.id).where(Document.folder_id.in_(folder_ids))).all()
+def folder_counts_payload(
+    folder: Folder,
+    db: Session,
+    user: UserContext | None = None,
+) -> dict[str, int]:
+    folders = all_folders(db)
+    folder_ids = subtree_folder_ids(folder, folders)
+    visible_folder_ids = folder_ids
+    if user is not None:
+        visible_folder_ids = {
+            item.id
+            for item in folders
+            if item.id in folder_ids and folder_access_level(item, user, db) >= 1
+        }
+    docs = (
+        list(db.execute(select(Document).where(Document.folder_id.in_(folder_ids))).scalars().all())
         if folder_ids
         else []
     )
+    if user is not None:
+        docs = [doc for doc in docs if document_access_level(doc, user, db) >= 1]
     return {
-        "folders": max(len(folder_ids) - 1, 0),
-        "documents": len(document_count),
+        "folders": max(len(visible_folder_ids) - 1, 0),
+        "documents": len(docs),
     }
 
 
@@ -1867,11 +1881,17 @@ def folder_permissions_payload(folder: Folder, db: Session) -> list[dict[str, ob
     ]
 
 
-def folder_properties_payload(folder: Folder, db: Session) -> dict[str, object]:
+def folder_properties_payload(
+    folder: Folder,
+    db: Session,
+    user: UserContext | None = None,
+) -> dict[str, object]:
     folders = all_folders(db)
     path_cache = build_folder_path_cache(folders)
     path = folder_path(folder, path_cache)
     docs = list(db.execute(select(Document)).scalars().all())
+    if user is not None:
+        docs = [doc for doc in docs if document_access_level(doc, user, db) >= 1]
     stats = docs_stats_for_folder_payloads(docs, db, path_cache)
     summary = folder_summary_payload(folder, path, stats)
     events = (
@@ -1893,7 +1913,7 @@ def folder_properties_payload(folder: Folder, db: Session) -> dict[str, object]:
             "created_by": folder.created_by,
             "created_by_name": folder.created_by_name or folder.created_by or "System",
             **ttl_policy_payload(folder),
-            "counts": folder_counts_payload(folder, db),
+            "counts": folder_counts_payload(folder, db, user),
             "history": [
                 {
                     "id": event.id,
@@ -2993,7 +3013,7 @@ def api_folder_properties(
     if not folder:
         raise HTTPException(status_code=404, detail="Folder not found")
     require_folder_access(folder, user, db, 1)
-    return folder_properties_payload(folder, db)
+    return folder_properties_payload(folder, db, user)
 
 
 @router.patch("/api/folders/properties")
@@ -3013,7 +3033,7 @@ def api_update_folder_properties(
         record_folder_event(folder, user, "metadata", "Updated folder appearance", db)
         record_folder_change(db, "properties")
         commit_state(db)
-        return folder_properties_payload(folder, db)
+        return folder_properties_payload(folder, db, user)
 
 
 @router.put("/api/folders/retention")
@@ -3038,7 +3058,7 @@ def api_update_folder_retention(
         record_folder_event(folder, user, "retention", "Updated folder retention policy", db)
         record_folder_change(db, "retention", include_document_updates=True)
         commit_state(db)
-        return folder_properties_payload(folder, db)
+        return folder_properties_payload(folder, db, user)
 
 
 @router.put("/api/folders/permissions")
@@ -3083,7 +3103,7 @@ def api_update_folder_permissions(
         record_folder_event(folder, user, "permissions", "Updated folder permissions", db)
         record_folder_change(db, "permissions")
         commit_state(db)
-        return folder_properties_payload(folder, db)
+        return folder_properties_payload(folder, db, user)
 
 
 @router.get("/api/documents/{doc_id}/detail")

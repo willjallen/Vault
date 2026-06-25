@@ -194,7 +194,23 @@ def _vault_group_names(user_id: int, db: Session) -> list[str]:
     )
 
 
+def vault_user_is_effective_admin(
+    user: VaultUser,
+    db: Session,
+    group_names: set[str] | list[str] | tuple[str, ...] | None = None,
+) -> bool:
+    if user.is_admin:
+        return True
+    groups = (
+        {group.strip().lower() for group in group_names if group.strip()}
+        if group_names is not None
+        else set(_vault_group_names(user.id, db))
+    )
+    return _admin_hint(user.email, groups)
+
+
 def _context_for_user(user: VaultUser, db: Session) -> UserContext:
+    groups = _vault_group_names(user.id, db)
     return {
         "id": str(user.id),
         "vault_user_id": user.id,
@@ -202,8 +218,8 @@ def _context_for_user(user: VaultUser, db: Session) -> UserContext:
         "subject": user.subject,
         "name": user.name,
         "email": user.email or "",
-        "groups": _vault_group_names(user.id, db),
-        "is_admin": bool(user.is_admin),
+        "groups": groups,
+        "is_admin": vault_user_is_effective_admin(user, db, groups),
     }
 
 
@@ -288,7 +304,7 @@ def _upsert_vault_user(
             subject=subject,
             email=email,
             name=display_name,
-            is_admin=admin_hint,
+            is_admin=False,
             is_active=True,
             last_login_at=now if mark_login else None,
             last_seen_at=now,
@@ -302,8 +318,6 @@ def _upsert_vault_user(
         user.last_seen_at = now
         if mark_login:
             user.last_login_at = now
-        if admin_hint:
-            user.is_admin = True
     db.flush()
     if groups is not None:
         _sync_vault_groups(db, user, groups)

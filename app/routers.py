@@ -28,6 +28,7 @@ from .auth import (
     oidc_callback_response,
     oidc_login_response,
     require_admin,
+    vault_user_is_effective_admin,
 )
 from .config import AUTH_MODE, BASE_DOMAIN, SITE_NAME, TTL_SWEEP_INTERVAL_SECONDS
 from .db import SessionLocal, get_db
@@ -2131,7 +2132,11 @@ def build_admin_directory_payload(db: Session) -> dict[str, object]:
                 "subject": user.subject,
                 "email": user.email or "",
                 "name": user.name,
-                "is_admin": bool(user.is_admin),
+                "is_admin": vault_user_is_effective_admin(
+                    user,
+                    db,
+                    [groups_by_id[group_id].name for group_id in group_ids_by_user[user.id]],
+                ),
                 "is_active": bool(user.is_active),
                 "created_at": user.created_at.isoformat() if user.created_at else None,
                 "last_login_at": user.last_login_at.isoformat() if user.last_login_at else None,
@@ -2170,18 +2175,17 @@ def build_admin_directory_payload(db: Session) -> dict[str, object]:
 
 
 def ensure_not_last_active_admin(db: Session, target: VaultUser) -> None:
-    if not target.is_admin or not target.is_active:
+    if not target.is_active or not vault_user_is_effective_admin(target, db):
         return
-    active_admins = list(
-        db.execute(
-            select(VaultUser).where(
-                VaultUser.is_admin == True,  # noqa: E712
-                VaultUser.is_active == True,  # noqa: E712
-            ),
+    active_admins = [
+        user
+        for user in db.execute(
+            select(VaultUser).where(VaultUser.is_active == True),  # noqa: E712
         )
         .scalars()
-        .all(),
-    )
+        .all()
+        if vault_user_is_effective_admin(user, db)
+    ]
     if len(active_admins) == 1 and active_admins[0].id == target.id:
         raise HTTPException(status_code=400, detail="At least one active admin is required")
 

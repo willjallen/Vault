@@ -56,6 +56,35 @@ class AuthTests(unittest.TestCase):
         self.assertEqual(user["groups"], ["vault-admin", "vault-users"])
         self.assertTrue(user["is_admin"])
 
+    def test_header_admin_group_removal_revokes_admin_context(self) -> None:
+        admin_request = HeaderRequest(
+            {
+                "Remote-User": "alice",
+                "Remote-Name": "Alice Example",
+                "Remote-Email": "alice@example.com",
+                "Remote-Groups": "vault-users,vault-admin",
+            },
+        )
+        user_request = HeaderRequest(
+            {
+                "Remote-User": "alice",
+                "Remote-Name": "Alice Example",
+                "Remote-Email": "alice@example.com",
+                "Remote-Groups": "vault-users",
+            },
+        )
+
+        with vault_runtime(auth_mode="headers") as ctx, ctx.db() as db:
+            first_context = current_user(admin_request, db)
+            self.assertTrue(first_context["is_admin"])
+
+            second_context = current_user(user_request, db)
+
+            self.assertFalse(second_context["is_admin"])
+            self.assertEqual(second_context["groups"], ["vault-users"])
+            stored_user = db.query(VaultUser).filter_by(subject="alice").one()
+            self.assertFalse(stored_user.is_admin)
+
     def test_disabled_header_user_request_does_not_sync_groups_or_profile(self) -> None:
         request = HeaderRequest(
             {

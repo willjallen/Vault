@@ -137,17 +137,21 @@ def _schema_needs_reset() -> bool:
             if _index_signature(existing_index) != _model_index_signature(expected_index):
                 return True
         existing_unique_constraints = {
-            constraint["name"]
+            constraint["name"]: tuple(constraint.get("column_names") or [])
             for constraint in inspector.get_unique_constraints(table.name)
             if constraint.get("name")
         }
-        expected_unique_constraints = {
-            constraint.name
-            for constraint in table.constraints
-            if isinstance(constraint, UniqueConstraint) and constraint.name
-        }
-        if not expected_unique_constraints.issubset(existing_unique_constraints):
-            return True
+        for expected_constraint in table.constraints:
+            if not isinstance(expected_constraint, UniqueConstraint):
+                continue
+            if not expected_constraint.name:
+                continue
+            existing_columns = existing_unique_constraints.get(expected_constraint.name)
+            if existing_columns is None:
+                return True
+            expected_columns = tuple(column.name for column in expected_constraint.columns)
+            if existing_columns != expected_columns:
+                return True
         existing_foreign_keys = set()
         for foreign_key in inspector.get_foreign_keys(table.name):
             referred_table = foreign_key.get("referred_table")

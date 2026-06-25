@@ -3031,6 +3031,7 @@ def api_update_folder_retention(
         require_folder_access(folder, user, db, 3)
         if action == "delete" and not user["is_admin"]:
             raise HTTPException(status_code=403, detail="Admin access required for delete TTL")
+        require_folder_subtree_access(folder, user, db, 3)
         folder.default_ttl_days = days
         folder.default_ttl_action = action
         reapply_ttl_for_folder_subtree(folder, db)

@@ -4,6 +4,7 @@ import unittest
 
 from tests.support import (
     FAKE_REQUEST,
+    add_permission,
     auth_headers,
     create_versioned_document,
     user_context,
@@ -11,12 +12,13 @@ from tests.support import (
     vault_test_client,
 )
 
-from app.models import Document, DocumentLock, StateEvent
+from app.models import Document, DocumentLock, Folder, StateEvent, VaultGroup
 from app.routers import (
     apply_folder_ttl,
     checkin_document,
     folder_path,
     get_or_create_folder_path,
+    get_root_folder,
     move_doc_item,
     move_folder_item,
     normalize_timestamp,
@@ -260,6 +262,53 @@ class RetentionTtlTests(unittest.TestCase):
                 self.assertIsNotNone(doc)
                 self.assertIsNone(doc.expiry_action)
                 self.assertIsNone(doc.expires_at)
+
+    def test_retention_update_rejects_inaccessible_descendants(self) -> None:
+        writer_headers = auth_headers("writer", ["writers"])
+
+        with vault_test_client() as ctx:
+            with ctx.db() as db:
+                root = get_root_folder(db, "vault")
+                writers = VaultGroup(name="writers")
+                confidential = VaultGroup(name="confidential")
+                db.add_all([writers, confidential])
+                db.flush()
+                add_permission(db, root, writers, write=True)
+
+                project = get_or_create_folder_path(db, "Project")
+                private = get_or_create_folder_path(db, "Project/Private")
+                db.flush()
+                add_permission(db, project, writers, write=True)
+                add_permission(db, private, confidential, write=True)
+
+                secret = create_versioned_document(
+                    db,
+                    private,
+                    name="secret.txt",
+                    data=b"secret",
+                )
+                project_id = project.id
+                secret_id = secret.id
+                db.commit()
+
+            update = ctx.client.put(
+                "/api/folders/retention",
+                json={
+                    "path": "Project",
+                    "default_ttl_action": "archive",
+                    "default_ttl_days": 30,
+                },
+                headers=writer_headers,
+            )
+            self.assertEqual(update.status_code, 404, update.text)
+
+            with ctx.db() as db:
+                project = db.get(Folder, project_id)
+                secret = db.get(Document, secret_id)
+                self.assertIsNone(project.default_ttl_action)
+                self.assertIsNone(project.default_ttl_days)
+                self.assertIsNone(secret.expiry_action)
+                self.assertIsNone(secret.expires_at)
 
     def test_moving_folder_out_of_ttl_scope_recalculates_descendant_documents(self) -> None:
         admin = user_context("alice", groups=["vault-admin"])

@@ -504,6 +504,26 @@ def mirror_folder_permission_chain(source: Folder, target: Folder, db: Session) 
         replace_folder_permissions_with_effective_access(source_folder, target_folder, db)
 
 
+def mirror_created_folder_permission_chain(
+    source: Folder,
+    target: Folder,
+    created_folders: list[Folder],
+    db: Session,
+) -> None:
+    created_ids = {folder.id for folder in created_folders}
+    if not created_ids:
+        return
+    source_chain = non_root_folder_chain(source)
+    target_chain = non_root_folder_chain(target)
+    if len(source_chain) != len(target_chain):
+        if target.id in created_ids:
+            replace_folder_permissions_with_effective_access(source, target, db)
+        return
+    for source_folder, target_folder in zip(source_chain, target_chain, strict=True):
+        if target_folder.id in created_ids:
+            replace_folder_permissions_with_effective_access(source_folder, target_folder, db)
+
+
 def document_access_level(doc: Document, user: UserContext, db: Session) -> int:
     return folder_access_level(doc.folder, user, db)
 
@@ -644,11 +664,15 @@ def get_folder_by_path(db: Session, path: str | None) -> Folder | None:
     return current
 
 
-def get_or_create_folder_path(db: Session, path: str | None) -> Folder:
+def get_or_create_folder_path_with_created(
+    db: Session,
+    path: str | None,
+) -> tuple[Folder, list[Folder]]:
     ref = parse_public_folder_path(path)
     current = get_root_folder(db, ref.root_key)
+    created: list[Folder] = []
     if not ref.relative_path:
-        return current
+        return current, created
     for part in ref.relative_path.split("/"):
         folder = find_child_folder(db, current.id, part)
         if not folder:
@@ -661,8 +685,14 @@ def get_or_create_folder_path(db: Session, path: str | None) -> Folder:
             folder.parent = current
             db.add(folder)
             db.flush()
+            created.append(folder)
         current = folder
-    return current
+    return current, created
+
+
+def get_or_create_folder_path(db: Session, path: str | None) -> Folder:
+    folder, _created = get_or_create_folder_path_with_created(db, path)
+    return folder
 
 
 def sanitize_folder_color(value: str | None) -> str | None:
@@ -1343,8 +1373,8 @@ def restore_doc_item(doc: Document, request: Request, user: UserContext, db: Ses
     archive_folder = doc.folder
     target_folder_path = folder_relative_path(doc.folder)
     require_write_for_folder_path(db, target_folder_path, user)
-    target_folder = get_or_create_folder_path(db, target_folder_path)
-    mirror_folder_permission_chain(doc.folder, target_folder, db)
+    target_folder, created_folders = get_or_create_folder_path_with_created(db, target_folder_path)
+    mirror_created_folder_permission_chain(doc.folder, target_folder, created_folders, db)
     mutate_doc_location(
         doc,
         target_folder,
@@ -1407,10 +1437,13 @@ def restore_folder_item(source: Folder, request: Request, user: UserContext, db:
     source_path = folder_path(source)
     target_path = folder_relative_path(source)
     require_write_for_folder_path(db, "/".join(target_path.split("/")[:-1]), user)
-    target_parent = get_or_create_folder_path(db, "/".join(target_path.split("/")[:-1]))
+    target_parent, created_parents = get_or_create_folder_path_with_created(
+        db,
+        "/".join(target_path.split("/")[:-1]),
+    )
     target_name = normalize_item_name(target_path.split("/")[-1], "Folder name")
-    if source.parent and not source.parent.is_root and target_parent is not None:
-        mirror_folder_permission_chain(source.parent, target_parent, db)
+    if source.parent and not source.parent.is_root:
+        mirror_created_folder_permission_chain(source.parent, target_parent, created_parents, db)
     replace_folder_permissions_with_effective_access(source, source, db)
     remove_empty_folder_conflict(db, target_parent.id, target_name, source.id)
     ensure_unique_folder_name(db, target_parent.id, target_name, source.id)

@@ -21,6 +21,7 @@ from app.routers import (
     download_items,
     get_or_create_folder_path,
     get_root_folder,
+    restore_doc_item,
     unlock_items,
 )
 
@@ -238,6 +239,42 @@ class AclPermissionTests(unittest.TestCase):
             with ctx.db() as db:
                 with self.assertRaises(HTTPException) as raised:
                     build_contents_payload(db, "Archive/Secret", outsider)
+                self.assertEqual(raised.exception.status_code, 404)
+
+    def test_restoring_document_does_not_overwrite_current_vault_folder_acl(self) -> None:
+        admin = user_context("admin", groups=["vault-admin"], is_admin=True)
+        outsider = user_context("outsider", groups=["outsiders"], is_admin=False)
+
+        with vault_runtime() as ctx:
+            with ctx.db() as db:
+                vault_root = get_root_folder(db, "vault")
+                archive_root = get_root_folder(db, "archive")
+                outsiders = VaultGroup(name="outsiders")
+                db.add(outsiders)
+                db.flush()
+                add_permission(db, vault_root, outsiders, write=True)
+                add_permission(db, archive_root, outsiders, write=True)
+
+                secret = get_or_create_folder_path(db, "Secret")
+                doc = create_versioned_document(
+                    db,
+                    secret,
+                    name="roadmap.txt",
+                    data=b"secret roadmap",
+                    actor=admin,
+                )
+                archive_doc_item(doc, FAKE_REQUEST, admin, db)
+
+                db.query(FolderPermission).filter_by(folder_id=secret.id).delete()
+                db.flush()
+                add_permission(db, secret, outsiders, view=False, read=False, write=False)
+
+                restore_doc_item(doc, FAKE_REQUEST, admin, db)
+                db.commit()
+
+            with ctx.db() as db:
+                with self.assertRaises(HTTPException) as raised:
+                    build_contents_payload(db, "Secret", outsider)
                 self.assertEqual(raised.exception.status_code, 404)
 
 

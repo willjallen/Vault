@@ -1,11 +1,20 @@
+import asyncio
 import datetime as dt
 import unittest
 
-from tests.support import FAKE_REQUEST, auth_headers, user_context, vault_runtime, vault_test_client
+from tests.support import (
+    FAKE_REQUEST,
+    auth_headers,
+    create_versioned_document,
+    user_context,
+    vault_runtime,
+    vault_test_client,
+)
 
 from app.models import Document, DocumentLock, StateEvent
 from app.routers import (
     apply_folder_ttl,
+    checkin_document,
     folder_path,
     get_or_create_folder_path,
     move_doc_item,
@@ -355,6 +364,69 @@ class RetentionTtlTests(unittest.TestCase):
                 doc = db.get(Document, doc_id)
                 self.assertIsNotNone(doc)
                 self.assertEqual(doc.name, "draft-renamed.txt")
+                self.assertEqual(doc.expiry_action, "delete")
+
+    def test_checkin_refreshes_delete_ttl_from_new_version_time(self) -> None:
+        user = user_context("alice", groups=["vault-admin"])
+
+        class Upload:
+            filename = "draft.txt"
+            content_type = "text/plain"
+
+            async def read(self) -> bytes:
+                return b"fresh content"
+
+        with vault_runtime() as ctx:
+            with ctx.db() as db:
+                folder = get_or_create_folder_path(db, "Temp")
+                folder.default_ttl_days = 7
+                folder.default_ttl_action = "delete"
+                doc = create_versioned_document(
+                    db,
+                    folder,
+                    name="draft.txt",
+                    data=b"old content",
+                    actor=user,
+                    committed_at=now_utc() - dt.timedelta(days=30),
+                )
+                apply_folder_ttl(doc, folder, doc.latest_modified_at)
+                self.assertLessEqual(normalize_timestamp(doc.expires_at), now_utc())
+                db.add(
+                    DocumentLock(
+                        document_id=doc.id,
+                        locked_by=str(user["id"]),
+                        locked_by_name=str(user["name"]),
+                    ),
+                )
+                db.commit()
+                doc_id = doc.id
+
+            with ctx.db() as db:
+                result = asyncio.run(
+                    checkin_document(
+                        doc_id,
+                        FAKE_REQUEST,
+                        Upload(),
+                        "new version",
+                        False,
+                        user,
+                        db,
+                    ),
+                )
+                self.assertEqual(result["path"], "Temp/draft.txt")
+                doc = db.get(Document, doc_id)
+                self.assertIsNotNone(doc)
+                self.assertGreater(
+                    normalize_timestamp(doc.expires_at),
+                    now_utc() + dt.timedelta(days=6),
+                )
+
+            result = sweep_expired_documents()
+            self.assertEqual(result["deleted"], [])
+
+            with ctx.db() as db:
+                doc = db.get(Document, doc_id)
+                self.assertIsNotNone(doc)
                 self.assertEqual(doc.expiry_action, "delete")
 
 

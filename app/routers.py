@@ -1031,6 +1031,7 @@ def create_document_version(
     doc.latest_modified_by = user["id"]
     doc.latest_version_number = version_number
     doc.version_count = max(doc.version_count or 0, version_number)
+    apply_folder_ttl(doc, doc.folder, timestamp)
     record_state_change(
         db,
         f"document.{created_via}",

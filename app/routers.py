@@ -2572,12 +2572,15 @@ def storage_reconciliation_report(db: Session, apply: bool = False) -> dict[str,
         db.execute(select(BlobLocation).where(BlobLocation.backend == "local")).scalars(),
     )
     known_local_keys = {location.object_key for location in local_locations}
-    try:
-        local_backend = get_storage_backend("local")
-        local_keys = set(local_backend.list_object_keys())
-    except StorageError:
-        local_keys = set()
+    local_backend = get_storage_backend("local")
+    local_keys = set(local_backend.list_object_keys())
     unreferenced_local_keys = sorted(local_keys - known_local_keys)
+    referenced_local_keys = {
+        location.object_key
+        for location in local_locations
+        if location.blob_id in referenced_blob_ids
+    }
+    missing_local_keys = sorted(referenced_local_keys - local_keys)
     orphan_local_keys = sorted(
         {
             location.object_key
@@ -2619,6 +2622,7 @@ def storage_reconciliation_report(db: Session, apply: bool = False) -> dict[str,
     return {
         "orphan_blob_ids": orphan_blob_ids,
         "unreferenced_local_keys": unreferenced_local_keys,
+        "missing_local_keys": missing_local_keys,
         "deleted_local_keys": sorted(
             set(unreferenced_local_keys) | set(orphan_local_keys),
         )

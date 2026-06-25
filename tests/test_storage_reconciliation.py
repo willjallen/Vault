@@ -8,6 +8,36 @@ from app.storage import get_storage_backend
 
 
 class StorageReconciliationTests(unittest.TestCase):
+    def test_report_flags_missing_referenced_local_object(self) -> None:
+        user = user_context("user", groups=[])
+
+        with vault_runtime() as ctx, ctx.db() as db:
+            folder = get_or_create_folder_path(db, "")
+            doc = create_versioned_document(
+                db,
+                folder,
+                name="kept.txt",
+                data=b"still referenced",
+                actor=user,
+            )
+            db.commit()
+
+            version = db.query(DocumentVersion).filter_by(document_id=doc.id).one()
+            location = (
+                db.query(BlobLocation)
+                .filter_by(blob_id=version.blob_id, backend="local")
+                .one()
+            )
+            object_key = location.object_key
+
+            get_storage_backend("local").delete_object(object_key)
+
+            report = storage_reconciliation_report(db, apply=False)
+
+            self.assertEqual(report["orphan_blob_ids"], [])
+            self.assertEqual(report["unreferenced_local_keys"], [])
+            self.assertEqual(report["missing_local_keys"], [object_key])
+
     def test_apply_removes_orphan_blob_metadata_and_local_object(self) -> None:
         user = user_context("user", groups=[])
 
@@ -31,15 +61,18 @@ class StorageReconciliationTests(unittest.TestCase):
             before = storage_reconciliation_report(db, apply=False)
             self.assertEqual(before["orphan_blob_ids"], [blob_id])
             self.assertEqual(before["unreferenced_local_keys"], [])
+            self.assertEqual(before["missing_local_keys"], [])
 
             applied = storage_reconciliation_report(db, apply=True)
             self.assertEqual(applied["orphan_blob_ids"], [blob_id])
+            self.assertEqual(applied["missing_local_keys"], [])
             self.assertTrue(applied["deleted_local_keys"])
             db.commit()
 
             after = storage_reconciliation_report(db, apply=False)
             self.assertEqual(after["orphan_blob_ids"], [])
             self.assertEqual(after["unreferenced_local_keys"], [])
+            self.assertEqual(after["missing_local_keys"], [])
             self.assertEqual(db.query(Blob).count(), 0)
             self.assertEqual(db.query(BlobLocation).count(), 0)
             self.assertEqual(db.query(DocumentVersion).count(), 0)
@@ -64,15 +97,18 @@ class StorageReconciliationTests(unittest.TestCase):
             before = storage_reconciliation_report(db, apply=False)
             self.assertEqual(before["orphan_blob_ids"], [blob_id])
             self.assertEqual(before["unreferenced_local_keys"], [])
+            self.assertEqual(before["missing_local_keys"], [])
 
             applied = storage_reconciliation_report(db, apply=True)
             self.assertEqual(applied["orphan_blob_ids"], [blob_id])
+            self.assertEqual(applied["missing_local_keys"], [])
             self.assertEqual(applied["deleted_local_keys"], [])
             db.commit()
 
             after = storage_reconciliation_report(db, apply=False)
             self.assertEqual(after["orphan_blob_ids"], [blob_id])
             self.assertEqual(after["unreferenced_local_keys"], [])
+            self.assertEqual(after["missing_local_keys"], [])
             self.assertEqual(db.query(Blob).count(), 1)
             location = db.query(BlobLocation).one()
             self.assertEqual(location.blob_id, blob_id)

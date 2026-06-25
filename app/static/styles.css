@@ -2526,6 +2526,11 @@ input[type="file"]::file-selector-button:hover {
   animation: notification-timebar var(--notification-duration, 4200ms) linear forwards;
 }
 
+.notification-row.phase-leaving .notification-timebar span {
+  width: 0;
+  animation: none;
+}
+
 .confirm-toast-layer {
   position: fixed;
   inset: 0;

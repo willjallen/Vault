@@ -2,6 +2,7 @@ import unittest
 
 from tests.support import (
     FAKE_REQUEST,
+    add_permission,
     auth_headers,
     create_versioned_document,
     user_context,
@@ -14,6 +15,7 @@ from app.routers import (
     archive_folder_item,
     get_folder_by_path,
     get_or_create_folder_path,
+    get_root_folder,
 )
 
 
@@ -234,6 +236,51 @@ class AdminSettingsTests(unittest.TestCase):
             )
             self.assertEqual(invalid.status_code, 400)
             self.assertEqual(invalid.json()["detail"], "Unknown setting: deleteAnything")
+
+    def test_admin_cannot_delete_group_used_by_folder_permissions(self) -> None:
+        admin_headers = auth_headers("admin", ["vault-admin"])
+        writer_headers = auth_headers("writer", ["writers"])
+
+        with vault_test_client() as ctx:
+            with ctx.db() as db:
+                root = get_root_folder(db, "vault")
+                writers = VaultGroup(name="writers")
+                confidential = VaultGroup(name="confidential")
+                db.add_all([writers, confidential])
+                db.flush()
+                add_permission(db, root, writers, write=True)
+
+                secret = get_or_create_folder_path(db, "Secret")
+                add_permission(db, secret, confidential, write=True)
+                confidential_id = confidential.id
+                db.commit()
+
+            hidden_before = ctx.client.get(
+                "/api/folders/contents",
+                params={"folder": "Secret"},
+                headers=writer_headers,
+            )
+            self.assertEqual(hidden_before.status_code, 404, hidden_before.text)
+
+            deleted = ctx.client.delete(
+                f"/api/admin/groups/{confidential_id}",
+                headers=admin_headers,
+            )
+            self.assertEqual(deleted.status_code, 400, deleted.text)
+
+            hidden_after = ctx.client.get(
+                "/api/folders/contents",
+                params={"folder": "Secret"},
+                headers=writer_headers,
+            )
+            self.assertEqual(hidden_after.status_code, 404, hidden_after.text)
+
+            with ctx.db() as db:
+                self.assertIsNotNone(db.get(VaultGroup, confidential_id))
+                self.assertEqual(
+                    db.query(FolderPermission).filter_by(group_id=confidential_id).count(),
+                    1,
+                )
 
 
 if __name__ == "__main__":

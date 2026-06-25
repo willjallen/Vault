@@ -2814,6 +2814,8 @@ def api_admin_delete_group(
     group = db.get(VaultGroup, group_id)
     if not group:
         raise HTTPException(status_code=404, detail="Group not found")
+    if db.execute(select(FolderPermission.id).where(FolderPermission.group_id == group.id)).first():
+        raise HTTPException(status_code=400, detail="Group is used by folder permissions")
     db.delete(group)
     return commit_admin_change(db, "group.deleted")
 

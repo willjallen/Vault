@@ -295,6 +295,8 @@ def _upsert_vault_user(
         )
         db.add(user)
     else:
+        if not user.is_active:
+            raise HTTPException(status_code=403, detail="User is disabled")
         user.email = email
         user.name = display_name
         user.last_seen_at = now
@@ -307,8 +309,6 @@ def _upsert_vault_user(
         _sync_vault_groups(db, user, groups)
     db.commit()
     db.refresh(user)
-    if not user.is_active:
-        raise HTTPException(status_code=403, detail="User is disabled")
     return user
 
 

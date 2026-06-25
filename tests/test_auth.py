@@ -7,7 +7,8 @@ from starlette.datastructures import Headers
 from tests.support import vault_runtime
 
 from app.auth import current_user
-from app.models import Folder, FolderPermission, VaultGroup
+from app.config import HEADER_AUTH_ISSUER
+from app.models import Folder, FolderPermission, VaultGroup, VaultGroupMembership, VaultUser
 
 
 class HeaderRequest:
@@ -54,6 +55,49 @@ class AuthTests(unittest.TestCase):
         self.assertEqual(user["email"], "alice@example.com")
         self.assertEqual(user["groups"], ["vault-admin", "vault-users"])
         self.assertTrue(user["is_admin"])
+
+    def test_disabled_header_user_request_does_not_sync_groups_or_profile(self) -> None:
+        request = HeaderRequest(
+            {
+                "Remote-User": "disabled",
+                "Remote-Name": "Updated Name",
+                "Remote-Email": "updated@example.com",
+                "Remote-Groups": "new-disabled-group",
+            },
+        )
+
+        with vault_runtime(auth_mode="headers") as ctx, ctx.db() as db:
+            user = VaultUser(
+                issuer=HEADER_AUTH_ISSUER,
+                subject="disabled",
+                email="old@example.com",
+                name="Disabled User",
+                is_active=False,
+            )
+            db.add(user)
+            db.commit()
+            user_id = user.id
+
+            with self.assertRaises(HTTPException) as raised:
+                current_user(request, db)
+
+            self.assertEqual(raised.exception.status_code, 403)
+            self.assertEqual(raised.exception.detail, "User is disabled")
+
+            db.expire_all()
+            disabled_user = db.get(VaultUser, user_id)
+            self.assertEqual(disabled_user.name, "Disabled User")
+            self.assertEqual(disabled_user.email, "old@example.com")
+            self.assertFalse(disabled_user.is_admin)
+            self.assertEqual(db.query(VaultGroup).filter_by(name="new-disabled-group").count(), 0)
+            self.assertEqual(db.query(VaultGroupMembership).count(), 0)
+            self.assertEqual(
+                db.query(FolderPermission)
+                .join(VaultGroup)
+                .filter(VaultGroup.name == "new-disabled-group")
+                .count(),
+                0,
+            )
 
     def test_dev_auth_requires_local_base_domain(self) -> None:
         with vault_runtime(auth_mode="dev") as ctx, ctx.db() as db:

@@ -1281,6 +1281,18 @@ def read_version_bytes(version: DocumentVersion) -> bytes:
     return data
 
 
+def read_authorized_version_bytes(
+    doc: Document,
+    version: DocumentVersion,
+    user: UserContext,
+    db: Session,
+) -> bytes:
+    data = read_version_bytes(version)
+    refresh_document_location(doc, db)
+    require_document_access(doc, user, db, 2)
+    return data
+
+
 def download_response(data: bytes, filename: str, mime_type: str | None = None) -> Response:
     safe_name = "".join(
         "_" if ord(char) < 32 or ord(char) == 127 else char
@@ -3738,70 +3750,74 @@ def download_items(
     user: UserContext = Depends(current_user),
     db: Session = Depends(get_db),
 ) -> Response:
-    items = normalize_action_items(require_action_items(payload), db)
-    docs_to_download: list[Document] = []
-    for item in items:
-        if item.type == "document":
-            doc = get_document_or_404(item.id or 0, db)
-            require_document_access(doc, user, db, 2)
-            docs_to_download.append(doc)
-        else:
-            folder_item = get_folder_for_action(item, db)
-            require_folder_access(folder_item, user, db, 2)
-            docs_to_download.extend(readable_docs_in_folder_subtree(db, folder_item, user))
-    unique_docs = list({doc.id: doc for doc in docs_to_download}.values())
-    for doc in unique_docs:
-        require_document_access(doc, user, db, 2)
-    if len(unique_docs) == 1 and len(items) == 1 and items[0].type == "document":
-        doc = unique_docs[0]
-        version = current_version(doc, db)
-        if not version:
-            raise HTTPException(status_code=404, detail="Document has no versions")
-        data = read_version_bytes(version)
-        record_event(
-            doc,
-            user,
-            "download",
-            f"Downloaded {document_path(doc)}",
-            db,
-            meta=client_meta(request),
-            publish_state=False,
-        )
-        record_state_change(db, "document.download", ("document_detail",))
-        db.commit()
-        return download_response(data, doc.name, version.mime_type)
-
-    buffer = io.BytesIO()
-    errors: list[str] = []
-    written: set[str] = set()
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+    with storage_write_lock():
+        items = normalize_action_items(require_action_items(payload), db)
+        docs_to_download: list[Document] = []
+        for item in items:
+            if item.type == "document":
+                doc = get_document_or_404(item.id or 0, db)
+                require_document_access(doc, user, db, 2)
+                docs_to_download.append(doc)
+            else:
+                folder_item = get_folder_for_action(item, db)
+                require_folder_access(folder_item, user, db, 2)
+                docs_to_download.extend(readable_docs_in_folder_subtree(db, folder_item, user))
+        unique_docs = list({doc.id: doc for doc in docs_to_download}.values())
         for doc in unique_docs:
-            archive_name = document_path(doc) or doc.name
-            if archive_name in written:
-                archive_name = f"{doc.id}-{archive_name}"
-            try:
-                version = current_version(doc, db)
-                if not version:
-                    raise HTTPException(status_code=404, detail="Document has no versions")
-                archive.writestr(archive_name, read_version_bytes(version))
-                written.add(archive_name)
-                record_event(
-                    doc,
-                    user,
-                    "download",
-                    f"Downloaded {document_path(doc)}",
-                    db,
-                    meta=client_meta(request),
-                    publish_state=False,
-                )
-            except HTTPException as exc:
-                errors.append(f"{archive_name}: {response_detail(exc)}")
-        if errors:
-            archive.writestr("vault-download-errors.txt", "\n".join(errors))
-    if written:
-        record_state_change(db, "document.download", ("document_detail",))
-    db.commit()
-    return download_response(buffer.getvalue(), "vault-download.zip", "application/zip")
+            require_document_access(doc, user, db, 2)
+        if len(unique_docs) == 1 and len(items) == 1 and items[0].type == "document":
+            doc = unique_docs[0]
+            version = current_version(doc, db)
+            if not version:
+                raise HTTPException(status_code=404, detail="Document has no versions")
+            data = read_authorized_version_bytes(doc, version, user, db)
+            record_event(
+                doc,
+                user,
+                "download",
+                f"Downloaded {document_path(doc)}",
+                db,
+                meta=client_meta(request),
+                publish_state=False,
+            )
+            record_state_change(db, "document.download", ("document_detail",))
+            db.commit()
+            return download_response(data, doc.name, version.mime_type)
+
+        buffer = io.BytesIO()
+        errors: list[str] = []
+        written: set[str] = set()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+            for doc in unique_docs:
+                archive_name = document_path(doc) or doc.name
+                if archive_name in written:
+                    archive_name = f"{doc.id}-{archive_name}"
+                try:
+                    version = current_version(doc, db)
+                    if not version:
+                        raise HTTPException(status_code=404, detail="Document has no versions")
+                    archive.writestr(
+                        archive_name,
+                        read_authorized_version_bytes(doc, version, user, db),
+                    )
+                    written.add(archive_name)
+                    record_event(
+                        doc,
+                        user,
+                        "download",
+                        f"Downloaded {document_path(doc)}",
+                        db,
+                        meta=client_meta(request),
+                        publish_state=False,
+                    )
+                except HTTPException as exc:
+                    errors.append(f"{archive_name}: {response_detail(exc)}")
+            if errors:
+                archive.writestr("vault-download-errors.txt", "\n".join(errors))
+        if written:
+            record_state_change(db, "document.download", ("document_detail",))
+        db.commit()
+        return download_response(buffer.getvalue(), "vault-download.zip", "application/zip")
 
 
 @router.post("/documents")
@@ -3956,18 +3972,19 @@ def download_version(
     user: UserContext = Depends(current_user),
     db: Session = Depends(get_db),
 ) -> Response:
-    doc = get_document_or_404(doc_id, db)
-    require_document_access(doc, user, db, 2)
-    version = get_version_or_404(doc, version_id, db)
-    data = read_version_bytes(version)
-    filename = version.original_filename or doc.name
-    record_event(
-        doc,
-        user,
-        "download",
-        f"Downloaded version v{version.version_number} of {document_path(doc)}",
-        db,
-        meta=client_meta(request),
-    )
-    db.commit()
-    return download_response(data, filename, version.mime_type)
+    with storage_write_lock():
+        doc = get_document_or_404(doc_id, db)
+        require_document_access(doc, user, db, 2)
+        version = get_version_or_404(doc, version_id, db)
+        data = read_authorized_version_bytes(doc, version, user, db)
+        filename = version.original_filename or doc.name
+        record_event(
+            doc,
+            user,
+            "download",
+            f"Downloaded version v{version.version_number} of {document_path(doc)}",
+            db,
+            meta=client_meta(request),
+        )
+        db.commit()
+        return download_response(data, filename, version.mime_type)

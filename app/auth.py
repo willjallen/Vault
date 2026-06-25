@@ -204,7 +204,11 @@ def vault_user_is_effective_admin(
     groups = (
         {group.strip().lower() for group in group_names if group.strip()}
         if group_names is not None
-        else set(_vault_group_names(user.id, db))
+        else {
+            group.strip().lower()
+            for group in _vault_group_names(user.id, db)
+            if group.strip()
+        }
     )
     return _admin_hint(user.email, groups)
 

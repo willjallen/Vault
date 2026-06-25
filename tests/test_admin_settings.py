@@ -21,8 +21,10 @@ from app.models import (
 )
 from app.routers import (
     AdminGroupPayload,
+    AdminUserUpdate,
     api_admin_delete_group,
     api_admin_remove_group_member,
+    api_admin_update_user,
     api_admin_update_group,
     archive_doc_item,
     archive_folder_item,
@@ -387,6 +389,38 @@ class AdminSettingsTests(unittest.TestCase):
                 .count(),
                 1,
             )
+
+    def test_last_admin_guard_normalizes_persisted_group_names(self) -> None:
+        acting_admin = user_context("bob", groups=["Vault-Admin"], is_admin=True)
+
+        with vault_test_client() as ctx, ctx.db() as db:
+            admin_group = VaultGroup(name="Vault-Admin")
+            bob = VaultUser(
+                issuer="oidc",
+                subject="bob",
+                email="bob@example.com",
+                name="Bob",
+                is_admin=False,
+                is_active=True,
+            )
+            db.add_all([admin_group, bob])
+            db.flush()
+            db.add(VaultGroupMembership(user_id=bob.id, group_id=admin_group.id))
+            db.commit()
+            user_id = bob.id
+
+            with self.assertRaises(HTTPException) as raised:
+                api_admin_update_user(
+                    user_id,
+                    AdminUserUpdate(is_active=False),
+                    acting_admin,
+                    db,
+                )
+
+            self.assertEqual(raised.exception.status_code, 400)
+            self.assertEqual(raised.exception.detail, "At least one active admin is required")
+            db.rollback()
+            self.assertTrue(db.get(VaultUser, user_id).is_active)
 
 
 if __name__ == "__main__":

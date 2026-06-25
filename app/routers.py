@@ -898,6 +898,17 @@ def readable_docs_in_folder_subtree(
     ]
 
 
+def require_folder_subtree_access(
+    root: Folder,
+    user: UserContext,
+    db: Session,
+    level: int,
+) -> None:
+    folder_ids = subtree_folder_ids(root, all_folders(db))
+    for folder in db.execute(select(Folder).where(Folder.id.in_(folder_ids))).scalars().all():
+        require_folder_access(folder, user, db, level)
+
+
 def docs_in_unlocked_folder_subtree(db: Session, root: Folder, user: UserContext) -> list[Document]:
     docs = docs_in_folder_subtree(db, root)
     for doc in docs:
@@ -1425,6 +1436,7 @@ def archive_folder_item(source: Folder, request: Request, user: UserContext, db:
     if folder_is_archive(source):
         raise HTTPException(status_code=400, detail="Folder is already archived")
     require_folder_access(source, user, db, 3)
+    require_folder_subtree_access(source, user, db, 3)
     source_path = folder_path(source)
     docs = docs_in_unlocked_folder_subtree(db, source, user)
     target_path = public_folder_path(ARCHIVE_ROOT_KEY, folder_relative_path(source))
@@ -1463,6 +1475,7 @@ def restore_folder_item(source: Folder, request: Request, user: UserContext, db:
     if source.is_root or not folder_is_archive(source):
         raise HTTPException(status_code=400, detail="Choose an archived folder to restore")
     require_folder_access(source, user, db, 3)
+    require_folder_subtree_access(source, user, db, 3)
     source_path = folder_path(source)
     docs = docs_in_unlocked_folder_subtree(db, source, user)
     target_path = folder_relative_path(source)
@@ -1556,6 +1569,7 @@ def move_folder_item(
         return source_path
     if target_path.startswith(f"{source_path}/"):
         raise HTTPException(status_code=400, detail="Cannot move a folder into itself")
+    require_folder_subtree_access(source, user, db, 3)
     docs_in_unlocked_folder_subtree(db, source, user)
     require_write_for_folder_path(db, destination_folder, user)
     target_parent = get_or_create_folder_path(db, destination_folder)
@@ -3346,7 +3360,7 @@ def delete_items_forever(
                                 detail="Delete forever is only available in Archive",
                             )
                         if not user["is_admin"]:
-                            require_folder_access(folder_item, user, db, 3)
+                            require_folder_subtree_access(folder_item, user, db, 3)
                         detail = folder_path(folder_item)
                         archive_parent = folder_item.parent
                         db.delete(folder_item)

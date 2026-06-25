@@ -12,7 +12,7 @@ from tests.support import (
     vault_runtime,
 )
 
-from app.models import DocumentLock, Folder, FolderPermission, VaultGroup
+from app.models import Document, DocumentLock, Folder, FolderPermission, VaultGroup
 from app.routers import (
     ActionItem,
     ActionPayload,
@@ -24,6 +24,7 @@ from app.routers import (
     build_contents_payload,
     create_document,
     create_folder,
+    document_path,
     download_items,
     get_or_create_folder_path,
     get_root_folder,
@@ -189,6 +190,58 @@ class AclPermissionTests(unittest.TestCase):
             with zipfile.ZipFile(io.BytesIO(response.body)) as archive:
                 self.assertEqual(archive.namelist(), ["Project/visible.txt"])
                 self.assertEqual(archive.read("Project/visible.txt"), b"visible")
+
+    def test_folder_archive_rejects_inaccessible_descendants(self) -> None:
+        admin = user_context("admin", groups=["vault-admin"], is_admin=True)
+        writer = user_context("writer", groups=["writers"], is_admin=False)
+
+        with vault_runtime() as ctx:
+            with ctx.db() as db:
+                vault_root = get_root_folder(db, "vault")
+                archive_root = get_root_folder(db, "archive")
+                writers = VaultGroup(name="writers")
+                confidential = VaultGroup(name="confidential")
+                db.add_all([writers, confidential])
+                db.flush()
+                add_permission(db, vault_root, writers, write=True)
+                add_permission(db, archive_root, writers, write=True)
+
+                project = get_or_create_folder_path(db, "Project")
+                private = get_or_create_folder_path(db, "Project/Private")
+                db.flush()
+                add_permission(db, project, writers, write=True)
+                add_permission(db, private, confidential, write=True)
+
+                create_versioned_document(
+                    db,
+                    project,
+                    name="visible.txt",
+                    data=b"visible",
+                    actor=admin,
+                )
+                secret = create_versioned_document(
+                    db,
+                    private,
+                    name="secret.txt",
+                    data=b"secret",
+                    actor=admin,
+                )
+                project_id = project.id
+                secret_id = secret.id
+                db.commit()
+
+                result = archive_items(
+                    ActionPayload(items=[ActionItem(type="folder", id=project_id)]),
+                    FAKE_REQUEST,
+                    writer,
+                    db,
+                )
+                self.assertEqual(result["ok"], [])
+                self.assertEqual(len(result["failed"]), 1)
+
+                db.expire_all()
+                secret = db.get(Document, secret_id)
+                self.assertEqual(document_path(secret), "Project/Private/secret.txt")
 
     def test_created_folders_inherit_parent_acl_and_missing_acl_denies(
         self,

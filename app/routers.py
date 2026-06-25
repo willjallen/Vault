@@ -833,9 +833,12 @@ def remove_empty_folder_conflict(
     parent_id: int,
     name: str,
     exclude_folder_id: int | None = None,
+    user: UserContext | None = None,
 ) -> None:
     existing = find_child_folder(db, parent_id, name)
     if existing and existing.id != exclude_folder_id and not folder_has_items(db, existing):
+        if user is not None:
+            require_folder_access(existing, user, db, 3)
         db.delete(existing)
         db.flush()
 
@@ -1446,9 +1449,9 @@ def archive_folder_item(source: Folder, request: Request, user: UserContext, db:
     target_name = normalize_item_name(target_path.split("/")[-1], "Folder name")
     if source.parent and not source.parent.is_root and target_parent is not None:
         mirror_folder_permission_chain(source.parent, target_parent, db)
-    replace_folder_permissions_with_effective_access(source, source, db)
-    remove_empty_folder_conflict(db, target_parent.id, target_name, source.id)
+    remove_empty_folder_conflict(db, target_parent.id, target_name, source.id, user)
     ensure_unique_folder_name(db, target_parent.id, target_name, source.id)
+    replace_folder_permissions_with_effective_access(source, source, db)
     meta = client_meta(request)
     for doc in docs:
         release_lock(get_active_lock(doc, db), user)
@@ -1488,9 +1491,9 @@ def restore_folder_item(source: Folder, request: Request, user: UserContext, db:
     target_name = normalize_item_name(target_path.split("/")[-1], "Folder name")
     if source.parent and not source.parent.is_root:
         mirror_created_folder_permission_chain(source.parent, target_parent, created_parents, db)
-    replace_folder_permissions_with_effective_access(source, source, db)
-    remove_empty_folder_conflict(db, target_parent.id, target_name, source.id)
+    remove_empty_folder_conflict(db, target_parent.id, target_name, source.id, user)
     ensure_unique_folder_name(db, target_parent.id, target_name, source.id)
+    replace_folder_permissions_with_effective_access(source, source, db)
     archive_parent = source.parent
     meta = client_meta(request)
     for doc in docs:

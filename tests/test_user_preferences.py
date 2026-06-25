@@ -1,8 +1,17 @@
 import unittest
 
-from tests.support import auth_headers, vault_test_client
+from tests.support import (
+    add_permission,
+    auth_headers,
+    create_versioned_document,
+    user_context,
+    vault_runtime,
+    vault_test_client,
+)
 
-from app.models import VaultUser
+from app.db import SessionLocal
+from app.models import Document, Folder, VaultGroup, VaultUser
+from app.routers import get_or_create_folder_path, get_root_folder, preferences_for_user
 
 
 class UserPreferenceTests(unittest.TestCase):
@@ -281,6 +290,106 @@ class UserPreferenceTests(unittest.TestCase):
             )
             self.assertEqual(new_contents.status_code, 200, new_contents.text)
             self.assertEqual(new_contents.json()["documents"][0]["name"], "crate.fbx")
+
+    def test_favorites_refresh_stale_folder_parent_before_access_filter(self) -> None:
+        reader = user_context("reader", groups=["readers"], is_admin=False)
+
+        with vault_runtime():
+            with SessionLocal() as db:
+                root = get_root_folder(db, "vault")
+                readers = VaultGroup(name="readers")
+                confidential = VaultGroup(name="confidential")
+                db.add_all([readers, confidential])
+                db.flush()
+                add_permission(db, root, readers)
+
+                project = get_or_create_folder_path(db, "Project")
+                secret = get_or_create_folder_path(db, "Secret")
+                db.flush()
+                add_permission(db, secret, confidential)
+                vault_user = VaultUser(
+                    issuer="test",
+                    subject="reader",
+                    email="reader@example.com",
+                    name="Reader",
+                    preferences={"favoriteItems": [{"type": "folder", "id": project.id}]},
+                )
+                db.add(vault_user)
+                db.commit()
+                reader["vault_user_id"] = vault_user.id
+                project_id = project.id
+                secret_id = secret.id
+                root_id = root.id
+
+            stale_db = SessionLocal()
+            try:
+                stale_folder = stale_db.get(Folder, project_id)
+                self.assertEqual(stale_folder.parent_id, root_id)
+                self.assertEqual(stale_folder.parent.name, "Vault")
+
+                with SessionLocal() as move_db:
+                    moved_folder = move_db.get(Folder, project_id)
+                    secret = move_db.get(Folder, secret_id)
+                    moved_folder.parent = secret
+                    moved_folder.parent_id = secret.id
+                    move_db.commit()
+
+                preferences = preferences_for_user(reader, stale_db)
+                self.assertEqual(preferences["favoriteItems"], [])
+            finally:
+                stale_db.close()
+
+    def test_favorites_refresh_stale_document_location_before_access_filter(self) -> None:
+        reader = user_context("reader", groups=["readers"], is_admin=False)
+
+        with vault_runtime():
+            with SessionLocal() as db:
+                root = get_root_folder(db, "vault")
+                readers = VaultGroup(name="readers")
+                confidential = VaultGroup(name="confidential")
+                db.add_all([readers, confidential])
+                db.flush()
+                add_permission(db, root, readers)
+
+                project = get_or_create_folder_path(db, "Project")
+                secret = get_or_create_folder_path(db, "Secret")
+                db.flush()
+                add_permission(db, secret, confidential)
+                doc = create_versioned_document(
+                    db,
+                    project,
+                    name="brief.txt",
+                    data=b"visible before move",
+                )
+                vault_user = VaultUser(
+                    issuer="test",
+                    subject="reader",
+                    email="reader@example.com",
+                    name="Reader",
+                    preferences={"favoriteItems": [{"type": "document", "id": doc.id}]},
+                )
+                db.add(vault_user)
+                db.commit()
+                reader["vault_user_id"] = vault_user.id
+                doc_id = doc.id
+                secret_id = secret.id
+
+            stale_db = SessionLocal()
+            try:
+                stale_doc = stale_db.get(Document, doc_id)
+                self.assertEqual(stale_doc.folder.name, "Project")
+
+                with SessionLocal() as move_db:
+                    moved_doc = move_db.get(Document, doc_id)
+                    secret = move_db.get(Folder, secret_id)
+                    moved_doc.folder = secret
+                    moved_doc.folder_id = secret.id
+                    move_db.commit()
+
+                preferences = preferences_for_user(reader, stale_db)
+                self.assertEqual(preferences["favoriteItems"], [])
+            finally:
+                stale_db.close()
 
 
 if __name__ == "__main__":

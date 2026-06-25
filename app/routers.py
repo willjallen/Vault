@@ -2374,6 +2374,30 @@ def resolved_favorite_items(
     raw_items = preferences.get("favoriteItems")
     if not isinstance(raw_items, list) or not raw_items:
         return []
+    resolved_targets: list[tuple[str, Folder | Document]] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        item_id = item.get("id")
+        if not isinstance(item_id, int):
+            continue
+        if item_type == "folder":
+            try:
+                folder = get_folder_by_id_or_404(item_id, db)
+            except HTTPException:
+                continue
+            if folder_access_level(folder, user, db) >= 1:
+                resolved_targets.append(("folder", folder))
+            continue
+        if item_type == "document":
+            try:
+                doc = get_document_or_404(item_id, db)
+            except HTTPException:
+                continue
+            if document_access_level(doc, user, db) >= 1:
+                resolved_targets.append(("document", doc))
+
     folders = all_folders(db)
     path_cache = build_folder_path_cache(folders)
     visible_docs = [
@@ -2384,17 +2408,9 @@ def resolved_favorite_items(
     stats = docs_stats_for_folder_payloads(visible_docs, db, path_cache)
     locks = active_locks_by_document(db)
     resolved: list[dict[str, object]] = []
-    for item in raw_items:
-        if not isinstance(item, dict):
-            continue
-        item_type = item.get("type")
-        item_id = item.get("id")
-        if not isinstance(item_id, int):
-            continue
+    for item_type, target in resolved_targets:
         if item_type == "folder":
-            folder = db.get(Folder, item_id)
-            if not folder or folder_access_level(folder, user, db) < 1:
-                continue
+            folder = target
             row = folder_summary_payload(folder, folder_path(folder, path_cache), stats)
             row.update(
                 {
@@ -2406,9 +2422,7 @@ def resolved_favorite_items(
             resolved.append(row)
             continue
         if item_type == "document":
-            doc = db.get(Document, item_id)
-            if not doc or document_access_level(doc, user, db) < 1:
-                continue
+            doc = target
             row = document_row_payload(doc, db, path_cache, locks, user)
             row["type"] = "document"
             resolved.append(row)

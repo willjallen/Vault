@@ -4,7 +4,14 @@ from collections.abc import Generator
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import UniqueConstraint, create_engine, event, inspect, select
+from sqlalchemy import (
+    ForeignKeyConstraint,
+    UniqueConstraint,
+    create_engine,
+    event,
+    inspect,
+    select,
+)
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
@@ -113,6 +120,37 @@ def _schema_needs_reset() -> bool:
             if isinstance(constraint, UniqueConstraint) and constraint.name
         }
         if not expected_unique_constraints.issubset(existing_unique_constraints):
+            return True
+        existing_foreign_keys = set()
+        for foreign_key in inspector.get_foreign_keys(table.name):
+            referred_table = foreign_key.get("referred_table")
+            constrained_columns = foreign_key.get("constrained_columns") or []
+            referred_columns = foreign_key.get("referred_columns") or []
+            ondelete = ((foreign_key.get("options") or {}).get("ondelete") or "").upper()
+            existing_foreign_keys.add(
+                tuple(
+                    (local_column, referred_table, remote_column, ondelete)
+                    for local_column, remote_column in zip(
+                        constrained_columns,
+                        referred_columns,
+                        strict=False,
+                    )
+                ),
+            )
+        expected_foreign_keys = {
+            tuple(
+                (
+                    element.parent.name,
+                    element.column.table.name,
+                    element.column.name,
+                    (element.ondelete or "").upper(),
+                )
+                for element in constraint.elements
+            )
+            for constraint in table.constraints
+            if isinstance(constraint, ForeignKeyConstraint)
+        }
+        if not expected_foreign_keys.issubset(existing_foreign_keys):
             return True
     return False
 

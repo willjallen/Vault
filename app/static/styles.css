@@ -2423,8 +2423,14 @@ input[type="file"]::file-selector-button:hover {
   background: var(--info-soft);
 }
 
-.notification-row.busy .notification-icon .app-icon {
+.notification-row.busy .notification-icon .app-icon-wrap {
   animation: notification-spin 0.95s linear infinite;
+  transform-origin: center;
+}
+
+.notification-row.indeterminate .notification-icon .app-icon-wrap {
+  animation: notification-spin 0.95s linear infinite;
+  transform-origin: center;
 }
 
 .notification-copy {
@@ -4986,7 +4992,8 @@ input[type="file"]::file-selector-button:hover {
     transition: none;
   }
 
-  .notification-row.busy .notification-icon .app-icon,
+  .notification-row.busy .notification-icon .app-icon-wrap,
+  .notification-row.indeterminate .notification-icon .app-icon-wrap,
   .transfer-progress.indeterminate span {
     animation: none;
   }

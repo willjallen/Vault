@@ -86,6 +86,7 @@ export function useVaultResources({
   selectedId,
   setSelectedId,
   setError,
+  showNotice,
 }) {
   const initialContents = initial.contents || { folders: [], documents: [] };
   const initialSidebar = initial.sidebar || { folder_children: {} };
@@ -477,6 +478,13 @@ export function useVaultResources({
       }
     });
     events.addEventListener("open", () => {
+      if (connectionReported) {
+        showNotice({
+          detail: "Live updates are back online.",
+          kind: "success",
+          title: "Reconnected to server",
+        });
+      }
       connectionReported = false;
     });
     events.onerror = () => {
@@ -484,7 +492,14 @@ export function useVaultResources({
         return;
       }
       connectionReported = true;
-      setError("Lost connection to the server. Retrying...");
+      showNotice({
+        detail: "Lost connection to the server.",
+        dismissible: false,
+        duration: null,
+        kind: "error",
+        progress: "indeterminate",
+        title: "Trying to reconnect",
+      });
     };
     return () => {
       events.close();
@@ -500,6 +515,7 @@ export function useVaultResources({
     fetchSidebar,
     invalidateContentsCache,
     setError,
+    showNotice,
   ]);
 
   return {

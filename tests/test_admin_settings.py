@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 
 from fastapi import HTTPException
@@ -26,12 +27,20 @@ from app.routers import (
     api_admin_remove_group_member,
     api_admin_update_group,
     api_admin_update_user,
+    api_events_stream,
     archive_doc_item,
     archive_folder_item,
     get_folder_by_path,
     get_or_create_folder_path,
     get_root_folder,
 )
+
+
+class FakeEventStreamRequest:
+    headers: dict[str, str] = {}
+
+    async def is_disconnected(self) -> bool:
+        return False
 
 
 def set_group_write_access(db, group_name: str, folder: Folder, *, write: bool) -> None:
@@ -68,6 +77,12 @@ class AdminSettingsTests(unittest.TestCase):
             )
             self.assertEqual(denied.status_code, 404)
 
+            timeout_denied = ctx.client.post(
+                "/api/admin/debug/timeout",
+                headers=admin_headers,
+            )
+            self.assertEqual(timeout_denied.status_code, 404)
+
     def test_dev_mode_exposes_admin_debug_tools(self) -> None:
         with vault_test_client(auth_mode="dev") as ctx:
             bootstrap = ctx.client.get("/api/bootstrap")
@@ -81,6 +96,20 @@ class AdminSettingsTests(unittest.TestCase):
             server_error = ctx.client.post("/api/admin/debug/error", json={"kind": "server"})
             self.assertEqual(server_error.status_code, 500)
             self.assertEqual(server_error.json()["detail"], "Debug server error")
+
+            stream = asyncio.run(api_events_stream(FakeEventStreamRequest(), user_context()))
+            timeout = ctx.client.post("/api/admin/debug/timeout")
+            self.assertEqual(timeout.status_code, 200, timeout.text)
+            self.assertEqual(timeout.json()["action"], "timeout")
+            self.assertEqual(timeout.json()["seconds"], 10)
+            self.assertEqual(timeout.json()["stream_retry_ms"], 10000)
+
+            stream_chunk = asyncio.run(anext(stream.body_iterator))
+            if isinstance(stream_chunk, bytes):
+                stream_chunk = stream_chunk.decode()
+            self.assertEqual(stream_chunk, "retry: 10000\n\n")
+            with self.assertRaises(StopAsyncIteration):
+                asyncio.run(anext(stream.body_iterator))
 
             seeded = ctx.client.post("/api/admin/debug/seed")
             self.assertEqual(seeded.status_code, 200, seeded.text)

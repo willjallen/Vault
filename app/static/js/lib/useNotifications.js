@@ -8,14 +8,18 @@ function normalizeNotice(input, fallbackDuration) {
   const detail = String(source.detail || "").trim();
   const title = String(source.title || "").trim();
   const duration =
-    Number.isFinite(source.duration) && source.duration > 0 ? source.duration : fallbackDuration;
+    source.duration === null || source.duration === false
+      ? null
+      : Number.isFinite(source.duration) && source.duration > 0
+        ? source.duration
+        : fallbackDuration;
 
   return {
     detail,
     dismissible: source.dismissible !== false,
     duration,
     kind: source.kind || "info",
-    progress: source.progress !== false,
+    progress: source.progress ?? true,
     title,
   };
 }
@@ -76,15 +80,19 @@ export function useNotifications(defaultDuration = DEFAULT_NOTICE_MS) {
           current && current.id === id ? { ...current, phase: "visible" } : current
         );
       }, 16);
-      const leaveTimer = window.setTimeout(() => {
-        setNotice((current) =>
-          current && current.id === id ? { ...current, phase: "leaving" } : current
-        );
-      }, normalized.duration);
-      const removeTimer = window.setTimeout(() => {
-        setNotice((current) => (current && current.id === id ? null : current));
-      }, normalized.duration + NOTICE_EXIT_MS);
-      noticeTimers.current = [enterTimer, leaveTimer, removeTimer];
+      const timers = [enterTimer];
+      if (normalized.duration) {
+        const leaveTimer = window.setTimeout(() => {
+          setNotice((current) =>
+            current && current.id === id ? { ...current, phase: "leaving" } : current
+          );
+        }, normalized.duration);
+        const removeTimer = window.setTimeout(() => {
+          setNotice((current) => (current && current.id === id ? null : current));
+        }, normalized.duration + NOTICE_EXIT_MS);
+        timers.push(leaveTimer, removeTimer);
+      }
+      noticeTimers.current = timers;
     },
     [clearNoticeTimers, defaultDuration]
   );

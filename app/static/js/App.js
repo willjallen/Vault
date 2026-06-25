@@ -252,6 +252,7 @@ export function App({ initial }) {
     selectedId,
     setError,
     setSelectedId,
+    showNotice,
   });
 
   useShareLinkResolution({

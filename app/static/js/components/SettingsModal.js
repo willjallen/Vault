@@ -765,6 +765,11 @@ function DebugPanel({ apiFetch, onDebugError }) {
         }),
     ],
     [
+      "Mock server timeout",
+      "clock",
+      () => runDebugRequest("Mock server timeout", "/api/admin/debug/timeout"),
+    ],
+    [
       "HTTP 500",
       "server",
       () =>

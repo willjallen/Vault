@@ -3,14 +3,17 @@ import { Icon } from "./common/Icon.js";
 
 const h = React.createElement;
 
-function noticeIcon(kind) {
-  if (kind === "busy") {
+function noticeIcon(notice) {
+  if (notice.progress === "indeterminate") {
     return "refresh";
   }
-  if (kind === "success") {
+  if (notice.kind === "busy") {
+    return "refresh";
+  }
+  if (notice.kind === "success") {
     return "check";
   }
-  if (kind === "info") {
+  if (notice.kind === "info") {
     return "info";
   }
   return "warning";
@@ -36,7 +39,8 @@ function NotificationRow({ notice, onDismiss }) {
   const detail = String(notice.detail || "").trim();
   const hasDetail = Boolean(detail);
   const dismissible = Boolean(onDismiss) && notice.dismissible !== false;
-  const showTimebar = Boolean(notice.duration && notice.progress !== false);
+  const indeterminate = notice.progress === "indeterminate";
+  const showTimebar = Boolean(notice.duration && notice.progress !== false && !indeterminate);
   const durationStyle = showTimebar ? { "--notification-duration": `${notice.duration}ms` } : {};
   return h(
     "div",
@@ -45,6 +49,7 @@ function NotificationRow({ notice, onDismiss }) {
         "notification-row",
         notice.kind || "error",
         hasDetail ? "has-detail" : "no-detail",
+        indeterminate ? "indeterminate" : "",
         `phase-${notice.phase || "visible"}`
       ),
       role: notice.kind === "error" ? "alert" : "status",
@@ -54,7 +59,7 @@ function NotificationRow({ notice, onDismiss }) {
       h(
         "span",
         { className: "notification-icon", key: "icon" },
-        h(Icon, { icon: noticeIcon(notice.kind), size: 15 })
+        h(Icon, { icon: noticeIcon(notice), size: 15 })
       ),
       h("div", { className: "notification-copy", key: "copy" }, [
         h("div", { className: "notification-title", key: "title" }, noticeTitle(notice)),

@@ -97,6 +97,8 @@ SYSTEM_USER: UserContext = {
 }
 SYSTEM_META = {"ip": None, "user_agent": None}
 _ttl_sweeper_task: asyncio.Task[None] | None = None
+_debug_event_stream_generation = 0
+_debug_event_stream_retry_ms = 3000
 
 
 def configure_router_runtime(
@@ -109,9 +111,12 @@ def configure_router_runtime(
 ) -> None:
     """Configure process-local route globals that are normally loaded from env."""
     global AUTH_MODE, BASE_DOMAIN, DEV_MODE, SITE_NAME, TTL_SWEEP_INTERVAL_SECONDS
+    global _debug_event_stream_generation, _debug_event_stream_retry_ms
 
     from . import config
 
+    _debug_event_stream_generation = 0
+    _debug_event_stream_retry_ms = 3000
     if auth_mode is not None:
         AUTH_MODE = auth_mode.strip().lower() or "headers"
         config.AUTH_MODE = AUTH_MODE
@@ -2658,6 +2663,18 @@ def state_events_after(last_id: int) -> list[StateEvent]:
         db.close()
 
 
+def debug_event_stream_generation() -> int:
+    if not DEV_MODE:
+        return 0
+    return _debug_event_stream_generation
+
+
+def debug_event_stream_retry_ms(stream_generation: int) -> int | None:
+    if not DEV_MODE or stream_generation == _debug_event_stream_generation:
+        return None
+    return _debug_event_stream_retry_ms
+
+
 def commit_state(db: Session) -> None:
     db.commit()
 
@@ -3014,6 +3031,23 @@ def api_admin_debug_error(
     if kind == "unavailable":
         raise HTTPException(status_code=503, detail="Debug service unavailable")
     raise HTTPException(status_code=500, detail="Debug server error")
+
+
+@router.post("/api/admin/debug/timeout")
+def api_admin_debug_timeout(
+    user: UserContext = Depends(require_dev_admin),
+) -> dict[str, object]:
+    global _debug_event_stream_generation, _debug_event_stream_retry_ms
+    del user
+    seconds = 10
+    _debug_event_stream_generation += 1
+    _debug_event_stream_retry_ms = seconds * 1000
+    return debug_action_result(
+        "timeout",
+        seconds=seconds,
+        stream_generation=_debug_event_stream_generation,
+        stream_retry_ms=_debug_event_stream_retry_ms,
+    )
 
 
 @router.post("/api/admin/debug/emit-state")
@@ -3524,6 +3558,7 @@ async def api_events_stream(
     user: UserContext = Depends(current_user),
 ) -> StreamingResponse:
     del user
+    stream_generation = debug_event_stream_generation()
     header_value = request.headers.get("last-event-id") or request.headers.get("Last-Event-ID")
     try:
         last_id = int(header_value) if header_value else latest_state_event_id()
@@ -3535,6 +3570,10 @@ async def api_events_stream(
         heartbeat_interval = 25.0
         last_heartbeat = dt.datetime.now(tz=dt.UTC)
         while not await request.is_disconnected():
+            retry_ms = debug_event_stream_retry_ms(stream_generation)
+            if retry_ms is not None:
+                yield f"retry: {retry_ms}\n\n"
+                return
             events = state_events_after(last_id)
             if events:
                 for event in events:

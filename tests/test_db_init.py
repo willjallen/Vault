@@ -168,6 +168,36 @@ class DatabaseInitTests(unittest.TestCase):
                 db_module.engine.dispose()
                 restore_runtime(snapshot)
 
+    def test_wrong_model_index_definition_is_rejected_on_startup(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="vault-db-init-") as temp_dir:
+            db_path = Path(temp_dir) / "vault.db"
+            snapshot = snapshot_runtime()
+            try:
+                db_module.configure_database(db_path)
+                db_module.Base.metadata.create_all(bind=db_module.engine)
+                with sqlite3.connect(db_path) as conn:
+                    conn.execute("DROP INDEX uq_document_locks_active_document")
+                    conn.execute(
+                        """
+                        CREATE INDEX uq_document_locks_active_document
+                        ON document_locks (document_id)
+                        """,
+                    )
+
+                with self.assertRaises(RuntimeError) as raised:
+                    db_module.init_db()
+
+                self.assertIn("Startup refused to alter or drop", str(raised.exception))
+                with sqlite3.connect(db_path) as conn:
+                    indexes = {
+                        row[1]: row[2]
+                        for row in conn.execute("PRAGMA index_list(document_locks)").fetchall()
+                    }
+                self.assertEqual(indexes["uq_document_locks_active_document"], 0)
+            finally:
+                db_module.engine.dispose()
+                restore_runtime(snapshot)
+
     def test_missing_unique_constraint_is_rejected_on_startup(self) -> None:
         with tempfile.TemporaryDirectory(prefix="vault-db-init-") as temp_dir:
             db_path = Path(temp_dir) / "vault.db"

@@ -123,10 +123,19 @@ def _schema_needs_reset() -> bool:
             )
             if existing_type != expected_type:
                 return True
-        existing_indexes = {index["name"] for index in inspector.get_indexes(table.name)}
-        expected_indexes = {index.name for index in table.indexes if index.name}
-        if not expected_indexes.issubset(existing_indexes):
-            return True
+        existing_indexes = {
+            index["name"]: index
+            for index in inspector.get_indexes(table.name)
+            if index.get("name")
+        }
+        for expected_index in table.indexes:
+            if not expected_index.name:
+                continue
+            existing_index = existing_indexes.get(expected_index.name)
+            if not existing_index:
+                return True
+            if _index_signature(existing_index) != _model_index_signature(expected_index):
+                return True
         existing_unique_constraints = {
             constraint["name"]
             for constraint in inspector.get_unique_constraints(table.name)
@@ -171,6 +180,31 @@ def _schema_needs_reset() -> bool:
         if not expected_foreign_keys.issubset(existing_foreign_keys):
             return True
     return False
+
+
+def _normalize_sql_expression(expression: object | None) -> str:
+    if expression is None:
+        return ""
+    return " ".join(str(expression).strip().split()).lower()
+
+
+def _index_signature(index: dict[str, Any]) -> tuple[tuple[str, ...], bool, str]:
+    sqlite_where = (index.get("dialect_options") or {}).get("sqlite_where")
+    return (
+        tuple(index.get("column_names") or []),
+        bool(index.get("unique")),
+        _normalize_sql_expression(sqlite_where),
+    )
+
+
+def _model_index_signature(index: Any) -> tuple[tuple[str, ...], bool, str]:
+    sqlite_options = index.dialect_options.get("sqlite", {})
+    sqlite_where = sqlite_options.get("where")
+    return (
+        tuple(column.name for column in index.columns),
+        bool(index.unique),
+        _normalize_sql_expression(sqlite_where),
+    )
 
 
 def _bootstrap_root_folders(folder_model: type[Any]) -> None:

@@ -1654,6 +1654,14 @@ body.sidebar-resizing {
   flex: 0 1 auto;
 }
 
+.file-name-match {
+  border-radius: 4px;
+  padding: 0 2px;
+  background: color-mix(in srgb, var(--info-soft) 82%, transparent);
+  color: var(--info-text);
+  box-shadow: inset 0 -1px 0 color-mix(in srgb, var(--accent-border) 72%, transparent);
+}
+
 .file-lock-indicator {
   display: inline-flex;
   align-items: center;

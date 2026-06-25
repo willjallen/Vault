@@ -533,6 +533,7 @@ export function VaultFileList({
       currentUser,
       editing,
       editValue: editing ? inlineFolderDraft.value || "" : "",
+      searchQuery,
       selectionKey,
       selected: selectedSet.has(selectionKey),
       draggingId,

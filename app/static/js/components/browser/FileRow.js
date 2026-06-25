@@ -6,6 +6,43 @@ import { TtlStatusLabel } from "./TtlStatusLabel.js";
 const { useEffect, useRef } = React;
 const h = React.createElement;
 
+function highlightedFileName(fileNameValue, query) {
+  const fileName = String(fileNameValue || "");
+  const needle = String(query || "").trim();
+  if (!needle) {
+    return fileName;
+  }
+
+  const lowerName = fileName.toLocaleLowerCase();
+  const lowerNeedle = needle.toLocaleLowerCase();
+  const parts = [];
+  let cursor = 0;
+  let matchIndex = lowerName.indexOf(lowerNeedle);
+  while (matchIndex !== -1) {
+    if (matchIndex > cursor) {
+      parts.push(fileName.slice(cursor, matchIndex));
+    }
+    const matchEnd = matchIndex + needle.length;
+    parts.push(
+      h(
+        "span",
+        { className: "file-name-match", key: `match-${matchIndex}` },
+        fileName.slice(matchIndex, matchEnd)
+      )
+    );
+    cursor = matchEnd;
+    matchIndex = lowerName.indexOf(lowerNeedle, cursor);
+  }
+
+  if (!parts.length) {
+    return fileName;
+  }
+  if (cursor < fileName.length) {
+    parts.push(fileName.slice(cursor));
+  }
+  return parts;
+}
+
 // eslint-disable-next-line complexity
 export function FileRow({
   doc,
@@ -14,6 +51,7 @@ export function FileRow({
   busy,
   editing,
   editValue,
+  searchQuery = "",
   selectionKey = "",
   selected,
   draggingId,
@@ -162,7 +200,7 @@ export function FileRow({
               h(
                 "div",
                 { className: classNames("name", isArchived ? "archived-text" : "") },
-                doc.name
+                highlightedFileName(doc.name, searchQuery)
               ),
             ]),
       ]),

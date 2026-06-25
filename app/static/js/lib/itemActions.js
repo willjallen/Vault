@@ -1,4 +1,4 @@
-import { folderBaseName, isArchivePath } from "./utils.js";
+import { folderBaseName, folderParent, isArchivePath } from "./utils.js";
 
 export function keyForItem(item) {
   if (item.type === "document") {
@@ -101,6 +101,7 @@ export function createBulkActionHandlers({
   clearAllSelections,
   docs,
   downloadWithProgress,
+  folder,
   refresh,
   requestConfirm,
   selectedDoc,
@@ -127,8 +128,16 @@ export function createBulkActionHandlers({
     return res.json();
   }
 
-  async function refreshAfterAction(nextFolder = undefined) {
-    await refresh(nextFolder, { invalidateContents: true, sidebar: true });
+  async function refreshAfterAction(nextFolder = undefined, options = {}) {
+    await refresh(nextFolder, { invalidateContents: true, sidebar: true, ...options });
+  }
+
+  function missingFolderFallbackForDelete() {
+    const currentFolder = folder || "";
+    if (!isArchivePath(currentFolder) || currentFolder === "Archive") {
+      return "";
+    }
+    return folderParent(currentFolder) || "Archive";
   }
 
   function handleDownloadItems(items) {
@@ -299,7 +308,10 @@ export function createBulkActionHandlers({
       if (warning) {
         setError(warning);
       }
-      await refreshAfterAction();
+      await refreshAfterAction(undefined, {
+        missingFolderFallback: missingFolderFallbackForDelete(),
+        suppressMissingFolderError: true,
+      });
       clearAllSelections();
       return true;
     } catch (err) {

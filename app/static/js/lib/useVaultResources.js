@@ -65,6 +65,17 @@ function isPendingEmptySearch({ contents, contentsPending, recursiveSearch, sear
   );
 }
 
+function criticalRefresh(promise) {
+  return promise.then(
+    () => ({ ok: true }),
+    (error) => ({ error, ok: Boolean(error?.suppressRefreshError) })
+  );
+}
+
+function optionalRefresh(promise) {
+  return promise.catch(() => null);
+}
+
 export function useVaultResources({
   initial,
   apiFetch,
@@ -214,9 +225,14 @@ export function useVaultResources({
       }
       if (res.status === 404) {
         if (!background && onMissingFolderRef.current) {
-          onMissingFolderRef.current(targetFolder);
+          onMissingFolderRef.current(targetFolder, {
+            fallbackFolder: options.missingFolderFallback || "",
+            suppressError: Boolean(options.suppressMissingFolderError),
+          });
         }
-        throw new Error("Folder not found");
+        const error = new Error("Folder not found");
+        error.suppressRefreshError = Boolean(options.suppressMissingFolderError);
+        throw error;
       }
       if (!res.ok) {
         throw new Error("Could not refresh contents");
@@ -323,18 +339,26 @@ export function useVaultResources({
       if (options.invalidateContents) {
         invalidateContentsCache();
       }
-      try {
-        const requests = [
-          fetchContents(nextFolder),
-          options.sidebar ? fetchSidebar() : Promise.resolve(null),
-          fetchMyEdits(),
-          selectedIdRef.current
-            ? fetchDocumentDetail(selectedIdRef.current)
-            : Promise.resolve(null),
-        ];
-        await Promise.all(requests);
-      } catch {
-        setError("Could not refresh data.");
+      const [contentsRefresh, sidebarRefresh] = await Promise.all([
+        criticalRefresh(
+          fetchContents(nextFolder, {
+            missingFolderFallback: options.missingFolderFallback,
+            suppressMissingFolderError: options.suppressMissingFolderError,
+          })
+        ),
+        options.sidebar ? criticalRefresh(fetchSidebar()) : Promise.resolve(true),
+        optionalRefresh(fetchMyEdits()),
+        selectedIdRef.current
+          ? optionalRefresh(fetchDocumentDetail(selectedIdRef.current))
+          : Promise.resolve(null),
+      ]);
+      if (!contentsRefresh.ok || !sidebarRefresh.ok) {
+        const failedRefresh = contentsRefresh.ok ? sidebarRefresh : contentsRefresh;
+        setError(
+          failedRefresh.error?.status === 0
+            ? failedRefresh.error.message
+            : "Could not refresh data."
+        );
       }
     },
     [
@@ -405,6 +429,7 @@ export function useVaultResources({
   useEffect(() => {
     const events = new EventSource("/api/events/stream");
     const pendingResources = new Set();
+    let connectionReported = false;
     let refreshTimer = null;
 
     function flushPendingRefreshes() {
@@ -451,7 +476,16 @@ export function useVaultResources({
         queueRefresh(["contents", "sidebar", "document_detail", "my_edits"]);
       }
     });
-    events.onerror = () => {};
+    events.addEventListener("open", () => {
+      connectionReported = false;
+    });
+    events.onerror = () => {
+      if (connectionReported) {
+        return;
+      }
+      connectionReported = true;
+      setError("Lost connection to the server. Retrying...");
+    };
     return () => {
       events.close();
       if (refreshTimer) {

@@ -127,6 +127,7 @@ import {
   faTerminal,
   faTree,
   faTruck,
+  faTriangleExclamation,
   faUniversalAccess,
   faUpload,
   faUsers,
@@ -325,6 +326,7 @@ const utilityIcons = new Map([
   ["refresh", iconEntry(faRotate)],
   ["search", iconEntry(faMagnifyingGlass)],
   ["upload", iconEntry(faUpload)],
+  ["warning", iconEntry(faTriangleExclamation)],
 ]);
 
 export const iconLibrary = folderIconEntries;

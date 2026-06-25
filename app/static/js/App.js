@@ -1,7 +1,9 @@
+/* eslint-disable max-lines */
 import { FinderShell } from "./components/FinderShell.js";
 import { DragPreview } from "./components/DragPreview.js";
 import { ConfirmToast } from "./components/ConfirmToast.js";
 import { FolderPropertiesModal } from "./components/FolderPropertiesModal.js";
+import { NotificationDock } from "./components/NotificationDock.js";
 import { SettingsModal } from "./components/SettingsModal.js";
 import { TransferDock } from "./components/TransferDock.js";
 import { ContextMenu } from "./components/browser/ContextMenu.js";
@@ -46,6 +48,8 @@ import { useVaultResources } from "./lib/useVaultResources.js";
 
 const { useEffect, useMemo, useState, useCallback, useRef } = React;
 const h = React.createElement;
+const ERROR_NOTICE_MS = 4200;
+const NOTICE_EXIT_MS = 260;
 
 export function App({ initial }) {
   const initialBootstrap = initial.bootstrap || initial;
@@ -63,7 +67,7 @@ export function App({ initial }) {
   const [folderAnchor, setFolderAnchor] = useState(null);
   const [uploading, setUploading] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
+  const [errorNotice, setErrorNotice] = useState(null);
   const [draggingId, setDraggingId] = useState(null);
   const [dragBundle, setDragBundle] = useState(null);
   const [dropHint, setDropHint] = useState(null);
@@ -86,10 +90,80 @@ export function App({ initial }) {
   const versionUploadOptions = useRef({});
   const settingsButtonRef = useRef(null);
   const confirmResolver = useRef(null);
+  const errorNoticeId = useRef(1);
+  const errorNoticeTimers = useRef([]);
   const shareCodeRef = useRef(initialShareCode);
   const historyModeRef = useRef("replace");
   const closeContextMenu = useCallback(() => setContextMenu(null), []);
   const { setToast, showToast, toast } = useToastMessage();
+
+  const clearErrorNoticeTimers = useCallback(() => {
+    errorNoticeTimers.current.forEach((timer) => window.clearTimeout(timer));
+    errorNoticeTimers.current = [];
+  }, []);
+
+  const dismissErrorNotice = useCallback(
+    (noticeId) => {
+      clearErrorNoticeTimers();
+      setErrorNotice((current) => {
+        if (!current || (noticeId && current.id !== noticeId)) {
+          return current;
+        }
+        return { ...current, phase: "leaving" };
+      });
+      const removeTimer = window.setTimeout(() => {
+        setErrorNotice((current) =>
+          !current || (noticeId && current.id !== noticeId) ? current : null
+        );
+      }, NOTICE_EXIT_MS);
+      errorNoticeTimers.current = [removeTimer];
+    },
+    [clearErrorNoticeTimers]
+  );
+
+  const setError = useCallback(
+    (message, duration = ERROR_NOTICE_MS) => {
+      clearErrorNoticeTimers();
+      const normalizedMessage = String(message || "").trim();
+      if (!normalizedMessage) {
+        setErrorNotice(null);
+        return;
+      }
+      const id = errorNoticeId.current;
+      errorNoticeId.current += 1;
+      setErrorNotice({
+        dismissible: true,
+        duration,
+        id,
+        kind: "error",
+        message: normalizedMessage,
+        phase: "entering",
+        title: "Error",
+      });
+      const enterTimer = window.setTimeout(() => {
+        setErrorNotice((current) =>
+          current && current.id === id ? { ...current, phase: "visible" } : current
+        );
+      }, 16);
+      const leaveTimer = window.setTimeout(() => {
+        setErrorNotice((current) =>
+          current && current.id === id ? { ...current, phase: "leaving" } : current
+        );
+      }, duration);
+      const removeTimer = window.setTimeout(() => {
+        setErrorNotice((current) => (current && current.id === id ? null : current));
+      }, duration + NOTICE_EXIT_MS);
+      errorNoticeTimers.current = [enterTimer, leaveTimer, removeTimer];
+    },
+    [clearErrorNoticeTimers]
+  );
+
+  useEffect(
+    () => () => {
+      clearErrorNoticeTimers();
+    },
+    [clearErrorNoticeTimers]
+  );
 
   const resolveConfirm = useCallback((confirmed) => {
     const resolver = confirmResolver.current;
@@ -239,9 +313,11 @@ export function App({ initial }) {
     initial,
     apiFetch,
     folder,
-    onMissingFolder: () => {
-      setError("Folder not found.");
-      replaceFolder("");
+    onMissingFolder: (_missingFolder, options = {}) => {
+      if (!options.suppressError) {
+        setError("Folder not found.");
+      }
+      replaceFolder(options.fallbackFolder || "");
     },
     onPreferencesRefresh: refreshUserPreferences,
     onSiteSettingsChange: setSiteSettings,
@@ -579,6 +655,7 @@ export function App({ initial }) {
     },
     docs,
     downloadWithProgress,
+    folder,
     refresh,
     requestConfirm,
     selectedDoc,
@@ -842,6 +919,21 @@ export function App({ initial }) {
     setContextMenu({ x: evt.clientX, y: evt.clientY, items });
   }
 
+  const notices = [
+    ...(errorNotice ? [errorNotice] : []),
+    ...(busy
+      ? [
+          {
+            dismissible: false,
+            id: "busy",
+            kind: "busy",
+            phase: "visible",
+            title: "Working",
+          },
+        ]
+      : []),
+  ];
+
   return h(
     React.Fragment,
     null,
@@ -953,6 +1045,7 @@ export function App({ initial }) {
       onChange: (e) => handleVersionUploadInput(e.target.files[0]),
     }),
     h(TransferDock, { transfers }),
+    h(NotificationDock, { notices, onDismiss: dismissErrorNotice }),
     h(DragPreview, { drag: dragBundle }),
     settingsOpen
       ? h(SettingsModal, {
@@ -991,8 +1084,6 @@ export function App({ initial }) {
         })
       : null,
     h(ConfirmToast, { request: confirmRequest, onResolve: resolveConfirm }),
-    contextMenu ? h(ContextMenu, { menu: contextMenu, onClose: closeContextMenu }) : null,
-    error ? h("div", { className: "toast error" }, error) : null,
-    busy ? h("div", { className: "toast subtle" }, "Working...") : null
+    contextMenu ? h(ContextMenu, { menu: contextMenu, onClose: closeContextMenu }) : null
   );
 }

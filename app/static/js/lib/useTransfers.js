@@ -106,7 +106,7 @@ export function useTransfers({ onUnauthorized } = {}) {
         status: "error",
       });
       removeTransfer(id, ERROR_HOLD_MS);
-      if ((err.status === 401 || err.status === 0) && onUnauthorized) {
+      if (err.status === 401 && onUnauthorized) {
         onUnauthorized();
       }
     },

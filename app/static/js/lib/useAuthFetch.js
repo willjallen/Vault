@@ -2,6 +2,12 @@ import { useTransfers } from "./useTransfers.js";
 
 const { useCallback, useMemo, useRef } = React;
 
+function connectionError() {
+  const error = new Error("Lost connection to the server.");
+  error.status = 0;
+  return error;
+}
+
 export function useAuthFetch({ initialBootstrap, setToast }) {
   const baseDomain =
     initialBootstrap.base_domain ||
@@ -42,12 +48,16 @@ export function useAuthFetch({ initialBootstrap, setToast }) {
           res.redirected && res.url && res.url.includes("auth.") && res.url.includes("://auth.");
         if (res.type === "opaqueredirect" || res.status === 401 || redirectedToAuth) {
           redirectToLogin();
-          throw new Error("Redirecting to login");
+          const error = new Error("Redirecting to login");
+          error.status = 401;
+          throw error;
         }
         return res;
       } catch (err) {
-        redirectToLogin();
-        throw err;
+        if (err.status === 401) {
+          throw err;
+        }
+        throw connectionError();
       }
     },
     [redirectToLogin]

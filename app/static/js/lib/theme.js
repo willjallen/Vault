@@ -12,13 +12,22 @@ const USER_PREFERENCE_DEFAULTS = {
   sidebarSectionSizes: {
     folders: 180,
     favorites: 95,
-    archive: 115,
     editing: 90,
+    archive: 115,
+  },
+  sidebarSectionCollapsed: {
+    folders: false,
+    favorites: false,
+    editing: false,
+    archive: true,
   },
 };
-export const SIDEBAR_SECTION_KEYS = ["folders", "favorites", "archive", "editing"];
-export const MIN_SIDEBAR_SECTION_SIZE = 72;
-export const MAX_SIDEBAR_SECTION_SIZE = 520;
+export const SIDEBAR_SECTION_KEYS = ["folders", "favorites", "editing", "archive"];
+export const MIN_SIDEBAR_SECTION_SIZE = 32;
+export const MAX_SIDEBAR_SECTION_SIZE = 4000;
+export const SIDEBAR_COLLAPSED_SECTION_SIZE = 32;
+export const SIDEBAR_EXPANDED_SECTION_SIZE = 90;
+export const SIDEBAR_COLLAPSE_THRESHOLD = 40;
 export function normalizeThemePreference(value) {
   return THEME_OPTIONS.includes(value) ? value : "system";
 }
@@ -139,6 +148,17 @@ export function normalizeSidebarSectionSizes(value) {
   }, {});
 }
 
+export function normalizeSidebarSectionCollapsed(value) {
+  const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  return SIDEBAR_SECTION_KEYS.reduce((collapsed, key) => {
+    // eslint-disable-next-line security/detect-object-injection
+    const defaultValue = USER_PREFERENCE_DEFAULTS.sidebarSectionCollapsed[key];
+    // eslint-disable-next-line security/detect-object-injection
+    collapsed[key] = typeof source[key] === "boolean" ? source[key] : defaultValue;
+    return collapsed;
+  }, {});
+}
+
 export function normalizeUserPreferences(value) {
   const source = value && typeof value === "object" ? value : {};
   return {
@@ -158,6 +178,7 @@ export function normalizeUserPreferences(value) {
     ),
     favoriteItems: normalizeFavoriteItems(source.favoriteItems),
     sidebarSectionSizes: normalizeSidebarSectionSizes(source.sidebarSectionSizes),
+    sidebarSectionCollapsed: normalizeSidebarSectionCollapsed(source.sidebarSectionCollapsed),
   };
 }
 
@@ -342,6 +363,15 @@ export function useAppearancePreferences({ apiFetch, initialPreferences } = {}) 
     [updatePreference]
   );
 
+  const handleSidebarLayoutChange = useCallback(
+    ({ sizes, collapsed }) =>
+      updatePreference({
+        sidebarSectionSizes: sizes,
+        sidebarSectionCollapsed: collapsed,
+      }),
+    [updatePreference]
+  );
+
   return {
     alternateRows: userPreferences.alternateRows,
     doubleClickDownload: userPreferences.doubleClickDownload,
@@ -351,11 +381,13 @@ export function useAppearancePreferences({ apiFetch, initialPreferences } = {}) 
     handleFavoriteItemsChange,
     handleOpenFoldersOnClickChange,
     handlePalettePreferenceChange,
+    handleSidebarLayoutChange,
     handleSidebarSectionSizesChange,
     handleThemePreferenceChange,
     openFoldersOnClick: userPreferences.openFoldersOnClick,
     palettePreference: userPreferences.palettePreference,
     refreshUserPreferences,
+    sidebarSectionCollapsed: userPreferences.sidebarSectionCollapsed,
     sidebarSectionSizes: userPreferences.sidebarSectionSizes,
     themePreference: userPreferences.themePreference,
     userPreferences,

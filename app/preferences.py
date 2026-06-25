@@ -10,16 +10,22 @@ USER_PREFERENCE_DEFAULTS: dict[str, object] = {
     "sidebarSectionSizes": {
         "folders": 180,
         "favorites": 95,
-        "archive": 115,
         "editing": 90,
+        "archive": 115,
+    },
+    "sidebarSectionCollapsed": {
+        "folders": False,
+        "favorites": False,
+        "editing": False,
+        "archive": True,
     },
 }
 THEME_PREFERENCES = {"system", "light", "dark"}
 PALETTE_PREFERENCES = {"cozy", "winui"}
 BOOLEAN_PREFERENCES = {"openFoldersOnClick", "alternateRows", "doubleClickDownload"}
-SIDEBAR_SECTION_KEYS = ("folders", "favorites", "archive", "editing")
-MIN_SIDEBAR_SECTION_SIZE = 72
-MAX_SIDEBAR_SECTION_SIZE = 520
+SIDEBAR_SECTION_KEYS = ("folders", "favorites", "editing", "archive")
+MIN_SIDEBAR_SECTION_SIZE = 32
+MAX_SIDEBAR_SECTION_SIZE = 4000
 
 
 def _clean_favorite_id(value: object, *, label: str, strict: bool) -> int | None:
@@ -113,11 +119,39 @@ def _clean_sidebar_section_sizes(value: object, *, strict: bool) -> dict[str, in
     return sizes
 
 
+def _clean_sidebar_section_collapsed(value: object, *, strict: bool) -> dict[str, bool]:
+    raw_defaults = USER_PREFERENCE_DEFAULTS["sidebarSectionCollapsed"]
+    defaults = raw_defaults if isinstance(raw_defaults, dict) else {}
+    collapsed = {key: bool(defaults.get(key, False)) for key in SIDEBAR_SECTION_KEYS}
+    if not isinstance(value, dict):
+        if strict:
+            raise ValueError("sidebarSectionCollapsed must be an object")
+        return collapsed
+    if strict:
+        unknown_keys = set(value) - set(SIDEBAR_SECTION_KEYS)
+        if unknown_keys:
+            raise ValueError(f"Unknown sidebar section: {next(iter(unknown_keys))}")
+    for key in SIDEBAR_SECTION_KEYS:
+        raw_value = value.get(key)
+        if raw_value is None:
+            continue
+        if not isinstance(raw_value, bool):
+            if strict:
+                raise ValueError(f"{key} sidebar collapsed state must be a boolean")
+            continue
+        collapsed[key] = raw_value
+    return collapsed
+
+
 def normalize_user_preferences(raw: object) -> dict[str, object]:
     """Return a complete, valid user preference object."""
     normalized = dict(USER_PREFERENCE_DEFAULTS)
     normalized["favoriteItems"] = []
     normalized["sidebarSectionSizes"] = _clean_sidebar_section_sizes(None, strict=False)
+    normalized["sidebarSectionCollapsed"] = _clean_sidebar_section_collapsed(
+        None,
+        strict=False,
+    )
     if not isinstance(raw, dict):
         return normalized
     theme = raw.get("themePreference")
@@ -136,6 +170,10 @@ def normalize_user_preferences(raw: object) -> dict[str, object]:
     )
     normalized["sidebarSectionSizes"] = _clean_sidebar_section_sizes(
         raw.get("sidebarSectionSizes"),
+        strict=False,
+    )
+    normalized["sidebarSectionCollapsed"] = _clean_sidebar_section_collapsed(
+        raw.get("sidebarSectionCollapsed"),
         strict=False,
     )
     return normalized
@@ -165,6 +203,8 @@ def clean_user_preference_patch(raw: object) -> dict[str, object]:
             cleaned[key] = _clean_favorite_items(value, strict=True)
         elif key == "sidebarSectionSizes":
             cleaned[key] = _clean_sidebar_section_sizes(value, strict=True)
+        elif key == "sidebarSectionCollapsed":
+            cleaned[key] = _clean_sidebar_section_collapsed(value, strict=True)
     return cleaned
 
 

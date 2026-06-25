@@ -68,7 +68,7 @@ body.app-root-page .finder-browser {
 }
 
 body.app-root-page .finder-sidebar {
-  overflow: visible;
+  overflow: hidden;
 }
 
 body.app-root-page .finder-browser {
@@ -378,33 +378,138 @@ header {
   box-shadow: var(--shadow-soft);
   min-height: 0;
   min-width: 0;
-  overflow: visible;
+  overflow: hidden;
   display: flex;
   flex-direction: column;
 }
 
+.sidebar-layout {
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  height: 100%;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  overflow: hidden;
+  transition: grid-template-rows 180ms cubic-bezier(0.2, 1.15, 0.25, 1);
+}
+
+body.sidebar-resizing .sidebar-layout {
+  transition: none;
+}
+
 .sidebar-section {
+  position: relative;
   margin-bottom: 14px;
   min-height: 0;
 }
 
 .sidebar-section.resizable-sidebar-section {
-  flex: var(--sidebar-section-size) 1 0;
   margin-bottom: 0;
   min-height: 0;
   display: flex;
   flex-direction: column;
+  overflow: hidden;
 }
 
 .sidebar-section .eyebrow {
   flex: 0 0 auto;
 }
 
+.sidebar-section-header {
+  flex: 0 0 auto;
+  width: 100%;
+  min-width: 0;
+  min-height: 24px;
+  margin: 0 0 4px 0;
+  padding: 0 2px;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  cursor: pointer;
+  text-align: left;
+  border-radius: 6px;
+  transition:
+    background 0.14s ease,
+    color 0.14s ease;
+}
+
+.sidebar-section-header:hover,
+.sidebar-section-header:focus-visible {
+  background: var(--surface-hover);
+  color: var(--text);
+  outline: none;
+}
+
+.sidebar-section-header.collapsed {
+  min-height: 28px;
+  margin-bottom: 0;
+  padding-inline: 6px;
+}
+
+.sidebar-section-title {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar-section-chevron {
+  flex: 0 0 auto;
+  opacity: 0.58;
+  transition:
+    opacity 0.14s ease,
+    transform 0.18s cubic-bezier(0.2, 1.15, 0.25, 1);
+}
+
+.sidebar-section-header:hover .sidebar-section-chevron,
+.sidebar-section-header:focus-visible .sidebar-section-chevron {
+  opacity: 0.9;
+}
+
 .sidebar-section-body,
 .my-edits-list {
   min-height: 0;
   flex: 1 1 auto;
-  overflow: visible;
+  overflow: hidden auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+}
+
+.sidebar-section-body:hover,
+.sidebar-section-body:focus-within,
+.my-edits-list:hover,
+.my-edits-list:focus-within {
+  scrollbar-color: color-mix(in srgb, var(--muted) 34%, transparent) transparent;
+}
+
+.sidebar-section-body::-webkit-scrollbar,
+.my-edits-list::-webkit-scrollbar {
+  width: 6px;
+}
+
+.sidebar-section-body::-webkit-scrollbar-track,
+.my-edits-list::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.sidebar-section-body::-webkit-scrollbar-thumb,
+.my-edits-list::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 999px;
+}
+
+.sidebar-section-body:hover::-webkit-scrollbar-thumb,
+.sidebar-section-body:focus-within::-webkit-scrollbar-thumb,
+.my-edits-list:hover::-webkit-scrollbar-thumb,
+.my-edits-list:focus-within::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--muted) 28%, transparent);
 }
 
 .sidebar-section-body {
@@ -602,11 +707,13 @@ body.sidebar-resizing {
 }
 
 .finder-shell.drag-active .finder-browser[data-drop-active="true"],
+.finder-shell.drag-active .sidebar-section[data-drop-active="true"],
 .finder-shell.drag-active .sidebar-section-body[data-drop-active="true"] {
   outline-offset: -5px;
 }
 
 .finder-shell.drag-active .finder-browser[data-drop-active="true"][data-drop-label]::after,
+.finder-shell.drag-active .sidebar-section[data-drop-active="true"][data-drop-label]::after,
 .finder-shell.drag-active .sidebar-section-body[data-drop-active="true"][data-drop-label]::after {
   content: attr(data-drop-label);
   position: absolute;

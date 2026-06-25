@@ -36,8 +36,14 @@ class UserPreferenceTests(unittest.TestCase):
                     "sidebarSectionSizes": {
                         "folders": 180,
                         "favorites": 95,
-                        "archive": 115,
                         "editing": 90,
+                        "archive": 115,
+                    },
+                    "sidebarSectionCollapsed": {
+                        "folders": False,
+                        "favorites": False,
+                        "editing": False,
+                        "archive": True,
                     },
                 },
             )
@@ -60,6 +66,12 @@ class UserPreferenceTests(unittest.TestCase):
                             "favorites": 150,
                             "archive": 130,
                             "editing": 90,
+                        },
+                        "sidebarSectionCollapsed": {
+                            "folders": False,
+                            "favorites": True,
+                            "archive": False,
+                            "editing": True,
                         },
                     },
                 },
@@ -94,6 +106,15 @@ class UserPreferenceTests(unittest.TestCase):
                     "favorites": 150,
                     "archive": 130,
                     "editing": 90,
+                },
+            )
+            self.assertEqual(
+                updated.json()["preferences"]["sidebarSectionCollapsed"],
+                {
+                    "folders": False,
+                    "favorites": True,
+                    "archive": False,
+                    "editing": True,
                 },
             )
 
@@ -160,6 +181,15 @@ class UserPreferenceTests(unittest.TestCase):
                 headers=headers,
             )
             self.assertEqual(invalid_sidebar_size.status_code, 400, invalid_sidebar_size.text)
+
+            invalid_sidebar_collapse = ctx.client.patch(
+                "/api/preferences",
+                json={"preferences": {"sidebarSectionCollapsed": {"favorites": "yes"}}},
+                headers=headers,
+            )
+            self.assertEqual(
+                invalid_sidebar_collapse.status_code, 400, invalid_sidebar_collapse.text
+            )
 
             current = ctx.client.get("/api/preferences", headers=headers)
             self.assertEqual(current.status_code, 200, current.text)

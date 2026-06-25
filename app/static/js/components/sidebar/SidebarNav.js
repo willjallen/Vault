@@ -1,15 +1,132 @@
 import { classNames, isArchivePath } from "../../lib/utils.js";
 import { favoriteItemKey } from "../../lib/favoriteItems.js";
 import { keyForItem } from "../../lib/itemActions.js";
-import { MIN_SIDEBAR_SECTION_SIZE, normalizeSidebarSectionSizes } from "../../lib/theme.js";
+import {
+  SIDEBAR_COLLAPSE_THRESHOLD,
+  SIDEBAR_COLLAPSED_SECTION_SIZE,
+  SIDEBAR_EXPANDED_SECTION_SIZE,
+  normalizeSidebarSectionCollapsed,
+  normalizeSidebarSectionSizes,
+} from "../../lib/theme.js";
 import { Icon } from "../common/Icon.js";
 import { MyEdits } from "./MyEdits.js";
 
 const h = React.createElement;
 const { useEffect, useRef, useState } = React;
+const SIDEBAR_RESIZE_HANDLE_SIZE = 10;
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
+}
+
+function sidebarSectionValue(source, key) {
+  switch (key) {
+    case "folders":
+      return source.folders;
+    case "favorites":
+      return source.favorites;
+    case "archive":
+      return source.archive;
+    case "editing":
+      return source.editing;
+    default:
+      return undefined;
+  }
+}
+
+function setSidebarSectionValue(target, key, value) {
+  switch (key) {
+    case "folders":
+      target.folders = value;
+      break;
+    case "favorites":
+      target.favorites = value;
+      break;
+    case "archive":
+      target.archive = value;
+      break;
+    case "editing":
+      target.editing = value;
+      break;
+    default:
+      break;
+  }
+}
+
+function sectionWeight(source, key) {
+  const value = Number(sidebarSectionValue(source, key));
+  return Number.isFinite(value) && value > 0 ? value : SIDEBAR_EXPANDED_SECTION_SIZE;
+}
+
+function sectionPixelValue(source, key) {
+  const value = Number(sidebarSectionValue(source, key));
+  return Number.isFinite(value) && value >= 0 ? value : 0;
+}
+
+function expandedWeightTotal(sizes, collapsed) {
+  let total = 0;
+  if (!collapsed.folders) {
+    total += sectionWeight(sizes, "folders");
+  }
+  if (!collapsed.favorites) {
+    total += sectionWeight(sizes, "favorites");
+  }
+  if (!collapsed.archive) {
+    total += sectionWeight(sizes, "archive");
+  }
+  if (!collapsed.editing) {
+    total += sectionWeight(sizes, "editing");
+  }
+  return total;
+}
+
+function collapsedSectionCount(collapsed) {
+  return (
+    Number(Boolean(collapsed.folders)) +
+    Number(Boolean(collapsed.favorites)) +
+    Number(Boolean(collapsed.archive)) +
+    Number(Boolean(collapsed.editing))
+  );
+}
+
+function resolvedSectionPixels(sizes, collapsed, availableHeight) {
+  const expandedAvailable = Math.max(
+    0,
+    availableHeight - collapsedSectionCount(collapsed) * SIDEBAR_COLLAPSED_SECTION_SIZE
+  );
+  const totalWeight = expandedWeightTotal(sizes, collapsed);
+  const scale = totalWeight > 0 ? expandedAvailable / totalWeight : 0;
+  return {
+    folders: collapsed.folders
+      ? SIDEBAR_COLLAPSED_SECTION_SIZE
+      : sectionWeight(sizes, "folders") * scale,
+    favorites: collapsed.favorites
+      ? SIDEBAR_COLLAPSED_SECTION_SIZE
+      : sectionWeight(sizes, "favorites") * scale,
+    archive: collapsed.archive
+      ? SIDEBAR_COLLAPSED_SECTION_SIZE
+      : sectionWeight(sizes, "archive") * scale,
+    editing: collapsed.editing
+      ? SIDEBAR_COLLAPSED_SECTION_SIZE
+      : sectionWeight(sizes, "editing") * scale,
+  };
+}
+
+function sizesFromPixels(pixels, collapsed, previousSizes) {
+  return {
+    folders: collapsed.folders
+      ? sectionWeight(previousSizes, "folders")
+      : Math.max(1, sectionPixelValue(pixels, "folders")),
+    favorites: collapsed.favorites
+      ? sectionWeight(previousSizes, "favorites")
+      : Math.max(1, sectionPixelValue(pixels, "favorites")),
+    archive: collapsed.archive
+      ? sectionWeight(previousSizes, "archive")
+      : Math.max(1, sectionPixelValue(pixels, "archive")),
+    editing: collapsed.editing
+      ? sectionWeight(previousSizes, "editing")
+      : Math.max(1, sectionPixelValue(pixels, "editing")),
+  };
 }
 
 function folderName(path, fallback) {
@@ -94,6 +211,26 @@ function folderDropHandlers({ disabled, dropFolder, onClearDropHint, onDropOnFol
       }
     },
   };
+}
+
+function SidebarSectionHeader({ title, collapsed = false, onToggleCollapsed }) {
+  return h(
+    "button",
+    {
+      className: classNames("sidebar-section-header", collapsed ? "collapsed" : ""),
+      type: "button",
+      onClick: onToggleCollapsed,
+      title: collapsed ? `Expand ${title}` : `Collapse ${title}`,
+    },
+    [
+      h("span", { className: "sidebar-section-title eyebrow tiny" }, title),
+      h(Icon, {
+        className: "sidebar-section-chevron",
+        icon: collapsed ? "chevron-right" : "chevron-down",
+        size: 11,
+      }),
+    ]
+  );
 }
 
 function SidebarFolderShortcut({
@@ -186,6 +323,8 @@ function SidebarFolderList({
   orderedItems,
   className = "",
   style,
+  collapsed = false,
+  onToggleCollapsed,
   emptyContent,
   sectionDragProps = {},
   dropActive = false,
@@ -206,54 +345,61 @@ function SidebarFolderList({
 }) {
   const selectedSet = new Set(selectedKeys || []);
   const paneItems = orderedItems || items;
-  return h("div", { className: classNames("sidebar-section", className), style }, [
-    h("p", { className: "eyebrow tiny" }, title),
-    h(
-      "div",
-      {
-        className: classNames(
-          "sidebar-section-body",
-          dropAvailable ? "drop-available" : "",
-          dropActive ? "drop-active" : ""
-        ),
-        ...sectionDragProps,
-      },
-      h(
-        "div",
-        { className: "tree" },
-        items.length
-          ? items.map((item) =>
-              h(SidebarFolderShortcut, {
-                key: item.path || item.name,
-                item,
-                currentFolder,
-                dropHint,
-                activeDropTarget,
-                selected: selectedSet.has(keyForItem(item)),
-                disableFolderDrops,
-                onSelect,
-                onSelectItem: (selectedItem, e) =>
-                  onSelectItem && onSelectItem(selectedItem, e, paneItems),
-                onContextMenu,
-                onFolderDragStart: (e, path) => {
-                  const key = keyForItem(item);
-                  const dragItems = selectedSet.has(key)
-                    ? paneItems.filter((folderItem) => selectedSet.has(keyForItem(folderItem)))
-                    : [item];
-                  if (onFolderDragStart) {
-                    onFolderDragStart(e, path, dragItems);
-                  }
-                },
-                onFolderDragEnd,
-                draggingFolderPath,
-                onDropOnFolder,
-                onClearDropHint,
-              })
-            )
-          : h("div", { className: "sidebar-empty" }, emptyContent || "Empty")
-      )
-    ),
-  ]);
+  return h(
+    "div",
+    {
+      className: classNames("sidebar-section", className, collapsed ? "collapsed" : ""),
+      style,
+      ...sectionDragProps,
+    },
+    h(SidebarSectionHeader, { collapsed, onToggleCollapsed, title }),
+    collapsed
+      ? null
+      : h(
+          "div",
+          {
+            className: classNames(
+              "sidebar-section-body",
+              dropAvailable ? "drop-available" : "",
+              dropActive ? "drop-active" : ""
+            ),
+          },
+          h(
+            "div",
+            { className: "tree" },
+            items.length
+              ? items.map((item) =>
+                  h(SidebarFolderShortcut, {
+                    key: item.path || item.name,
+                    item,
+                    currentFolder,
+                    dropHint,
+                    activeDropTarget,
+                    selected: selectedSet.has(keyForItem(item)),
+                    disableFolderDrops,
+                    onSelect,
+                    onSelectItem: (selectedItem, e) =>
+                      onSelectItem && onSelectItem(selectedItem, e, paneItems),
+                    onContextMenu,
+                    onFolderDragStart: (e, path) => {
+                      const key = keyForItem(item);
+                      const dragItems = selectedSet.has(key)
+                        ? paneItems.filter((folderItem) => selectedSet.has(keyForItem(folderItem)))
+                        : [item];
+                      if (onFolderDragStart) {
+                        onFolderDragStart(e, path, dragItems);
+                      }
+                    },
+                    onFolderDragEnd,
+                    draggingFolderPath,
+                    onDropOnFolder,
+                    onClearDropHint,
+                  })
+                )
+              : h("div", { className: "sidebar-empty" }, emptyContent || "Empty")
+          )
+        )
+  );
 }
 
 function SidebarFavoriteShortcut({
@@ -357,6 +503,8 @@ function SidebarFavoriteList({
   items,
   className = "",
   style,
+  collapsed = false,
+  onToggleCollapsed,
   sectionDragProps = {},
   dropActive = false,
   dropAvailable = false,
@@ -407,25 +555,32 @@ function SidebarFavoriteList({
     );
   });
 
-  return h("div", { className: classNames("sidebar-section", className), style }, [
-    h("p", { className: "eyebrow tiny" }, title),
-    h(
-      "div",
-      {
-        className: classNames(
-          "sidebar-section-body",
-          dropAvailable ? "drop-available" : "",
-          dropActive ? "drop-active" : ""
-        ),
-        ...sectionDragProps,
-      },
-      h(
-        "div",
-        { className: "tree" },
-        rows.length ? rows : h("div", { className: "sidebar-empty" }, "No favorites")
-      )
-    ),
-  ]);
+  return h(
+    "div",
+    {
+      className: classNames("sidebar-section", className, collapsed ? "collapsed" : ""),
+      style,
+      ...sectionDragProps,
+    },
+    h(SidebarSectionHeader, { collapsed, onToggleCollapsed, title }),
+    collapsed
+      ? null
+      : h(
+          "div",
+          {
+            className: classNames(
+              "sidebar-section-body",
+              dropAvailable ? "drop-available" : "",
+              dropActive ? "drop-active" : ""
+            ),
+          },
+          h(
+            "div",
+            { className: "tree" },
+            rows.length ? rows : h("div", { className: "sidebar-empty" }, "No favorites")
+          )
+        )
+  );
 }
 
 function SidebarResizeHandle({ before, after, onPointerDown }) {
@@ -448,6 +603,7 @@ export function SidebarNav({
   activeDropTarget,
   dragActive = false,
   favoriteDropAvailable = false,
+  sidebarSectionCollapsed,
   sidebarSectionSizes,
   myEdits = [],
   selectedId,
@@ -455,6 +611,7 @@ export function SidebarNav({
   onSelectItem,
   onSelectFavoriteDocument,
   onContextMenu,
+  onSidebarLayoutChange,
   onSidebarSectionSizesChange,
   onFavoriteFileContextMenu,
   onSelectMyEdit,
@@ -467,10 +624,16 @@ export function SidebarNav({
   onDropOnFolder,
   onClearDropHint,
 }) {
+  const layoutRef = useRef(null);
   const [draftSizes, setDraftSizes] = useState(() =>
     normalizeSidebarSectionSizes(sidebarSectionSizes)
   );
+  const [draftCollapsed, setDraftCollapsed] = useState(() =>
+    normalizeSidebarSectionCollapsed(sidebarSectionCollapsed)
+  );
+  const [layoutHeight, setLayoutHeight] = useState(0);
   const draftSizesRef = useRef(draftSizes);
+  const draftCollapsedRef = useRef(draftCollapsed);
 
   useEffect(() => {
     const normalized = normalizeSidebarSectionSizes(sidebarSectionSizes);
@@ -478,48 +641,136 @@ export function SidebarNav({
     setDraftSizes(normalized);
   }, [sidebarSectionSizes]);
 
-  function updateDraftSizes(nextSizes) {
+  useEffect(() => {
+    const normalized = normalizeSidebarSectionCollapsed(sidebarSectionCollapsed);
+    draftCollapsedRef.current = normalized;
+    setDraftCollapsed(normalized);
+  }, [sidebarSectionCollapsed]);
+
+  useEffect(() => {
+    const layout = layoutRef.current;
+    if (!layout) {
+      return undefined;
+    }
+    function updateLayoutHeight() {
+      setLayoutHeight(layout.getBoundingClientRect().height);
+    }
+    updateLayoutHeight();
+    const observer = new ResizeObserver(updateLayoutHeight);
+    observer.observe(layout);
+    return () => observer.disconnect();
+  }, []);
+
+  function updateDraftLayout(nextSizes, nextCollapsed) {
     draftSizesRef.current = nextSizes;
+    draftCollapsedRef.current = nextCollapsed;
     setDraftSizes(nextSizes);
+    setDraftCollapsed(nextCollapsed);
   }
 
-  function sectionStyle(key) {
-    // eslint-disable-next-line security/detect-object-injection
-    return { "--sidebar-section-size": draftSizes[key] };
+  function commitDraftLayout() {
+    if (onSidebarLayoutChange) {
+      onSidebarLayoutChange({
+        collapsed: draftCollapsedRef.current,
+        sizes: draftSizesRef.current,
+      });
+      return;
+    }
+    if (onSidebarSectionSizesChange) {
+      onSidebarSectionSizesChange(draftSizesRef.current);
+    }
+  }
+
+  function availableSectionHeight() {
+    return Math.max(0, layoutHeight - SIDEBAR_RESIZE_HANDLE_SIZE * 3);
+  }
+
+  function currentSectionPixels() {
+    return resolvedSectionPixels(draftSizes, draftCollapsed, availableSectionHeight());
+  }
+
+  function layoutStyle() {
+    const pixels = currentSectionPixels();
+    return {
+      gridTemplateRows: [
+        `${Math.max(0, pixels.folders)}px`,
+        `${SIDEBAR_RESIZE_HANDLE_SIZE}px`,
+        `${Math.max(0, pixels.favorites)}px`,
+        `${SIDEBAR_RESIZE_HANDLE_SIZE}px`,
+        `${Math.max(0, pixels.editing)}px`,
+        `${SIDEBAR_RESIZE_HANDLE_SIZE}px`,
+        `${Math.max(0, pixels.archive)}px`,
+      ].join(" "),
+    };
+  }
+
+  function sectionCollapsed(key) {
+    return Boolean(sidebarSectionValue(draftCollapsed, key));
+  }
+
+  function toggleSectionCollapsed(key) {
+    const nextSizes = { ...draftSizesRef.current };
+    const nextCollapsed = { ...draftCollapsedRef.current };
+    const collapsed = !sidebarSectionValue(nextCollapsed, key);
+    setSidebarSectionValue(nextCollapsed, key, collapsed);
+    setSidebarSectionValue(nextSizes, key, SIDEBAR_EXPANDED_SECTION_SIZE);
+    updateDraftLayout(nextSizes, nextCollapsed);
+    commitDraftLayout();
   }
 
   function handleResizePointerDown(pointerEvent, before, after) {
     pointerEvent.preventDefault();
     const startY = pointerEvent.clientY;
-    const startSizes = draftSizesRef.current;
-    // eslint-disable-next-line security/detect-object-injection
-    const startBefore = startSizes[before];
-    // eslint-disable-next-line security/detect-object-injection
-    const startAfter = startSizes[after];
+    const startSizes = sizesFromPixels(
+      currentSectionPixels(),
+      draftCollapsedRef.current,
+      draftSizesRef.current
+    );
+    const startCollapsed = draftCollapsedRef.current;
+    const startPixels = resolvedSectionPixels(startSizes, startCollapsed, availableSectionHeight());
+    const startBefore = sectionPixelValue(startPixels, before);
+    const startAfter = sectionPixelValue(startPixels, after);
     const pairSize = startBefore + startAfter;
 
     function handlePointerMove(moveEvent) {
-      const maxBefore = Math.max(MIN_SIDEBAR_SECTION_SIZE, pairSize - MIN_SIDEBAR_SECTION_SIZE);
-      const nextBefore = clamp(
-        startBefore + moveEvent.clientY - startY,
-        MIN_SIDEBAR_SECTION_SIZE,
-        maxBefore
-      );
-      const nextAfter = clamp(pairSize - nextBefore, MIN_SIDEBAR_SECTION_SIZE, pairSize);
-      updateDraftSizes({
-        ...startSizes,
-        [before]: nextBefore,
-        [after]: nextAfter,
-      });
+      const desiredBefore = startBefore + moveEvent.clientY - startY;
+      const desiredAfter = pairSize - desiredBefore;
+      const nextPixels = { ...startPixels };
+      const nextCollapsed = { ...startCollapsed };
+      if (desiredBefore <= SIDEBAR_COLLAPSE_THRESHOLD) {
+        setSidebarSectionValue(nextCollapsed, before, true);
+        setSidebarSectionValue(nextCollapsed, after, false);
+        setSidebarSectionValue(nextPixels, before, SIDEBAR_COLLAPSED_SECTION_SIZE);
+        setSidebarSectionValue(
+          nextPixels,
+          after,
+          Math.max(1, pairSize - SIDEBAR_COLLAPSED_SECTION_SIZE)
+        );
+      } else if (desiredAfter <= SIDEBAR_COLLAPSE_THRESHOLD) {
+        setSidebarSectionValue(nextCollapsed, before, false);
+        setSidebarSectionValue(nextCollapsed, after, true);
+        setSidebarSectionValue(
+          nextPixels,
+          before,
+          Math.max(1, pairSize - SIDEBAR_COLLAPSED_SECTION_SIZE)
+        );
+        setSidebarSectionValue(nextPixels, after, SIDEBAR_COLLAPSED_SECTION_SIZE);
+      } else {
+        const nextBefore = clamp(desiredBefore, 1, Math.max(1, pairSize - 1));
+        setSidebarSectionValue(nextCollapsed, before, false);
+        setSidebarSectionValue(nextCollapsed, after, false);
+        setSidebarSectionValue(nextPixels, before, nextBefore);
+        setSidebarSectionValue(nextPixels, after, Math.max(1, pairSize - nextBefore));
+      }
+      const nextSizes = sizesFromPixels(nextPixels, nextCollapsed, startSizes);
+      updateDraftLayout(nextSizes, nextCollapsed);
     }
 
     function handlePointerUp() {
       window.removeEventListener("pointermove", handlePointerMove);
       window.removeEventListener("pointerup", handlePointerUp);
       document.body.classList.remove("sidebar-resizing");
-      if (onSidebarSectionSizesChange) {
-        onSidebarSectionSizesChange(draftSizesRef.current);
-      }
+      commitDraftLayout();
     }
 
     document.body.classList.add("sidebar-resizing");
@@ -545,14 +796,21 @@ export function SidebarNav({
     sourcePane: "favorites",
   }));
 
-  return [
+  return h(
+    "div",
+    {
+      className: "sidebar-layout",
+      ref: layoutRef,
+      style: layoutStyle(),
+    },
     h(SidebarFolderList, {
       key: "folders",
       title: "Folders",
       items: vaultItems,
       orderedItems: allItems,
       className: "resizable-sidebar-section",
-      style: sectionStyle("folders"),
+      collapsed: sectionCollapsed("folders"),
+      onToggleCollapsed: () => toggleSectionCollapsed("folders"),
       currentFolder: currentFolder || "",
       dropHint,
       activeDropTarget,
@@ -577,7 +835,8 @@ export function SidebarNav({
       title: "Favorites",
       items: favoriteShortcutItems,
       className: "resizable-sidebar-section",
-      style: sectionStyle("favorites"),
+      collapsed: sectionCollapsed("favorites"),
+      onToggleCollapsed: () => toggleSectionCollapsed("favorites"),
       sectionDragProps: {
         "data-vault-drop-kind": "favorites",
         "data-drop-active": activeDropTarget?.kind === "favorites" ? "true" : undefined,
@@ -600,8 +859,24 @@ export function SidebarNav({
       draggingFolderPath,
     }),
     h(SidebarResizeHandle, {
-      key: "favorites-archive",
+      key: "favorites-editing",
       before: "favorites",
+      after: "editing",
+      onPointerDown: handleResizePointerDown,
+    }),
+    h(MyEdits, {
+      key: "my-edits",
+      className: "resizable-sidebar-section",
+      collapsed: sectionCollapsed("editing"),
+      edits: myEdits,
+      onToggleCollapsed: () => toggleSectionCollapsed("editing"),
+      selectedId,
+      onSelect: onSelectMyEdit,
+      onContextMenu: onMyEditContextMenu,
+    }),
+    h(SidebarResizeHandle, {
+      key: "editing-archive",
+      before: "editing",
       after: "archive",
       onPointerDown: handleResizePointerDown,
     }),
@@ -611,7 +886,8 @@ export function SidebarNav({
       items: archiveItems,
       orderedItems: allItems,
       className: "resizable-sidebar-section",
-      style: sectionStyle("archive"),
+      collapsed: sectionCollapsed("archive"),
+      onToggleCollapsed: () => toggleSectionCollapsed("archive"),
       currentFolder: currentFolder || "",
       dropHint,
       activeDropTarget,
@@ -624,21 +900,6 @@ export function SidebarNav({
       draggingFolderPath,
       onDropOnFolder,
       onClearDropHint,
-    }),
-    h(SidebarResizeHandle, {
-      key: "archive-editing",
-      before: "archive",
-      after: "editing",
-      onPointerDown: handleResizePointerDown,
-    }),
-    h(MyEdits, {
-      key: "my-edits",
-      className: "resizable-sidebar-section",
-      style: sectionStyle("editing"),
-      edits: myEdits,
-      selectedId,
-      onSelect: onSelectMyEdit,
-      onContextMenu: onMyEditContextMenu,
-    }),
-  ];
+    })
+  );
 }

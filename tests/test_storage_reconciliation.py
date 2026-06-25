@@ -38,6 +38,51 @@ class StorageReconciliationTests(unittest.TestCase):
             self.assertEqual(report["unreferenced_local_keys"], [])
             self.assertEqual(report["missing_local_keys"], [object_key])
 
+    def test_apply_preserves_referenced_local_object_with_missing_location_metadata(
+        self,
+    ) -> None:
+        user = user_context("user", groups=[])
+        data = b"referenced content with missing metadata"
+
+        with vault_runtime() as ctx, ctx.db() as db:
+            folder = get_or_create_folder_path(db, "")
+            doc = create_versioned_document(
+                db,
+                folder,
+                name="kept.txt",
+                data=data,
+                actor=user,
+            )
+            db.commit()
+
+            version = db.query(DocumentVersion).filter_by(document_id=doc.id).one()
+            location = (
+                db.query(BlobLocation)
+                .filter_by(blob_id=version.blob_id, backend="local")
+                .one()
+            )
+            object_key = location.object_key
+            db.delete(location)
+            db.commit()
+
+            applied = storage_reconciliation_report(db, apply=True)
+            self.assertEqual(applied["orphan_blob_ids"], [])
+            self.assertEqual(applied["unreferenced_local_keys"], [])
+            self.assertEqual(applied["missing_local_keys"], [])
+            self.assertEqual(applied["missing_local_location_keys"], [object_key])
+            self.assertEqual(applied["deleted_local_keys"], [])
+            db.commit()
+
+            self.assertEqual(get_storage_backend("local").read_bytes(object_key), data)
+            restored_location = (
+                db.query(BlobLocation)
+                .filter_by(blob_id=version.blob_id, backend="local", object_key=object_key)
+                .one()
+            )
+            self.assertEqual(restored_location.bucket, "")
+            after = storage_reconciliation_report(db, apply=False)
+            self.assertEqual(after["missing_local_location_keys"], [])
+
     def test_apply_removes_orphan_blob_metadata_and_local_object(self) -> None:
         user = user_context("user", groups=[])
 

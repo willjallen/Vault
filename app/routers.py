@@ -63,6 +63,7 @@ from .storage import (
     StorageNotFoundError,
     get_storage_backend,
     new_version_id,
+    object_key_for_hash,
     storage_write_lock,
 )
 from .version import APP_VERSION
@@ -2641,6 +2642,11 @@ def storage_reconciliation_report(db: Session, apply: bool = False) -> dict[str,
     referenced_blob_ids = {
         row[0] for row in db.execute(select(DocumentVersion.blob_id)).all() if row[0] is not None
     }
+    referenced_blobs = (
+        list(db.execute(select(Blob).where(Blob.id.in_(referenced_blob_ids))).scalars())
+        if referenced_blob_ids
+        else []
+    )
     orphan_blobs = [
         blob for blob in db.execute(select(Blob)).scalars() if blob.id not in referenced_blob_ids
     ]
@@ -2650,14 +2656,32 @@ def storage_reconciliation_report(db: Session, apply: bool = False) -> dict[str,
     )
     known_local_keys = {location.object_key for location in local_locations}
     local_backend = get_storage_backend("local")
+    local_bucket = local_backend.bucket
     local_keys = set(local_backend.list_object_keys())
-    unreferenced_local_keys = sorted(local_keys - known_local_keys)
     referenced_local_keys = {
         location.object_key
         for location in local_locations
         if location.blob_id in referenced_blob_ids
     }
+    local_location_pairs = {
+        (location.blob_id, location.object_key) for location in local_locations
+    }
+    recoverable_referenced_local_locations: set[tuple[int, str]] = set()
+    for blob in referenced_blobs:
+        object_key = object_key_for_hash(blob.hash_algo, blob.hash)
+        if object_key in local_keys:
+            recoverable_referenced_local_locations.add((blob.id, object_key))
+    recoverable_referenced_local_keys = {
+        object_key for _, object_key in recoverable_referenced_local_locations
+    }
+    referenced_protected_local_keys = referenced_local_keys | recoverable_referenced_local_keys
+    unreferenced_local_keys = sorted(local_keys - known_local_keys - recoverable_referenced_local_keys)
     missing_local_keys = sorted(referenced_local_keys - local_keys)
+    missing_local_location_keys = sorted(
+        object_key
+        for blob_id, object_key in recoverable_referenced_local_locations
+        if (blob_id, object_key) not in local_location_pairs
+    )
     orphan_local_keys = sorted(
         {
             location.object_key
@@ -2666,9 +2690,9 @@ def storage_reconciliation_report(db: Session, apply: bool = False) -> dict[str,
             if location.backend == "local"
         },
     )
+    orphan_local_keys_to_delete = sorted(set(orphan_local_keys) - referenced_protected_local_keys)
     if apply:
-        local_backend = get_storage_backend("local")
-        for object_key in orphan_local_keys:
+        for object_key in orphan_local_keys_to_delete:
             local_backend.delete_object(object_key)
         orphan_blob_id_set = set(orphan_blob_ids)
         remote_location_blob_ids = {
@@ -2695,13 +2719,38 @@ def storage_reconciliation_report(db: Session, apply: bool = False) -> dict[str,
                 db.delete(blob)
         for object_key in unreferenced_local_keys:
             local_backend.delete_object(object_key)
+        for blob_id, object_key in sorted(recoverable_referenced_local_locations):
+            if (blob_id, object_key) in local_location_pairs:
+                continue
+            existing_location = (
+                db.execute(
+                    select(BlobLocation).where(
+                        BlobLocation.backend == "local",
+                        BlobLocation.bucket == local_bucket,
+                        BlobLocation.object_key == object_key,
+                    ),
+                )
+                .scalars()
+                .first()
+            )
+            if existing_location:
+                continue
+            db.add(
+                BlobLocation(
+                    blob_id=blob_id,
+                    backend="local",
+                    bucket=local_bucket,
+                    object_key=object_key,
+                ),
+            )
         db.flush()
     return {
         "orphan_blob_ids": orphan_blob_ids,
         "unreferenced_local_keys": unreferenced_local_keys,
         "missing_local_keys": missing_local_keys,
+        "missing_local_location_keys": missing_local_location_keys,
         "deleted_local_keys": sorted(
-            set(unreferenced_local_keys) | set(orphan_local_keys),
+            set(unreferenced_local_keys) | set(orphan_local_keys_to_delete),
         )
         if apply
         else [],

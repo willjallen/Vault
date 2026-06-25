@@ -161,7 +161,6 @@ export function VaultFileList({
   const marqueeDragRef = useRef(null);
   const marqueeFrameRef = useRef(null);
   const suppressClickRef = useRef(false);
-  const selectAllRef = useRef(null);
   const [marquee, setMarquee] = useState(null);
   const inArchive = isArchivePath(folder);
   const draftInFolder = inlineFolderDraft && inlineFolderDraft.parent === (folder || "");
@@ -181,13 +180,6 @@ export function VaultFileList({
   const visibleKeys = orderedKeys;
   const allVisibleSelected =
     visibleKeys.length > 0 && visibleKeys.every((key) => selectedSet.has(key));
-  const someVisibleSelected = visibleKeys.some((key) => selectedSet.has(key));
-
-  useEffect(() => {
-    if (selectAllRef.current) {
-      selectAllRef.current.indeterminate = someVisibleSelected && !allVisibleSelected;
-    }
-  }, [allVisibleSelected, someVisibleSelected]);
 
   const updateMarqueeSelection = useCallback(() => {
     marqueeFrameRef.current = null;
@@ -662,7 +654,6 @@ export function VaultFileList({
               className: "contents-select-checkbox",
               disabled: visibleKeys.length === 0,
               onChange: handleSelectAllChange,
-              ref: selectAllRef,
               type: "checkbox",
             })
           ),

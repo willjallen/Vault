@@ -1903,7 +1903,12 @@ def folder_properties_payload(
         .scalars()
         .all()
     )
-    groups = list(db.execute(select(VaultGroup).order_by(VaultGroup.name)).scalars().all())
+    can_manage_permissions = user is None or folder_access_level(folder, user, db) >= 3
+    groups = (
+        list(db.execute(select(VaultGroup).order_by(VaultGroup.name)).scalars().all())
+        if can_manage_permissions
+        else []
+    )
     summary.update(
         {
             "id": folder.id,
@@ -1924,7 +1929,9 @@ def folder_properties_payload(
                 }
                 for event in events
             ],
-            "permissions": folder_permissions_payload(folder, db),
+            "permissions": folder_permissions_payload(folder, db)
+            if can_manage_permissions
+            else [],
             "available_groups": [{"id": group.id, "name": group.name} for group in groups],
         },
     )

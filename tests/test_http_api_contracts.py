@@ -202,6 +202,8 @@ class HttpApiContractTests(unittest.TestCase):
             self.assertEqual(payload["size_bytes"], 0)
             self.assertIsNone(payload["latest_by"])
             self.assertIsNone(payload["modified_at"])
+            self.assertEqual(payload["permissions"], [])
+            self.assertEqual(payload["available_groups"], [])
 
 
 if __name__ == "__main__":

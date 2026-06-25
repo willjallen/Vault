@@ -634,9 +634,40 @@ def ttl_policy_payload(folder: Folder) -> dict[str, object | None]:
     }
 
 
-def apply_folder_ttl(doc: Document, folder: Folder, timestamp: dt.datetime | None = None) -> None:
+def direct_folder_ttl_policy(folder: Folder) -> tuple[int | None, str | None]:
     days = folder.default_ttl_days
     action = (folder.default_ttl_action or "").strip().lower()
+    if action not in TTL_ACTIONS or not days or days < 1:
+        return None, None
+    return days, action
+
+
+def effective_folder_ttl_policy(folder: Folder) -> tuple[int | None, str | None, Folder | None]:
+    current: Folder | None = folder
+    seen: set[int] = set()
+    while current and current.id not in seen:
+        seen.add(current.id)
+        days, action = direct_folder_ttl_policy(current)
+        if days and action:
+            if action == "archive" and folder_is_archive(folder):
+                return None, None, None
+            return days, action, current
+        current = current.parent
+    return None, None, None
+
+
+def effective_ttl_policy_payload(folder: Folder) -> dict[str, object | None]:
+    days, action, source = effective_folder_ttl_policy(folder)
+    return {
+        "effective_ttl_days": days,
+        "effective_ttl_action": action or "none",
+        "effective_ttl_source_id": source.id if source else None,
+        "effective_ttl_inherited": bool(source and source.id != folder.id),
+    }
+
+
+def apply_folder_ttl(doc: Document, folder: Folder, timestamp: dt.datetime | None = None) -> None:
+    days, action, _source = effective_folder_ttl_policy(folder)
     if action not in TTL_ACTIONS or not days:
         doc.expires_at = None
         doc.expiry_action = None
@@ -744,6 +775,11 @@ def subtree_folder_ids(root: Folder, folders: list[Folder]) -> set[int]:
 def docs_in_folder_subtree(db: Session, root: Folder) -> list[Document]:
     ids = subtree_folder_ids(root, all_folders(db))
     return list(db.execute(select(Document).where(Document.folder_id.in_(ids))).scalars().all())
+
+
+def reapply_ttl_for_folder_subtree(folder: Folder, db: Session) -> None:
+    for doc in docs_in_folder_subtree(db, folder):
+        apply_folder_ttl(doc, doc.folder, doc.latest_modified_at)
 
 
 def set_subtree_root_key(db: Session, root: Folder, root_key: str) -> None:
@@ -1376,6 +1412,7 @@ def move_folder_item(
     source.parent = target_parent
     source.parent_id = target_parent.id
     source.name = target_name
+    reapply_ttl_for_folder_subtree(source, db)
     event_type = (
         "rename"
         if source_parent_path == folder_path(target_parent) and target_name != source_name
@@ -1611,6 +1648,7 @@ def folder_summary_payload(folder: Folder, path: str, stats: list[DocStat]) -> d
         "icon": folder.icon or "",
         "default_ttl_days": folder.default_ttl_days,
         "default_ttl_action": folder.default_ttl_action or "none",
+        **effective_ttl_policy_payload(folder),
         "latest_by": latest_by,
         "modified_at": latest.isoformat() if latest else None,
         "modified_display": format_mtime(latest),
@@ -1821,6 +1859,7 @@ def build_sidebar_payload(db: Session, user: UserContext) -> dict[str, object]:
             "access": folder_access_payload(item, user, db),
             "default_ttl_days": item.default_ttl_days,
             "default_ttl_action": item.default_ttl_action or "none",
+            **effective_ttl_policy_payload(item),
         }
         for item in folders
         if folder_access_level(item, user, db) >= 1
@@ -2821,8 +2860,9 @@ def api_update_folder_retention(
             raise HTTPException(status_code=403, detail="Admin access required for delete TTL")
         folder.default_ttl_days = days
         folder.default_ttl_action = action
+        reapply_ttl_for_folder_subtree(folder, db)
         record_folder_event(folder, user, "retention", "Updated folder retention policy", db)
-        record_folder_change(db, "retention")
+        record_folder_change(db, "retention", include_document_updates=True)
         commit_state(db)
         return folder_properties_payload(folder, db)
 

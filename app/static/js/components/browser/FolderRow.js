@@ -24,6 +24,18 @@ function folderDropAttributes({ editing, folder, isDraft, isDropTarget }) {
   };
 }
 
+function folderRetentionStatus(folder) {
+  const hasEffectiveRetention =
+    folder.effective_ttl_action && folder.effective_ttl_action !== "none";
+  const action = hasEffectiveRetention ? folder.effective_ttl_action : folder.default_ttl_action;
+  const days = hasEffectiveRetention ? folder.effective_ttl_days : folder.default_ttl_days;
+  const label = retentionPolicyLabel(action, days);
+  return {
+    labels: retentionPolicyStatusLabels(action, days),
+    title: label && folder.effective_ttl_inherited ? `${label} · inherited` : label,
+  };
+}
+
 export function FolderRow({
   folder,
   editing,
@@ -50,11 +62,7 @@ export function FolderRow({
   const inputRef = useRef(null);
   const committingRef = useRef(false);
   const isArchived = isArchivePath(folder.path || "");
-  const retentionLabel = retentionPolicyLabel(folder.default_ttl_action, folder.default_ttl_days);
-  const retentionLabels = retentionPolicyStatusLabels(
-    folder.default_ttl_action,
-    folder.default_ttl_days
-  );
+  const retention = folderRetentionStatus(folder);
 
   useEffect(() => {
     if (!editing || !inputRef.current) {
@@ -209,11 +217,11 @@ export function FolderRow({
       ),
       h("div", { className: "file-cell status-col" }, [
         h("span", { className: "status-pill subtle status-version" }, "Folder"),
-        retentionLabels
+        retention.labels
           ? h(TtlStatusLabel, {
               className: "policy status-ttl folder-status-ttl",
-              labels: retentionLabels,
-              title: retentionLabel,
+              labels: retention.labels,
+              title: retention.title,
             })
           : [
               h("span", {

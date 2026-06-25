@@ -86,6 +86,14 @@ function normalizeFavoriteItem(value) {
       icon: normalizeOptionalFavoriteString(value.icon),
       default_ttl_action: normalizeOptionalFavoriteString(value.default_ttl_action),
       default_ttl_days: Number.isInteger(value.default_ttl_days) ? value.default_ttl_days : null,
+      effective_ttl_action: normalizeOptionalFavoriteString(value.effective_ttl_action),
+      effective_ttl_days: Number.isInteger(value.effective_ttl_days)
+        ? value.effective_ttl_days
+        : null,
+      effective_ttl_inherited: Boolean(value.effective_ttl_inherited),
+      effective_ttl_source_id: Number.isInteger(value.effective_ttl_source_id)
+        ? value.effective_ttl_source_id
+        : null,
       access: value.access && typeof value.access === "object" ? value.access : {},
       archived: Boolean(value.archived),
       modified_at: normalizeOptionalFavoriteString(value.modified_at) || null,

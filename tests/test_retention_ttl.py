@@ -1,7 +1,7 @@
 import datetime as dt
 import unittest
 
-from tests.support import FAKE_REQUEST, user_context, vault_runtime
+from tests.support import FAKE_REQUEST, auth_headers, user_context, vault_runtime, vault_test_client
 
 from app.models import Document, DocumentLock, StateEvent
 from app.routers import (
@@ -9,6 +9,7 @@ from app.routers import (
     folder_path,
     get_or_create_folder_path,
     move_doc_item,
+    move_folder_item,
     normalize_timestamp,
     now_utc,
     restore_doc_item,
@@ -137,7 +138,7 @@ class RetentionTtlTests(unittest.TestCase):
                 event_count = db.query(StateEvent).filter_by(event_type="retention.expired").count()
                 self.assertEqual(event_count, 0)
 
-    def test_child_folder_without_ttl_does_not_inherit_parent_delete_ttl(self) -> None:
+    def test_child_folder_inherits_parent_delete_ttl(self) -> None:
         with vault_runtime() as ctx:
             with ctx.db() as db:
                 parent = get_or_create_folder_path(db, "Temp")
@@ -152,6 +153,125 @@ class RetentionTtlTests(unittest.TestCase):
                 db.add(doc)
                 db.flush()
                 apply_folder_ttl(doc, child, now_utc() - dt.timedelta(days=30))
+                self.assertEqual(doc.expiry_action, "delete")
+                self.assertLessEqual(normalize_timestamp(doc.expires_at), now_utc())
+                safe = get_or_create_folder_path(db, "Safe")
+                safe_doc = Document(
+                    folder_id=safe.id,
+                    name="old-but-outside-scope.txt",
+                    latest_modified_at=now_utc() - dt.timedelta(days=30),
+                )
+                db.add(safe_doc)
+                db.flush()
+                apply_folder_ttl(safe_doc, safe, safe_doc.latest_modified_at)
+                self.assertIsNone(safe_doc.expiry_action)
+                self.assertIsNone(safe_doc.expires_at)
+                db.commit()
+                doc_id = doc.id
+                safe_doc_id = safe_doc.id
+
+            result = sweep_expired_documents()
+            self.assertEqual(result["deleted"], ["Temp/Keep/child-safe.txt"])
+
+            with ctx.db() as db:
+                self.assertIsNone(db.get(Document, doc_id))
+                self.assertIsNotNone(db.get(Document, safe_doc_id))
+
+    def test_retention_update_reapplies_existing_subtree_and_contents_payload(self) -> None:
+        headers = auth_headers("alice", ["vault-admin"])
+        with vault_test_client() as ctx:
+            with ctx.db() as db:
+                get_or_create_folder_path(db, "Project")
+                child = get_or_create_folder_path(db, "Project/Concept")
+                doc = Document(
+                    folder_id=child.id,
+                    name="sketch.png",
+                    latest_modified_at=now_utc() - dt.timedelta(days=5),
+                )
+                db.add(doc)
+                db.commit()
+                doc_id = doc.id
+
+            update = ctx.client.put(
+                "/api/folders/retention",
+                json={
+                    "path": "Project",
+                    "default_ttl_action": "archive",
+                    "default_ttl_days": 30,
+                },
+                headers=headers,
+            )
+            self.assertEqual(update.status_code, 200, update.text)
+            with ctx.db() as db:
+                doc = db.get(Document, doc_id)
+                self.assertIsNotNone(doc)
+                self.assertEqual(doc.expiry_action, "archive")
+                self.assertIsNotNone(doc.expires_at)
+                self.assertGreater(
+                    normalize_timestamp(doc.expires_at),
+                    now_utc() + dt.timedelta(days=24),
+                )
+
+            contents = ctx.client.get(
+                "/api/folders/contents",
+                params={"folder": "Project"},
+                headers=headers,
+            )
+            self.assertEqual(contents.status_code, 200, contents.text)
+            child_row = contents.json()["folders"][0]
+            self.assertEqual(child_row["path"], "Project/Concept")
+            self.assertEqual(child_row["default_ttl_action"], "none")
+            self.assertIsNone(child_row["default_ttl_days"])
+            self.assertEqual(child_row["effective_ttl_action"], "archive")
+            self.assertEqual(child_row["effective_ttl_days"], 30)
+            self.assertTrue(child_row["effective_ttl_inherited"])
+
+            child_contents = ctx.client.get(
+                "/api/folders/contents",
+                params={"folder": "Project/Concept"},
+                headers=headers,
+            )
+            self.assertEqual(child_contents.status_code, 200, child_contents.text)
+            doc_row = child_contents.json()["documents"][0]
+            self.assertEqual(doc_row["expiry_action"], "archive")
+            self.assertIsNotNone(doc_row["expires_at"])
+
+            clear = ctx.client.put(
+                "/api/folders/retention",
+                json={
+                    "path": "Project",
+                    "default_ttl_action": "none",
+                    "default_ttl_days": None,
+                },
+                headers=headers,
+            )
+            self.assertEqual(clear.status_code, 200, clear.text)
+            with ctx.db() as db:
+                doc = db.get(Document, doc_id)
+                self.assertIsNotNone(doc)
+                self.assertIsNone(doc.expiry_action)
+                self.assertIsNone(doc.expires_at)
+
+    def test_moving_folder_out_of_ttl_scope_recalculates_descendant_documents(self) -> None:
+        admin = user_context("alice", groups=["vault-admin"])
+
+        with vault_runtime() as ctx:
+            with ctx.db() as db:
+                expiring = get_or_create_folder_path(db, "Expiring")
+                expiring.default_ttl_days = 1
+                expiring.default_ttl_action = "delete"
+                child = get_or_create_folder_path(db, "Expiring/Work")
+                get_or_create_folder_path(db, "Safe")
+                doc = Document(
+                    folder_id=child.id,
+                    name="asset.fbx",
+                    latest_modified_at=now_utc() - dt.timedelta(days=10),
+                )
+                db.add(doc)
+                db.flush()
+                apply_folder_ttl(doc, child, doc.latest_modified_at)
+                self.assertEqual(doc.expiry_action, "delete")
+                move_folder_item(child, "Safe", admin, db)
                 db.commit()
                 doc_id = doc.id
 
@@ -161,8 +281,9 @@ class RetentionTtlTests(unittest.TestCase):
             with ctx.db() as db:
                 doc = db.get(Document, doc_id)
                 self.assertIsNotNone(doc)
-                self.assertIsNone(doc.expires_at)
+                self.assertEqual(folder_path(doc.folder), "Safe/Work")
                 self.assertIsNone(doc.expiry_action)
+                self.assertIsNone(doc.expires_at)
 
     def test_moving_from_delete_ttl_folder_to_plain_folder_clears_delete_expiry(self) -> None:
         admin = user_context("alice", groups=["vault-admin"])

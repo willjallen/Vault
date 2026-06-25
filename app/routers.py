@@ -368,13 +368,23 @@ def user_group_names(user: UserContext) -> set[str]:
 
 
 def access_level(can_view: bool, can_read: bool, can_write: bool) -> int:
-    if can_write:
+    if can_view and can_read and can_write:
         return 3
-    if can_read:
+    if can_view and can_read:
         return 2
     if can_view:
         return 1
     return 0
+
+
+def validate_permission_flags(can_view: bool, can_read: bool, can_write: bool) -> None:
+    if can_write and (not can_read or not can_view):
+        raise HTTPException(
+            status_code=400,
+            detail="Write permission requires read and view permission",
+        )
+    if can_read and not can_view:
+        raise HTTPException(status_code=400, detail="Read permission requires view permission")
 
 
 def default_root_folder_permissions(db: Session, folder: Folder) -> None:
@@ -3012,6 +3022,7 @@ def api_update_folder_permissions(
             .all()
         }
         for row in payload.permissions:
+            validate_permission_flags(row.can_view, row.can_read, row.can_write)
             if row.group_id in seen:
                 raise HTTPException(status_code=400, detail="Duplicate group permission")
             seen.add(row.group_id)

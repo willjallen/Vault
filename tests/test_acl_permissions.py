@@ -14,6 +14,9 @@ from app.models import DocumentLock, Folder, FolderPermission, VaultGroup
 from app.routers import (
     ActionItem,
     ActionPayload,
+    FolderPermissionPayload,
+    FolderPermissionsPayload,
+    api_update_folder_permissions,
     archive_items,
     archive_doc_item,
     build_contents_payload,
@@ -264,6 +267,45 @@ class AclPermissionTests(unittest.TestCase):
                 with self.assertRaises(HTTPException) as raised:
                     build_contents_payload(db, "Secret/Plans", outsider)
                 self.assertEqual(raised.exception.status_code, 404)
+
+    def test_permission_update_rejects_write_without_read_and_view(self) -> None:
+        admin = user_context("admin", groups=["vault-admin"], is_admin=True)
+
+        with vault_runtime() as ctx, ctx.db() as db:
+            root = get_root_folder(db, "vault")
+            project = get_or_create_folder_path(db, "Project")
+            outsiders = VaultGroup(name="outsiders")
+            db.add(outsiders)
+            db.flush()
+            add_permission(db, root, outsiders, view=False, read=False, write=False)
+            db.commit()
+
+            with self.assertRaises(HTTPException) as raised:
+                api_update_folder_permissions(
+                    FolderPermissionsPayload(
+                        path="Project",
+                        permissions=[
+                            FolderPermissionPayload(
+                                group_id=outsiders.id,
+                                can_view=False,
+                                can_read=False,
+                                can_write=True,
+                            ),
+                        ],
+                    ),
+                    admin,
+                    db,
+                )
+
+            self.assertEqual(raised.exception.status_code, 400)
+            self.assertEqual(
+                raised.exception.detail,
+                "Write permission requires read and view permission",
+            )
+            self.assertEqual(
+                db.query(FolderPermission).filter_by(folder_id=project.id).count(),
+                0,
+            )
 
     def test_archiving_restricted_document_preserves_folder_acl_in_archive(self) -> None:
         admin = user_context("admin", groups=["vault-admin"], is_admin=True)

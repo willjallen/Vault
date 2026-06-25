@@ -1793,10 +1793,6 @@ body.sidebar-resizing {
   max-width: 100%;
 }
 
-.folder-status-ttl {
-  grid-column: 2 / 4;
-}
-
 .status-empty {
   display: block;
   min-width: 0;
@@ -1829,6 +1825,19 @@ body.sidebar-resizing {
   transition:
     opacity 0.12s ease,
     transform 0.12s ease;
+}
+
+@media (min-width: 901px) {
+  .file-row.folder .file-cell.status-col {
+    box-sizing: border-box;
+    width: calc(100% + 106px);
+    padding-right: 32px;
+  }
+
+  .file-row.folder .file-cell.row-actions {
+    position: relative;
+    z-index: 1;
+  }
 }
 
 .file-row:hover .file-cell.row-actions,

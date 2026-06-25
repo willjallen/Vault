@@ -217,24 +217,22 @@ export function FolderRow({
       ),
       h("div", { className: "file-cell status-col" }, [
         h("span", { className: "status-pill subtle status-version" }, "Folder"),
+        h("span", {
+          "aria-hidden": "true",
+          className: "status-empty status-lock",
+          key: "lock",
+        }),
         retention.labels
           ? h(TtlStatusLabel, {
               className: "policy status-ttl folder-status-ttl",
               labels: retention.labels,
               title: retention.title,
             })
-          : [
-              h("span", {
-                "aria-hidden": "true",
-                className: "status-empty status-lock",
-                key: "lock",
-              }),
-              h("span", {
-                "aria-hidden": "true",
-                className: "status-empty status-ttl",
-                key: "ttl",
-              }),
-            ],
+          : h("span", {
+              "aria-hidden": "true",
+              className: "status-empty status-ttl",
+              key: "ttl",
+            }),
       ]),
       h(
         "div",

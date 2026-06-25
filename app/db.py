@@ -4,7 +4,7 @@ from collections.abc import Generator
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import create_engine, event, inspect, select
+from sqlalchemy import UniqueConstraint, create_engine, event, inspect, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
@@ -101,6 +101,18 @@ def _schema_needs_reset() -> bool:
         existing_indexes = {index["name"] for index in inspector.get_indexes(table.name)}
         expected_indexes = {index.name for index in table.indexes if index.name}
         if not expected_indexes.issubset(existing_indexes):
+            return True
+        existing_unique_constraints = {
+            constraint["name"]
+            for constraint in inspector.get_unique_constraints(table.name)
+            if constraint.get("name")
+        }
+        expected_unique_constraints = {
+            constraint.name
+            for constraint in table.constraints
+            if isinstance(constraint, UniqueConstraint) and constraint.name
+        }
+        if not expected_unique_constraints.issubset(existing_unique_constraints):
             return True
     return False
 

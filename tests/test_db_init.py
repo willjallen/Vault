@@ -168,6 +168,44 @@ class DatabaseInitTests(unittest.TestCase):
                 db_module.engine.dispose()
                 restore_runtime(snapshot)
 
+    def test_missing_unique_constraint_is_rejected_on_startup(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="vault-db-init-") as temp_dir:
+            db_path = Path(temp_dir) / "vault.db"
+            snapshot = snapshot_runtime()
+            try:
+                db_module.configure_database(db_path)
+                db_module.Base.metadata.create_all(bind=db_module.engine)
+                with sqlite3.connect(db_path) as conn:
+                    conn.execute("PRAGMA foreign_keys=OFF")
+                    conn.execute("DROP TABLE vault_groups")
+                    conn.execute(
+                        """
+                        CREATE TABLE vault_groups (
+                            id INTEGER NOT NULL,
+                            name VARCHAR NOT NULL,
+                            description TEXT,
+                            created_at DATETIME NOT NULL,
+                            PRIMARY KEY (id)
+                        )
+                        """,
+                    )
+                    conn.execute("CREATE INDEX ix_vault_groups_id ON vault_groups (id)")
+
+                with self.assertRaises(RuntimeError) as raised:
+                    db_module.init_db()
+
+                self.assertIn("Startup refused to alter or drop", str(raised.exception))
+                with sqlite3.connect(db_path) as conn:
+                    constraints = conn.execute(
+                        "PRAGMA index_list(vault_groups)",
+                    ).fetchall()
+                self.assertFalse(
+                    any(row[1].startswith("sqlite_autoindex_vault_groups") for row in constraints),
+                )
+            finally:
+                db_module.engine.dispose()
+                restore_runtime(snapshot)
+
 
 if __name__ == "__main__":
     unittest.main()

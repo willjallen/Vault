@@ -19,11 +19,10 @@ function compactMenuItems(items) {
 export function buildFileMenuItems(actions) {
   const { doc, currentUser, busy } = actions;
   const lock = doc.lock || {};
-  const lockedByMe = lock && lock.by === currentUser.id;
   const lockedByOther = lock && lock.by && lock.by !== currentUser.id;
   return compactMenuItems([
     actions.openFileDetails
-      ? { label: "Details", action: () => actions.openFileDetails(doc) }
+      ? { label: "History", action: () => actions.openFileDetails(doc) }
       : null,
     { label: "Rename", action: () => actions.handleRenameFile(doc), disabled: busy },
     doc.favorite && actions.handleRemoveFavoriteItem
@@ -34,15 +33,6 @@ export function buildFileMenuItems(actions) {
         }
       : null,
     { label: "Share", action: () => actions.handleShareItem(doc), disabled: busy },
-    { label: "Download", action: () => actions.handleView(doc) },
-    !doc.archived && !lockedByOther
-      ? {
-          label: lockedByMe ? "Upload" : "Replace",
-          action: () =>
-            actions.handleVersionUploadClick(doc, { renameToUploadedName: !lockedByMe }),
-          disabled: busy,
-        }
-      : null,
     {
       label: "Move...",
       action: () => actions.openMoveDialogForDoc(doc),
@@ -50,14 +40,7 @@ export function buildFileMenuItems(actions) {
     },
     doc.archived
       ? { label: "Restore to Vault", action: () => actions.handleUnarchive(doc.id), disabled: busy }
-      : { label: "Move to Archive", action: () => actions.handleArchive(doc.id), disabled: busy },
-    !doc.archived && !lockedByOther
-      ? {
-          label: lockedByMe ? "Unlock file" : "Lock for editing",
-          action: () => (lockedByMe ? actions.handleRelease(doc.id) : actions.handleLock(doc)),
-          disabled: busy,
-        }
-      : null,
+      : { label: "Archive", action: () => actions.handleArchive(doc.id), disabled: busy },
     canDeleteForeverItem(doc, actions)
       ? {
           label: "Delete forever",
@@ -185,7 +168,7 @@ export function buildSelectionMenuItems(actions) {
 
   return compactMenuItems([
     {
-      label: "Download",
+      label: "Download files",
       action: () => actions.handleDownloadSelection(selectedItems),
       disabled: busy || !noRoots,
     },
@@ -196,7 +179,7 @@ export function buildSelectionMenuItems(actions) {
     },
     noneArchived && noRoots
       ? {
-          label: "Move to Archive",
+          label: "Archive files",
           action: () => actions.handleArchiveItems(selectedItems),
           disabled: busy,
         }

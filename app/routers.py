@@ -3636,7 +3636,7 @@ def unlock_items(
                         raise HTTPException(status_code=400, detail="Only files can be unlocked")
                     doc = get_document_or_404(item.id or 0, db)
                     require_document_access(doc, user, db, 3)
-                    lock = get_active_lock(doc, db)
+                    lock = ensure_not_locked_by_other(doc, user, db)
                     release_lock(lock, user)
                     record_event(
                         doc,

@@ -177,6 +177,49 @@ class EditStaleStateTests(unittest.TestCase):
                 )
                 self.assertEqual(active_locks.count(), 1)
 
+    def test_non_admin_cannot_unlock_another_users_lock(self) -> None:
+        admin = user_context("admin", groups=["vault-admin"], is_admin=True)
+        owner = user_context("owner", groups=["writers"], is_admin=False)
+        other = user_context("other", groups=["writers"], is_admin=False)
+
+        with vault_runtime() as ctx:
+            with ctx.db() as db:
+                root = get_root_folder(db, "vault")
+                writers = VaultGroup(name="writers")
+                db.add(writers)
+                db.flush()
+                add_permission(db, root, writers, write=True)
+
+                project = get_or_create_folder_path(db, "Project")
+                doc = create_versioned_document(db, project, actor=admin)
+                db.add(
+                    DocumentLock(
+                        document_id=doc.id,
+                        locked_by=str(owner["id"]),
+                        locked_by_name=str(owner["name"]),
+                    ),
+                )
+                db.commit()
+                doc_id = doc.id
+
+                result = unlock_items(
+                    ActionPayload(items=[ActionItem(type="document", id=doc_id)]),
+                    FAKE_REQUEST,
+                    other,
+                    db,
+                )
+
+                self.assertEqual(result["ok"], [])
+                self.assertEqual(
+                    result["failed"][0]["detail"],
+                    "Document is locked by another user",
+                )
+                active_locks = db.query(DocumentLock).filter_by(
+                    document_id=doc_id,
+                    is_active=True,
+                )
+                self.assertEqual(active_locks.count(), 1)
+
     def test_folder_archive_rejects_descendant_lock_by_other_user(self) -> None:
         admin = user_context("admin", groups=["vault-admin"], is_admin=True)
         writer = user_context("writer", groups=["writers"], is_admin=False)

@@ -82,8 +82,8 @@ class AclPermissionTests(unittest.TestCase):
                 db.add(
                     DocumentLock(
                         document_id=doc.id,
-                        locked_by=str(reader["id"]),
-                        locked_by_name=str(reader["name"]),
+                        locked_by=str(writer["id"]),
+                        locked_by_name=str(writer["name"]),
                     ),
                 )
                 doc_id = doc.id

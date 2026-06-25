@@ -2,6 +2,7 @@
 
 import asyncio
 import datetime as dt
+import hashlib
 import io
 import json
 import logging
@@ -1249,7 +1250,7 @@ def location_for_blob(blob: Blob) -> BlobLocation:
 def read_version_bytes(version: DocumentVersion) -> bytes:
     location = location_for_blob(version.blob)
     try:
-        return get_storage_backend(location.backend).read_bytes(
+        data = get_storage_backend(location.backend).read_bytes(
             location.object_key,
             location.bucket,
         )
@@ -1257,6 +1258,13 @@ def read_version_bytes(version: DocumentVersion) -> bytes:
         raise HTTPException(status_code=404, detail="Blob missing from storage") from exc
     except StorageConfigurationError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+    if (
+        version.blob.hash_algo != "sha256"
+        or len(data) != version.blob.size_bytes
+        or hashlib.sha256(data).hexdigest() != version.blob.hash
+    ):
+        raise HTTPException(status_code=500, detail="Blob content does not match metadata")
+    return data
 
 
 def download_response(data: bytes, filename: str, mime_type: str | None = None) -> Response:

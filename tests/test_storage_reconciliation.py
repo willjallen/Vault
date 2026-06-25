@@ -1,13 +1,48 @@
 import unittest
 
+from fastapi import HTTPException
 from tests.support import create_versioned_document, user_context, vault_runtime
 
 from app.models import Blob, BlobLocation, DocumentVersion
-from app.routers import get_or_create_folder_path, storage_reconciliation_report
+from app.routers import (
+    get_or_create_folder_path,
+    read_version_bytes,
+    storage_reconciliation_report,
+)
 from app.storage import get_storage_backend
 
 
 class StorageReconciliationTests(unittest.TestCase):
+    def test_read_version_rejects_corrupt_local_object(self) -> None:
+        user = user_context("user", groups=[])
+        original = b"trusted content"
+
+        with vault_runtime() as ctx, ctx.db() as db:
+            folder = get_or_create_folder_path(db, "")
+            doc = create_versioned_document(
+                db,
+                folder,
+                name="kept.txt",
+                data=original,
+                actor=user,
+            )
+            db.commit()
+
+            version = db.query(DocumentVersion).filter_by(document_id=doc.id).one()
+            location = (
+                db.query(BlobLocation)
+                .filter_by(blob_id=version.blob_id, backend="local")
+                .one()
+            )
+            object_path = ctx.temp_dir / "objects" / location.object_key
+            object_path.write_bytes(b"corrupt content")
+
+            with self.assertRaises(HTTPException) as raised:
+                read_version_bytes(version)
+
+            self.assertEqual(raised.exception.status_code, 500)
+            self.assertEqual(raised.exception.detail, "Blob content does not match metadata")
+
     def test_report_flags_missing_referenced_local_object(self) -> None:
         user = user_context("user", groups=[])
 

@@ -1678,9 +1678,12 @@ body.sidebar-resizing {
 }
 
 .ttl-chip {
-  max-width: 100%;
+  container-type: inline-size;
   min-width: 0;
-  display: inline-flex;
+  width: 100%;
+  max-width: 100%;
+  display: inline-grid;
+  grid-template-columns: auto minmax(0, 1fr);
   align-items: center;
   gap: 4px;
   color: var(--danger-text);
@@ -1690,11 +1693,38 @@ body.sidebar-resizing {
   opacity: 0.76;
 }
 
-.ttl-chip span:last-child {
+.ttl-label {
+  grid-column: 2;
+  grid-row: 1;
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  overflow: visible;
+  text-overflow: clip;
   white-space: nowrap;
+}
+
+.ttl-label-medium,
+.ttl-label-compact {
+  display: none;
+}
+
+@container (max-width: 140px) {
+  .ttl-label-full {
+    display: none;
+  }
+
+  .ttl-label-medium {
+    display: inline;
+  }
+}
+
+@container (max-width: 78px) {
+  .ttl-label-medium {
+    display: none;
+  }
+
+  .ttl-label-compact {
+    display: inline;
+  }
 }
 
 .ttl-chip.applied {
@@ -1761,6 +1791,10 @@ body.sidebar-resizing {
   justify-self: start;
   min-width: 0;
   max-width: 100%;
+}
+
+.folder-status-ttl {
+  grid-column: 2 / 4;
 }
 
 .status-empty {

@@ -1,6 +1,7 @@
-import { classNames, expiryStatusLabel, formatDate } from "../../lib/utils.js";
+import { classNames, expiryStatusLabel, expiryStatusLabels, formatDate } from "../../lib/utils.js";
 import { Icon } from "../common/Icon.js";
 import { RowSelectionIcon } from "./RowSelectionIcon.js";
+import { TtlStatusLabel } from "./TtlStatusLabel.js";
 
 const { useEffect, useRef } = React;
 const h = React.createElement;
@@ -50,7 +51,10 @@ export function FileRow({
       : "Unlock file"
     : "Lock for editing";
   const expiryLabel = expiryStatusLabel(doc.expires_at, doc.expiry_action);
-  const expiryTitle = doc.expires_at ? formatDate(doc.expires_at) : "";
+  const expiryLabels = expiryStatusLabels(doc.expires_at, doc.expiry_action);
+  const expiryDateLabel = doc.expires_at ? formatDate(doc.expires_at) : "";
+  const expiryTitle =
+    expiryLabel && expiryDateLabel ? `${expiryLabel} · ${expiryDateLabel}` : expiryDateLabel;
 
   useEffect(() => {
     if (!editing || !inputRef.current) {
@@ -197,11 +201,12 @@ export function FileRow({
               ]
             )
           : h("span", { "aria-hidden": "true", className: "status-empty status-lock" }),
-        expiryLabel
-          ? h("span", { className: "ttl-chip applied status-ttl", title: expiryTitle }, [
-              h(Icon, { icon: "clock", key: "icon", size: 11 }),
-              h("span", { key: "label" }, expiryLabel),
-            ])
+        expiryLabels
+          ? h(TtlStatusLabel, {
+              className: "applied status-ttl",
+              labels: expiryLabels,
+              title: expiryTitle,
+            })
           : h("span", { "aria-hidden": "true", className: "status-empty status-ttl" }),
       ]),
       h("div", { className: "file-cell row-actions" }, [

@@ -1,6 +1,13 @@
-import { classNames, formatDate, isArchivePath, retentionPolicyLabel } from "../../lib/utils.js";
+import {
+  classNames,
+  formatDate,
+  isArchivePath,
+  retentionPolicyLabel,
+  retentionPolicyStatusLabels,
+} from "../../lib/utils.js";
 import { Icon } from "../common/Icon.js";
 import { RowSelectionIcon } from "./RowSelectionIcon.js";
+import { TtlStatusLabel } from "./TtlStatusLabel.js";
 
 const { useEffect, useRef } = React;
 const h = React.createElement;
@@ -44,6 +51,10 @@ export function FolderRow({
   const committingRef = useRef(false);
   const isArchived = isArchivePath(folder.path || "");
   const retentionLabel = retentionPolicyLabel(folder.default_ttl_action, folder.default_ttl_days);
+  const retentionLabels = retentionPolicyStatusLabels(
+    folder.default_ttl_action,
+    folder.default_ttl_days
+  );
 
   useEffect(() => {
     if (!editing || !inputRef.current) {
@@ -198,13 +209,24 @@ export function FolderRow({
       ),
       h("div", { className: "file-cell status-col" }, [
         h("span", { className: "status-pill subtle status-version" }, "Folder"),
-        h("span", { "aria-hidden": "true", className: "status-empty status-lock" }),
-        retentionLabel
-          ? h("span", { className: "ttl-chip policy status-ttl", title: retentionLabel }, [
-              h(Icon, { icon: "clock", key: "icon", size: 11 }),
-              h("span", { key: "label" }, retentionLabel),
-            ])
-          : h("span", { "aria-hidden": "true", className: "status-empty status-ttl" }),
+        retentionLabels
+          ? h(TtlStatusLabel, {
+              className: "policy status-ttl folder-status-ttl",
+              labels: retentionLabels,
+              title: retentionLabel,
+            })
+          : [
+              h("span", {
+                "aria-hidden": "true",
+                className: "status-empty status-lock",
+                key: "lock",
+              }),
+              h("span", {
+                "aria-hidden": "true",
+                className: "status-empty status-ttl",
+                key: "ttl",
+              }),
+            ],
       ]),
       h(
         "div",

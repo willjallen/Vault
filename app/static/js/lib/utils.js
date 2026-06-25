@@ -109,6 +109,35 @@ function formatSemanticDate(date, now) {
   return date.toLocaleDateString(undefined, options);
 }
 
+function ttlActionVerb(action) {
+  const normalized = (action || "").toLowerCase();
+  if (normalized === "delete") {
+    return "Delete";
+  }
+  if (normalized === "archive") {
+    return "Archive";
+  }
+  return "";
+}
+
+function formatDurationLong(value, unit) {
+  return `${value} ${unit}${value === 1 ? "" : "s"}`;
+}
+
+function formatDurationCompact(value, unit) {
+  const suffix = unit === "minute" ? "m" : unit === "hour" ? "h" : "d";
+  return `${value}${suffix}`;
+}
+
+function ttlDisplayLabels(verb, relation, value, unit) {
+  const compact = formatDurationCompact(value, unit);
+  return {
+    compact,
+    full: `${verb} ${relation} ${formatDurationLong(value, unit)}`,
+    medium: `${verb} ${compact}`,
+  };
+}
+
 export function formatDate(iso, fallback = "Not updated yet", now = new Date()) {
   if (!iso) {
     return fallback;
@@ -121,39 +150,67 @@ export function formatDate(iso, fallback = "Not updated yet", now = new Date()) 
 }
 
 export function retentionPolicyLabel(action, days) {
-  const normalized = (action || "").toLowerCase();
+  const verb = ttlActionVerb(action);
   const ttlDays = Number(days);
-  if (!Number.isFinite(ttlDays) || ttlDays < 1 || !["archive", "delete"].includes(normalized)) {
+  if (!verb || !Number.isFinite(ttlDays) || ttlDays < 1) {
     return "";
   }
-  const verb = normalized === "delete" ? "Delete" : "Archive";
-  return `${verb} after ${ttlDays}d`;
+  return `${verb} after ${formatDurationLong(ttlDays, "day")}`;
+}
+
+export function retentionPolicyStatusLabels(action, days) {
+  const verb = ttlActionVerb(action);
+  const ttlDays = Number(days);
+  if (!verb || !Number.isFinite(ttlDays) || ttlDays < 1) {
+    return null;
+  }
+  return ttlDisplayLabels(verb, "after", ttlDays, "day");
 }
 
 export function expiryStatusLabel(expiresAt, action) {
-  const normalized = (action || "").toLowerCase();
+  const verb = ttlActionVerb(action);
   const expires = new Date(expiresAt || "");
-  if (
-    !expiresAt ||
-    Number.isNaN(expires.getTime()) ||
-    !["archive", "delete"].includes(normalized)
-  ) {
+  if (!expiresAt || Number.isNaN(expires.getTime()) || !verb) {
     return "";
   }
-  const verb = normalized === "delete" ? "Delete" : "Archive";
   const remainingMs = expires.getTime() - Date.now();
   if (remainingMs <= 0) {
     return `${verb} due`;
   }
   const minutes = Math.ceil(remainingMs / 60000);
   if (minutes < 60) {
-    return `${verb} in ${minutes}m`;
+    return `${verb} in ${formatDurationLong(minutes, "minute")}`;
   }
   const hours = Math.ceil(remainingMs / 3600000);
   if (hours < 48) {
-    return `${verb} in ${hours}h`;
+    return `${verb} in ${formatDurationLong(hours, "hour")}`;
   }
-  return `${verb} in ${Math.ceil(remainingMs / 86400000)}d`;
+  return `${verb} in ${formatDurationLong(Math.ceil(remainingMs / 86400000), "day")}`;
+}
+
+export function expiryStatusLabels(expiresAt, action) {
+  const verb = ttlActionVerb(action);
+  const expires = new Date(expiresAt || "");
+  if (!expiresAt || Number.isNaN(expires.getTime()) || !verb) {
+    return null;
+  }
+  const remainingMs = expires.getTime() - Date.now();
+  if (remainingMs <= 0) {
+    return {
+      compact: "due",
+      full: `${verb} due`,
+      medium: `${verb} due`,
+    };
+  }
+  const minutes = Math.ceil(remainingMs / 60000);
+  if (minutes < 60) {
+    return ttlDisplayLabels(verb, "in", minutes, "minute");
+  }
+  const hours = Math.ceil(remainingMs / 3600000);
+  if (hours < 48) {
+    return ttlDisplayLabels(verb, "in", hours, "hour");
+  }
+  return ttlDisplayLabels(verb, "in", Math.ceil(remainingMs / 86400000), "day");
 }
 
 export function isArchivePath(path) {

@@ -101,10 +101,16 @@ def _schema_needs_reset() -> bool:
     for table in Base.metadata.sorted_tables:
         if table.name not in tables:
             return True
-        existing_columns = {column["name"] for column in inspector.get_columns(table.name)}
-        expected_columns = {column.name for column in table.columns}
-        if not expected_columns.issubset(existing_columns):
+        existing_columns = {
+            column["name"]: column for column in inspector.get_columns(table.name)
+        }
+        expected_columns = {column.name: column for column in table.columns}
+        if not set(expected_columns).issubset(existing_columns):
             return True
+        for column_name, expected_column in expected_columns.items():
+            existing_column = existing_columns[column_name]
+            if bool(existing_column.get("nullable")) != bool(expected_column.nullable):
+                return True
         existing_indexes = {index["name"] for index in inspector.get_indexes(table.name)}
         expected_indexes = {index.name for index in table.indexes if index.name}
         if not expected_indexes.issubset(existing_indexes):

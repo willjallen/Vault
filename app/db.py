@@ -111,6 +111,18 @@ def _schema_needs_reset() -> bool:
             existing_column = existing_columns[column_name]
             if bool(existing_column.get("nullable")) != bool(expected_column.nullable):
                 return True
+            expected_type = getattr(
+                expected_column.type,
+                "_type_affinity",
+                type(expected_column.type),
+            )
+            existing_type = getattr(
+                existing_column["type"],
+                "_type_affinity",
+                type(existing_column["type"]),
+            )
+            if existing_type != expected_type:
+                return True
         existing_indexes = {index["name"] for index in inspector.get_indexes(table.name)}
         expected_indexes = {index.name for index in table.indexes if index.name}
         if not expected_indexes.issubset(existing_indexes):

@@ -290,6 +290,50 @@ class DatabaseInitTests(unittest.TestCase):
                 db_module.engine.dispose()
                 restore_runtime(snapshot)
 
+    def test_wrong_column_type_is_rejected_on_startup(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="vault-db-init-") as temp_dir:
+            db_path = Path(temp_dir) / "vault.db"
+            snapshot = snapshot_runtime()
+            try:
+                db_module.configure_database(db_path)
+                db_module.Base.metadata.create_all(bind=db_module.engine)
+                with sqlite3.connect(db_path) as conn:
+                    conn.execute("PRAGMA foreign_keys=OFF")
+                    conn.execute("DROP TABLE folder_events")
+                    conn.execute(
+                        """
+                        CREATE TABLE folder_events (
+                            id INTEGER NOT NULL,
+                            folder_id TEXT NOT NULL,
+                            event_type VARCHAR NOT NULL,
+                            actor VARCHAR,
+                            actor_name VARCHAR,
+                            message TEXT,
+                            created_at DATETIME NOT NULL,
+                            PRIMARY KEY (id),
+                            FOREIGN KEY(folder_id) REFERENCES folders(id) ON DELETE CASCADE
+                        )
+                        """,
+                    )
+                    conn.execute("CREATE INDEX ix_folder_events_id ON folder_events (id)")
+                    conn.execute(
+                        "CREATE INDEX ix_folder_events_folder_id ON folder_events (folder_id)",
+                    )
+
+                with self.assertRaises(RuntimeError) as raised:
+                    db_module.init_db()
+
+                self.assertIn("Startup refused to alter or drop", str(raised.exception))
+                with sqlite3.connect(db_path) as conn:
+                    columns = {
+                        row[1]: row[2]
+                        for row in conn.execute("PRAGMA table_info(folder_events)").fetchall()
+                    }
+                self.assertEqual(columns["folder_id"], "TEXT")
+            finally:
+                db_module.engine.dispose()
+                restore_runtime(snapshot)
+
 
 if __name__ == "__main__":
     unittest.main()

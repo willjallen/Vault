@@ -20,6 +20,7 @@ from joserfc import jwk, jwt
 from joserfc.errors import JoseError
 from joserfc.jwt import JWTClaimsRegistry
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .config import (
@@ -291,7 +292,7 @@ def _sync_vault_groups(db: Session, user: VaultUser, groups: set[str]) -> None:
             db.add(VaultGroupMembership(user_id=user.id, group_id=group_id))
 
 
-def _upsert_vault_user(
+def _upsert_vault_user_once(
     db: Session,
     issuer: str,
     subject: str,
@@ -342,6 +343,36 @@ def _upsert_vault_user(
     db.commit()
     db.refresh(user)
     return user
+
+
+def _upsert_vault_user(
+    db: Session,
+    issuer: str,
+    subject: str,
+    email: str | None,
+    name: str | None,
+    groups: set[str] | None = None,
+    admin_hint: bool = False,
+    mark_login: bool = False,
+) -> VaultUser:
+    for attempt in range(2):
+        try:
+            return _upsert_vault_user_once(
+                db,
+                issuer,
+                subject,
+                email,
+                name,
+                groups=groups,
+                admin_hint=admin_hint,
+                mark_login=mark_login,
+            )
+        except IntegrityError:
+            db.rollback()
+            if attempt == 0:
+                continue
+            raise
+    raise HTTPException(status_code=500, detail="Could not sync user identity")
 
 
 def _dev_identity(db: Session) -> UserContext | None:

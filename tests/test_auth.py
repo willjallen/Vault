@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 
 from fastapi import HTTPException
+from sqlalchemy import event
 from starlette.datastructures import Headers, URL
 from tests.support import vault_runtime
 
@@ -216,6 +217,45 @@ class AuthTests(unittest.TestCase):
         self.assertEqual(user["name"], "Dev User")
         self.assertEqual(user["groups"], ["vault-admin", "vault-users"])
         self.assertTrue(user["is_admin"])
+
+    def test_identity_upsert_recovers_from_concurrent_user_insert(self) -> None:
+        with vault_runtime(auth_mode="headers") as ctx, ctx.db() as db:
+            inserted = False
+
+            def insert_duplicate_user(session, _flush_context, _instances):
+                nonlocal inserted
+                if inserted:
+                    return
+                inserted = True
+                with ctx.db() as other_db:
+                    other_db.add(
+                        VaultUser(
+                            issuer=HEADER_AUTH_ISSUER,
+                            subject="race",
+                            email="race@example.com",
+                            name="Race Winner",
+                        ),
+                    )
+                    other_db.commit()
+
+            event.listen(db, "before_flush", insert_duplicate_user)
+            try:
+                user = auth_module._upsert_vault_user(
+                    db,
+                    HEADER_AUTH_ISSUER,
+                    "race",
+                    "race@example.com",
+                    "Race Loser",
+                    {"vault-users"},
+                )
+            finally:
+                event.remove(db, "before_flush", insert_duplicate_user)
+
+            self.assertEqual(user.subject, "race")
+            self.assertEqual(user.name, "Race Loser")
+            self.assertEqual(db.query(VaultUser).filter_by(subject="race").count(), 1)
+            self.assertEqual(db.query(VaultGroup).filter_by(name="vault-users").count(), 1)
+            self.assertEqual(db.query(VaultGroupMembership).count(), 1)
 
     def test_compose_does_not_publish_dev_auth_to_all_interfaces_by_default(self) -> None:
         compose = (Path(__file__).resolve().parents[1] / "docker-compose.yml").read_text()

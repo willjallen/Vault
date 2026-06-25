@@ -36,7 +36,7 @@ function NotificationRow({ notice, onDismiss }) {
   const detail = String(notice.detail || "").trim();
   const hasDetail = Boolean(detail);
   const dismissible = Boolean(onDismiss) && notice.dismissible !== false;
-  const showTimebar = Boolean(notice.duration && hasDetail);
+  const showTimebar = Boolean(notice.duration && notice.progress !== false);
   const durationStyle = showTimebar ? { "--notification-duration": `${notice.duration}ms` } : {};
   return h(
     "div",

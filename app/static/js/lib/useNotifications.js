@@ -15,6 +15,7 @@ function normalizeNotice(input, fallbackDuration) {
     dismissible: source.dismissible !== false,
     duration,
     kind: source.kind || "info",
+    progress: source.progress !== false,
     title,
   };
 }

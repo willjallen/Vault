@@ -98,6 +98,10 @@ def _schema_needs_reset() -> bool:
         expected_columns = {column.name for column in table.columns}
         if not expected_columns.issubset(existing_columns):
             return True
+        existing_indexes = {index["name"] for index in inspector.get_indexes(table.name)}
+        expected_indexes = {index.name for index in table.indexes if index.name}
+        if not expected_indexes.issubset(existing_indexes):
+            return True
     return False
 
 

@@ -1,7 +1,13 @@
 import unittest
 
 from fastapi import HTTPException
-from tests.support import FAKE_REQUEST, add_permission, user_context, vault_runtime
+from tests.support import (
+    FAKE_REQUEST,
+    add_permission,
+    create_versioned_document,
+    user_context,
+    vault_runtime,
+)
 
 from app.models import Folder, FolderPermission, VaultGroup
 from app.routers import (
@@ -9,6 +15,7 @@ from app.routers import (
     get_folder_by_path,
     get_or_create_folder_path,
     get_root_folder,
+    restore_doc_item,
     restore_folder_item,
 )
 
@@ -132,6 +139,44 @@ class ArchiveFolderPlaceholderTests(unittest.TestCase):
 
             rows = db.query(Folder).filter_by(name="Project").all()
             self.assertEqual(sorted(row.root_key for row in rows), ["archive", "vault"])
+
+    def test_restore_document_does_not_prune_inaccessible_empty_archive_parent(self) -> None:
+        writer = user_context("writer", groups=["writers"], is_admin=False)
+
+        with vault_runtime() as ctx, ctx.db() as db:
+            vault_root = get_root_folder(db, "vault")
+            writers = VaultGroup(name="writers")
+            confidential = VaultGroup(name="confidential")
+            db.add_all([writers, confidential])
+            db.flush()
+            add_permission(db, vault_root, writers, write=True)
+
+            archive_project = get_or_create_folder_path(db, "Archive/Project")
+            archive_sub = get_or_create_folder_path(db, "Archive/Project/Sub")
+            add_permission(db, archive_project, confidential, write=True)
+            add_permission(db, archive_sub, writers, write=True)
+            doc = create_versioned_document(
+                db,
+                archive_sub,
+                name="restore.txt",
+                data=b"restore",
+                actor=writer,
+            )
+            archive_project_id = archive_project.id
+            archive_sub_id = archive_sub.id
+            db.commit()
+
+            result = restore_doc_item(doc, FAKE_REQUEST, writer, db)
+            self.assertEqual(result, "Project/Sub/restore.txt")
+            db.commit()
+
+            self.assertIsNone(db.get(Folder, archive_sub_id))
+            self.assertIsNotNone(db.get(Folder, archive_project_id))
+            self.assertIsNotNone(get_folder_by_path(db, "Archive/Project"))
+            self.assertEqual(
+                db.query(FolderPermission).filter_by(folder_id=archive_project_id).count(),
+                1,
+            )
 
 
 if __name__ == "__main__":

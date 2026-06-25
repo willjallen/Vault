@@ -939,11 +939,17 @@ def folder_has_items(db: Session, folder: Folder) -> bool:
     return doc is not None
 
 
-def prune_empty_archive_folders(db: Session, folder: Folder | None) -> None:
+def prune_empty_archive_folders(
+    db: Session,
+    folder: Folder | None,
+    user: UserContext | None = None,
+) -> None:
     current = folder
     while current and folder_is_archive(current) and not current.is_root:
         db.flush()
         if folder_has_items(db, current):
+            return
+        if user is not None and folder_access_level(current, user, db) < 3:
             return
         parent = current.parent
         db.delete(current)
@@ -1430,7 +1436,7 @@ def restore_doc_item(doc: Document, request: Request, user: UserContext, db: Ses
         f"Restored to Vault from {source_path}",
         publish_state=False,
     )
-    prune_empty_archive_folders(db, archive_folder)
+    prune_empty_archive_folders(db, archive_folder, user)
     return document_path(doc)
 
 
@@ -1513,7 +1519,7 @@ def restore_folder_item(source: Folder, request: Request, user: UserContext, db:
     set_subtree_root_key(db, source, VAULT_ROOT_KEY)
     for doc in docs:
         apply_folder_ttl(doc, doc.folder, doc.latest_modified_at)
-    prune_empty_archive_folders(db, archive_parent)
+    prune_empty_archive_folders(db, archive_parent, user)
     record_folder_event(source, user, "restore", f"Restored to Vault from {source_path}", db)
     return target_path
 
@@ -3433,7 +3439,7 @@ def delete_items_forever(
                         detail = document_path(doc)
                         archive_folder = doc.folder
                         db.delete(doc)
-                        prune_empty_archive_folders(db, archive_folder)
+                        prune_empty_archive_folders(db, archive_folder, user)
                     else:
                         folder_item = get_folder_for_action(item, db)
                         if folder_item.is_root or not folder_is_archive(folder_item):
@@ -3446,7 +3452,7 @@ def delete_items_forever(
                         detail = folder_path(folder_item)
                         archive_parent = folder_item.parent
                         db.delete(folder_item)
-                        prune_empty_archive_folders(db, archive_parent)
+                        prune_empty_archive_folders(db, archive_parent, user)
                 result["ok"].append(action_result(item, detail))
                 changed = True
             except HTTPException as exc:

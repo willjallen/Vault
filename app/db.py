@@ -200,7 +200,7 @@ def _schema_needs_reset() -> bool:
             for constraint in table.constraints
             if isinstance(constraint, ForeignKeyConstraint)
         }
-        if not expected_foreign_keys.issubset(existing_foreign_keys):
+        if existing_foreign_keys != expected_foreign_keys:
             return True
     return False
 

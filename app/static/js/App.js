@@ -26,6 +26,7 @@ import {
   folderToItem,
   keyForItem,
 } from "./lib/itemActions.js";
+import { favoriteItemsToSidebarItems } from "./lib/favoriteItems.js";
 import { folderBaseName, isArchivePath } from "./lib/utils.js";
 import {
   initialFolderForApp,
@@ -36,6 +37,7 @@ import {
 } from "./lib/shareLinks.js";
 import { useAuthFetch } from "./lib/useAuthFetch.js";
 import { useFolderNavigation } from "./lib/useFolderNavigation.js";
+import { useFavoritePreferenceActions } from "./lib/useFavoritePreferenceActions.js";
 import { useMoveDialog } from "./lib/useMoveDialog.js";
 import { normalizeSiteSettings } from "./lib/siteSettings.js";
 import { useAppearancePreferences } from "./lib/theme.js";
@@ -152,13 +154,18 @@ export function App({ initial }) {
   const {
     alternateRows,
     doubleClickDownload,
+    favoriteItems,
     handleAlternateRowsChange,
     handleDoubleClickDownloadChange,
+    handleFavoriteItemsChange,
     handleOpenFoldersOnClickChange,
     handlePalettePreferenceChange,
+    handleSidebarSectionSizesChange,
     handleThemePreferenceChange,
     openFoldersOnClick,
     palettePreference,
+    refreshUserPreferences,
+    sidebarSectionSizes,
     themePreference,
   } = useAppearancePreferences({
     apiFetch,
@@ -230,6 +237,11 @@ export function App({ initial }) {
     initial,
     apiFetch,
     folder,
+    onMissingFolder: () => {
+      setError("Folder not found.");
+      replaceFolder("");
+    },
+    onPreferencesRefresh: refreshUserPreferences,
     onSiteSettingsChange: setSiteSettings,
     selectedId,
     setError,
@@ -288,9 +300,7 @@ export function App({ initial }) {
           // eslint-disable-next-line security/detect-object-injection
           const metadata = folderMetadata[path] || {};
           return folderToItem({
-            access: metadata.access,
-            color: metadata.color,
-            icon: metadata.icon,
+            ...metadata,
             name: folderBaseName(path, path === "Archive" ? "Archive" : "Folder"),
             path,
           });
@@ -300,16 +310,14 @@ export function App({ initial }) {
     const archiveMetadata = folderMetadata.Archive || {};
     return [
       folderToItem({
-        access: vaultMetadata.access,
-        color: vaultMetadata.color,
+        ...vaultMetadata,
         icon: vaultMetadata.icon || "house",
         name: initialBootstrap.site_name || "Vault",
         path: "",
       }),
       ...childrenFor("", (path) => !isArchivePath(path)),
       folderToItem({
-        access: archiveMetadata.access,
-        color: archiveMetadata.color,
+        ...archiveMetadata,
         icon: archiveMetadata.icon || "box-archive",
         name: "Archive",
         path: "Archive",
@@ -317,9 +325,23 @@ export function App({ initial }) {
       ...childrenFor("Archive", (path) => isArchivePath(path)),
     ];
   }, [folderChildren, folderMetadata, initialBootstrap.site_name]);
+  const favoriteSidebarItems = useMemo(
+    () =>
+      favoriteItemsToSidebarItems(favoriteItems, {
+        contentsItems,
+        folderMetadata,
+        folderPaneItems,
+      }),
+    [contentsItems, favoriteItems, folderMetadata, folderPaneItems]
+  );
   const folderByKey = useMemo(
-    () => new Map(folderPaneItems.map((item) => [keyForItem(item), item])),
-    [folderPaneItems]
+    () =>
+      new Map(
+        [...folderPaneItems, ...favoriteSidebarItems.filter((item) => item.type === "folder")].map(
+          (item) => [keyForItem(item), item]
+        )
+      ),
+    [favoriteSidebarItems, folderPaneItems]
   );
   const selectedContentsItems = useMemo(
     () => contentsSelection.map((key) => contentsByKey.get(key)).filter(Boolean),
@@ -374,6 +396,12 @@ export function App({ initial }) {
   function sameKeys(left, right) {
     return left.length === right.length && left.join("\u0000") === right.join("\u0000");
   }
+
+  const { handleAddFavoriteItems, handleRemoveFavoriteItem } = useFavoritePreferenceActions({
+    closeContextMenu,
+    favoriteItems,
+    onFavoriteItemsChange: handleFavoriteItemsChange,
+  });
 
   useEffect(() => {
     const docItems = selectedContentsItems.filter((item) => item.type === "document");
@@ -442,6 +470,20 @@ export function App({ initial }) {
     setContentsSelection([]);
     setContentsAnchor(null);
     applyPaneSelection("folders", item, pointerEvent, orderedItems);
+  }
+
+  function handleSelectFavoriteDocument(item) {
+    if (!item?.id) {
+      return;
+    }
+    const key = keyForItem(item);
+    const targetFolder = item.folder || "";
+    setFolderSelection([]);
+    setFolderAnchor(null);
+    navigateToFolder(targetFolder);
+    setContentsSelection([key]);
+    setContentsAnchor(key);
+    setSelectedId(item.id);
   }
 
   function handleContentsSortChange(key) {
@@ -651,19 +693,6 @@ export function App({ initial }) {
     setDragBundle(null);
   }
 
-  useEffect(() => {
-    if (!dragBundle) {
-      return undefined;
-    }
-    function updateDragPosition(evt) {
-      setDragBundle((current) =>
-        current ? { ...current, x: evt.clientX, y: evt.clientY } : current
-      );
-    }
-    window.addEventListener("dragover", updateDragPosition);
-    return () => window.removeEventListener("dragover", updateDragPosition);
-  }, [dragBundle]);
-
   function handleUploadClick() {
     if (uploadInput.current) {
       uploadInput.current.click();
@@ -714,6 +743,7 @@ export function App({ initial }) {
       handlePermanentDelete,
       handlePermanentDeleteFolder,
       handleRelease,
+      handleRemoveFavoriteItem,
       handleRestoreItems,
       handleRenameFile,
       handleRenameFolder,
@@ -777,10 +807,20 @@ export function App({ initial }) {
     }
     const item = folderToItem(folderItem);
     const key = keyForItem(item);
-    const useFolderPane = folderItem.sourcePane === "folders" || !contentsByKey.has(key);
+    const useFolderPane =
+      folderItem.sourcePane === "folders" ||
+      folderItem.sourcePane === "favorites" ||
+      !contentsByKey.has(key);
     const paneSelection = useFolderPane ? folderSelection : contentsSelection;
     const paneItems = useFolderPane ? selectedFolderItems : selectedContentsItems;
-    const selectedItems = paneSelection.includes(key) ? paneItems : [item];
+    const selectedItems = paneSelection.includes(key) && paneItems.length ? paneItems : [item];
+    const menuItems = item.favorite
+      ? selectedItems.map((selectedItem) =>
+          selectedItem.type === "folder" && selectedItem.path === item.path
+            ? { ...selectedItem, favorite: true }
+            : selectedItem
+        )
+      : selectedItems;
     if (options.select !== false && !paneSelection.includes(key)) {
       if (useFolderPane) {
         setFolderSelection([key]);
@@ -790,7 +830,7 @@ export function App({ initial }) {
         setContentsAnchor(key);
       }
     }
-    const items = buildSelectionMenuItems(contextActions({ selectedItems }));
+    const items = buildSelectionMenuItems(contextActions({ selectedItems: menuItems }));
     setContextMenu({ x: evt.clientX, y: evt.clientY, items });
   }
 
@@ -817,6 +857,7 @@ export function App({ initial }) {
       breadcrumbs,
       myEdits,
       folderChildren,
+      favoriteItems: favoriteSidebarItems,
       subfolders,
       files: docs,
       selectedId,
@@ -825,6 +866,7 @@ export function App({ initial }) {
       contentsSelection,
       folderItems: folderPaneItems,
       folderSelection,
+      sidebarSectionSizes,
       searchQuery,
       recursiveSearch,
       contentsPending,
@@ -849,17 +891,15 @@ export function App({ initial }) {
       onNavigateUp: navigateUp,
       onSelectFolder: navigateToFolder,
       onSelectDoc: setSelectedId,
+      onSelectFavoriteDocument: handleSelectFavoriteDocument,
       onSelectContentItem: handleSelectContentItem,
       onSelectFolderItem: handleSelectFolderItem,
+      onAddFavoriteItems: handleAddFavoriteItems,
+      onSidebarSectionSizesChange: handleSidebarSectionSizesChange,
       onSearchQueryChange: setSearchQuery,
       onRecursiveSearchChange: setRecursiveSearch,
       onContentsSortChange: handleContentsSortChange,
-      onClearSelection: () => {
-        setContentsSelection([]);
-        setContentsAnchor(null);
-        setFolderSelection([]);
-        setFolderAnchor(null);
-      },
+      onClearSelection: clearAllSelections,
       onContentsMarqueeSelectionChange: handleContentsMarqueeSelectionChange,
       onOpenDoc: handleView,
       onDropOnFolder: handleDropOnFolder,
@@ -872,6 +912,7 @@ export function App({ initial }) {
       onFolderDragStart: handleFolderDragStart,
       onFolderDragEnd: handleFolderDragEnd,
       onFileContextMenu: handleFileContextMenu,
+      onFavoriteFileContextMenu: (evt, item) => handleFileContextMenu(evt, item, { select: false }),
       onFolderContextMenu: handleFolderContextMenu,
       onMyEditContextMenu: handleMyEditContextMenu,
       onPageContextMenu: handlePageContextMenu,

@@ -181,7 +181,7 @@ class AdminSettingsTests(unittest.TestCase):
             self.assertEqual(deleted.json()["failed"], [])
             self.assertEqual(
                 deleted.json()["ok"][0]["item"],
-                {"type": "folder", "path": "Archive/Project"},
+                {"type": "folder", "id": folder_row["id"], "path": "Archive/Project"},
             )
 
             with ctx.db() as db:

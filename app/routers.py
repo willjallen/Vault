@@ -135,6 +135,14 @@ class PublicFolderPath:
     relative_path: str
 
 
+@dataclass(frozen=True)
+class NormalizedActionItem:
+    type: str
+    id: int | None = None
+    path: str | None = None
+    strict_path: bool = False
+
+
 class ActionItem(BaseModel):
     type: str
     id: int | None = None
@@ -1065,7 +1073,7 @@ def sanitize_mime_type(mime_type: str | None, filename: str) -> str:
     return candidate
 
 
-def action_item_payload(item: ActionItem) -> dict[str, object]:
+def action_item_payload(item: NormalizedActionItem) -> dict[str, object]:
     payload: dict[str, object] = {"type": item.type}
     if item.id is not None:
         payload["id"] = item.id
@@ -1074,13 +1082,15 @@ def action_item_payload(item: ActionItem) -> dict[str, object]:
     return payload
 
 
-def item_label(item: ActionItem) -> str:
+def item_label(item: NormalizedActionItem) -> str:
     if item.type == "document":
         return f"document:{item.id}"
+    if item.id is not None:
+        return f"folder:{item.id}"
     return f"folder:{normalize_folder(item.path)}"
 
 
-def action_result(item: ActionItem, detail: str | None = None) -> dict[str, object]:
+def action_result(item: NormalizedActionItem, detail: str | None = None) -> dict[str, object]:
     result = {"item": action_item_payload(item)}
     if detail:
         result["detail"] = detail
@@ -1097,18 +1107,18 @@ def require_action_items(payload: ActionPayload) -> list[ActionItem]:
     return payload.items
 
 
-def normalize_action_items(items: list[ActionItem], db: Session) -> list[ActionItem]:
-    folders: list[tuple[ActionItem, Folder]] = []
-    documents: list[tuple[ActionItem, Document]] = []
+def normalize_action_items(items: list[ActionItem], db: Session) -> list[NormalizedActionItem]:
+    folders: list[tuple[NormalizedActionItem, Folder]] = []
+    documents: list[tuple[NormalizedActionItem, Document]] = []
     seen: set[str] = set()
-    normalized: list[ActionItem] = []
+    normalized: list[NormalizedActionItem] = []
     for item in items:
         item_type = item.type.strip().lower()
         if item_type == "document":
             if item.id is None:
                 raise HTTPException(status_code=400, detail="Document id is required")
             doc = get_document_or_404(item.id, db)
-            normalized_item = ActionItem(type="document", id=doc.id)
+            normalized_item = NormalizedActionItem(type="document", id=doc.id)
             key = item_label(normalized_item)
             if key not in seen:
                 seen.add(key)
@@ -1116,13 +1126,26 @@ def normalize_action_items(items: list[ActionItem], db: Session) -> list[ActionI
                 documents.append((normalized_item, doc))
             continue
         if item_type == "folder":
+            folder: Folder | None = None
             path = normalize_folder(item.path)
-            if not path:
+            strict_path = item.id is None
+            if item.id is not None:
+                if item.id < 1:
+                    raise HTTPException(status_code=400, detail="Folder id must be positive")
+                folder = db.get(Folder, item.id)
+            elif path:
+                folder = get_folder_by_path(db, path)
+            else:
                 raise HTTPException(status_code=400, detail="Folder path is required")
-            folder = get_folder_by_path(db, path)
             if not folder:
-                raise HTTPException(status_code=404, detail=f"Folder not found: {path}")
-            normalized_item = ActionItem(type="folder", path=folder_path(folder))
+                detail = f"Folder not found: {path}" if path else "Folder not found"
+                raise HTTPException(status_code=404, detail=detail)
+            normalized_item = NormalizedActionItem(
+                type="folder",
+                id=folder.id,
+                path=folder_path(folder),
+                strict_path=strict_path,
+            )
             key = item_label(normalized_item)
             if key not in seen:
                 seen.add(key)
@@ -1132,7 +1155,7 @@ def normalize_action_items(items: list[ActionItem], db: Session) -> list[ActionI
         raise HTTPException(status_code=400, detail="Invalid item type")
 
     folder_paths = [folder_path(folder) for _, folder in folders]
-    pruned: list[ActionItem] = []
+    pruned: list[NormalizedActionItem] = []
     for item in normalized:
         if item.type == "folder":
             path = normalize_folder(item.path)
@@ -1150,11 +1173,22 @@ def normalize_action_items(items: list[ActionItem], db: Session) -> list[ActionI
     return pruned
 
 
+def get_folder_for_action(item: NormalizedActionItem, db: Session) -> Folder:
+    folder = db.get(Folder, item.id) if item.id is not None else get_folder_by_path(db, item.path)
+    if not folder:
+        raise HTTPException(status_code=404, detail="Folder not found")
+    db.refresh(folder)
+    db.expire(folder, ["parent"])
+    if item.strict_path and normalize_folder(item.path) != folder_path(folder):
+        raise HTTPException(status_code=404, detail="Folder not found")
+    return folder
+
+
 def batch_state_changed(db: Session, event_type: str) -> None:
     record_state_change(
         db,
         f"batch.{event_type}",
-        ("contents", "sidebar", "document_detail", "my_edits"),
+        ("contents", "sidebar", "document_detail", "my_edits", "preferences"),
     )
 
 
@@ -1570,6 +1604,7 @@ def folder_summary_payload(folder: Folder, path: str, stats: list[DocStat]) -> d
             latest = stat.mtime
             latest_by = stat.latest_by
     return {
+        "id": folder.id,
         "path": path,
         "name": path.split("/")[-1] if path else "Vault",
         "color": folder.color or "",
@@ -1780,9 +1815,12 @@ def build_sidebar_payload(db: Session, user: UserContext) -> dict[str, object]:
     }
     metadata = {
         folder_path(item, path_cache): {
+            "id": item.id,
             "color": item.color or "",
             "icon": item.icon or "",
             "access": folder_access_payload(item, user, db),
+            "default_ttl_days": item.default_ttl_days,
+            "default_ttl_action": item.default_ttl_action or "none",
         }
         for item in folders
         if folder_access_level(item, user, db) >= 1
@@ -1927,7 +1965,9 @@ def commit_admin_change(
 
 def build_bootstrap_payload(user: UserContext, folder: str, db: Session) -> dict[str, object]:
     ensure_root_folders(db)
-    current = get_folder_by_path(db, folder) or get_root_folder(db, VAULT_ROOT_KEY)
+    current = get_folder_by_path(db, folder)
+    if not current:
+        raise HTTPException(status_code=404, detail="Folder not found")
     require_folder_access(current, user, db, 1)
     return {
         "auth_mode": AUTH_MODE,
@@ -1985,12 +2025,63 @@ def index_template_context(request: Request, state: dict[str, object]) -> dict[s
     }
 
 
+def resolved_favorite_items(
+    preferences: dict[str, object],
+    user: UserContext,
+    db: Session,
+) -> list[dict[str, object]]:
+    raw_items = preferences.get("favoriteItems")
+    if not isinstance(raw_items, list) or not raw_items:
+        return []
+    folders = all_folders(db)
+    path_cache = build_folder_path_cache(folders)
+    visible_docs = [
+        doc
+        for doc in db.execute(select(Document)).scalars().all()
+        if document_access_level(doc, user, db) >= 1
+    ]
+    stats = docs_stats_for_folder_payloads(visible_docs, db, path_cache)
+    locks = active_locks_by_document(db)
+    resolved: list[dict[str, object]] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        item_id = item.get("id")
+        if not isinstance(item_id, int):
+            continue
+        if item_type == "folder":
+            folder = db.get(Folder, item_id)
+            if not folder or folder_access_level(folder, user, db) < 1:
+                continue
+            row = folder_summary_payload(folder, folder_path(folder, path_cache), stats)
+            row.update(
+                {
+                    "type": "folder",
+                    "archived": folder_is_archive(folder),
+                    "access": folder_access_payload(folder, user, db),
+                },
+            )
+            resolved.append(row)
+            continue
+        if item_type == "document":
+            doc = db.get(Document, item_id)
+            if not doc or document_access_level(doc, user, db) < 1:
+                continue
+            row = document_row_payload(doc, db, path_cache, locks, user)
+            row["type"] = "document"
+            resolved.append(row)
+    return resolved
+
+
 def preferences_for_user(user: UserContext, db: Session) -> dict[str, object]:
     user_id = int(user.get("vault_user_id") or 0)
     if not user_id:
         return normalize_user_preferences({})
     vault_user = db.get(VaultUser, user_id)
-    return normalize_user_preferences(vault_user.preferences if vault_user else {})
+    preferences = normalize_user_preferences(vault_user.preferences if vault_user else {})
+    preferences["favoriteItems"] = resolved_favorite_items(preferences, user, db)
+    return preferences
 
 
 def require_vault_user(user: UserContext, db: Session) -> VaultUser:
@@ -2123,7 +2214,7 @@ def record_document_deleted(db: Session) -> None:
     record_state_change(
         db,
         "document.deleted",
-        ("contents", "sidebar", "document_detail", "my_edits"),
+        ("contents", "sidebar", "document_detail", "my_edits", "preferences"),
     )
 
 
@@ -2607,7 +2698,7 @@ def api_update_preferences(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     vault_user.preferences = merge_user_preferences(vault_user.preferences, patch)
     db.commit()
-    return {"preferences": normalize_user_preferences(vault_user.preferences)}
+    return {"preferences": preferences_for_user(user, db)}
 
 
 @router.get("/api/folders/sidebar")
@@ -2844,7 +2935,7 @@ def create_folder(
     folder: str = Form(...),
     user: UserContext = Depends(current_user),
     db: Session = Depends(get_db),
-) -> dict[str, str]:
+) -> dict[str, object]:
     normalized = normalize_folder(folder)
     if not normalized:
         raise HTTPException(status_code=400, detail="Folder path is required")
@@ -2871,7 +2962,7 @@ def create_folder(
         record_folder_event(created, user, "create", f"Created {normalized}", db)
         record_folder_change(db, "created")
         db.commit()
-    return {"folder": normalized}
+    return {"folder": normalized, "id": created.id}
 
 
 @router.post("/api/move")
@@ -2893,9 +2984,7 @@ def move_items(
                     moved = move_doc_item(doc, destination, request, user, db)
                     result["ok"].append(action_result(item, moved))
                 else:
-                    folder_item = get_folder_by_path(db, item.path)
-                    if not folder_item:
-                        raise HTTPException(status_code=404, detail="Folder not found")
+                    folder_item = get_folder_for_action(item, db)
                     moved = move_folder_item(folder_item, destination, user, db)
                     result["ok"].append(action_result(item, moved))
                 changed = True
@@ -2940,9 +3029,7 @@ def rename_item(
                 )
                 result["ok"].append(action_result(item, renamed))
             else:
-                folder_item = get_folder_by_path(db, item.path)
-                if not folder_item:
-                    raise HTTPException(status_code=404, detail="Folder not found")
+                folder_item = get_folder_for_action(item, db)
                 destination_folder = (
                     normalize_folder(payload.destination_folder)
                     if payload.destination_folder is not None
@@ -2980,9 +3067,7 @@ def archive_items(
                     doc = get_document_or_404(item.id or 0, db)
                     archived = archive_doc_item(doc, request, user, db)
                 else:
-                    folder_item = get_folder_by_path(db, item.path)
-                    if not folder_item:
-                        raise HTTPException(status_code=404, detail="Folder not found")
+                    folder_item = get_folder_for_action(item, db)
                     archived = archive_folder_item(folder_item, request, user, db)
                 result["ok"].append(action_result(item, archived))
                 changed = True
@@ -3011,9 +3096,7 @@ def restore_items(
                     doc = get_document_or_404(item.id or 0, db)
                     restored = restore_doc_item(doc, request, user, db)
                 else:
-                    folder_item = get_folder_by_path(db, item.path)
-                    if not folder_item:
-                        raise HTTPException(status_code=404, detail="Folder not found")
+                    folder_item = get_folder_for_action(item, db)
                     restored = restore_folder_item(folder_item, request, user, db)
                 result["ok"].append(action_result(item, restored))
                 changed = True
@@ -3054,8 +3137,8 @@ def delete_items_forever(
                     db.delete(doc)
                     prune_empty_archive_folders(db, archive_folder)
                 else:
-                    folder_item = get_folder_by_path(db, item.path)
-                    if not folder_item or folder_item.is_root or not folder_is_archive(folder_item):
+                    folder_item = get_folder_for_action(item, db)
+                    if folder_item.is_root or not folder_is_archive(folder_item):
                         raise HTTPException(
                             status_code=400,
                             detail="Delete forever is only available in Archive",
@@ -3168,9 +3251,7 @@ def download_items(
             require_document_access(doc, user, db, 2)
             docs_to_download.append(doc)
         else:
-            folder_item = get_folder_by_path(db, item.path)
-            if not folder_item:
-                raise HTTPException(status_code=404, detail="Folder not found")
+            folder_item = get_folder_for_action(item, db)
             require_folder_access(folder_item, user, db, 2)
             docs_to_download.extend(docs_in_folder_subtree(db, folder_item))
     unique_docs = list({doc.id: doc for doc in docs_to_download}.values())

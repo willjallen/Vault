@@ -57,6 +57,7 @@ body.app-root-page .finder-toolbar {
 
 body.app-root-page .finder-frame {
   flex: 1 1 auto;
+  height: 100%;
   min-height: 0;
 }
 
@@ -67,7 +68,7 @@ body.app-root-page .finder-browser {
 }
 
 body.app-root-page .finder-sidebar {
-  overflow: auto;
+  overflow: visible;
 }
 
 body.app-root-page .finder-browser {
@@ -365,6 +366,7 @@ header {
   grid-template-columns: 240px minmax(0, 1fr);
   gap: 12px;
   align-items: stretch;
+  height: 100%;
   min-width: 0;
 }
 
@@ -374,13 +376,101 @@ header {
   border-radius: var(--radius);
   padding: 12px;
   box-shadow: var(--shadow-soft);
-  min-height: 560px;
+  min-height: 0;
   min-width: 0;
-  overflow: hidden;
+  overflow: visible;
+  display: flex;
+  flex-direction: column;
 }
 
 .sidebar-section {
   margin-bottom: 14px;
+  min-height: 0;
+}
+
+.sidebar-section.resizable-sidebar-section {
+  flex: var(--sidebar-section-size) 1 0;
+  margin-bottom: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.sidebar-section .eyebrow {
+  flex: 0 0 auto;
+}
+
+.sidebar-section-body,
+.my-edits-list {
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow: visible;
+}
+
+.sidebar-section-body {
+  position: relative;
+  border-radius: 10px;
+  isolation: isolate;
+  transition:
+    background 0.15s ease,
+    box-shadow 0.15s ease;
+}
+
+.sidebar-section-body.drop-available {
+  background: color-mix(in srgb, var(--accent-drop) 42%, transparent);
+  box-shadow: inset 0 0 0 1px var(--accent-border);
+}
+
+.sidebar-section-body.drop-active {
+  background: var(--accent-drop);
+  box-shadow:
+    inset 0 0 0 2px var(--accent-border-strong),
+    var(--shadow-selection);
+}
+
+.sidebar-section-body.drop-active::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 7;
+  border: 2px solid var(--accent-border-strong);
+  border-radius: inherit;
+  background: color-mix(in srgb, var(--accent-drop) 52%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 28%, transparent);
+  animation: drop-overlay-pop 240ms cubic-bezier(0.2, 1.25, 0.3, 1);
+  pointer-events: none;
+}
+
+.sidebar-resize-handle {
+  position: relative;
+  flex: 0 0 10px;
+  min-height: 10px;
+  cursor: row-resize;
+}
+
+.sidebar-resize-handle::before {
+  content: "";
+  position: absolute;
+  left: 6px;
+  right: 6px;
+  top: 50%;
+  height: 1px;
+  background: var(--border-subtle);
+  transform: translateY(-50%);
+  transition:
+    background 0.15s ease,
+    box-shadow 0.15s ease;
+}
+
+.sidebar-resize-handle:hover::before,
+body.sidebar-resizing .sidebar-resize-handle::before {
+  background: var(--accent-border);
+  box-shadow: 0 0 0 1px var(--focus-ring);
+}
+
+body.sidebar-resizing {
+  cursor: row-resize;
+  user-select: none;
 }
 
 .sidebar-title {
@@ -443,11 +533,12 @@ header {
 }
 
 .tree {
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: 6px;
   max-width: 100%;
-  overflow: hidden auto;
+  min-height: 0;
 }
 
 .tree-node {
@@ -485,6 +576,53 @@ header {
     background 0.15s ease,
     border 0.15s ease,
     box-shadow 0.15s ease;
+}
+
+.finder-shell.drag-active [data-vault-drop-kind] {
+  scroll-margin: 10px;
+}
+
+.finder-shell.drag-active .finder-browser.drop-zone-available,
+.finder-shell.drag-active .folder-node[data-vault-drop-kind],
+.finder-shell.drag-active .file-row.folder[data-vault-drop-kind] {
+  outline: 1px solid color-mix(in srgb, var(--accent-border) 60%, transparent);
+  outline-offset: -2px;
+}
+
+.finder-shell.drag-active .folder-node[data-vault-drop-kind],
+.finder-shell.drag-active .file-row.folder[data-vault-drop-kind] {
+  background: color-mix(in srgb, var(--accent-drop) 38%, var(--surface-raised));
+}
+
+.finder-shell.drag-active [data-drop-active="true"] {
+  outline: 2px solid var(--accent-border-strong);
+  outline-offset: -2px;
+  background: var(--accent-drop);
+  box-shadow: var(--shadow-selection);
+}
+
+.finder-shell.drag-active .finder-browser[data-drop-active="true"],
+.finder-shell.drag-active .sidebar-section-body[data-drop-active="true"] {
+  outline-offset: -5px;
+}
+
+.finder-shell.drag-active .finder-browser[data-drop-active="true"][data-drop-label]::after,
+.finder-shell.drag-active .sidebar-section-body[data-drop-active="true"][data-drop-label]::after {
+  content: attr(data-drop-label);
+  position: absolute;
+  right: 14px;
+  bottom: 14px;
+  z-index: 8;
+  padding: 6px 9px;
+  border: 1px solid var(--accent-border);
+  border-radius: 999px;
+  background: var(--surface-overlay);
+  color: var(--accent-text);
+  box-shadow: var(--shadow-soft);
+  font-size: 0.72rem;
+  font-weight: 750;
+  line-height: 1;
+  pointer-events: none;
 }
 
 .tree-caret {
@@ -572,6 +710,68 @@ header {
   box-shadow: 0 0 0 2px var(--focus-ring);
 }
 
+.folder-node.favorite {
+  background: color-mix(in srgb, var(--surface-raised) 88%, var(--accent-soft) 12%);
+}
+
+.folder-node.favorite-file .folder-glyph {
+  color: var(--text-muted);
+}
+
+.folder-node.favorite-insert-before::before,
+.folder-node.favorite-insert-after::after {
+  content: "";
+  position: absolute;
+  left: 6px;
+  right: 6px;
+  z-index: 9;
+  height: 2px;
+  border-radius: 999px;
+  background: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent);
+  pointer-events: none;
+  animation: favorite-insert-pop 220ms cubic-bezier(0.2, 1.4, 0.3, 1);
+}
+
+.folder-node.favorite-insert-before::before {
+  top: 0;
+}
+
+.folder-node.favorite-insert-after::after {
+  bottom: 0;
+}
+
+@keyframes drop-overlay-pop {
+  0% {
+    opacity: 0;
+  }
+
+  70% {
+    opacity: 1;
+  }
+
+  100% {
+    opacity: 1;
+  }
+}
+
+@keyframes favorite-insert-pop {
+  0% {
+    opacity: 0;
+    transform: translateY(-2px);
+  }
+
+  72% {
+    opacity: 1;
+    transform: translateY(1px);
+  }
+
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
 .folder-glyph {
   width: 18px;
   height: 18px;
@@ -601,6 +801,22 @@ header {
   flex-direction: column;
   gap: 2px;
   cursor: pointer;
+}
+
+.my-edits-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.sidebar-empty {
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  font-weight: 650;
+  padding: 8px 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .my-edit-chip .chip-dot {

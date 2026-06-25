@@ -1,7 +1,10 @@
 import { folderBaseName, isArchivePath } from "./utils.js";
 
 export function keyForItem(item) {
-  return item.type === "document" ? `document:${item.id}` : `folder:${item.path || ""}`;
+  if (item.type === "document") {
+    return `document:${item.id}`;
+  }
+  return item.id ? `folder:${item.id}` : `folder:${item.path || ""}`;
 }
 
 export function docToItem(doc) {
@@ -12,6 +15,7 @@ export function docToItem(doc) {
     archived: Boolean(doc.archived),
     access: doc.access || {},
     folder: doc.folder || "",
+    favorite: Boolean(doc.favorite),
     id: doc.id,
     latest_by: doc.latest_by || "",
     modified_at: doc.modified_at || null,
@@ -38,11 +42,13 @@ export function folderToItem(folderItem) {
     default_ttl_action: folderItem.default_ttl_action || "none",
     default_ttl_days: folderItem.default_ttl_days || null,
     icon: folderItem.icon || "",
+    id: folderItem.id || null,
     latest_by: folderItem.latest_by || "",
     modified_at: folderItem.modified_at || null,
     modified_display: folderItem.modified_display || "",
     name: folderItem.name || folderBaseName(folderItem.path || "", "Folder"),
     path: folderItem.path || "",
+    favorite: Boolean(folderItem.favorite),
     size_bytes: folderItem.size_bytes || 0,
     size_display: folderItem.size_display || "",
     type: "folder",
@@ -50,9 +56,12 @@ export function folderToItem(folderItem) {
 }
 
 function apiItem(item) {
-  return item.type === "document"
-    ? { type: "document", id: item.id }
-    : { type: "folder", path: item.path };
+  if (item.type === "document") {
+    return { type: "document", id: item.id };
+  }
+  return item.id
+    ? { type: "folder", id: item.id, path: item.path || "" }
+    : { type: "folder", path: item.path || "" };
 }
 
 function selectionLabel(items) {

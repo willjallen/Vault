@@ -18,7 +18,22 @@ const MARQUEE_AUTO_SCROLL_EDGE = 48;
 const MARQUEE_AUTO_SCROLL_MAX = 18;
 
 function itemSelectionKey(item) {
-  return item.type === "document" ? `document:${item.id}` : `folder:${item.path || ""}`;
+  if (item.type === "document") {
+    return `document:${item.id}`;
+  }
+  return item.id ? `folder:${item.id}` : `folder:${item.path || ""}`;
+}
+
+function classIf(condition, className) {
+  return condition ? className : "";
+}
+
+function isActiveFolderDropTarget(dropHint, activeDropTarget, path) {
+  const folderPath = path || "";
+  return (
+    dropHint === path ||
+    (activeDropTarget?.kind === "folder" && activeDropTarget.folder === folderPath)
+  );
 }
 
 function marqueeModeFromEvent(evt) {
@@ -115,6 +130,8 @@ export function VaultFileList({
   draggingFolderPath,
   dropHint,
   uploadHover,
+  activeDropTarget,
+  dragActive = false,
   onSelectFolder,
   onSelectItem,
   onSearchQueryChange,
@@ -380,15 +397,9 @@ export function VaultFileList({
   );
 
   function dragItemsFor(item, type) {
-    const key = type === "document" ? `document:${item.id}` : `folder:${item.path || ""}`;
+    const key = itemSelectionKey({ ...item, type });
     if (selectedSet.has(key)) {
-      return orderedItems.filter((orderedItem) =>
-        selectedSet.has(
-          orderedItem.type === "document"
-            ? `document:${orderedItem.id}`
-            : `folder:${orderedItem.path || ""}`
-        )
-      );
+      return orderedItems.filter((orderedItem) => selectedSet.has(itemSelectionKey(orderedItem)));
     }
     return [
       type === "document"
@@ -404,6 +415,7 @@ export function VaultFileList({
           }
         : {
             archived: isArchivePath(item.path || ""),
+            id: item.id || null,
             name: item.name,
             path: item.path || "",
             size_bytes: item.size_bytes || 0,
@@ -472,7 +484,8 @@ export function VaultFileList({
   }
 
   function renderFolderRow(folderItem) {
-    const selectionKey = `folder:${folderItem.path || ""}`;
+    const selectionKey = itemSelectionKey(folderItem);
+    const folderDropActive = isActiveFolderDropTarget(dropHint, activeDropTarget, folderItem.path);
     return h(FolderRow, {
       key: selectionKey,
       folder: folderItem,
@@ -481,7 +494,7 @@ export function VaultFileList({
         inlineFolderDraft.mode === "rename" &&
         inlineFolderDraft.path === folderItem.path,
       editValue: inlineFolderDraft?.value || "",
-      isDropTarget: dropHint === folderItem.path,
+      isDropTarget: folderDropActive,
       isDragging: draggingFolderPath === folderItem.path,
       selectionKey,
       selected: selectedSet.has(selectionKey),
@@ -547,15 +560,22 @@ export function VaultFileList({
     });
   }
 
+  const browserDropActive = isActiveFolderDropTarget(dropHint, activeDropTarget, folder);
+
   return h(
     "section",
     {
       className: classNames(
         "finder-browser",
-        inArchive ? "archived-scope" : "",
-        uploadHover ? "upload-hover" : "",
-        dropHint === folder ? "drop-target" : ""
+        classIf(inArchive, "archived-scope"),
+        classIf(uploadHover, "upload-hover"),
+        classIf(browserDropActive, "drop-target"),
+        classIf(dragActive, "drop-zone-available")
       ),
+      "data-vault-drop-kind": "folder",
+      "data-drop-folder": folder || "",
+      "data-drop-label": "Drop here",
+      "data-drop-active": browserDropActive ? "true" : undefined,
       onDragOver: onCanvasDragOver,
       onDragLeave: onCanvasDragLeave,
       onDrop: onCanvasDrop,

@@ -1,15 +1,43 @@
 import { Toolbar } from "./toolbar/Toolbar.js";
 import { SidebarNav } from "./sidebar/SidebarNav.js";
-import { MyEdits } from "./sidebar/MyEdits.js";
 import { VaultFileList } from "./browser/FileList.js";
+import {
+  dragCanUseVaultDropZones,
+  dragHasFavoriteItems,
+  favoriteItemsFromDrag,
+} from "../lib/dragPayloads.js";
 
 const h = React.createElement;
+const { useCallback, useEffect, useRef, useState } = React;
+
+function sameDropTarget(left, right) {
+  return (
+    (left?.kind || "") === (right?.kind || "") &&
+    (left?.folder || "") === (right?.folder || "") &&
+    (left?.beforeKey || "") === (right?.beforeKey || "")
+  );
+}
+
+function resolveFavoriteBeforeKey(evt, zone) {
+  const row = evt.target.closest?.("[data-favorite-key]");
+  if (!row || !zone.contains(row)) {
+    return "";
+  }
+  const rect = row.getBoundingClientRect();
+  if (evt.clientY < rect.top + rect.height / 2) {
+    return row.dataset.favoriteKey || "";
+  }
+  const rows = Array.from(zone.querySelectorAll("[data-favorite-key]"));
+  const index = rows.indexOf(row);
+  return rows[index + 1]?.dataset.favoriteKey || "";
+}
 
 export function FinderShell({
   folder,
   breadcrumbs,
   myEdits,
   folderChildren,
+  favoriteItems,
   subfolders,
   files,
   selectedId,
@@ -18,6 +46,7 @@ export function FinderShell({
   contentsSelection,
   folderItems,
   folderSelection,
+  sidebarSectionSizes,
   searchQuery,
   recursiveSearch,
   contentsPending,
@@ -37,8 +66,11 @@ export function FinderShell({
   onNavigateUp,
   onSelectFolder,
   onSelectDoc,
+  onSelectFavoriteDocument,
   onSelectContentItem,
   onSelectFolderItem,
+  onAddFavoriteItems,
+  onSidebarSectionSizesChange,
   onSearchQueryChange,
   onRecursiveSearchChange,
   onContentsSortChange,
@@ -55,6 +87,7 @@ export function FinderShell({
   onFolderDragStart,
   onFolderDragEnd,
   onFileContextMenu,
+  onFavoriteFileContextMenu,
   onFolderContextMenu,
   onMyEditContextMenu,
   onPageContextMenu,
@@ -68,9 +101,129 @@ export function FinderShell({
   settingsButtonRef,
   actions,
 }) {
+  const shellRef = useRef(null);
+  const dragFrameRef = useRef(0);
+  const pendingDragUiRef = useRef(null);
+  const [dragUi, setDragUi] = useState({ active: false, target: null, favoriteDrop: false });
+
+  function resolveDropTarget(evt) {
+    const shell = shellRef.current;
+    const zone = evt.target.closest?.("[data-vault-drop-kind]");
+    if (!shell || !zone || !shell.contains(zone)) {
+      return null;
+    }
+    const kind = zone.dataset.vaultDropKind;
+    if (kind === "favorites") {
+      return dragHasFavoriteItems(evt)
+        ? { kind: "favorites", beforeKey: resolveFavoriteBeforeKey(evt, zone) }
+        : null;
+    }
+    if (kind === "folder") {
+      return { kind: "folder", folder: zone.dataset.dropFolder || "" };
+    }
+    return null;
+  }
+
+  function commitDragUi(nextUi) {
+    setDragUi((current) =>
+      current.active === nextUi.active &&
+      current.favoriteDrop === nextUi.favoriteDrop &&
+      sameDropTarget(current.target, nextUi.target)
+        ? current
+        : nextUi
+    );
+  }
+
+  function scheduleDragUi(nextUi) {
+    pendingDragUiRef.current = nextUi;
+    if (dragFrameRef.current) {
+      return;
+    }
+    dragFrameRef.current = window.requestAnimationFrame(() => {
+      dragFrameRef.current = 0;
+      commitDragUi(
+        pendingDragUiRef.current || { active: false, target: null, favoriteDrop: false }
+      );
+    });
+  }
+
+  const clearDragUi = useCallback(() => {
+    pendingDragUiRef.current = null;
+    if (dragFrameRef.current) {
+      window.cancelAnimationFrame(dragFrameRef.current);
+      dragFrameRef.current = 0;
+    }
+    commitDragUi({ active: false, target: null, favoriteDrop: false });
+    if (onClearDropHint) {
+      onClearDropHint();
+    }
+  }, [onClearDropHint]);
+
+  useEffect(
+    () => () => {
+      if (dragFrameRef.current) {
+        window.cancelAnimationFrame(dragFrameRef.current);
+        dragFrameRef.current = 0;
+      }
+    },
+    []
+  );
+
+  function handleShellDragOver(evt) {
+    if (!dragCanUseVaultDropZones(evt)) {
+      return;
+    }
+    evt.preventDefault();
+    evt.stopPropagation();
+    const target = resolveDropTarget(evt);
+    evt.dataTransfer.dropEffect = target?.kind === "favorites" ? "copy" : target ? "move" : "none";
+    scheduleDragUi({
+      active: true,
+      favoriteDrop: dragHasFavoriteItems(evt),
+      target,
+    });
+  }
+
+  function handleShellDragLeave(evt) {
+    if (evt.currentTarget.contains(evt.relatedTarget)) {
+      return;
+    }
+    clearDragUi();
+  }
+
+  function handleShellDrop(evt) {
+    if (!dragCanUseVaultDropZones(evt)) {
+      return;
+    }
+    evt.preventDefault();
+    evt.stopPropagation();
+    const target = resolveDropTarget(evt);
+    clearDragUi();
+    if (!target) {
+      return;
+    }
+    if (target.kind === "favorites") {
+      const items = favoriteItemsFromDrag(evt);
+      if (items.length && onAddFavoriteItems) {
+        onAddFavoriteItems(items, { beforeKey: target.beforeKey || "" });
+      }
+      return;
+    }
+    if (target.kind === "folder" && onDropOnFolder) {
+      onDropOnFolder(target.folder || "", evt, false);
+    }
+  }
+
   return h(
     "div",
-    { className: "finder-shell", onContextMenu: onPageContextMenu },
+    {
+      className: `finder-shell${dragUi.active ? " drag-active" : ""}`,
+      onContextMenu: onPageContextMenu,
+      onDragLeaveCapture: handleShellDragLeave,
+      onDragOverCapture: handleShellDragOver,
+      onDropCapture: handleShellDrop,
+      ref: shellRef,
+    },
     h(Toolbar, {
       folder,
       breadcrumbs,
@@ -97,26 +250,34 @@ export function FinderShell({
           currentFolder: folder,
           folderChildren,
           folderItems,
+          favoriteItems,
           selectedKeys: folderSelection,
           dropHint,
+          activeDropTarget: dragUi.target,
+          dragActive: dragUi.active,
+          favoriteDropAvailable: dragUi.favoriteDrop,
+          sidebarSectionSizes,
+          myEdits,
+          selectedId,
           onSelect: onSelectFolder,
           onSelectItem: onSelectFolderItem,
+          onSelectFavoriteDocument,
+          onSelectMyEdit: (doc) => {
+            onSelectFolder(doc.folder || "");
+            onSelectDoc(doc.id);
+          },
           openFoldersOnClick,
           onContextMenu: onFolderContextMenu,
+          onSidebarSectionSizesChange,
+          onFavoriteFileContextMenu,
+          onMyEditContextMenu,
+          onFileDragStart,
+          onFileDragEnd,
           onFolderDragStart,
           onFolderDragEnd,
           draggingFolderPath,
           onDropOnFolder,
           onClearDropHint,
-        }),
-        h(MyEdits, {
-          edits: myEdits,
-          selectedId,
-          onSelect: (doc) => {
-            onSelectFolder(doc.folder || "");
-            onSelectDoc(doc.id);
-          },
-          onContextMenu: onMyEditContextMenu,
         })
       ),
       h(VaultFileList, {
@@ -137,6 +298,8 @@ export function FinderShell({
         draggingFolderPath,
         dropHint,
         uploadHover,
+        activeDropTarget: dragUi.target,
+        dragActive: dragUi.active,
         onSelectFolder,
         onSelectItem: onSelectContentItem,
         onSearchQueryChange,

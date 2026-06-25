@@ -15,7 +15,10 @@ function metadataFromContents(contents) {
       {
         access: item.access || {},
         color: item.color || "",
+        default_ttl_action: item.default_ttl_action || "none",
+        default_ttl_days: item.default_ttl_days || null,
         icon: item.icon || "",
+        id: item.id || null,
       },
     ])
   );
@@ -62,6 +65,8 @@ export function useVaultResources({
   initial,
   apiFetch,
   folder,
+  onMissingFolder,
+  onPreferencesRefresh,
   onSiteSettingsChange,
   selectedId,
   setSelectedId,
@@ -91,12 +96,16 @@ export function useVaultResources({
   const prefetchingKeysRef = useRef(new Set());
   const contentRequestRef = useRef(0);
   const detailRequestRef = useRef(0);
+  const onMissingFolderRef = useRef(onMissingFolder);
+  const onPreferencesRefreshRef = useRef(onPreferencesRefresh);
   const folderRef = useRef(folder || "");
   const searchQueryRef = useRef(searchQuery);
   const recursiveSearchRef = useRef(recursiveSearch);
   const selectedIdRef = useRef(selectedId);
 
   folderRef.current = folder || "";
+  onMissingFolderRef.current = onMissingFolder;
+  onPreferencesRefreshRef.current = onPreferencesRefresh;
   searchQueryRef.current = searchQuery;
   recursiveSearchRef.current = recursiveSearch;
   selectedIdRef.current = selectedId;
@@ -198,6 +207,12 @@ export function useVaultResources({
       const res = await apiFetch(`/api/folders/contents?${params.toString()}`);
       if (!background && requestId !== contentRequestRef.current) {
         return null;
+      }
+      if (res.status === 404) {
+        if (!background && onMissingFolderRef.current) {
+          onMissingFolderRef.current(targetFolder);
+        }
+        throw new Error("Folder not found");
       }
       if (!res.ok) {
         throw new Error("Could not refresh contents");
@@ -406,6 +421,9 @@ export function useVaultResources({
       }
       if (resources.has("settings")) {
         fetchSettings().catch(() => setError("Could not refresh settings."));
+      }
+      if (resources.has("preferences") && onPreferencesRefreshRef.current) {
+        onPreferencesRefreshRef.current().catch(() => setError("Could not refresh preferences."));
       }
       if (resources.has("document_detail") && selectedIdRef.current) {
         fetchDocumentDetail(selectedIdRef.current).catch(() =>

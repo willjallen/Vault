@@ -26,6 +26,13 @@ export function buildFileMenuItems(actions) {
       ? { label: "Details", action: () => actions.openFileDetails(doc) }
       : null,
     { label: "Rename", action: () => actions.handleRenameFile(doc), disabled: busy },
+    doc.favorite && actions.handleRemoveFavoriteItem
+      ? {
+          label: "Remove from Favorites",
+          action: () => actions.handleRemoveFavoriteItem(doc),
+          disabled: busy,
+        }
+      : null,
     { label: "Share", action: () => actions.handleShareItem(doc), disabled: busy },
     { label: "Download", action: () => actions.handleView(doc) },
     !doc.archived && !lockedByOther
@@ -91,6 +98,13 @@ export function buildFolderMenuItems(actions) {
     { label: "Open", action: () => actions.navigateToFolder(folderPath) },
     hasPath && !isRoot
       ? { label: "Rename", action: () => actions.beginRenameFolder(folderPath), disabled: busy }
+      : null,
+    folderItem.favorite && actions.handleRemoveFavoriteItem
+      ? {
+          label: "Remove from Favorites",
+          action: () => actions.handleRemoveFavoriteItem(folderItem),
+          disabled: busy,
+        }
       : null,
     { label: "Share", action: () => actions.handleShareItem(folderItem), disabled: busy },
     {

@@ -37,6 +37,10 @@ function itemInArchive(item) {
   return item.archived || isArchivePath(item.path || item.folder || "");
 }
 
+function selectionHasFolders(items) {
+  return items.some((item) => item.type === "folder");
+}
+
 function handleSelectionDrop({
   target,
   targetFolder,
@@ -375,8 +379,12 @@ export function createDropHandlers({
     if (items.length) {
       e.dataTransfer.setData("application/x-vault-selection", JSON.stringify({ items }));
     }
+    if (selectionHasFolders(items)) {
+      e.dataTransfer.setData("application/x-vault-folder-selection", "1");
+    }
+    e.dataTransfer.setData("application/x-vault-favorite-selection", "1");
     e.dataTransfer.setData("application/x-doc-id", String(docId));
-    e.dataTransfer.effectAllowed = "move";
+    e.dataTransfer.effectAllowed = "copyMove";
     setDraggingId(docId);
   }
 
@@ -392,8 +400,10 @@ export function createDropHandlers({
     if (items.length) {
       e.dataTransfer.setData("application/x-vault-selection", JSON.stringify({ items }));
     }
+    e.dataTransfer.setData("application/x-vault-folder-selection", "1");
+    e.dataTransfer.setData("application/x-vault-favorite-selection", "1");
     e.dataTransfer.setData("application/x-folder-path", path);
-    e.dataTransfer.effectAllowed = "move";
+    e.dataTransfer.effectAllowed = "copyMove";
     setDraggingFolderPath(path);
   }
 

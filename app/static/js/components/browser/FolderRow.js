@@ -5,6 +5,18 @@ import { RowSelectionIcon } from "./RowSelectionIcon.js";
 const { useEffect, useRef } = React;
 const h = React.createElement;
 
+function folderDropAttributes({ editing, folder, isDraft, isDropTarget }) {
+  if (editing || isDraft) {
+    return {};
+  }
+  return {
+    "data-vault-drop-kind": "folder",
+    "data-drop-folder": folder.path || "",
+    "data-drop-label": "Move here",
+    "data-drop-active": isDropTarget ? "true" : undefined,
+  };
+}
+
 export function FolderRow({
   folder,
   editing,
@@ -85,6 +97,7 @@ export function FolderRow({
         editing ? "editing" : ""
       ),
       "data-selection-key": selectionKey || undefined,
+      ...folderDropAttributes({ editing, folder, isDraft, isDropTarget }),
       draggable: !editing && !isDraft && selected,
       tabIndex: editing ? undefined : 0,
       onClick: editing ? undefined : onSelect,

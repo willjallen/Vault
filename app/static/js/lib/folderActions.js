@@ -60,8 +60,11 @@ export function createFolderActionHandlers({
       return;
     }
     const success = await handleArchiveItems([folderToItem({ path: selectedFolder })]);
-    if (success && shouldNavigate) {
-      replaceFolder(`Archive/${selectedFolder}`);
+    if (success) {
+      const archivedPath = `Archive/${selectedFolder}`;
+      if (shouldNavigate) {
+        replaceFolder(archivedPath);
+      }
     }
   }
 
@@ -73,8 +76,11 @@ export function createFolderActionHandlers({
       return;
     }
     const success = await handleRestoreItems([folderToItem({ path: selectedFolder })]);
-    if (success && shouldNavigate) {
-      replaceFolder(selectedFolder.replace(/^Archive\/?/, ""));
+    if (success) {
+      const restoredPath = selectedFolder.replace(/^Archive\/?/, "");
+      if (shouldNavigate) {
+        replaceFolder(restoredPath);
+      }
     }
   }
 

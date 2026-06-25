@@ -8,7 +8,17 @@ const USER_PREFERENCE_DEFAULTS = {
   openFoldersOnClick: true,
   alternateRows: false,
   doubleClickDownload: false,
+  favoriteItems: [],
+  sidebarSectionSizes: {
+    folders: 180,
+    favorites: 95,
+    archive: 115,
+    editing: 90,
+  },
 };
+export const SIDEBAR_SECTION_KEYS = ["folders", "favorites", "archive", "editing"];
+export const MIN_SIDEBAR_SECTION_SIZE = 72;
+export const MAX_SIDEBAR_SECTION_SIZE = 520;
 export function normalizeThemePreference(value) {
   return THEME_OPTIONS.includes(value) ? value : "system";
 }
@@ -37,6 +47,98 @@ function normalizeBooleanPreference(value, fallback) {
   return fallback;
 }
 
+function hasControlCharacters(value) {
+  return Array.from(value).some((char) => char.charCodeAt(0) < 32);
+}
+
+function normalizeOptionalFavoriteString(value) {
+  if (typeof value !== "string") {
+    return "";
+  }
+  const cleaned = value.replace(/\\/g, "/").trim();
+  return cleaned.length <= 512 && !hasControlCharacters(cleaned) ? cleaned : "";
+}
+
+function normalizeFavoriteItem(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const id = Number(value.id);
+  if (!Number.isInteger(id) || id < 1) {
+    return null;
+  }
+  if (value.type === "folder") {
+    return {
+      type: "folder",
+      id,
+      name: normalizeOptionalFavoriteString(value.name),
+      path: normalizeOptionalFavoriteString(value.path),
+      color: normalizeOptionalFavoriteString(value.color),
+      icon: normalizeOptionalFavoriteString(value.icon),
+      default_ttl_action: normalizeOptionalFavoriteString(value.default_ttl_action),
+      default_ttl_days: Number.isInteger(value.default_ttl_days) ? value.default_ttl_days : null,
+      access: value.access && typeof value.access === "object" ? value.access : {},
+      archived: Boolean(value.archived),
+      modified_at: normalizeOptionalFavoriteString(value.modified_at) || null,
+      modified_display: normalizeOptionalFavoriteString(value.modified_display),
+      latest_by: normalizeOptionalFavoriteString(value.latest_by),
+      size_bytes: Number.isFinite(value.size_bytes) ? value.size_bytes : 0,
+      size_display: normalizeOptionalFavoriteString(value.size_display),
+    };
+  }
+  if (value.type === "document") {
+    return {
+      type: "document",
+      id,
+      name: normalizeOptionalFavoriteString(value.name),
+      folder: normalizeOptionalFavoriteString(value.folder),
+      path: normalizeOptionalFavoriteString(value.path),
+    };
+  }
+  return null;
+}
+
+function favoriteItemKey(item) {
+  return item.type === "document" ? `document:${item.id}` : `folder:${item.id}`;
+}
+
+export function normalizeFavoriteItems(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const seen = new Set();
+  const items = [];
+  value.forEach((rawItem) => {
+    const item = normalizeFavoriteItem(rawItem);
+    if (item) {
+      const key = favoriteItemKey(item);
+      if (!seen.has(key)) {
+        seen.add(key);
+        items.push(item);
+      }
+    }
+  });
+  return items;
+}
+
+export function normalizeSidebarSectionSizes(value) {
+  const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  return SIDEBAR_SECTION_KEYS.reduce((sizes, key) => {
+    // eslint-disable-next-line security/detect-object-injection
+    const rawSize = source[key];
+    // eslint-disable-next-line security/detect-object-injection
+    const defaultSize = USER_PREFERENCE_DEFAULTS.sidebarSectionSizes[key];
+    const numericSize =
+      typeof rawSize === "number" && Number.isFinite(rawSize) ? rawSize : defaultSize;
+    // eslint-disable-next-line security/detect-object-injection
+    sizes[key] = Math.max(
+      MIN_SIDEBAR_SECTION_SIZE,
+      Math.min(MAX_SIDEBAR_SECTION_SIZE, Math.round(numericSize))
+    );
+    return sizes;
+  }, {});
+}
+
 export function normalizeUserPreferences(value) {
   const source = value && typeof value === "object" ? value : {};
   return {
@@ -54,6 +156,8 @@ export function normalizeUserPreferences(value) {
       source.doubleClickDownload,
       USER_PREFERENCE_DEFAULTS.doubleClickDownload
     ),
+    favoriteItems: normalizeFavoriteItems(source.favoriteItems),
+    sidebarSectionSizes: normalizeSidebarSectionSizes(source.sidebarSectionSizes),
   };
 }
 
@@ -83,6 +187,18 @@ async function patchUserPreferences(apiFetch, patch) {
   if (!res.ok) {
     const detail = await res.json().catch(() => ({}));
     throw new Error(detail.detail || "Could not save preferences");
+  }
+  const payload = await res.json();
+  return normalizeUserPreferences(payload.preferences);
+}
+
+async function fetchUserPreferences(apiFetch) {
+  if (!apiFetch) {
+    return null;
+  }
+  const res = await apiFetch("/api/preferences");
+  if (!res.ok) {
+    throw new Error("Could not refresh preferences");
   }
   const payload = await res.json();
   return normalizeUserPreferences(payload.preferences);
@@ -182,6 +298,15 @@ export function useAppearancePreferences({ apiFetch, initialPreferences } = {}) 
     [apiFetch, userPreferences]
   );
 
+  const refreshUserPreferences = useCallback(() => {
+    return fetchUserPreferences(apiFetch).then((savedPreferences) => {
+      if (savedPreferences) {
+        setUserPreferences(savedPreferences);
+      }
+      return savedPreferences;
+    });
+  }, [apiFetch]);
+
   const handleThemePreferenceChange = useCallback(
     (preference) => updatePreference({ themePreference: preference }),
     [updatePreference]
@@ -207,16 +332,31 @@ export function useAppearancePreferences({ apiFetch, initialPreferences } = {}) 
     [updatePreference]
   );
 
+  const handleFavoriteItemsChange = useCallback(
+    (preference) => updatePreference({ favoriteItems: preference }),
+    [updatePreference]
+  );
+
+  const handleSidebarSectionSizesChange = useCallback(
+    (preference) => updatePreference({ sidebarSectionSizes: preference }),
+    [updatePreference]
+  );
+
   return {
     alternateRows: userPreferences.alternateRows,
     doubleClickDownload: userPreferences.doubleClickDownload,
+    favoriteItems: userPreferences.favoriteItems,
     handleAlternateRowsChange,
     handleDoubleClickDownloadChange,
+    handleFavoriteItemsChange,
     handleOpenFoldersOnClickChange,
     handlePalettePreferenceChange,
+    handleSidebarSectionSizesChange,
     handleThemePreferenceChange,
     openFoldersOnClick: userPreferences.openFoldersOnClick,
     palettePreference: userPreferences.palettePreference,
+    refreshUserPreferences,
+    sidebarSectionSizes: userPreferences.sidebarSectionSizes,
     themePreference: userPreferences.themePreference,
     userPreferences,
   };

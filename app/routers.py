@@ -1534,18 +1534,19 @@ def move_folder_item(
     target_ref = parse_public_folder_path(destination_folder)
     if source.root_key != target_ref.root_key:
         raise HTTPException(status_code=400, detail="Use archive or restore for Archive moves")
-    docs_in_unlocked_folder_subtree(db, source, user)
-    require_write_for_folder_path(db, destination_folder, user)
-    target_parent = get_or_create_folder_path(db, destination_folder)
     source_path = folder_path(source)
     source_parent_path = folder_path(source.parent) if source.parent else ""
     source_name = source.name
     target_name = normalize_item_name(name or source.name, "Folder name")
-    target_path = join_path(folder_path(target_parent), target_name)
+    target_parent_path = public_folder_path(target_ref.root_key, target_ref.relative_path)
+    target_path = join_path(target_parent_path, target_name)
     if target_path == source_path:
         return source_path
     if target_path.startswith(f"{source_path}/"):
         raise HTTPException(status_code=400, detail="Cannot move a folder into itself")
+    docs_in_unlocked_folder_subtree(db, source, user)
+    require_write_for_folder_path(db, destination_folder, user)
+    target_parent = get_or_create_folder_path(db, destination_folder)
     ensure_unique_folder_name(db, target_parent.id, target_name, source.id)
     source.parent = target_parent
     source.parent_id = target_parent.id

@@ -1,6 +1,7 @@
 import unittest
 from contextlib import contextmanager
 
+from fastapi import HTTPException
 from tests.support import FAKE_REQUEST, create_versioned_document, user_context, vault_runtime
 
 import app.routers as routers
@@ -14,6 +15,7 @@ from app.routers import (
     folder_path,
     get_folder_by_path,
     get_or_create_folder_path,
+    move_folder_item,
 )
 
 
@@ -68,6 +70,29 @@ class FolderStaleStateTests(unittest.TestCase):
                     [("vault", "Renamed")],
                 )
                 self.assertEqual(db.query(DocumentEvent).count(), 0)
+
+    def test_failed_move_into_descendant_does_not_create_destination_folders(self) -> None:
+        user = user_context("alice")
+
+        with vault_runtime() as ctx:
+            with ctx.db() as db:
+                source = get_or_create_folder_path(db, "Project")
+                db.commit()
+
+                with self.assertRaises(HTTPException) as raised:
+                    move_folder_item(source, "Project/NewParent", user, db)
+
+                self.assertEqual(raised.exception.status_code, 400)
+                self.assertEqual(raised.exception.detail, "Cannot move a folder into itself")
+                db.commit()
+
+            with ctx.db() as db:
+                self.assertIsNone(get_folder_by_path(db, "Project/NewParent"))
+                folders = db.query(Folder).filter(Folder.is_root == False).all()  # noqa: E712
+                self.assertEqual(
+                    [(folder.root_key, folder_path(folder)) for folder in folders],
+                    [("vault", "Project")],
+                )
 
 
 if __name__ == "__main__":

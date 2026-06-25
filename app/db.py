@@ -105,7 +105,7 @@ def _schema_needs_reset() -> bool:
             column["name"]: column for column in inspector.get_columns(table.name)
         }
         expected_columns = {column.name: column for column in table.columns}
-        if not set(expected_columns).issubset(existing_columns):
+        if set(existing_columns) != set(expected_columns):
             return True
         for column_name, expected_column in expected_columns.items():
             existing_column = existing_columns[column_name]

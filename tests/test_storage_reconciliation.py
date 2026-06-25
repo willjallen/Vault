@@ -73,6 +73,43 @@ class StorageReconciliationTests(unittest.TestCase):
             self.assertEqual(report["unreferenced_local_keys"], [])
             self.assertEqual(report["missing_local_keys"], [object_key])
 
+    def test_report_flags_corrupt_referenced_local_object(self) -> None:
+        user = user_context("user", groups=[])
+
+        with vault_runtime() as ctx, ctx.db() as db:
+            folder = get_or_create_folder_path(db, "")
+            doc = create_versioned_document(
+                db,
+                folder,
+                name="kept.txt",
+                data=b"trusted content",
+                actor=user,
+            )
+            db.commit()
+
+            version = db.query(DocumentVersion).filter_by(document_id=doc.id).one()
+            location = (
+                db.query(BlobLocation)
+                .filter_by(blob_id=version.blob_id, backend="local")
+                .one()
+            )
+            object_key = location.object_key
+            object_path = ctx.temp_dir / "objects" / object_key
+            object_path.write_bytes(b"corrupt content")
+
+            report = storage_reconciliation_report(db, apply=False)
+
+            self.assertEqual(report["orphan_blob_ids"], [])
+            self.assertEqual(report["unreferenced_local_keys"], [])
+            self.assertEqual(report["missing_local_keys"], [])
+            self.assertEqual(report["corrupt_local_keys"], [object_key])
+
+            applied = storage_reconciliation_report(db, apply=True)
+
+            self.assertEqual(applied["corrupt_local_keys"], [object_key])
+            self.assertEqual(applied["deleted_local_keys"], [])
+            self.assertEqual(object_path.read_bytes(), b"corrupt content")
+
     def test_apply_preserves_referenced_local_object_with_missing_location_metadata(
         self,
     ) -> None:

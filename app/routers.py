@@ -1247,6 +1247,14 @@ def location_for_blob(blob: Blob) -> BlobLocation:
     return locations[0]
 
 
+def blob_bytes_match(blob: Blob, data: bytes) -> bool:
+    return (
+        blob.hash_algo == "sha256"
+        and len(data) == blob.size_bytes
+        and hashlib.sha256(data).hexdigest() == blob.hash
+    )
+
+
 def read_version_bytes(version: DocumentVersion) -> bytes:
     location = location_for_blob(version.blob)
     try:
@@ -1258,11 +1266,7 @@ def read_version_bytes(version: DocumentVersion) -> bytes:
         raise HTTPException(status_code=404, detail="Blob missing from storage") from exc
     except StorageConfigurationError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
-    if (
-        version.blob.hash_algo != "sha256"
-        or len(data) != version.blob.size_bytes
-        or hashlib.sha256(data).hexdigest() != version.blob.hash
-    ):
+    if not blob_bytes_match(version.blob, data):
         raise HTTPException(status_code=500, detail="Blob content does not match metadata")
     return data
 
@@ -2775,6 +2779,7 @@ def storage_reconciliation_report(db: Session, apply: bool = False) -> dict[str,
         if referenced_blob_ids
         else []
     )
+    referenced_blobs_by_id = {blob.id: blob for blob in referenced_blobs}
     orphan_blobs = [
         blob for blob in db.execute(select(Blob)).scalars() if blob.id not in referenced_blob_ids
     ]
@@ -2795,15 +2800,40 @@ def storage_reconciliation_report(db: Session, apply: bool = False) -> dict[str,
         (location.blob_id, location.object_key) for location in local_locations
     }
     recoverable_referenced_local_locations: set[tuple[int, str]] = set()
+    corrupt_local_keys: set[str] = set()
     for blob in referenced_blobs:
         object_key = object_key_for_hash(blob.hash_algo, blob.hash)
-        if object_key in local_keys:
+        if object_key not in local_keys:
+            continue
+        try:
+            data = local_backend.read_bytes(object_key, local_backend.bucket)
+        except StorageError:
+            corrupt_local_keys.add(object_key)
+            continue
+        if blob_bytes_match(blob, data):
             recoverable_referenced_local_locations.add((blob.id, object_key))
+        else:
+            corrupt_local_keys.add(object_key)
+    for location in local_locations:
+        blob = referenced_blobs_by_id.get(location.blob_id)
+        if blob is None or location.object_key not in local_keys:
+            continue
+        try:
+            data = local_backend.read_bytes(location.object_key, location.bucket)
+        except StorageError:
+            corrupt_local_keys.add(location.object_key)
+            continue
+        if not blob_bytes_match(blob, data):
+            corrupt_local_keys.add(location.object_key)
     recoverable_referenced_local_keys = {
         object_key for _, object_key in recoverable_referenced_local_locations
     }
-    referenced_protected_local_keys = referenced_local_keys | recoverable_referenced_local_keys
-    unreferenced_local_keys = sorted(local_keys - known_local_keys - recoverable_referenced_local_keys)
+    referenced_protected_local_keys = (
+        referenced_local_keys | recoverable_referenced_local_keys | corrupt_local_keys
+    )
+    unreferenced_local_keys = sorted(
+        local_keys - known_local_keys - recoverable_referenced_local_keys - corrupt_local_keys,
+    )
     missing_local_keys = sorted(referenced_local_keys - local_keys)
     missing_local_location_keys = sorted(
         object_key
@@ -2877,6 +2907,7 @@ def storage_reconciliation_report(db: Session, apply: bool = False) -> dict[str,
         "unreferenced_local_keys": unreferenced_local_keys,
         "missing_local_keys": missing_local_keys,
         "missing_local_location_keys": missing_local_location_keys,
+        "corrupt_local_keys": sorted(corrupt_local_keys),
         "deleted_local_keys": sorted(
             set(unreferenced_local_keys) | set(orphan_local_keys_to_delete),
         )

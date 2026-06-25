@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from sqlalchemy import (
+    CheckConstraint,
     ForeignKeyConstraint,
     UniqueConstraint,
     create_engine,
@@ -171,6 +172,23 @@ def _schema_needs_reset() -> bool:
             expected_columns = tuple(column.name for column in expected_constraint.columns)
             if existing_columns != expected_columns:
                 return True
+        existing_check_constraints = {
+            (
+                constraint.get("name") or "",
+                _normalize_sql_expression(constraint.get("sqltext")),
+            )
+            for constraint in inspector.get_check_constraints(table.name)
+        }
+        expected_check_constraints = {
+            (
+                constraint.name or "",
+                _normalize_sql_expression(constraint.sqltext),
+            )
+            for constraint in table.constraints
+            if isinstance(constraint, CheckConstraint)
+        }
+        if existing_check_constraints != expected_check_constraints:
+            return True
         existing_foreign_keys = set()
         for foreign_key in inspector.get_foreign_keys(table.name):
             referred_table = foreign_key.get("referred_table")

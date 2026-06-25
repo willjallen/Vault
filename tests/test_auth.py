@@ -182,6 +182,18 @@ class AuthTests(unittest.TestCase):
             self.assertEqual(raised.exception.status_code, 401)
             self.assertEqual(raised.exception.detail, "Authentication required")
 
+    def test_oidc_session_cookie_rejects_non_ascii_payload(self) -> None:
+        with vault_runtime(auth_mode="oidc") as ctx, ctx.db() as db:
+            request = CookieRequest(
+                {auth_module.SESSION_COOKIE_NAME: "not-ascii-\u2603.signature"},
+            )
+
+            with self.assertRaises(HTTPException) as raised:
+                current_user(request, db)
+
+            self.assertEqual(raised.exception.status_code, 401)
+            self.assertEqual(raised.exception.detail, "Authentication required")
+
     def test_dev_auth_requires_local_base_domain(self) -> None:
         with vault_runtime(auth_mode="dev") as ctx, ctx.db() as db:
             os.environ["BASE_DOMAIN"] = "vault.example.com"

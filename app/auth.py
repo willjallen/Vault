@@ -1,6 +1,7 @@
 """Authentication and canonical Vault identity helpers."""
 
 import base64
+import binascii
 import datetime as dt
 import hashlib
 import hmac
@@ -149,12 +150,17 @@ def _verify_payload(value: str | None) -> dict[str, object] | None:
     if not value or "." not in value:
         return None
     body, signature = value.rsplit(".", 1)
-    expected = hmac.new(SESSION_SECRET.encode("utf-8"), body.encode("ascii"), hashlib.sha256)
+    try:
+        body_bytes = body.encode("ascii")
+        signature.encode("ascii")
+    except UnicodeEncodeError:
+        return None
+    expected = hmac.new(SESSION_SECRET.encode("utf-8"), body_bytes, hashlib.sha256)
     if not hmac.compare_digest(_b64encode(expected.digest()), signature):
         return None
     try:
         payload = json.loads(_b64decode(body))
-    except (ValueError, json.JSONDecodeError):
+    except (binascii.Error, UnicodeDecodeError, ValueError, json.JSONDecodeError):
         return None
     if not isinstance(payload, dict):
         return None

@@ -1,7 +1,7 @@
 import datetime as dt
 import unittest
 
-from tests.support import add_permission, auth_headers, vault_test_client
+from tests.support import add_permission, auth_headers, create_versioned_document, vault_test_client
 
 from app.models import Document, Folder, ShareLink, VaultGroup
 from app.routers import get_root_folder, now_utc
@@ -204,6 +204,43 @@ class ShareLinkTests(unittest.TestCase):
                 headers=artist_headers,
             )
             self.assertEqual(visible_folder.status_code, 200, visible_folder.text)
+
+    def test_folder_share_stats_exclude_inaccessible_descendants(self) -> None:
+        admin_headers = auth_headers("admin", ["vault-admin"])
+        artist_headers = auth_headers("artist", ["artists"])
+
+        with vault_test_client() as ctx:
+            with ctx.db() as db:
+                root = get_root_folder(db, "vault")
+                project = create_child_folder(db, root, "Project")
+                private = create_child_folder(db, project, "Private")
+
+                artists = VaultGroup(name="artists")
+                confidential = VaultGroup(name="confidential")
+                db.add_all([artists, confidential])
+                db.flush()
+                add_permission(db, root, artists)
+                add_permission(db, project, artists)
+                add_permission(db, private, confidential)
+
+                create_versioned_document(db, project, name="visible.txt", data=b"ok")
+                create_versioned_document(db, private, name="secret.txt", data=b"topsecret")
+                db.commit()
+                project_id = project.id
+
+            share = ctx.client.post(
+                "/api/share-links",
+                json={"target_type": "folder", "folder_id": project_id},
+                headers=admin_headers,
+            )
+            self.assertEqual(share.status_code, 200, share.text)
+
+            resolved = ctx.client.get(
+                f"/api/share-links/{share.json()['code']}",
+                headers=artist_headers,
+            )
+            self.assertEqual(resolved.status_code, 200, resolved.text)
+            self.assertEqual(resolved.json()["folder_item"]["size_bytes"], len(b"ok"))
 
     def test_deleted_targets_resolve_as_not_found(self) -> None:
         admin_headers = auth_headers("admin", ["vault-admin"])

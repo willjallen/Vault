@@ -2350,8 +2350,13 @@ def resolved_share_payload(link: ShareLink, user: UserContext, db: Session) -> d
             raise HTTPException(status_code=404, detail="Folder not found")
         require_folder_access(folder, user, db, 1)
         path = folder_path(folder, path_cache)
+        visible_docs = [
+            doc
+            for doc in db.execute(select(Document)).scalars().all()
+            if document_access_level(doc, user, db) >= 1
+        ]
         stats = docs_stats_for_folder_payloads(
-            list(db.execute(select(Document)).scalars().all()),
+            visible_docs,
             db,
             path_cache,
         )

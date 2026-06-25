@@ -313,6 +313,50 @@ class RetentionTtlTests(unittest.TestCase):
                 self.assertIsNone(doc.expiry_action)
                 self.assertEqual(doc.folder.name, "Safe")
 
+    def test_renaming_in_delete_ttl_folder_refreshes_expiry_from_new_modified_time(self) -> None:
+        admin = user_context("alice", groups=["vault-admin"])
+
+        with vault_runtime() as ctx:
+            with ctx.db() as db:
+                folder = get_or_create_folder_path(db, "Temp")
+                folder.default_ttl_days = 7
+                folder.default_ttl_action = "delete"
+                doc = Document(
+                    folder_id=folder.id,
+                    name="draft.txt",
+                    latest_modified_at=now_utc() - dt.timedelta(days=30),
+                )
+                db.add(doc)
+                db.flush()
+                apply_folder_ttl(doc, folder, doc.latest_modified_at)
+                self.assertLessEqual(normalize_timestamp(doc.expires_at), now_utc())
+                db.commit()
+
+                renamed_path = move_doc_item(
+                    doc,
+                    "Temp",
+                    FAKE_REQUEST,
+                    admin,
+                    db,
+                    name="draft-renamed.txt",
+                )
+                self.assertEqual(renamed_path, "Temp/draft-renamed.txt")
+                self.assertGreater(
+                    normalize_timestamp(doc.expires_at),
+                    now_utc() + dt.timedelta(days=6),
+                )
+                db.commit()
+                doc_id = doc.id
+
+            result = sweep_expired_documents()
+            self.assertEqual(result["deleted"], [])
+
+            with ctx.db() as db:
+                doc = db.get(Document, doc_id)
+                self.assertIsNotNone(doc)
+                self.assertEqual(doc.name, "draft-renamed.txt")
+                self.assertEqual(doc.expiry_action, "delete")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2301,13 +2301,11 @@ def mutate_doc_location(
     publish_state: bool = True,
 ) -> None:
     ensure_unique_document_path(db, target_folder.id, target_name, doc.id)
-    folder_changed = doc.folder_id != target_folder.id
     doc.folder = target_folder
     doc.folder_id = target_folder.id
     doc.name = target_name
     doc.latest_modified_at = now_utc()
-    if folder_changed:
-        apply_folder_ttl(doc, target_folder, doc.latest_modified_at)
+    apply_folder_ttl(doc, target_folder, doc.latest_modified_at)
     record_event(doc, user, event_type, message, db, meta=meta, publish_state=publish_state)
 
 

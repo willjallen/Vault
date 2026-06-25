@@ -123,6 +123,12 @@ def _schema_needs_reset() -> bool:
             )
             if existing_type != expected_type:
                 return True
+        existing_primary_key = tuple(
+            inspector.get_pk_constraint(table.name).get("constrained_columns") or [],
+        )
+        expected_primary_key = tuple(column.name for column in table.primary_key.columns)
+        if existing_primary_key != expected_primary_key:
+            return True
         existing_indexes = {
             index["name"]: index
             for index in inspector.get_indexes(table.name)

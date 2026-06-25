@@ -158,6 +158,30 @@ class AuthTests(unittest.TestCase):
             self.assertEqual(raised.exception.status_code, 401)
             self.assertEqual(raised.exception.detail, "Authentication required")
 
+    def test_oidc_session_cookie_rejects_boolean_user_id(self) -> None:
+        with vault_runtime(auth_mode="oidc") as ctx, ctx.db() as db:
+            user = VaultUser(
+                issuer="issuer",
+                subject="alice",
+                email="alice@example.com",
+                name="Alice",
+                is_active=True,
+            )
+            db.add(user)
+            db.commit()
+            self.assertEqual(user.id, 1)
+
+            cookie = auth_module._sign_payload(
+                {"uid": True, "exp": auth_module.time.time() + 60},
+            )
+            request = CookieRequest({auth_module.SESSION_COOKIE_NAME: cookie})
+
+            with self.assertRaises(HTTPException) as raised:
+                current_user(request, db)
+
+            self.assertEqual(raised.exception.status_code, 401)
+            self.assertEqual(raised.exception.detail, "Authentication required")
+
     def test_dev_auth_requires_local_base_domain(self) -> None:
         with vault_runtime(auth_mode="dev") as ctx, ctx.db() as db:
             os.environ["BASE_DOMAIN"] = "vault.example.com"

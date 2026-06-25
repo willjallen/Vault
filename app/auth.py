@@ -156,6 +156,8 @@ def _verify_payload(value: str | None) -> dict[str, object] | None:
         payload = json.loads(_b64decode(body))
     except (ValueError, json.JSONDecodeError):
         return None
+    if not isinstance(payload, dict):
+        return None
     expires_at = payload.get("exp")
     if (
         isinstance(expires_at, bool)
@@ -164,7 +166,7 @@ def _verify_payload(value: str | None) -> dict[str, object] | None:
         or float(expires_at) < time.time()
     ):
         return None
-    return payload if isinstance(payload, dict) else None
+    return payload
 
 
 def _cookie_secure(request: Request) -> bool:
@@ -391,7 +393,7 @@ def _header_identity(request: Request, db: Session) -> UserContext:
 def _session_identity(request: Request, db: Session) -> UserContext | None:
     payload = _verify_payload(request.cookies.get(SESSION_COOKIE_NAME))
     user_id = payload.get("uid") if payload else None
-    if not isinstance(user_id, int):
+    if isinstance(user_id, bool) or not isinstance(user_id, int):
         return None
     user = db.execute(select(VaultUser).where(VaultUser.id == user_id)).scalars().first()
     if not user or not user.is_active:

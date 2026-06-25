@@ -587,6 +587,40 @@ class DatabaseInitTests(unittest.TestCase):
                 db_module.engine.dispose()
                 restore_runtime(snapshot)
 
+    def test_unexpected_trigger_is_rejected_on_startup(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="vault-db-init-") as temp_dir:
+            db_path = Path(temp_dir) / "vault.db"
+            snapshot = snapshot_runtime()
+            try:
+                db_module.configure_database(db_path)
+                db_module.Base.metadata.create_all(bind=db_module.engine)
+                with sqlite3.connect(db_path) as conn:
+                    conn.execute(
+                        """
+                        CREATE TRIGGER vault_groups_delete_documents
+                        AFTER INSERT ON vault_groups
+                        BEGIN
+                            DELETE FROM documents;
+                        END
+                        """,
+                    )
+
+                with self.assertRaises(RuntimeError) as raised:
+                    db_module.init_db()
+
+                self.assertIn("Startup refused to alter or drop", str(raised.exception))
+                with sqlite3.connect(db_path) as conn:
+                    trigger = conn.execute(
+                        """
+                        SELECT name FROM sqlite_master
+                        WHERE type = 'trigger' AND name = 'vault_groups_delete_documents'
+                        """,
+                    ).fetchone()
+                self.assertEqual(trigger, ("vault_groups_delete_documents",))
+            finally:
+                db_module.engine.dispose()
+                restore_runtime(snapshot)
+
 
 if __name__ == "__main__":
     unittest.main()

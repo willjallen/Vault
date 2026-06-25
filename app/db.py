@@ -99,6 +99,13 @@ def _schema_needs_reset() -> bool:
     tables = set(inspector.get_table_names())
     if not tables:
         return False
+    model_table_names = {table.name for table in Base.metadata.sorted_tables}
+    with engine.connect() as connection:
+        live_triggers = connection.exec_driver_sql(
+            "SELECT name, tbl_name FROM sqlite_master WHERE type = 'trigger'",
+        ).fetchall()
+    if any(trigger[1] in model_table_names for trigger in live_triggers):
+        return True
     for table in Base.metadata.sorted_tables:
         if table.name not in tables:
             return True

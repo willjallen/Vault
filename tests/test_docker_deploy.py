@@ -154,6 +154,7 @@ class DockerDeployTests(unittest.TestCase):
             "VAULT_TTL_SWEEP_INTERVAL_SECONDS: ${VAULT_TTL_SWEEP_INTERVAL_SECONDS:-60}",
             compose,
         )
+        self.assertIn("VAULT_EXPORT_WORKERS: ${VAULT_EXPORT_WORKERS:-1}", compose)
         self.assertNotIn("/vault-metadata", compose)
         self.assertNotIn("/vault-objects", compose)
         self.assertIn("VAULT_DOCKER_RUNTIME: ${VAULT_DOCKER_RUNTIME:-1}", compose)

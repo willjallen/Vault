@@ -35,6 +35,7 @@ ENV_KEYS = (
     "VAULT_TRANSFER_CHUNK_BYTES",
     "VAULT_TRANSFER_SESSION_TTL_SECONDS",
     "VAULT_EXPORT_TTL_SECONDS",
+    "VAULT_EXPORT_WORKERS",
     "VAULT_EXPORT_ZIP_COMPRESSION_THRESHOLD_BYTES",
     "VAULT_EXPORT_ZIP_COMPRESSLEVEL",
     "VAULT_TRANSFERS_PATH",
@@ -68,6 +69,7 @@ class RuntimeSnapshot:
     base_domain: str
     dev_mode: bool
     export_ttl_seconds: int
+    export_workers: int
     export_zip_compression_threshold_bytes: int
     export_zip_compresslevel: int
     max_upload_bytes: int
@@ -234,6 +236,7 @@ def snapshot_runtime() -> RuntimeSnapshot:
         base_domain=routers_module.BASE_DOMAIN,
         dev_mode=routers_module.DEV_MODE,
         export_ttl_seconds=routers_module.EXPORT_TTL_SECONDS,
+        export_workers=routers_module.EXPORT_WORKERS,
         export_zip_compression_threshold_bytes=routers_module.EXPORT_ZIP_COMPRESSION_THRESHOLD_BYTES,
         export_zip_compresslevel=routers_module.EXPORT_ZIP_COMPRESSLEVEL,
         max_upload_bytes=routers_module.MAX_UPLOAD_BYTES,
@@ -278,6 +281,7 @@ def restore_runtime(snapshot: RuntimeSnapshot) -> None:
         base_domain=snapshot.base_domain,
         dev_mode=snapshot.dev_mode,
         export_ttl_seconds=snapshot.export_ttl_seconds,
+        export_workers=snapshot.export_workers,
         export_zip_compression_threshold_bytes=snapshot.export_zip_compression_threshold_bytes,
         export_zip_compresslevel=snapshot.export_zip_compresslevel,
         max_upload_bytes=snapshot.max_upload_bytes,
@@ -318,6 +322,7 @@ def vault_runtime(
                 "VAULT_OBJECTS_PATH": str(objects_path),
                 "VAULT_PUBLIC_URL": "",
                 "VAULT_SESSION_COOKIE_SECURE": "auto",
+                "VAULT_EXPORT_WORKERS": "1",
                 "VAULT_EXPORT_ZIP_COMPRESSION_THRESHOLD_BYTES": str(3 * 1024 * 1024 * 1024),
                 "VAULT_EXPORT_ZIP_COMPRESSLEVEL": "1",
                 "VAULT_TRANSFERS_PATH": str(transfers_path),
@@ -338,6 +343,7 @@ def vault_runtime(
             base_domain="localhost",
             dev_mode=runtime_dev_mode,
             export_ttl_seconds=86400,
+            export_workers=1,
             export_zip_compression_threshold_bytes=3 * 1024 * 1024 * 1024,
             export_zip_compresslevel=1,
             max_upload_bytes=5 * 1024 * 1024 * 1024,

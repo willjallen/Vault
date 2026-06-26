@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import mimetypes
+import queue
 import re
 import secrets
 import shutil
@@ -55,6 +56,7 @@ from .config import (
     BASE_DOMAIN,
     DEV_MODE,
     EXPORT_TTL_SECONDS,
+    EXPORT_WORKERS,
     EXPORT_ZIP_COMPRESSION_THRESHOLD_BYTES,
     EXPORT_ZIP_COMPRESSLEVEL,
     MAX_UPLOAD_BYTES,
@@ -137,6 +139,10 @@ SYSTEM_USER: UserContext = {
 }
 SYSTEM_META: dict[str, str | None] = {"ip": None, "user_agent": None}
 _ttl_sweeper_task: asyncio.Task[None] | None = None
+_export_queue: queue.Queue[str] = queue.Queue()
+_export_queue_lock = threading.Lock()
+_export_queued_or_running: set[str] = set()
+_export_workers: list[threading.Thread] = []
 _debug_event_stream_generation = 0
 _debug_event_stream_retry_ms = 3000
 STREAM_CHUNK_SIZE = 8 * 1024 * 1024
@@ -207,6 +213,7 @@ def configure_router_runtime(
     base_domain: str | None = None,
     dev_mode: bool | None = None,
     export_ttl_seconds: int | None = None,
+    export_workers: int | None = None,
     export_zip_compression_threshold_bytes: int | None = None,
     export_zip_compresslevel: int | None = None,
     max_upload_bytes: int | None = None,
@@ -219,7 +226,7 @@ def configure_router_runtime(
 ) -> None:
     """Configure process-local route globals that are normally loaded from env."""
     global AUTH_MODE, BASE_DOMAIN, DEV_MODE, EXPORT_TTL_SECONDS, MAX_UPLOAD_BYTES, PUBLIC_URL
-    global EXPORT_ZIP_COMPRESSION_THRESHOLD_BYTES, EXPORT_ZIP_COMPRESSLEVEL
+    global EXPORT_WORKERS, EXPORT_ZIP_COMPRESSION_THRESHOLD_BYTES, EXPORT_ZIP_COMPRESSLEVEL
     global SITE_NAME
     global TRANSFER_CHUNK_BYTES, TRANSFERS_PATH, TRANSFER_SESSION_TTL_SECONDS
     global TTL_SWEEP_INTERVAL_SECONDS
@@ -259,6 +266,9 @@ def configure_router_runtime(
     if export_ttl_seconds is not None:
         EXPORT_TTL_SECONDS = max(60, int(export_ttl_seconds))
         config.EXPORT_TTL_SECONDS = EXPORT_TTL_SECONDS
+    if export_workers is not None:
+        EXPORT_WORKERS = max(1, int(export_workers))
+        config.EXPORT_WORKERS = EXPORT_WORKERS
     if export_zip_compression_threshold_bytes is not None:
         EXPORT_ZIP_COMPRESSION_THRESHOLD_BYTES = max(0, int(export_zip_compression_threshold_bytes))
         config.EXPORT_ZIP_COMPRESSION_THRESHOLD_BYTES = EXPORT_ZIP_COMPRESSION_THRESHOLD_BYTES
@@ -1331,6 +1341,18 @@ def upload_part_paths(session: UploadSession) -> list[Path]:
     return paths
 
 
+def upload_session_has_recoverable_parts(session: UploadSession) -> bool:
+    parts_by_number = uploaded_parts_by_number(session)
+    for part_number in range(1, session.part_count + 1):
+        part = parts_by_number.get(part_number)
+        if part is None:
+            return False
+        part_path = upload_part_path(session.id, part_number)
+        if not part_path.exists() or part_path.stat().st_size != part.size_bytes:
+            return False
+    return True
+
+
 def get_or_create_blob_for_upload_session(
     db: Session,
     session: UploadSession,
@@ -1796,6 +1818,48 @@ def transfer_expires_at(seconds: int) -> dt.datetime:
 
 def upload_session_dir(session_id: str) -> Path:
     return TRANSFERS_PATH / "uploads" / session_id
+
+
+def export_temp_dir() -> Path:
+    return TRANSFERS_PATH / "exports"
+
+
+def export_temp_job_token(job_id: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]", "", job_id)[:64] or "job"
+
+
+def create_export_temp_path(job_id: str | None = None) -> Path:
+    export_dir = export_temp_dir()
+    export_dir.mkdir(parents=True, exist_ok=True)
+    prefix = f"vault-export-{export_temp_job_token(job_id)}-" if job_id else "vault-export-"
+    zip_temp = tempfile.NamedTemporaryFile(
+        prefix=prefix,
+        suffix=".zip",
+        dir=export_dir,
+        delete=False,
+    )
+    zip_path = Path(zip_temp.name)
+    zip_temp.close()
+    return zip_path
+
+
+def clear_export_temp_files(job_ids: set[str] | None = None) -> list[str]:
+    export_dir = export_temp_dir()
+    if not export_dir.exists():
+        return []
+    deleted: list[str] = []
+    patterns = (
+        [f"vault-export-{export_temp_job_token(job_id)}-*.zip" for job_id in sorted(job_ids)]
+        if job_ids is not None
+        else ["vault-export-*.zip"]
+    )
+    for pattern in patterns:
+        for temp_path in export_dir.glob(pattern):
+            if not temp_path.is_file():
+                continue
+            temp_path.unlink(missing_ok=True)
+            deleted.append(str(temp_path))
+    return deleted
 
 
 def upload_part_path(session_id: str, part_number: int) -> Path:
@@ -2291,19 +2355,19 @@ def export_docs_for_job(job: ExportJob, db: Session) -> list[Document]:
 
 
 def run_export_job(job_id: str) -> None:
-    zip_temp = tempfile.NamedTemporaryFile(prefix="vault-export-", suffix=".zip", delete=False)
-    zip_path = Path(zip_temp.name)
-    zip_temp.close()
+    zip_path: Path | None = None
     try:
         with SessionLocal() as db:
-            job = db.get(ExportJob, job_id)
-            if not job or job.status != "queued":
-                return
-            export_job = job
-            export_job.status = "running"
-            export_job.updated_at = now_utc()
-            db.commit()
+            with storage_write_lock():
+                job = db.get(ExportJob, job_id)
+                if not job or job.status != "queued":
+                    return
+                export_job = job
+                export_job.status = "running"
+                export_job.updated_at = now_utc()
+                db.commit()
 
+            zip_path = create_export_temp_path(job_id)
             user = transfer_user_context(export_job)
             docs = export_docs_for_job(export_job, db)
             versions: list[tuple[Document, DocumentVersion]] = []
@@ -2403,29 +2467,30 @@ def run_export_job(job_id: str) -> None:
             if export_job.status == "cancelled":
                 return
             digest, size_bytes = hash_file(zip_path)
-            db.refresh(export_job)
-            if export_job.status == "cancelled":
-                return
-            blob = get_or_create_blob_for_upload(
-                db,
-                UploadSpool(path=zip_path, digest=digest, size_bytes=size_bytes),
-                "application/zip",
-            )
-            artifact = ExportArtifact(
-                job_id=export_job.id,
-                blob_id=blob.id,
-                filename=export_job.filename,
-                mime_type="application/zip",
-                size_bytes=size_bytes,
-                hash_algo="sha256",
-                hash=digest,
-                expires_at=export_job.expires_at,
-            )
-            db.add(artifact)
-            export_job.status = "complete"
-            export_job.completed_at = now_utc()
-            export_job.updated_at = export_job.completed_at
-            db.commit()
+            with storage_write_lock():
+                db.refresh(export_job)
+                if export_job.status == "cancelled":
+                    return
+                blob = get_or_create_blob_for_upload(
+                    db,
+                    UploadSpool(path=zip_path, digest=digest, size_bytes=size_bytes),
+                    "application/zip",
+                )
+                artifact = ExportArtifact(
+                    job_id=export_job.id,
+                    blob_id=blob.id,
+                    filename=export_job.filename,
+                    mime_type="application/zip",
+                    size_bytes=size_bytes,
+                    hash_algo="sha256",
+                    hash=digest,
+                    expires_at=export_job.expires_at,
+                )
+                db.add(artifact)
+                export_job.status = "complete"
+                export_job.completed_at = now_utc()
+                export_job.updated_at = export_job.completed_at
+                db.commit()
     except ExportCancelled:
         return
     except Exception as exc:
@@ -2437,12 +2502,60 @@ def run_export_job(job_id: str) -> None:
                 job.updated_at = now_utc()
                 db.commit()
     finally:
-        zip_path.unlink(missing_ok=True)
+        if zip_path is not None:
+            zip_path.unlink(missing_ok=True)
+
+
+def _export_worker_loop() -> None:
+    while True:
+        job_id = _export_queue.get()
+        try:
+            run_export_job(job_id)
+        except Exception:
+            logger.exception("Export worker failed unexpectedly for job %s", job_id)
+        finally:
+            with _export_queue_lock:
+                _export_queued_or_running.discard(job_id)
+            _export_queue.task_done()
+
+
+def ensure_export_workers() -> None:
+    with _export_queue_lock:
+        _export_workers[:] = [worker for worker in _export_workers if worker.is_alive()]
+        while len(_export_workers) < EXPORT_WORKERS:
+            worker_number = len(_export_workers) + 1
+            worker = threading.Thread(
+                target=_export_worker_loop,
+                name=f"vault-export-worker-{worker_number}",
+                daemon=True,
+            )
+            worker.start()
+            _export_workers.append(worker)
 
 
 def start_export_job(job_id: str) -> None:
-    thread = threading.Thread(target=run_export_job, args=(job_id,), daemon=True)
-    thread.start()
+    ensure_export_workers()
+    with _export_queue_lock:
+        if job_id in _export_queued_or_running:
+            return
+        _export_queued_or_running.add(job_id)
+        _export_queue.put(job_id)
+
+
+def start_pending_export_jobs(limit: int = 1000) -> list[str]:
+    with SessionLocal() as db:
+        job_ids = [
+            job.id
+            for job in db.execute(
+                select(ExportJob)
+                .where(ExportJob.status == "queued")
+                .order_by(ExportJob.created_at)
+                .limit(limit),
+            ).scalars()
+        ]
+    for job_id in job_ids:
+        start_export_job(job_id)
+    return job_ids
 
 
 def sanitize_mime_type(mime_type: str | None, filename: str) -> str:
@@ -3898,6 +4011,91 @@ def delete_unreferenced_blob(db: Session, blob: Blob) -> list[str]:
         db.delete(location)
     db.delete(blob)
     return deleted_keys
+
+
+def recover_interrupted_transfers(
+    *,
+    enqueue_exports: bool = True,
+    cleanup_export_temps: bool = True,
+) -> dict[str, list[str]]:
+    result: dict[str, list[str]] = {
+        "resumed_uploads": [],
+        "failed_uploads": [],
+        "requeued_exports": [],
+        "queued_exports": [],
+        "deleted_export_temps": [],
+        "deleted_export_objects": [],
+    }
+    with storage_write_lock():
+        db = SessionLocal()
+        try:
+            timestamp = now_utc()
+            upload_sessions = list(
+                db.execute(
+                    select(UploadSession)
+                    .where(UploadSession.status == "completing")
+                    .order_by(UploadSession.updated_at),
+                )
+                .scalars()
+                .all(),
+            )
+            for session in upload_sessions:
+                expires_at = normalize_timestamp(session.expires_at)
+                if expires_at is not None and expires_at <= timestamp:
+                    continue
+                session.verification_total_bytes = 0
+                session.verification_processed_bytes = 0
+                session.updated_at = timestamp
+                if upload_session_has_recoverable_parts(session):
+                    session.status = "active"
+                    session.error = None
+                    result["resumed_uploads"].append(session.id)
+                    continue
+                session.status = "failed"
+                session.error = "Upload completion interrupted and part files are missing"
+                clear_upload_session_parts(session)
+                clear_upload_session_files(session.id)
+                result["failed_uploads"].append(session.id)
+
+            export_jobs = list(
+                db.execute(
+                    select(ExportJob)
+                    .where(ExportJob.status.in_(("running", "finalizing")))
+                    .order_by(ExportJob.updated_at),
+                )
+                .scalars()
+                .all(),
+            )
+            recovered_artifact_blobs: dict[int, Blob] = {}
+            for job in export_jobs:
+                expires_at = normalize_timestamp(job.expires_at)
+                if expires_at is not None and expires_at <= timestamp:
+                    continue
+                for artifact in list(job.artifacts):
+                    recovered_artifact_blobs[artifact.blob_id] = artifact.blob
+                    db.delete(artifact)
+                job.status = "queued"
+                job.processed_items = 0
+                job.processed_bytes = 0
+                job.error = None
+                job.updated_at = timestamp
+                result["requeued_exports"].append(job.id)
+            if cleanup_export_temps and result["requeued_exports"]:
+                result["deleted_export_temps"] = clear_export_temp_files(
+                    set(result["requeued_exports"]),
+                )
+            db.flush()
+            for blob in recovered_artifact_blobs.values():
+                result["deleted_export_objects"].extend(delete_unreferenced_blob(db, blob))
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+    if enqueue_exports:
+        result["queued_exports"] = start_pending_export_jobs()
+    return result
 
 
 def sweep_expired_transfers(limit: int = 250) -> dict[str, list[str]]:

@@ -31,8 +31,11 @@ from app.models import (
 )
 from app.routers import (
     ExportCancelled,
+    create_export_temp_path,
     current_version,
     get_or_create_folder_path,
+    recover_interrupted_transfers,
+    reserve_upload_completion,
     sweep_expired_transfers,
     upload_session_dir,
     write_version_to_zip,
@@ -439,6 +442,120 @@ class StreamingTransferTests(unittest.TestCase):
                 self.assertEqual(upload_session.verification_total_bytes, len(data))
                 self.assertEqual(upload_session.verification_processed_bytes, len(data))
 
+    def test_interrupted_upload_completion_is_recovered_to_active(self) -> None:
+        headers = auth_headers("uploader", ["vault-admin"])
+        data = b"abcdefgh"
+
+        with vault_test_client() as ctx:
+            session_response = ctx.client.post(
+                "/api/uploads",
+                json={
+                    "filename": "recover-completing.txt",
+                    "folder": "",
+                    "mime_type": "text/plain",
+                    "mode": "create",
+                    "size_bytes": len(data),
+                },
+                headers=headers,
+            )
+            self.assertEqual(session_response.status_code, 200, session_response.text)
+            session = session_response.json()
+            for index, offset in enumerate(range(0, len(data), 4), start=1):
+                chunk = data[offset : offset + 4]
+                part_response = ctx.client.put(
+                    f"/api/uploads/{session['id']}/parts/{index}",
+                    content=chunk,
+                    headers={
+                        **headers,
+                        "Content-Type": "application/octet-stream",
+                        "X-Upload-Offset": str(offset),
+                        "X-Upload-Size": str(len(chunk)),
+                    },
+                )
+                self.assertEqual(part_response.status_code, 200, part_response.text)
+
+            with ctx.db() as db:
+                upload_session = db.get(UploadSession, session["id"])
+                self.assertIsNotNone(upload_session)
+                reserve_upload_completion(upload_session, db)
+
+            recovered = recover_interrupted_transfers(
+                enqueue_exports=False,
+                cleanup_export_temps=False,
+            )
+
+            self.assertEqual(recovered["resumed_uploads"], [session["id"]])
+            status = ctx.client.get(f"/api/uploads/{session['id']}", headers=headers)
+            self.assertEqual(status.status_code, 200, status.text)
+            self.assertEqual(status.json()["status"], "active")
+            self.assertIsNone(status.json()["verification"])
+
+            completed = ctx.client.post(
+                f"/api/uploads/{session['id']}/complete",
+                json={"sha256": sha256_hex(data)},
+                headers=headers,
+            )
+            self.assertEqual(completed.status_code, 200, completed.text)
+            downloaded = ctx.client.get(
+                f"/documents/{completed.json()['id']}/download",
+                headers=headers,
+            )
+            self.assertEqual(downloaded.content, data)
+
+    def test_interrupted_upload_completion_fails_when_parts_are_missing(self) -> None:
+        headers = auth_headers("uploader", ["vault-admin"])
+        data = b"abcdefgh"
+
+        with vault_test_client() as ctx:
+            session_response = ctx.client.post(
+                "/api/uploads",
+                json={
+                    "filename": "missing-part.txt",
+                    "folder": "",
+                    "mime_type": "text/plain",
+                    "mode": "create",
+                    "size_bytes": len(data),
+                },
+                headers=headers,
+            )
+            self.assertEqual(session_response.status_code, 200, session_response.text)
+            session = session_response.json()
+            for index, offset in enumerate(range(0, len(data), 4), start=1):
+                chunk = data[offset : offset + 4]
+                part_response = ctx.client.put(
+                    f"/api/uploads/{session['id']}/parts/{index}",
+                    content=chunk,
+                    headers={
+                        **headers,
+                        "Content-Type": "application/octet-stream",
+                        "X-Upload-Offset": str(offset),
+                        "X-Upload-Size": str(len(chunk)),
+                    },
+                )
+                self.assertEqual(part_response.status_code, 200, part_response.text)
+
+            with ctx.db() as db:
+                upload_session = db.get(UploadSession, session["id"])
+                self.assertIsNotNone(upload_session)
+                reserve_upload_completion(upload_session, db)
+            upload_part_path = upload_session_dir(session["id"]) / "00000001.part"
+            upload_part_path.unlink()
+
+            recovered = recover_interrupted_transfers(
+                enqueue_exports=False,
+                cleanup_export_temps=False,
+            )
+
+            self.assertEqual(recovered["failed_uploads"], [session["id"]])
+            completed = ctx.client.post(
+                f"/api/uploads/{session['id']}/complete",
+                json={"sha256": sha256_hex(data)},
+                headers=headers,
+            )
+            self.assertEqual(completed.status_code, 409)
+            self.assertEqual(completed.json()["detail"], "Upload session is failed")
+            self.assertFalse(upload_session_dir(session["id"]).exists())
+
     def test_upload_abort_cleans_parts_and_blocks_completion(self) -> None:
         headers = auth_headers("uploader", ["vault-admin"])
         data = b"abcdef"
@@ -746,6 +863,58 @@ class StreamingTransferTests(unittest.TestCase):
 
         self.assertEqual(size, len(data))
         self.assertTrue(archive.force_zip64)
+
+    def test_interrupted_export_recovery_requeues_job_and_cleans_temp_files(self) -> None:
+        user = user_context("downloader")
+
+        with vault_test_client() as ctx:
+            with ctx.db() as db:
+                folder = get_or_create_folder_path(db, "Project")
+                doc = create_versioned_document(
+                    db,
+                    folder,
+                    name="one.txt",
+                    data=b"one",
+                    actor=user,
+                )
+                db.flush()
+                job = ExportJob(
+                    id="interrupted-export",
+                    status="finalizing",
+                    created_by=str(user["id"]),
+                    created_by_name=str(user["name"]),
+                    user_context=user,
+                    request_payload={"items": [{"type": "document", "id": doc.id}]},
+                    filename="vault-download.zip",
+                    total_items=1,
+                    processed_items=1,
+                    total_bytes=3,
+                    processed_bytes=3,
+                    error="partial",
+                    expires_at=routers.now_utc() + dt.timedelta(hours=1),
+                )
+                db.add(job)
+                db.commit()
+
+            temp_path = create_export_temp_path("interrupted-export")
+            self.assertEqual(temp_path.parent, routers.TRANSFERS_PATH / "exports")
+            temp_path.write_bytes(b"partial zip")
+
+            with patch("app.routers.start_export_job") as start_export_job:
+                recovered = recover_interrupted_transfers()
+
+            self.assertEqual(recovered["requeued_exports"], ["interrupted-export"])
+            self.assertEqual(recovered["queued_exports"], ["interrupted-export"])
+            start_export_job.assert_called_once_with("interrupted-export")
+            self.assertIn(str(temp_path), recovered["deleted_export_temps"])
+            self.assertFalse(temp_path.exists())
+            with ctx.db() as db:
+                job = db.get(ExportJob, "interrupted-export")
+                self.assertIsNotNone(job)
+                self.assertEqual(job.status, "queued")
+                self.assertEqual(job.processed_items, 0)
+                self.assertEqual(job.processed_bytes, 0)
+                self.assertIsNone(job.error)
 
     def test_export_job_creates_downloadable_zip_artifact(self) -> None:
         user = user_context("downloader")

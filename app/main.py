@@ -14,6 +14,7 @@ from . import config
 from .assets import validate_static_assets
 from .db import init_db
 from .routers import (
+    recover_interrupted_transfers,
     router,
     start_ttl_sweeper,
     stop_ttl_sweeper,
@@ -119,6 +120,7 @@ def create_app(*, enable_ttl_sweeper: bool = True) -> FastAPI:
         ensure_storage()
         sweep_expired_documents()
         sweep_expired_transfers()
+        recover_interrupted_transfers()
         if enable_ttl_sweeper:
             start_ttl_sweeper()
 

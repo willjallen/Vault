@@ -1,4 +1,4 @@
-import { readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -20,71 +20,6 @@ const manifestKeys = {
 
 function normalizePath(value) {
   return value.split(path.sep).join("/");
-}
-
-async function listFiles(dir) {
-  const files = [];
-
-  async function visit(current) {
-    let children = [];
-    try {
-      children = await readdir(current);
-    } catch {
-      return;
-    }
-    for (const child of children) {
-      const childPath = path.join(current, child);
-      const childStat = await stat(childPath);
-      if (childStat.isDirectory()) {
-        await visit(childPath);
-        continue;
-      }
-      files.push(normalizePath(path.relative(dir, childPath)));
-    }
-  }
-
-  await visit(dir);
-  return files.sort();
-}
-
-async function sameFile(left, right) {
-  try {
-    const [leftBytes, rightBytes] = await Promise.all([readFile(left), readFile(right)]);
-    return leftBytes.equals(rightBytes);
-  } catch {
-    return false;
-  }
-}
-
-async function assertDirectoriesMatch(expectedDir, actualDir) {
-  const [expectedFiles, actualFiles] = await Promise.all([
-    listFiles(expectedDir),
-    listFiles(actualDir),
-  ]);
-  const expectedSet = new Set(expectedFiles);
-  const actualSet = new Set(actualFiles);
-  const missing = expectedFiles.filter((file) => !actualSet.has(file));
-  const extra = actualFiles.filter((file) => !expectedSet.has(file));
-  const changed = [];
-
-  for (const file of expectedFiles) {
-    if (!actualSet.has(file)) {
-      continue;
-    }
-    const matches = await sameFile(path.join(expectedDir, file), path.join(actualDir, file));
-    if (!matches) {
-      changed.push(file);
-    }
-  }
-
-  if (missing.length || extra.length || changed.length) {
-    const details = [
-      ...missing.map((file) => `missing ${file}`),
-      ...extra.map((file) => `extra ${file}`),
-      ...changed.map((file) => `changed ${file}`),
-    ];
-    throw new Error(`Static asset bundle is stale:\n${details.join("\n")}`);
-  }
 }
 
 async function buildAssets(targetDir) {
@@ -127,12 +62,31 @@ async function buildAssets(targetDir) {
     path.join(targetDir, "manifest.json"),
     `${JSON.stringify(manifest, Object.keys(manifest).sort(), 2)}\n`
   );
+  return manifest;
+}
+
+async function assertBuiltAssets(targetDir, manifest) {
+  for (const key of Object.values(manifestKeys)) {
+    const assetUrl = manifest[key];
+    if (!assetUrl) {
+      throw new Error(`Static asset manifest is missing ${key}`);
+    }
+    if (!assetUrl.startsWith("/static/dist/")) {
+      throw new Error(`Static asset manifest entry ${key} must reference /static/dist`);
+    }
+    const relativeOutput = assetUrl.replace("/static/dist/", "");
+    const assetPath = path.join(targetDir, relativeOutput);
+    const assetStat = await stat(assetPath);
+    if (!assetStat.isFile() || assetStat.size <= 0) {
+      throw new Error(`Static asset ${key} is empty or invalid`);
+    }
+  }
 }
 
 try {
-  await buildAssets(outdir);
+  const manifest = await buildAssets(outdir);
+  await assertBuiltAssets(outdir, manifest);
   if (checkMode) {
-    await assertDirectoriesMatch(outdir, sourceOutdir);
     await rm(outdir, { force: true, recursive: true });
   }
 } catch (error) {

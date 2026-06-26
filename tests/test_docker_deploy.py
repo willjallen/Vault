@@ -206,6 +206,13 @@ class DockerDeployTests(unittest.TestCase):
         self.assertNotIn("/vault-metadata", dockerfile)
         self.assertNotIn("/vault-objects", dockerfile)
 
+    def test_generated_static_assets_are_ignored_build_output(self) -> None:
+        dockerignore = (ROOT / ".dockerignore").read_text()
+        gitignore = (ROOT / ".gitignore").read_text()
+
+        self.assertIn("app/static/dist/", dockerignore)
+        self.assertIn("app/static/dist/", gitignore)
+
     def test_semver_tag_workflow_builds_and_publishes_ghcr_image(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "docker-image.yml").read_text()
 

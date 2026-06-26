@@ -79,6 +79,15 @@ repos:
         args:
           - "-c"
           - ".venv/bin/python -m pip check"
+      - id: build-assets
+        name: build frontend assets
+        entry: bash
+        language: system
+        pass_filenames: false
+        always_run: true
+        args:
+          - "-c"
+          - "npm run build:assets"
       - id: unit-tests
         name: python unit tests
         entry: bash

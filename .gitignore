@@ -25,6 +25,7 @@ htmlcov/
 # Node and frontend tooling
 node_modules/
 .npm/
+app/static/dist/
 
 # Runtime data, logs, and local debug artifacts
 .docker-data/

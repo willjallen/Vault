@@ -820,6 +820,41 @@ class StreamingTransferTests(unittest.TestCase):
                 self.assertEqual(info.compress_type, zipfile.ZIP_DEFLATED)
                 self.assertLess(info.compress_size, info.file_size)
 
+    def test_large_export_stores_precompressed_entries(self) -> None:
+        user = user_context("downloader")
+        headers = auth_headers("downloader", ["vault-admin"])
+
+        with vault_test_client() as ctx:
+            routers.configure_router_runtime(export_zip_compression_threshold_bytes=1)
+            with ctx.db() as db:
+                folder = get_or_create_folder_path(db, "Project")
+                create_versioned_document(
+                    db,
+                    folder,
+                    name="image.png",
+                    data=b"\x89PNG\r\n\x1a\n" + (b"already compressed" * 128),
+                    actor=user,
+                    content_type="image/png",
+                )
+                db.commit()
+                folder_id = folder.id
+
+            export_response = ctx.client.post(
+                "/api/exports",
+                json={"items": [{"type": "folder", "id": folder_id}]},
+                headers=headers,
+            )
+            self.assertEqual(export_response.status_code, 200, export_response.text)
+            export = wait_for_export(ctx.client, export_response.json()["id"], headers=headers)
+            self.assertEqual(export["status"], "complete")
+            response = ctx.client.get(str(export["download_url"]), headers=headers)
+            self.assertEqual(response.status_code, 200, response.text)
+            with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+                self.assertEqual(
+                    archive.getinfo("Project/image.png").compress_type,
+                    zipfile.ZIP_STORED,
+                )
+
     def test_export_reports_finalizing_while_artifact_is_promoted(self) -> None:
         user = user_context("downloader")
         headers = auth_headers("downloader", ["vault-admin"])

@@ -1,6 +1,7 @@
 """Storage backends for content-addressed vault blobs."""
 
 import datetime
+import errno
 import hashlib
 import shutil
 import threading
@@ -253,8 +254,13 @@ class LocalBlobStorage(BlobStorageBackend):
         if not target.exists():
             temp_path = target.with_name(f"{target.name}.tmp-{uuid.uuid4().hex}")
             try:
-                with source_path.open("rb") as source, temp_path.open("xb") as output:
-                    shutil.copyfileobj(source, output, STORAGE_CHUNK_SIZE)
+                try:
+                    source_path.replace(temp_path)
+                except OSError as exc:
+                    if exc.errno != errno.EXDEV:
+                        raise
+                    with source_path.open("rb") as source, temp_path.open("xb") as output:
+                        shutil.copyfileobj(source, output, STORAGE_CHUNK_SIZE)
                 temp_path.replace(target)
             except Exception:
                 temp_path.unlink(missing_ok=True)

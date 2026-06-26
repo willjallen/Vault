@@ -14,6 +14,7 @@ import threading
 import time
 import uuid
 import zipfile
+import zlib
 from collections import defaultdict
 from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass
@@ -139,6 +140,64 @@ _ttl_sweeper_task: asyncio.Task[None] | None = None
 _debug_event_stream_generation = 0
 _debug_event_stream_retry_ms = 3000
 STREAM_CHUNK_SIZE = 8 * 1024 * 1024
+EXPORT_COMPRESSION_SAMPLE_BYTES = 1024 * 1024
+EXPORT_COMPRESSION_MIN_RATIO = 0.98
+EXPORT_COMPRESSIBLE_MIME_PREFIXES = ("text/",)
+EXPORT_COMPRESSIBLE_MIME_TYPES = {
+    "application/csv",
+    "application/javascript",
+    "application/json",
+    "application/sql",
+    "application/toml",
+    "application/xml",
+    "application/x-yaml",
+    "image/svg+xml",
+}
+EXPORT_STORED_MIME_PREFIXES = ("audio/", "video/")
+EXPORT_STORED_MIME_TYPES = {
+    "application/gzip",
+    "application/pdf",
+    "application/vnd.rar",
+    "application/x-7z-compressed",
+    "application/x-bzip2",
+    "application/x-gzip",
+    "application/x-rar-compressed",
+    "application/x-tar",
+    "application/x-xz",
+    "application/zip",
+    "image/avif",
+    "image/gif",
+    "image/heic",
+    "image/heif",
+    "image/jpeg",
+    "image/jpg",
+    "image/png",
+    "image/webp",
+}
+EXPORT_STORED_EXTENSIONS = {
+    ".7z",
+    ".avi",
+    ".avif",
+    ".bz2",
+    ".gz",
+    ".heic",
+    ".heif",
+    ".jpg",
+    ".jpeg",
+    ".m4v",
+    ".mkv",
+    ".mov",
+    ".mp3",
+    ".mp4",
+    ".pdf",
+    ".png",
+    ".rar",
+    ".webm",
+    ".webp",
+    ".xz",
+    ".zip",
+    ".zst",
+}
 ResolvedFavoriteTarget = tuple[Literal["folder"], Folder] | tuple[Literal["document"], Document]
 
 
@@ -2076,11 +2135,81 @@ def hash_file(path: Path) -> tuple[str, int]:
     return digest.hexdigest(), size_bytes
 
 
+def zip_info_for_entry(
+    archive_name: str,
+    compression: int,
+    compresslevel: int | None = None,
+) -> zipfile.ZipInfo:
+    current = now_utc()
+    info = zipfile.ZipInfo(
+        archive_name,
+        date_time=(
+            current.year,
+            current.month,
+            current.day,
+            current.hour,
+            current.minute,
+            current.second,
+        ),
+    )
+    info.compress_type = compression
+    if compression == zipfile.ZIP_DEFLATED and compresslevel is not None:
+        cast(Any, info)._compresslevel = compresslevel
+    return info
+
+
+def normalized_export_mime_type(archive_name: str, version: DocumentVersion) -> str:
+    guessed_type = mimetypes.guess_type(archive_name)[0] or ""
+    raw_type = (version.mime_type or guessed_type).strip().lower()
+    return raw_type.split(";", 1)[0]
+
+
+def export_entry_is_known_compressible(archive_name: str, version: DocumentVersion) -> bool:
+    mime_type = normalized_export_mime_type(archive_name, version)
+    return mime_type in EXPORT_COMPRESSIBLE_MIME_TYPES or mime_type.startswith(
+        EXPORT_COMPRESSIBLE_MIME_PREFIXES,
+    )
+
+
+def export_entry_is_known_stored(archive_name: str, version: DocumentVersion) -> bool:
+    mime_type = normalized_export_mime_type(archive_name, version)
+    extension = Path(archive_name).suffix.lower()
+    return (
+        mime_type in EXPORT_STORED_MIME_TYPES
+        or mime_type.startswith(EXPORT_STORED_MIME_PREFIXES)
+        or extension in EXPORT_STORED_EXTENSIONS
+    )
+
+
+def sampled_zip_compression(sample: bytes) -> int:
+    if not sample:
+        return zipfile.ZIP_STORED
+    compressed = zlib.compress(sample, level=EXPORT_ZIP_COMPRESSLEVEL)
+    if len(compressed) <= int(len(sample) * EXPORT_COMPRESSION_MIN_RATIO):
+        return zipfile.ZIP_DEFLATED
+    return zipfile.ZIP_STORED
+
+
+def export_entry_compression(
+    archive_name: str,
+    version: DocumentVersion,
+    total_bytes: int,
+) -> int | None:
+    if export_zip_compression(total_bytes) == zipfile.ZIP_STORED:
+        return zipfile.ZIP_STORED
+    if export_entry_is_known_stored(archive_name, version):
+        return zipfile.ZIP_STORED
+    if export_entry_is_known_compressible(archive_name, version):
+        return zipfile.ZIP_DEFLATED
+    return None
+
+
 def write_version_to_zip(
     archive: zipfile.ZipFile,
     archive_name: str,
     version: DocumentVersion,
     *,
+    compression: int | None = zipfile.ZIP_STORED,
     progress_callback: Callable[[int], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
 ) -> int:
@@ -2092,7 +2221,18 @@ def write_version_to_zip(
             location.object_key,
             location.bucket,
         ) as reader:
-            with archive.open(archive_name, "w", force_zip64=True) as target:
+            first_chunk = b""
+            if compression is None:
+                first_chunk = reader.read(EXPORT_COMPRESSION_SAMPLE_BYTES)
+                compression = sampled_zip_compression(first_chunk)
+            zip_info = zip_info_for_entry(archive_name, compression, EXPORT_ZIP_COMPRESSLEVEL)
+            with archive.open(zip_info, "w", force_zip64=True) as target:
+                if first_chunk:
+                    size_bytes += len(first_chunk)
+                    digest.update(first_chunk)
+                    target.write(first_chunk)
+                    if progress_callback:
+                        progress_callback(len(first_chunk))
                 while True:
                     if should_cancel and should_cancel():
                         raise ExportCancelled
@@ -2212,16 +2352,11 @@ def run_export_job(job_id: str) -> None:
                 pending_processed_bytes += delta_bytes
                 flush_export_progress()
 
-            compression = export_zip_compression(total_bytes)
-            compresslevel = (
-                EXPORT_ZIP_COMPRESSLEVEL if compression == zipfile.ZIP_DEFLATED else None
-            )
             with zipfile.ZipFile(
                 zip_path,
                 "w",
-                compression,
+                zipfile.ZIP_STORED,
                 allowZip64=True,
-                compresslevel=compresslevel,
             ) as archive:
                 for doc, version in versions:
                     if export_is_cancelled():
@@ -2234,6 +2369,11 @@ def run_export_job(job_id: str) -> None:
                             archive,
                             archive_name,
                             version,
+                            compression=export_entry_compression(
+                                archive_name,
+                                version,
+                                total_bytes,
+                            ),
                             progress_callback=record_export_progress,
                             should_cancel=export_is_cancelled,
                         )

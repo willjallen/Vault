@@ -195,6 +195,27 @@ class AuthTests(unittest.TestCase):
             self.assertEqual(raised.exception.status_code, 401)
             self.assertEqual(raised.exception.detail, "Authentication required")
 
+    def test_cookie_secure_auto_honors_https_public_url(self) -> None:
+        original_public_url = auth_module.PUBLIC_URL
+        original_cookie_secure = auth_module.SESSION_COOKIE_SECURE
+        request = CookieRequest()
+        try:
+            auth_module.SESSION_COOKIE_SECURE = "auto"
+            auth_module.PUBLIC_URL = ""
+            self.assertFalse(auth_module._cookie_secure(request))
+
+            auth_module.PUBLIC_URL = "https://vault.example.com"
+            self.assertTrue(auth_module._cookie_secure(request))
+
+            auth_module.SESSION_COOKIE_SECURE = "false"
+            self.assertFalse(auth_module._cookie_secure(request))
+
+            auth_module.SESSION_COOKIE_SECURE = "true"
+            self.assertTrue(auth_module._cookie_secure(request))
+        finally:
+            auth_module.PUBLIC_URL = original_public_url
+            auth_module.SESSION_COOKIE_SECURE = original_cookie_secure
+
     def test_dev_auth_requires_local_base_domain(self) -> None:
         with vault_runtime(auth_mode="dev") as ctx, ctx.db() as db:
             os.environ["BASE_DOMAIN"] = "vault.example.com"

@@ -44,9 +44,11 @@ from .config import (
     OIDC_USERNAME_CLAIM,
     PUBLIC_URL,
     SESSION_COOKIE_NAME,
+    SESSION_COOKIE_SECURE,
     SESSION_MAX_AGE_SECONDS,
     SESSION_SECRET,
     new_token_urlsafe,
+    oidc_url_uses_secure_transport,
 )
 from .db import get_db
 from .models import Folder, FolderPermission, VaultGroup, VaultGroupMembership, VaultUser
@@ -77,11 +79,12 @@ def configure_auth(
     bootstrap_admin_emails: set[str] | None = None,
     session_secret: str | None = None,
     session_cookie_name: str | None = None,
+    session_cookie_secure: str | None = None,
     session_max_age_seconds: int | None = None,
 ) -> None:
     """Configure process-local auth globals."""
     global ADMIN_GROUPS, AUTH_MODE, BOOTSTRAP_ADMIN_EMAILS
-    global SESSION_COOKIE_NAME, SESSION_MAX_AGE_SECONDS, SESSION_SECRET
+    global SESSION_COOKIE_NAME, SESSION_COOKIE_SECURE, SESSION_MAX_AGE_SECONDS, SESSION_SECRET
 
     from . import config
 
@@ -96,6 +99,8 @@ def configure_auth(
         SESSION_SECRET = session_secret
     if session_cookie_name is not None:
         SESSION_COOKIE_NAME = session_cookie_name.strip() or "vault_session"
+    if session_cookie_secure is not None:
+        SESSION_COOKIE_SECURE = session_cookie_secure.strip().lower() or "auto"
     if session_max_age_seconds is not None:
         SESSION_MAX_AGE_SECONDS = session_max_age_seconds
 
@@ -107,6 +112,7 @@ def configure_auth(
     config.BOOTSTRAP_ADMIN_EMAILS = BOOTSTRAP_ADMIN_EMAILS
     config.SESSION_SECRET = SESSION_SECRET
     config.SESSION_COOKIE_NAME = SESSION_COOKIE_NAME
+    config.SESSION_COOKIE_SECURE = SESSION_COOKIE_SECURE
     config.SESSION_MAX_AGE_SECONDS = SESSION_MAX_AGE_SECONDS
 
 
@@ -177,7 +183,12 @@ def _verify_payload(value: str | None) -> dict[str, object] | None:
 
 
 def _cookie_secure(request: Request) -> bool:
-    return request.url.scheme == "https"
+    mode = SESSION_COOKIE_SECURE.strip().lower()
+    if mode in {"1", "true", "yes", "on"}:
+        return True
+    if mode in {"0", "false", "no", "off"}:
+        return False
+    return request.url.scheme == "https" or PUBLIC_URL.lower().startswith("https://")
 
 
 def _safe_redirect(value: str | None) -> str:
@@ -502,6 +513,8 @@ def _http_json(
     parsed_url = urllib.parse.urlparse(url)
     if parsed_url.scheme not in {"http", "https"}:
         raise HTTPException(status_code=502, detail="OIDC provider URL is invalid")
+    if not oidc_url_uses_secure_transport(url):
+        raise HTTPException(status_code=502, detail="OIDC provider URL must use HTTPS")
     body = urllib.parse.urlencode(data).encode("utf-8") if data is not None else None
     request = urllib.request.Request(url, data=body, headers=headers or {})  # noqa: S310
     try:

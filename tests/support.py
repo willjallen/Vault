@@ -29,6 +29,8 @@ ENV_KEYS = (
     "VAULT_DEV_MODE",
     "VAULT_DB_PATH",
     "VAULT_OBJECTS_PATH",
+    "VAULT_PUBLIC_URL",
+    "VAULT_SESSION_COOKIE_SECURE",
     "VAULT_MAX_UPLOAD_BYTES",
     "VAULT_TRANSFER_CHUNK_BYTES",
     "VAULT_TRANSFER_SESSION_TTL_SECONDS",
@@ -59,11 +61,13 @@ class RuntimeSnapshot:
     bootstrap_admin_emails: set[str]
     session_secret: str
     session_cookie_name: str
+    session_cookie_secure: str
     session_max_age_seconds: int
     base_domain: str
     dev_mode: bool
     export_ttl_seconds: int
     max_upload_bytes: int
+    public_url: str
     site_name: str
     transfer_chunk_bytes: int
     transfer_session_ttl_seconds: int
@@ -221,11 +225,13 @@ def snapshot_runtime() -> RuntimeSnapshot:
         bootstrap_admin_emails=set(auth_module.BOOTSTRAP_ADMIN_EMAILS),
         session_secret=auth_module.SESSION_SECRET,
         session_cookie_name=auth_module.SESSION_COOKIE_NAME,
+        session_cookie_secure=auth_module.SESSION_COOKIE_SECURE,
         session_max_age_seconds=auth_module.SESSION_MAX_AGE_SECONDS,
         base_domain=routers_module.BASE_DOMAIN,
         dev_mode=routers_module.DEV_MODE,
         export_ttl_seconds=routers_module.EXPORT_TTL_SECONDS,
         max_upload_bytes=routers_module.MAX_UPLOAD_BYTES,
+        public_url=routers_module.PUBLIC_URL,
         site_name=routers_module.SITE_NAME,
         transfer_chunk_bytes=routers_module.TRANSFER_CHUNK_BYTES,
         transfer_session_ttl_seconds=routers_module.TRANSFER_SESSION_TTL_SECONDS,
@@ -258,6 +264,7 @@ def restore_runtime(snapshot: RuntimeSnapshot) -> None:
         bootstrap_admin_emails=snapshot.bootstrap_admin_emails,
         session_secret=snapshot.session_secret,
         session_cookie_name=snapshot.session_cookie_name,
+        session_cookie_secure=snapshot.session_cookie_secure,
         session_max_age_seconds=snapshot.session_max_age_seconds,
     )
     routers_module.configure_router_runtime(
@@ -266,6 +273,7 @@ def restore_runtime(snapshot: RuntimeSnapshot) -> None:
         dev_mode=snapshot.dev_mode,
         export_ttl_seconds=snapshot.export_ttl_seconds,
         max_upload_bytes=snapshot.max_upload_bytes,
+        public_url=snapshot.public_url,
         site_name=snapshot.site_name,
         transfer_chunk_bytes=snapshot.transfer_chunk_bytes,
         transfer_session_ttl_seconds=snapshot.transfer_session_ttl_seconds,
@@ -300,6 +308,8 @@ def vault_runtime(
                 "VAULT_DEV_MODE": "1" if runtime_dev_mode else "0",
                 "VAULT_DB_PATH": str(db_path),
                 "VAULT_OBJECTS_PATH": str(objects_path),
+                "VAULT_PUBLIC_URL": "",
+                "VAULT_SESSION_COOKIE_SECURE": "auto",
                 "VAULT_TRANSFERS_PATH": str(transfers_path),
                 "VAULT_STORAGE_BACKEND": "local",
             },
@@ -311,6 +321,7 @@ def vault_runtime(
             admin_groups={"admin", "vault-admin"},
             bootstrap_admin_emails=set(),
             session_secret="test-session-secret",  # noqa: S106 - fixed test-only signing key
+            session_cookie_secure="auto",
         )
         routers_module.configure_router_runtime(
             auth_mode=auth_mode,
@@ -318,6 +329,7 @@ def vault_runtime(
             dev_mode=runtime_dev_mode,
             export_ttl_seconds=86400,
             max_upload_bytes=5 * 1024 * 1024 * 1024,
+            public_url="",
             transfer_chunk_bytes=4,
             transfer_session_ttl_seconds=86400,
             transfers_path=transfers_path,

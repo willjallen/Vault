@@ -8,6 +8,7 @@ from tests.support import (
     vault_test_client,
 )
 
+import app.config as config_module
 from app.models import Document, Folder, VaultGroup
 from app.routers import (
     create_document_version,
@@ -25,6 +26,24 @@ def create_child_folder(db, root: Folder, name: str) -> Folder:
 
 
 class HttpApiContractTests(unittest.TestCase):
+    def test_security_headers_are_applied_to_http_responses(self) -> None:
+        original_public_url = config_module.PUBLIC_URL
+        try:
+            with vault_test_client() as ctx:
+                response = ctx.client.get("/health")
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.headers["x-content-type-options"], "nosniff")
+                self.assertEqual(response.headers["x-frame-options"], "DENY")
+                self.assertEqual(response.headers["referrer-policy"], "no-referrer")
+                self.assertIn("frame-ancestors 'none'", response.headers["content-security-policy"])
+                self.assertNotIn("strict-transport-security", response.headers)
+
+                config_module.PUBLIC_URL = "https://vault.example.com"
+                secure_response = ctx.client.get("/health")
+                self.assertIn("max-age=", secure_response.headers["strict-transport-security"])
+        finally:
+            config_module.PUBLIC_URL = original_public_url
+
     def test_file_api_permissions_over_real_http(self) -> None:
         admin_headers = auth_headers("admin", ["vault-admin"])
         viewer_headers = auth_headers("viewer", ["viewers"])

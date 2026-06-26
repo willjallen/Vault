@@ -116,6 +116,31 @@ class DockerDeployTests(unittest.TestCase):
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("VAULT_SESSION_SECRET is required", completed.stderr)
 
+    def test_runtime_validation_rejects_insecure_oidc_production_origin(self) -> None:
+        env = os.environ.copy()
+        env["VAULT_AUTH_MODE"] = "oidc"
+        env["VAULT_DEV_MODE"] = "0"
+        env.pop("VAULT_DEV_AUTH", None)
+        env.pop("VAULT_OIDC_ALLOW_INSECURE_HTTP", None)
+        env.pop("VAULT_PUBLIC_URL", None)
+        env["VAULT_SESSION_SECRET"] = "test-session-secret"  # noqa: S105 - test-only secret
+        env["VAULT_OIDC_ISSUER"] = "http://idp.example.com"
+        env["VAULT_OIDC_CLIENT_ID"] = "vault"
+        env["VAULT_OIDC_CLIENT_SECRET"] = "oidc-secret"  # noqa: S105 - test-only secret
+        script = "from app import config; config.validate_runtime_config()"
+
+        completed = subprocess.run(  # noqa: S603 - fixed interpreter and repo-local import check
+            [sys.executable, "-c", script],
+            cwd=ROOT,
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("VAULT_OIDC_ISSUER must use https", completed.stderr)
+
     def test_compose_uses_single_data_volume_and_production_auth_defaults(self) -> None:
         compose = (ROOT / "docker-compose.yml").read_text()
 
@@ -133,6 +158,8 @@ class DockerDeployTests(unittest.TestCase):
         self.assertNotIn("/vault-objects", compose)
         self.assertIn("VAULT_DOCKER_RUNTIME: ${VAULT_DOCKER_RUNTIME:-1}", compose)
         self.assertIn("VAULT_SESSION_SECRET: ${VAULT_SESSION_SECRET:-}", compose)
+        self.assertIn("VAULT_SESSION_COOKIE_SECURE: ${VAULT_SESSION_COOKIE_SECURE:-auto}", compose)
+        self.assertIn("FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-127.0.0.1}", compose)
         self.assertIn("VAULT_AUTH_MODE: ${VAULT_AUTH_MODE:-headers}", compose)
         self.assertNotIn("VAULT_DEV_AUTH", compose)
         self.assertNotIn("dev-insecure-session-secret", compose)

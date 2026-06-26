@@ -11,6 +11,8 @@ from tests.support import (
     vault_test_client,
 )
 
+import app.config as config_module
+import app.routers as routers_module
 from app.db import SessionLocal
 from app.models import Document, Folder, ShareLink, VaultGroup
 from app.routers import get_root_folder, now_utc, resolved_share_payload
@@ -132,6 +134,32 @@ class ShareLinkTests(unittest.TestCase):
                 headers=artist_headers,
             )
             self.assertEqual(expired.status_code, 404)
+
+    def test_share_creation_uses_configured_public_url(self) -> None:
+        admin_headers = auth_headers("admin", ["vault-admin"])
+        original_config_public_url = config_module.PUBLIC_URL
+        original_router_public_url = routers_module.PUBLIC_URL
+        try:
+            with vault_test_client() as ctx:
+                config_module.PUBLIC_URL = "https://vault.example.com"
+                routers_module.PUBLIC_URL = "https://vault.example.com"
+                with ctx.db() as db:
+                    root = get_root_folder(db, "vault")
+                    doc = create_versioned_document(db, root, name="brief.txt", data=b"brief")
+                    db.commit()
+                    doc_id = doc.id
+
+                response = ctx.client.post(
+                    "/api/share-links",
+                    json={"target_type": "document", "document_id": doc_id},
+                    headers=admin_headers,
+                )
+                self.assertEqual(response.status_code, 200, response.text)
+                payload = response.json()
+                self.assertEqual(payload["url"], f"https://vault.example.com/s/{payload['code']}")
+        finally:
+            config_module.PUBLIC_URL = original_config_public_url
+            routers_module.PUBLIC_URL = original_router_public_url
 
     def test_share_creation_rejects_bad_and_inaccessible_targets(self) -> None:
         artist_headers = auth_headers("artist", ["artists"])

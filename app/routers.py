@@ -54,6 +54,7 @@ from .config import (
     DEV_MODE,
     EXPORT_TTL_SECONDS,
     MAX_UPLOAD_BYTES,
+    PUBLIC_URL,
     SITE_NAME,
     TRANSFER_CHUNK_BYTES,
     TRANSFER_SESSION_TTL_SECONDS,
@@ -145,6 +146,7 @@ def configure_router_runtime(
     dev_mode: bool | None = None,
     export_ttl_seconds: int | None = None,
     max_upload_bytes: int | None = None,
+    public_url: str | None = None,
     site_name: str | None = None,
     transfer_chunk_bytes: int | None = None,
     transfers_path: str | Path | None = None,
@@ -152,7 +154,8 @@ def configure_router_runtime(
     ttl_sweep_interval_seconds: int | None = None,
 ) -> None:
     """Configure process-local route globals that are normally loaded from env."""
-    global AUTH_MODE, BASE_DOMAIN, DEV_MODE, EXPORT_TTL_SECONDS, MAX_UPLOAD_BYTES, SITE_NAME
+    global AUTH_MODE, BASE_DOMAIN, DEV_MODE, EXPORT_TTL_SECONDS, MAX_UPLOAD_BYTES, PUBLIC_URL
+    global SITE_NAME
     global TRANSFER_CHUNK_BYTES, TRANSFERS_PATH, TRANSFER_SESSION_TTL_SECONDS
     global TTL_SWEEP_INTERVAL_SECONDS
     global _debug_event_stream_generation, _debug_event_stream_retry_ms
@@ -176,6 +179,9 @@ def configure_router_runtime(
     if max_upload_bytes is not None:
         MAX_UPLOAD_BYTES = max(1, int(max_upload_bytes))
         config.MAX_UPLOAD_BYTES = MAX_UPLOAD_BYTES
+    if public_url is not None:
+        PUBLIC_URL = public_url.strip().rstrip("/")
+        config.PUBLIC_URL = PUBLIC_URL
     if transfer_chunk_bytes is not None:
         TRANSFER_CHUNK_BYTES = max(1, int(transfer_chunk_bytes))
         config.TRANSFER_CHUNK_BYTES = TRANSFER_CHUNK_BYTES
@@ -3421,6 +3427,8 @@ def generate_share_code(db: Session) -> str:
 
 
 def share_url(request: Request, code: str) -> str:
+    if PUBLIC_URL:
+        return f"{PUBLIC_URL}/s/{quote(code, safe='')}"
     return str(request.url_for("share_entry", code=code))
 
 

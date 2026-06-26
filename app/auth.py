@@ -448,7 +448,7 @@ def _session_identity(request: Request, db: Session) -> UserContext | None:
 
 
 def _auth_required(request: Request) -> None:
-    if AUTH_MODE == "oidc" and request.method == "GET" and request.url.path == "/":
+    if AUTH_MODE == "oidc" and request.method == "GET" and not request.url.path.startswith("/api/"):
         rd = urllib.parse.quote(_request_path_with_query(request))
         raise HTTPException(
             status_code=303,
@@ -538,6 +538,8 @@ def oidc_login_response(request: Request) -> RedirectResponse:
     authorization_endpoint = str(discovery.get("authorization_endpoint") or "")
     if not authorization_endpoint:
         raise HTTPException(status_code=500, detail="OIDC authorization endpoint is missing")
+    if not oidc_url_uses_secure_transport(authorization_endpoint):
+        raise HTTPException(status_code=502, detail="OIDC authorization endpoint must use HTTPS")
 
     state = new_token_urlsafe()
     nonce = new_token_urlsafe()
@@ -585,7 +587,7 @@ def _exchange_code_for_token(
     headers = {"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"}
     if OIDC_CLIENT_AUTH == "client_secret_post":
         form["client_secret"] = OIDC_CLIENT_SECRET
-    elif OIDC_CLIENT_SECRET:
+    elif OIDC_CLIENT_AUTH == "client_secret_basic" and OIDC_CLIENT_SECRET:
         credentials = f"{OIDC_CLIENT_ID}:{OIDC_CLIENT_SECRET}".encode()
         headers["Authorization"] = f"Basic {base64.b64encode(credentials).decode('ascii')}"
     return _http_json(token_endpoint, form, headers)

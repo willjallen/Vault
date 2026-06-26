@@ -20,10 +20,14 @@ class HeaderRequest:
 
 class CookieRequest:
     method = "GET"
-    url = URL("http://testserver/api/bootstrap")
 
-    def __init__(self, cookies: dict[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        cookies: dict[str, str] | None = None,
+        url: str = "http://testserver/api/bootstrap",
+    ) -> None:
         self.cookies = cookies or {}
+        self.url = URL(url)
 
 
 class AuthTests(unittest.TestCase):
@@ -194,6 +198,80 @@ class AuthTests(unittest.TestCase):
 
             self.assertEqual(raised.exception.status_code, 401)
             self.assertEqual(raised.exception.detail, "Authentication required")
+
+    def test_oidc_browser_get_redirects_to_login_with_return_path(self) -> None:
+        with vault_runtime(auth_mode="oidc") as ctx, ctx.db() as db:
+            request = CookieRequest(url="http://testserver/s/share-code?preview=1")
+
+            with self.assertRaises(HTTPException) as raised:
+                current_user(request, db)
+
+            self.assertEqual(raised.exception.status_code, 303)
+            self.assertEqual(
+                raised.exception.headers["Location"],
+                "/login?rd=/s/share-code%3Fpreview%3D1",
+            )
+
+    def test_oidc_login_rejects_insecure_authorization_endpoint(self) -> None:
+        original_auth_mode = auth_module.AUTH_MODE
+        original_discovery = auth_module._oidc_discovery
+        try:
+            auth_module.AUTH_MODE = "oidc"
+            auth_module._oidc_discovery = lambda: {
+                "authorization_endpoint": "http://idp.example.com/auth"
+            }
+            with self.assertRaises(HTTPException) as raised:
+                auth_module.oidc_login_response(CookieRequest())
+
+            self.assertEqual(raised.exception.status_code, 502)
+            self.assertEqual(
+                raised.exception.detail,
+                "OIDC authorization endpoint must use HTTPS",
+            )
+        finally:
+            auth_module.AUTH_MODE = original_auth_mode
+            auth_module._oidc_discovery = original_discovery
+
+    def test_oidc_client_auth_none_does_not_send_configured_secret(self) -> None:
+        original_client_auth = auth_module.OIDC_CLIENT_AUTH
+        original_client_id = auth_module.OIDC_CLIENT_ID
+        original_client_secret = auth_module.OIDC_CLIENT_SECRET
+        original_redirect_uri = auth_module.OIDC_REDIRECT_URI
+        original_http_json = auth_module._http_json
+        captured: dict[str, object] = {}
+
+        def fake_http_json(
+            url: str,
+            data: dict[str, str] | None = None,
+            headers: dict[str, str] | None = None,
+        ) -> dict[str, object]:
+            captured["url"] = url
+            captured["data"] = data or {}
+            captured["headers"] = headers or {}
+            return {"id_token": "token"}
+
+        try:
+            auth_module.OIDC_CLIENT_AUTH = "none"
+            auth_module.OIDC_CLIENT_ID = "public-client"
+            auth_module.OIDC_CLIENT_SECRET = "configured-but-unused"  # noqa: S105
+            auth_module.OIDC_REDIRECT_URI = "https://vault.example.com/auth/callback"
+            auth_module._http_json = fake_http_json
+
+            token = auth_module._exchange_code_for_token(
+                CookieRequest(),
+                "auth-code",
+                {"token_endpoint": "https://idp.example.com/token"},
+            )
+
+            self.assertEqual(token, {"id_token": "token"})
+            self.assertNotIn("client_secret", captured["data"])
+            self.assertNotIn("Authorization", captured["headers"])
+        finally:
+            auth_module.OIDC_CLIENT_AUTH = original_client_auth
+            auth_module.OIDC_CLIENT_ID = original_client_id
+            auth_module.OIDC_CLIENT_SECRET = original_client_secret
+            auth_module.OIDC_REDIRECT_URI = original_redirect_uri
+            auth_module._http_json = original_http_json
 
     def test_cookie_secure_auto_honors_https_public_url(self) -> None:
         original_public_url = auth_module.PUBLIC_URL

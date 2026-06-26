@@ -69,6 +69,7 @@ export function FileRow({
   onCheckout,
   onLock,
   onMore,
+  onOpenDetails,
   onSelect,
   onOpen,
   onDragStart,
@@ -234,14 +235,26 @@ export function FileRow({
         h("span", { className: "muted tiny" }, doc.size_display || "-")
       ),
       h("div", { className: "file-cell status-col" }, [
-        h(
-          "span",
-          {
-            className: "version-chip status-version",
-            title: `Current version: v${versionCount}`,
-          },
-          `v${versionCount}`
-        ),
+        onOpenDetails
+          ? h(
+              "button",
+              {
+                "aria-label": `View version history for ${doc.name}`,
+                className: "version-chip-button status-version",
+                onClick: (e) => stopRowAction(e, () => onOpenDetails(doc)),
+                title: `View version history: v${versionCount}`,
+                type: "button",
+              },
+              h("span", { className: "version-chip" }, `v${versionCount}`)
+            )
+          : h(
+              "span",
+              {
+                className: "version-chip status-version",
+                title: `Current version: v${versionCount}`,
+              },
+              `v${versionCount}`
+            ),
         locked
           ? h(
               "span",

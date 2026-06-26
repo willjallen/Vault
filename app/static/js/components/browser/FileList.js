@@ -694,6 +694,7 @@ export function VaultFileList({
       onCheckout: () => actions.handleStartEdit?.(doc),
       onLock: () => (lockedByMe ? actions.handleRelease?.(doc.id) : actions.handleLock?.(doc)),
       onMore: (e) => openContextMenuForItem(e, doc, { select: false }),
+      onOpenDetails: actions.openFileDetails,
       onSelect: (e) => onSelectItem && onSelectItem(doc, "document", e, orderedItems),
       onOpen: onOpenFile,
       onDragStart: (e) => onFileDragStart(e, doc.id, dragItemsFor(doc, "document")),

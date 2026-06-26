@@ -47,7 +47,7 @@ function recursiveSearchPath(folder) {
   const path = String(folder || "")
     .replace(/^Vault\/?/, "")
     .replace(/^\/+|\/+$/g, "");
-  return path ? `${path}/` : "";
+  return path ? `${path}/` : "/";
 }
 
 // eslint-disable-next-line complexity

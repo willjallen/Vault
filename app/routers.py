@@ -37,7 +37,7 @@ from fastapi import (
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, select
+from sqlalchemy import delete, event as sqlalchemy_event, select
 from sqlalchemy.orm import Session
 
 from . import db as db_runtime
@@ -145,6 +145,12 @@ _export_queued_or_running: set[str] = set()
 _export_workers: list[threading.Thread] = []
 _debug_event_stream_generation = 0
 _debug_event_stream_retry_ms = 3000
+STATE_EVENT_SESSION_FLAG = "vault_state_changed"
+STATE_EVENT_HEARTBEAT_SECONDS = 25.0
+_state_event_revision = 0
+_state_event_condition: asyncio.Condition | None = None
+_state_event_loop: asyncio.AbstractEventLoop | None = None
+_state_event_lock = threading.Lock()
 STREAM_CHUNK_SIZE = 8 * 1024 * 1024
 EXPORT_COMPRESSION_SAMPLE_BYTES = 1024 * 1024
 EXPORT_COMPRESSION_MIN_RATIO = 0.98
@@ -3832,6 +3838,7 @@ def record_state_change(db: Session, event_type: str, resources: tuple[str, ...]
         "resources": normalized_resources,
     }
     db.add(StateEvent(event_type=event_type, payload=payload))
+    db.info[STATE_EVENT_SESSION_FLAG] = True
 
 
 def record_folder_change(
@@ -3878,6 +3885,70 @@ def state_events_after(last_id: int) -> list[StateEvent]:
         )
     finally:
         db.close()
+
+
+def state_event_revision() -> int:
+    with _state_event_lock:
+        return _state_event_revision
+
+
+def state_event_condition() -> asyncio.Condition:
+    global _state_event_condition, _state_event_loop
+    loop = asyncio.get_running_loop()
+    if _state_event_condition is None or _state_event_loop is not loop:
+        _state_event_condition = asyncio.Condition()
+        _state_event_loop = loop
+    return _state_event_condition
+
+
+def _notify_state_event_waiters() -> None:
+    condition = _state_event_condition
+    if condition is None:
+        return
+
+    async def notify() -> None:
+        async with condition:
+            condition.notify_all()
+
+    asyncio.create_task(notify())
+
+
+def notify_state_event_committed() -> None:
+    global _state_event_revision
+    with _state_event_lock:
+        _state_event_revision += 1
+        loop = _state_event_loop
+    if loop is not None and loop.is_running():
+        loop.call_soon_threadsafe(_notify_state_event_waiters)
+
+
+async def wait_for_state_event_revision(last_seen_revision: int, timeout_seconds: float) -> int:
+    if state_event_revision() != last_seen_revision:
+        return state_event_revision()
+
+    condition = state_event_condition()
+    try:
+        async with condition:
+            await asyncio.wait_for(
+                condition.wait_for(lambda: state_event_revision() != last_seen_revision),
+                timeout=timeout_seconds,
+            )
+    except TimeoutError:
+        return state_event_revision()
+    return state_event_revision()
+
+
+def session_after_commit(session: Session) -> None:
+    if session.info.pop(STATE_EVENT_SESSION_FLAG, False):
+        notify_state_event_committed()
+
+
+def session_after_rollback(session: Session) -> None:
+    session.info.pop(STATE_EVENT_SESSION_FLAG, None)
+
+
+sqlalchemy_event.listen(Session, "after_commit", session_after_commit)
+sqlalchemy_event.listen(Session, "after_rollback", session_after_rollback)
 
 
 def debug_event_stream_generation() -> int:
@@ -4955,24 +5026,34 @@ async def api_events_stream(
 
     async def event_generator() -> AsyncIterator[str]:
         nonlocal last_id
-        heartbeat_interval = 25.0
         last_heartbeat = dt.datetime.now(tz=dt.UTC)
+        last_seen_revision = state_event_revision()
         while not await request.is_disconnected():
             retry_ms = debug_event_stream_retry_ms(stream_generation)
             if retry_ms is not None:
                 yield f"retry: {retry_ms}\n\n"
                 return
-            events = state_events_after(last_id)
+            events = await asyncio.to_thread(state_events_after, last_id)
             if events:
                 for event in events:
                     last_id = event.id
                     yield (f"id: {event.id}\nevent: state\ndata: {json.dumps(event.payload)}\n\n")
                 last_heartbeat = dt.datetime.now(tz=dt.UTC)
+                last_seen_revision = state_event_revision()
+                continue
+
             now = dt.datetime.now(tz=dt.UTC)
-            if (now - last_heartbeat).total_seconds() >= heartbeat_interval:
+            seconds_since_heartbeat = (now - last_heartbeat).total_seconds()
+            if seconds_since_heartbeat >= STATE_EVENT_HEARTBEAT_SECONDS:
                 yield ": heartbeat\n\n"
                 last_heartbeat = now
-            await asyncio.sleep(0.5)
+                last_seen_revision = state_event_revision()
+                continue
+
+            last_seen_revision = await wait_for_state_event_revision(
+                last_seen_revision,
+                STATE_EVENT_HEARTBEAT_SECONDS - seconds_since_heartbeat,
+            )
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 

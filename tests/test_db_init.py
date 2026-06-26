@@ -3,12 +3,34 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from sqlalchemy.pool import QueuePool
 from tests.support import restore_runtime, snapshot_runtime
 
 from app import db as db_module, models
 
 
 class DatabaseInitTests(unittest.TestCase):
+    def test_sqlite_runtime_uses_explicit_pool_and_busy_timeout(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="vault-db-init-") as temp_dir:
+            db_path = Path(temp_dir) / "vault.db"
+            snapshot = snapshot_runtime()
+            try:
+                db_module.configure_database(db_path)
+
+                with db_module.engine.connect() as connection:
+                    busy_timeout = connection.exec_driver_sql("PRAGMA busy_timeout").scalar()
+
+                self.assertEqual(busy_timeout, db_module.SQLITE_BUSY_TIMEOUT_MS)
+                self.assertIsInstance(db_module.engine.pool, QueuePool)
+                self.assertEqual(db_module.engine.pool.size(), db_module.SQLITE_POOL_SIZE)
+                self.assertEqual(
+                    db_module.engine.pool.timeout(),
+                    db_module.SQLITE_POOL_TIMEOUT_SECONDS,
+                )
+            finally:
+                db_module.engine.dispose()
+                restore_runtime(snapshot)
+
     def test_incompatible_schema_is_not_dropped_on_startup(self) -> None:
         with tempfile.TemporaryDirectory(prefix="vault-db-init-") as temp_dir:
             db_path = Path(temp_dir) / "vault.db"

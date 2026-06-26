@@ -15,8 +15,15 @@ from sqlalchemy import (
 )
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
+from sqlalchemy.pool import QueuePool
 
 from .config import DB_PATH
+
+SQLITE_BUSY_TIMEOUT_MS = 30_000
+SQLITE_CONNECT_TIMEOUT_SECONDS = SQLITE_BUSY_TIMEOUT_MS / 1000
+SQLITE_POOL_SIZE = 10
+SQLITE_MAX_OVERFLOW = 10
+SQLITE_POOL_TIMEOUT_SECONDS = 30
 
 
 class Base(DeclarativeBase):
@@ -28,14 +35,18 @@ def set_sqlite_pragma(dbapi_connection: Any, _: object) -> None:
     cursor.execute("PRAGMA journal_mode=WAL;")
     cursor.execute("PRAGMA synchronous=NORMAL;")
     cursor.execute("PRAGMA foreign_keys=ON;")
-    cursor.execute("PRAGMA busy_timeout=5000;")
+    cursor.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS};")
     cursor.close()
 
 
 def create_database_engine(db_path: Path) -> Engine:
     configured_engine = create_engine(
         f"sqlite:///{db_path}",
-        connect_args={"check_same_thread": False, "timeout": 30},
+        connect_args={"check_same_thread": False, "timeout": SQLITE_CONNECT_TIMEOUT_SECONDS},
+        poolclass=QueuePool,
+        pool_size=SQLITE_POOL_SIZE,
+        max_overflow=SQLITE_MAX_OVERFLOW,
+        pool_timeout=SQLITE_POOL_TIMEOUT_SECONDS,
         pool_pre_ping=True,
     )
     event.listen(configured_engine, "connect", set_sqlite_pragma)

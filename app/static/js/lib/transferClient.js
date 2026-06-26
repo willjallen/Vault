@@ -1,7 +1,11 @@
 const UPLOAD_SESSION_STORAGE_KEY = "vault.uploadSessions";
 const UPLOAD_CONCURRENCY = 8;
 const UPLOAD_RETRY_LIMIT = 3;
+const DOWNLOAD_CONCURRENCY = 4;
+const DOWNLOAD_SEGMENT_BYTES = 64 * 1024 * 1024;
+const DOWNLOAD_SEGMENTED_MIN_BYTES = 128 * 1024 * 1024;
 const DOWNLOAD_WRITE_BUFFER_BYTES = 32 * 1024 * 1024;
+const DOWNLOAD_WRITE_BACKPRESSURE_BYTES = 512 * 1024 * 1024;
 const EXPORT_POLL_MS = 900;
 const PROGRESS_TICK_MS = 80;
 const VERIFICATION_POLL_MS = 240;
@@ -54,6 +58,10 @@ function progressFromValues(loaded, total, startedAt, options = {}) {
     stage: options.stage || "transfer",
     total,
   };
+}
+
+function byteLength(value) {
+  return value?.byteLength || value?.size || value?.length || 0;
 }
 
 function isAbortError(error) {
@@ -502,6 +510,15 @@ function filenameFromDisposition(disposition) {
   return plainMatch ? plainMatch[1].replace(/"/g, "").trim() : "";
 }
 
+function totalFromContentRange(contentRange) {
+  const match = (contentRange || "").match(/^bytes\s+\d+-\d+\/(\d+)$/i);
+  if (!match) {
+    return null;
+  }
+  const total = Number(match[1]);
+  return Number.isFinite(total) && total > 0 ? total : null;
+}
+
 function cleanDownloadName(filename) {
   return (filename || "download").trim().replace(/[\\/:*?"<>|]+/g, "_") || "download";
 }
@@ -525,12 +542,76 @@ async function cancelResponseBody(response) {
   await response.body.cancel().catch(() => {});
 }
 
+function createWriteQueue(writer, signal) {
+  let chain = Promise.resolve();
+  let pendingBytes = 0;
+  let queuedError = null;
+  let waiters = [];
+
+  function notifyWaiters() {
+    const currentWaiters = waiters;
+    waiters = [];
+    currentWaiters.forEach((resolve) => resolve());
+  }
+
+  async function waitForBackpressure() {
+    while (pendingBytes > DOWNLOAD_WRITE_BACKPRESSURE_BYTES && !queuedError) {
+      await new Promise((resolve) => {
+        waiters.push(resolve);
+      });
+    }
+    if (queuedError) {
+      throw queuedError;
+    }
+  }
+
+  function enqueue(payload, size) {
+    throwIfAborted(signal);
+    if (queuedError) {
+      throw queuedError;
+    }
+    pendingBytes += size;
+    const writeTask = chain.then(() => {
+      throwIfAborted(signal);
+      return writer.write(payload);
+    });
+    chain = writeTask.catch(() => {});
+    writeTask.then(
+      () => {
+        pendingBytes -= size;
+        notifyWaiters();
+      },
+      (error) => {
+        pendingBytes -= size;
+        queuedError = error;
+        notifyWaiters();
+      }
+    );
+    return waitForBackpressure();
+  }
+
+  return {
+    async write(data, position = null) {
+      const size = byteLength(data);
+      const payload = position === null ? data : { type: "write", position, data };
+      await enqueue(payload, size);
+    },
+    async idle() {
+      await chain;
+      if (queuedError) {
+        throw queuedError;
+      }
+    },
+  };
+}
+
 async function streamResponseToFile({ response, writer, total, onProgress, signal, startedAt }) {
   const reader = response.body?.getReader?.();
   if (!reader) {
     await writer.abort().catch(() => {});
     throw new Error("Streaming downloads are not supported by this browser.");
   }
+  const writeQueue = createWriteQueue(writer, signal);
   let loaded = 0;
   let pendingChunks = [];
   let pendingBytes = 0;
@@ -555,7 +636,7 @@ async function streamResponseToFile({ response, writer, total, onProgress, signa
         : new Blob(pendingChunks, { type: "application/octet-stream" });
     pendingChunks = [];
     pendingBytes = 0;
-    await writer.write(payload);
+    await writeQueue.write(payload);
   }
 
   try {
@@ -577,6 +658,7 @@ async function streamResponseToFile({ response, writer, total, onProgress, signa
       emitDownloadProgress();
     }
     await flushPendingChunks();
+    await writeQueue.idle();
     emitDownloadProgress("finalizing", { force: true });
     await writer.close();
     return loaded;
@@ -587,6 +669,129 @@ async function streamResponseToFile({ response, writer, total, onProgress, signa
       throw new TransferCancelledError();
     }
     throw error;
+  }
+}
+
+async function downloadRangesToFile({ url, writer, total, onProgress, signal, startedAt }) {
+  const writeQueue = createWriteQueue(writer, signal);
+  const rangeAbort = new AbortController();
+  const workerCount = Math.min(DOWNLOAD_CONCURRENCY, Math.ceil(total / DOWNLOAD_SEGMENT_BYTES));
+  let loaded = 0;
+  let nextStart = 0;
+  let lastProgressEmittedAt = 0;
+
+  function abortRangeRequests() {
+    rangeAbort.abort();
+  }
+
+  if (signal) {
+    signal.addEventListener("abort", abortRangeRequests, { once: true });
+  }
+
+  function nextSegment() {
+    if (nextStart >= total) {
+      return null;
+    }
+    const start = nextStart;
+    const end = Math.min(start + DOWNLOAD_SEGMENT_BYTES - 1, total - 1);
+    nextStart = end + 1;
+    return { end, start };
+  }
+
+  function emitDownloadProgress(options = {}) {
+    const now = performance.now();
+    if (!options.force && now - lastProgressEmittedAt < PROGRESS_TICK_MS) {
+      return;
+    }
+    lastProgressEmittedAt = now;
+    onProgress(
+      progressFromValues(loaded, total, startedAt, { stage: options.stage || "downloading" })
+    );
+  }
+
+  async function downloadSegment(segment) {
+    let response = null;
+    try {
+      response = await fetch(url, {
+        credentials: "include",
+        headers: { Range: `bytes=${segment.start}-${segment.end}` },
+        signal: rangeAbort.signal,
+      });
+      if (response.status !== 206) {
+        throw await errorFromResponse(response, "Download range request failed");
+      }
+      const reader = response.body?.getReader?.();
+      if (!reader) {
+        throw new Error("Streaming downloads are not supported by this browser.");
+      }
+      let writePosition = segment.start;
+      let pendingChunks = [];
+      let pendingBytes = 0;
+
+      async function flushPendingChunks() {
+        if (!pendingBytes) {
+          return;
+        }
+        const payload =
+          pendingChunks.length === 1
+            ? pendingChunks[0]
+            : new Blob(pendingChunks, { type: "application/octet-stream" });
+        const position = writePosition;
+        writePosition += pendingBytes;
+        pendingChunks = [];
+        pendingBytes = 0;
+        await writeQueue.write(payload, position);
+      }
+
+      while (true) {
+        throwIfAborted(signal);
+        const { done, value } = await reader.read();
+        if (done) {
+          break;
+        }
+        if (!value) {
+          continue;
+        }
+        const size = byteLength(value);
+        loaded += size;
+        pendingChunks.push(value);
+        pendingBytes += size;
+        if (pendingBytes >= DOWNLOAD_WRITE_BUFFER_BYTES) {
+          await flushPendingChunks();
+        }
+        emitDownloadProgress();
+      }
+      await flushPendingChunks();
+    } catch (error) {
+      abortRangeRequests();
+      throw error;
+    } finally {
+      await cancelResponseBody(response);
+    }
+  }
+
+  async function downloadWorker() {
+    while (true) {
+      throwIfAborted(signal);
+      const segment = nextSegment();
+      if (!segment) {
+        return;
+      }
+      await downloadSegment(segment);
+    }
+  }
+
+  try {
+    onProgress(progressFromValues(0, total, startedAt, { stage: "downloading" }));
+    await Promise.all(Array.from({ length: workerCount }, () => downloadWorker()));
+    await writeQueue.idle();
+    emitDownloadProgress({ force: true, stage: "finalizing" });
+    await writer.close();
+    return loaded;
+  } finally {
+    if (signal) {
+      signal.removeEventListener("abort", abortRangeRequests);
+    }
   }
 }
 
@@ -604,16 +809,48 @@ export async function downloadUrl({
     throwIfAborted(signal);
     onProgress(progressFromValues(0, fallbackTotal, startedAt, { stage: "starting" }));
     writer = await openDownloadWriter(fallbackName, signal);
-    response = await fetch(url, { credentials: "include", signal });
+    response = await fetch(url, {
+      credentials: "include",
+      headers: { Range: "bytes=0-0" },
+      signal,
+    });
     if (!response.ok) {
       throw await errorFromResponse(response, "Download failed");
     }
+    const rangeTotal = totalFromContentRange(response.headers.get("Content-Range"));
     const headerLength = Number(response.headers.get("Content-Length") || 0);
-    const total = Number.isFinite(headerLength) && headerLength > 0 ? headerLength : fallbackTotal;
+    const total =
+      rangeTotal ||
+      (Number.isFinite(headerLength) && headerLength > 0 ? headerLength : fallbackTotal);
     const filename =
       filenameFromDisposition(response.headers.get("Content-Disposition")) ||
       fallbackName ||
       "download";
+    if (
+      response.status === 206 &&
+      total >= DOWNLOAD_SEGMENTED_MIN_BYTES &&
+      typeof writer.seek === "function"
+    ) {
+      await cancelResponseBody(response);
+      response = null;
+      const segmentedSize = await downloadRangesToFile({
+        onProgress,
+        signal,
+        startedAt,
+        total,
+        url,
+        writer,
+      });
+      writer = null;
+      return { filename, size: segmentedSize || total || 0, status: 200 };
+    }
+    if (response.status === 206) {
+      await cancelResponseBody(response);
+      response = await fetch(url, { credentials: "include", signal });
+      if (!response.ok) {
+        throw await errorFromResponse(response, "Download failed");
+      }
+    }
     onProgress(progressFromValues(0, total, startedAt, { stage: "downloading" }));
     const size = await streamResponseToFile({
       onProgress,

@@ -86,6 +86,11 @@ export function buildFolderMenuItems(actions) {
   const isRoot = !folderPath || folderPath === "Archive";
   const canMoveFolder = hasPath && !isRoot && !isArchivedFolder;
   return compactMenuItems([
+    {
+      label: "Download",
+      action: () => actions.handleDownloadSelection([folderItem]),
+      disabled: busy || isRoot,
+    },
     { label: "Open", action: () => actions.navigateToFolder(folderPath) },
     canMoveFolder
       ? { label: "Rename", action: () => actions.beginRenameFolder(folderPath), disabled: busy }

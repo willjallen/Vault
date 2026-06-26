@@ -2080,7 +2080,7 @@ def write_version_to_zip(
             location.object_key,
             location.bucket,
         ) as reader:
-            with archive.open(archive_name, "w") as target:
+            with archive.open(archive_name, "w", force_zip64=True) as target:
                 while True:
                     if should_cancel and should_cancel():
                         raise ExportCancelled
@@ -2191,7 +2191,7 @@ def run_export_job(job_id: str) -> None:
                 pending_processed_bytes += delta_bytes
                 flush_export_progress()
 
-            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED, allowZip64=True) as archive:
                 for doc, version in versions:
                     if export_is_cancelled():
                         return

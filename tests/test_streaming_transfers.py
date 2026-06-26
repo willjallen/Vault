@@ -3,7 +3,9 @@ import io
 import tempfile
 import unittest
 import zipfile
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from tests.support import (
@@ -689,6 +691,46 @@ class StreamingTransferTests(unittest.TestCase):
                     Path(zip_path).unlink(missing_ok=True)
                 self.assertGreater(checks, 1)
 
+    def test_export_zip_writer_forces_zip64_entries(self) -> None:
+        data = b"payload"
+        blob = SimpleNamespace(
+            hash_algo="sha256",
+            hash=sha256_hex(data),
+            locations=[],
+            size_bytes=len(data),
+        )
+        version = SimpleNamespace(blob=blob)
+
+        class Target(io.BytesIO):
+            def __enter__(self) -> "Target":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                self.close()
+
+        class Archive:
+            force_zip64: bool | None = None
+
+            def open(self, _name: str, _mode: str, *, force_zip64: bool = False) -> Target:
+                self.force_zip64 = force_zip64
+                return Target()
+
+        class Storage:
+            @contextmanager
+            def open_reader(self, _object_key: str, _bucket: str):
+                yield io.BytesIO(data)
+
+        location = SimpleNamespace(backend="local", bucket="", object_key="payload")
+        archive = Archive()
+        with (
+            patch("app.routers.location_for_blob", return_value=location),
+            patch("app.routers.get_storage_backend", return_value=Storage()),
+        ):
+            size = write_version_to_zip(archive, "payload.bin", version)
+
+        self.assertEqual(size, len(data))
+        self.assertTrue(archive.force_zip64)
+
     def test_export_job_creates_downloadable_zip_artifact(self) -> None:
         user = user_context("downloader")
         headers = auth_headers("downloader", ["vault-admin"])
@@ -717,6 +759,10 @@ class StreamingTransferTests(unittest.TestCase):
             response = ctx.client.get(str(export["download_url"]), headers=headers)
             self.assertEqual(response.status_code, 200, response.text)
             with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+                self.assertEqual(
+                    archive.getinfo("Project/one.txt").compress_type,
+                    zipfile.ZIP_STORED,
+                )
                 self.assertEqual(archive.read("Project/one.txt"), b"one")
                 self.assertEqual(archive.read("Project/two.txt"), b"two")
 

@@ -60,19 +60,7 @@
 
       {% if lock and lock.locked_by == user.id and not archived %}
         <div class="checkin-box" style="margin-top:16px;">
-          <h3>Save your changes back to the vault</h3>
-          <form action="/documents/{{ doc.id }}/checkin" method="post" enctype="multipart/form-data">
-            <input type="hidden" name="redirect_to" value="{{ redirect_to }}" />
-            <label>
-              Choose the edited file
-              <input type="file" name="file" required />
-            </label>
-            <label>
-              What changed? (optional)
-              <input type="text" name="note" placeholder="Short note about the update" />
-            </label>
-            <button class="btn primary" type="submit">Save changes</button>
-          </form>
+          <h3>You are editing this document</h3>
           <form class="inline-form" action="/documents/{{ doc.id }}/release" method="post">
             <input type="hidden" name="redirect_to" value="{{ redirect_to }}" />
             <button class="btn secondary" type="submit">Stop editing without saving</button>

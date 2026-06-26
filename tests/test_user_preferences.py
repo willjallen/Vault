@@ -4,6 +4,7 @@ from tests.support import (
     add_permission,
     auth_headers,
     create_versioned_document,
+    upload_file_via_session,
     user_context,
     vault_runtime,
     vault_test_client,
@@ -22,11 +23,13 @@ class UserPreferenceTests(unittest.TestCase):
             created_folder = ctx.client.post("/folders", data={"folder": "Art"}, headers=headers)
             self.assertEqual(created_folder.status_code, 200, created_folder.text)
             folder_id = created_folder.json()["id"]
-            uploaded = ctx.client.post(
-                "/documents",
-                data={"folder": "Art"},
-                files={"file": ("chest.fbx", b"chest", "model/fbx")},
+            uploaded = upload_file_via_session(
+                ctx.client,
                 headers=headers,
+                filename="chest.fbx",
+                data=b"chest",
+                content_type="model/fbx",
+                folder="Art",
             )
             self.assertEqual(uploaded.status_code, 200, uploaded.text)
             document_id = uploaded.json()["id"]
@@ -220,11 +223,13 @@ class UserPreferenceTests(unittest.TestCase):
             )
             self.assertEqual(created_child.status_code, 200, created_child.text)
             child_id = created_child.json()["id"]
-            uploaded = ctx.client.post(
-                "/documents",
-                data={"folder": "Art/Props"},
-                files={"file": ("crate.fbx", b"crate", "model/fbx")},
+            uploaded = upload_file_via_session(
+                ctx.client,
                 headers=headers,
+                filename="crate.fbx",
+                data=b"crate",
+                content_type="model/fbx",
+                folder="Art/Props",
             )
             self.assertEqual(uploaded.status_code, 200, uploaded.text)
             document_id = uploaded.json()["id"]

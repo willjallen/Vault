@@ -4368,7 +4368,7 @@ input[type="file"]::file-selector-button:hover {
 .transfer-row {
   pointer-events: auto;
   display: grid;
-  grid-template-columns: 36px minmax(0, 1fr);
+  grid-template-columns: 36px minmax(0, 1fr) 28px;
   gap: 10px;
   align-items: center;
   padding: 12px;
@@ -4463,7 +4463,7 @@ input[type="file"]::file-selector-button:hover {
   min-width: 0;
   display: flex;
   flex-direction: column;
-  gap: 5px;
+  gap: 4px;
 }
 
 .transfer-line {
@@ -4485,6 +4485,19 @@ input[type="file"]::file-selector-button:hover {
   color: var(--muted);
   font-size: 0.84rem;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.transfer-stage {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0;
+  line-height: 1;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
   white-space: nowrap;
 }
 
@@ -4516,7 +4529,8 @@ input[type="file"]::file-selector-button:hover {
   min-width: 8px;
   border-radius: inherit;
   background: var(--progress-bar);
-  transition: width 0.14s cubic-bezier(0.2, 0.8, 0.2, 1);
+  transition: width 0.22s linear;
+  will-change: width;
 }
 
 .transfer-progress.indeterminate span {
@@ -4531,6 +4545,35 @@ input[type="file"]::file-selector-button:hover {
 
 .transfer-row.error .transfer-progress span {
   background: var(--danger-fill);
+}
+
+.transfer-cancel-button {
+  width: 28px;
+  height: 28px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 999px;
+  background: var(--surface-raised);
+  color: var(--text-secondary);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition:
+    transform 0.14s ease,
+    border-color 0.14s ease,
+    background 0.14s ease,
+    color 0.14s ease;
+}
+
+.transfer-cancel-button:hover {
+  border-color: var(--danger-border);
+  background: var(--danger-soft);
+  color: var(--danger-text);
+  transform: translateY(-1px);
+}
+
+.transfer-cancel-button:active {
+  transform: translateY(0) scale(0.96);
 }
 
 .inline-form {
@@ -5130,9 +5173,11 @@ input[type="file"]::file-selector-button:hover {
     transition: none;
   }
 
+  .transfer-progress span,
   .notification-row.busy .notification-icon .app-icon-wrap,
   .notification-row.indeterminate .notification-icon .app-icon-wrap,
   .transfer-progress.indeterminate span {
+    transition: none;
     animation: none;
   }
 }

@@ -1,6 +1,12 @@
 import unittest
 
-from tests.support import add_permission, auth_headers, create_versioned_document, vault_test_client
+from tests.support import (
+    add_permission,
+    auth_headers,
+    create_versioned_document,
+    upload_file_via_session,
+    vault_test_client,
+)
 
 from app.models import Document, Folder, VaultGroup
 from app.routers import (
@@ -124,13 +130,23 @@ class HttpApiContractTests(unittest.TestCase):
                 files={"file": ("reader.txt", b"reader", "text/plain")},
                 headers=reader_headers,
             )
-            self.assertEqual(reader_upload.status_code, 403)
+            self.assertEqual(reader_upload.status_code, 410)
 
-            writer_upload = ctx.client.post(
-                "/documents",
-                data={"folder": "Project"},
-                files={"file": ("writer.txt", b"writer", "text/plain")},
+            reader_session_upload = upload_file_via_session(
+                ctx.client,
+                headers=reader_headers,
+                filename="reader.txt",
+                data=b"reader",
+                folder="Project",
+            )
+            self.assertEqual(reader_session_upload.status_code, 403)
+
+            writer_upload = upload_file_via_session(
+                ctx.client,
                 headers=writer_headers,
+                filename="writer.txt",
+                data=b"writer",
+                folder="Project",
             )
             self.assertEqual(writer_upload.status_code, 200, writer_upload.text)
             self.assertEqual(writer_upload.json()["path"], "Project/writer.txt")

@@ -13,6 +13,7 @@ BASE_DOMAIN = os.getenv("BASE_DOMAIN", "localhost")
 SITE_NAME = os.getenv("VAULT_SITE_NAME", "Vault").strip() or "Vault"
 DATA_DIR = Path(os.getenv("VAULT_DATA_DIR", "/data")).resolve()
 DB_PATH = Path(os.getenv("VAULT_DB_PATH", str(DATA_DIR / "vault.db"))).resolve()
+TRANSFERS_PATH = Path(os.getenv("VAULT_TRANSFERS_PATH", str(DATA_DIR / "transfers"))).resolve()
 PUBLIC_URL = os.getenv("VAULT_PUBLIC_URL", "").strip().rstrip("/")
 _REQUIRE_SESSION_SECRET_ENV = os.getenv("VAULT_REQUIRE_SESSION_SECRET")
 _DOCKER_RUNTIME_ENV = os.getenv("VAULT_DOCKER_RUNTIME", "0")
@@ -43,6 +44,15 @@ SESSION_SECRET = _SESSION_SECRET_ENV or _OIDC_CLIENT_SECRET_ENV or "dev-insecure
 SESSION_MAX_AGE_SECONDS = int(os.getenv("VAULT_SESSION_MAX_AGE_SECONDS", "604800"))
 TTL_SWEEP_INTERVAL_SECONDS = max(10, int(os.getenv("VAULT_TTL_SWEEP_INTERVAL_SECONDS", "60")))
 MAX_UPLOAD_BYTES = max(1, int(os.getenv("VAULT_MAX_UPLOAD_BYTES", str(5 * 1024 * 1024 * 1024))))
+TRANSFER_CHUNK_BYTES = max(
+    1,
+    int(os.getenv("VAULT_TRANSFER_CHUNK_BYTES", str(32 * 1024 * 1024))),
+)
+TRANSFER_SESSION_TTL_SECONDS = max(
+    60,
+    int(os.getenv("VAULT_TRANSFER_SESSION_TTL_SECONDS", "86400")),
+)
+EXPORT_TTL_SECONDS = max(60, int(os.getenv("VAULT_EXPORT_TTL_SECONDS", "86400")))
 BOOTSTRAP_ADMIN_EMAILS = {
     item.strip().lower()
     for item in os.getenv("VAULT_BOOTSTRAP_ADMIN_EMAILS", "").split(",")

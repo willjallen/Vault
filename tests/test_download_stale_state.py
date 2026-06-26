@@ -1,5 +1,4 @@
 import unittest
-from unittest.mock import patch
 
 from fastapi import HTTPException
 from tests.support import (
@@ -10,7 +9,6 @@ from tests.support import (
     vault_runtime,
 )
 
-import app.routers as routers
 from app.db import SessionLocal
 from app.models import Document, VaultGroup
 from app.routers import (
@@ -60,52 +58,34 @@ class DownloadStaleStateTests(unittest.TestCase):
             doc.folder_id = secret.id
             db.commit()
 
-    def test_direct_download_rechecks_access_after_blob_read(self) -> None:
+    def test_direct_download_rechecks_access_from_stale_session(self) -> None:
         with vault_runtime():
             doc_id, _version_id, reader = self._create_hidden_move_fixture()
-            original_copy = routers.copy_version_to_temp
-            moved = False
-
-            def move_before_copy(version):
-                nonlocal moved
-                if not moved:
-                    moved = True
-                    self._move_document_under_hidden_acl(doc_id)
-                return original_copy(version)
 
             with SessionLocal() as db:
-                with patch.object(routers, "copy_version_to_temp", side_effect=move_before_copy):
-                    with self.assertRaises(HTTPException) as raised:
-                        download_items(
-                            ActionPayload(items=[ActionItem(type="document", id=doc_id)]),
-                            FAKE_REQUEST,
-                            reader,
-                            db,
-                        )
+                db.get(Document, doc_id)
+                self._move_document_under_hidden_acl(doc_id)
+                with self.assertRaises(HTTPException) as raised:
+                    download_items(
+                        ActionPayload(items=[ActionItem(type="document", id=doc_id)]),
+                        FAKE_REQUEST,
+                        reader,
+                        db,
+                    )
 
-            self.assertTrue(moved)
             self.assertEqual(raised.exception.status_code, 404)
             self.assertEqual(raised.exception.detail, "Document not found")
 
-    def test_version_download_rechecks_access_after_blob_read(self) -> None:
+    def test_version_download_rechecks_access_from_stale_session(self) -> None:
         with vault_runtime():
             doc_id, version_id, reader = self._create_hidden_move_fixture()
-            original_copy = routers.copy_version_to_temp
-            moved = False
-
-            def move_before_copy(version):
-                nonlocal moved
-                if not moved:
-                    moved = True
-                    self._move_document_under_hidden_acl(doc_id)
-                return original_copy(version)
 
             with SessionLocal() as db:
-                with patch.object(routers, "copy_version_to_temp", side_effect=move_before_copy):
-                    with self.assertRaises(HTTPException) as raised:
-                        download_version(doc_id, version_id, FAKE_REQUEST, reader, db)
+                db.get(Document, doc_id)
+                self._move_document_under_hidden_acl(doc_id)
+                with self.assertRaises(HTTPException) as raised:
+                    download_version(doc_id, version_id, FAKE_REQUEST, reader, db)
 
-            self.assertTrue(moved)
             self.assertEqual(raised.exception.status_code, 404)
             self.assertEqual(raised.exception.detail, "Document not found")
 

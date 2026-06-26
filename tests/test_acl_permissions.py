@@ -1,4 +1,3 @@
-import asyncio
 import io
 import unittest
 import zipfile
@@ -7,10 +6,14 @@ from fastapi import HTTPException
 from tests.support import (
     FAKE_REQUEST,
     add_permission,
+    auth_headers,
     collect_response_body,
     create_versioned_document,
+    upload_file_via_session,
     user_context,
     vault_runtime,
+    vault_test_client,
+    wait_for_export,
 )
 
 from app.models import Document, DocumentLock, Folder, FolderPermission, VaultGroup
@@ -23,7 +26,6 @@ from app.routers import (
     archive_doc_item,
     archive_items,
     build_contents_payload,
-    create_document,
     create_folder,
     document_path,
     download_items,
@@ -34,21 +36,6 @@ from app.routers import (
 )
 
 
-class Upload:
-    filename = "writer.txt"
-    content_type = "text/plain"
-
-    def __init__(self) -> None:
-        self._sent = False
-
-    async def read(self, size: int = -1) -> bytes:
-        del size
-        if self._sent:
-            return b""
-        self._sent = True
-        return b"writer"
-
-
 class AclPermissionTests(unittest.TestCase):
     def test_folder_acl_enforces_visible_read_and_write_paths(self) -> None:
         admin = user_context("admin", groups=["vault-admin"], is_admin=True)
@@ -57,7 +44,7 @@ class AclPermissionTests(unittest.TestCase):
         writer = user_context("writer", groups=["writers"], is_admin=False)
         outsider = user_context("outsider", groups=["outsiders"], is_admin=False)
 
-        with vault_runtime() as ctx:
+        with vault_test_client() as ctx:
             with ctx.db() as db:
                 root = get_root_folder(db, "vault")
                 viewers = VaultGroup(name="viewers")
@@ -141,21 +128,31 @@ class AclPermissionTests(unittest.TestCase):
                 active_locks = db.query(DocumentLock).filter_by(document_id=doc_id, is_active=True)
                 self.assertEqual(active_locks.count(), 0)
 
-                try:
-                    with self.assertRaises(HTTPException) as upload_raised:
-                        asyncio.run(create_document(FAKE_REQUEST, Upload(), "Project", reader, db))
-                    self.assertEqual(upload_raised.exception.status_code, 403)
-                finally:
-                    db.rollback()
+                db.rollback()
 
-                result = asyncio.run(create_document(FAKE_REQUEST, Upload(), "Project", writer, db))
-                self.assertEqual(result["path"], "Project/writer.txt")
+            reader_upload = upload_file_via_session(
+                ctx.client,
+                headers=auth_headers("reader", ["readers"]),
+                filename="writer.txt",
+                data=b"writer",
+                folder="Project",
+            )
+            self.assertEqual(reader_upload.status_code, 403)
+
+            writer_upload = upload_file_via_session(
+                ctx.client,
+                headers=auth_headers("writer", ["writers"]),
+                filename="writer.txt",
+                data=b"writer",
+                folder="Project",
+            )
+            self.assertEqual(writer_upload.status_code, 200, writer_upload.text)
+            self.assertEqual(writer_upload.json()["path"], "Project/writer.txt")
 
     def test_folder_download_excludes_inaccessible_descendants(self) -> None:
         admin = user_context("admin", groups=["vault-admin"], is_admin=True)
-        reader = user_context("reader", groups=["readers"], is_admin=False)
 
-        with vault_runtime() as ctx:
+        with vault_test_client() as ctx:
             with ctx.db() as db:
                 root = get_root_folder(db, "vault")
                 readers = VaultGroup(name="readers")
@@ -187,15 +184,23 @@ class AclPermissionTests(unittest.TestCase):
                 project_id = project.id
                 db.commit()
 
-            with ctx.db() as db:
-                response = download_items(
-                    ActionPayload(items=[ActionItem(type="folder", id=project_id)]),
-                    FAKE_REQUEST,
-                    reader,
-                    db,
-                )
+            export_response = ctx.client.post(
+                "/api/exports",
+                json={"items": [{"type": "folder", "id": project_id}]},
+                headers=auth_headers("reader", ["readers"]),
+            )
+            self.assertEqual(export_response.status_code, 200, export_response.text)
+            export = wait_for_export(
+                ctx.client,
+                export_response.json()["id"],
+                headers=auth_headers("reader", ["readers"]),
+            )
+            self.assertEqual(export["status"], "complete")
+            response = ctx.client.get(
+                str(export["download_url"]), headers=auth_headers("reader", ["readers"])
+            )
 
-            with zipfile.ZipFile(io.BytesIO(collect_response_body(response))) as archive:
+            with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
                 self.assertEqual(archive.namelist(), ["Project/visible.txt"])
                 self.assertEqual(archive.read("Project/visible.txt"), b"visible")
 

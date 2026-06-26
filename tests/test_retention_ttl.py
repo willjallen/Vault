@@ -1,4 +1,3 @@
-import asyncio
 import datetime as dt
 import unittest
 
@@ -7,6 +6,7 @@ from tests.support import (
     add_permission,
     auth_headers,
     create_versioned_document,
+    upload_file_via_session,
     user_context,
     vault_runtime,
     vault_test_client,
@@ -15,7 +15,6 @@ from tests.support import (
 from app.models import Document, DocumentLock, Folder, StateEvent, VaultGroup
 from app.routers import (
     apply_folder_ttl,
-    checkin_document,
     folder_path,
     get_or_create_folder_path,
     get_root_folder,
@@ -420,21 +419,7 @@ class RetentionTtlTests(unittest.TestCase):
     def test_checkin_refreshes_delete_ttl_from_new_version_time(self) -> None:
         user = user_context("alice", groups=["vault-admin"])
 
-        class Upload:
-            filename = "draft.txt"
-            content_type = "text/plain"
-
-            def __init__(self) -> None:
-                self._sent = False
-
-            async def read(self, size: int = -1) -> bytes:
-                del size
-                if self._sent:
-                    return b""
-                self._sent = True
-                return b"fresh content"
-
-        with vault_runtime() as ctx:
+        with vault_test_client() as ctx:
             with ctx.db() as db:
                 folder = get_or_create_folder_path(db, "Temp")
                 folder.default_ttl_days = 7
@@ -449,29 +434,28 @@ class RetentionTtlTests(unittest.TestCase):
                 )
                 apply_folder_ttl(doc, folder, doc.latest_modified_at)
                 self.assertLessEqual(normalize_timestamp(doc.expires_at), now_utc())
-                db.add(
-                    DocumentLock(
-                        document_id=doc.id,
-                        locked_by=str(user["id"]),
-                        locked_by_name=str(user["name"]),
-                    ),
-                )
                 db.commit()
                 doc_id = doc.id
 
+            locked = ctx.client.post(
+                "/api/lock",
+                json={"items": [{"type": "document", "id": doc_id}]},
+                headers=auth_headers("alice", ["vault-admin"]),
+            )
+            self.assertEqual(locked.status_code, 200, locked.text)
+            uploaded = upload_file_via_session(
+                ctx.client,
+                headers=auth_headers("alice", ["vault-admin"]),
+                filename="draft.txt",
+                data=b"fresh content",
+                folder="",
+                mode="checkin",
+                document_id=doc_id,
+                note="new version",
+            )
+            self.assertEqual(uploaded.status_code, 200, uploaded.text)
+            self.assertEqual(uploaded.json()["path"], "Temp/draft.txt")
             with ctx.db() as db:
-                result = asyncio.run(
-                    checkin_document(
-                        doc_id,
-                        FAKE_REQUEST,
-                        Upload(),
-                        "new version",
-                        False,
-                        user,
-                        db,
-                    ),
-                )
-                self.assertEqual(result["path"], "Temp/draft.txt")
                 doc = db.get(Document, doc_id)
                 self.assertIsNotNone(doc)
                 self.assertGreater(

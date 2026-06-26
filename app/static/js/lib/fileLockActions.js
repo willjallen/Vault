@@ -26,21 +26,19 @@ export function createFileLockActions({
   async function handleSave(docId, file, note, options = {}) {
     setBusy(true);
     setError("");
-    const form = new FormData();
-    form.append("file", file);
-    if (note) {
-      form.append("note", note);
-    }
-    if (options.renameToUploadedName) {
-      form.append("rename_to_upload", "true");
-    }
     try {
-      await uploadWithProgress({
-        formData: form,
+      const result = await uploadWithProgress({
+        documentId: docId,
+        file,
+        mode: "checkin",
         name: file.name,
+        note,
+        renameToUpload: Boolean(options.renameToUploadedName),
         size: file.size,
-        url: `/documents/${docId}/checkin`,
       });
+      if (result.cancelled) {
+        return false;
+      }
       await refresh();
       return true;
     } catch (err) {
@@ -142,13 +140,19 @@ export function createFileLockActions({
       name: doc.name,
       size: doc.size_bytes,
       url: `/documents/${doc.id}/checkout`,
-    }).catch((err) => {
-      setError(err.message || "Checkout failed.");
-      refresh();
-    });
-    if (updateDocument) {
-      updateDocument(doc.id, (item) => ({ ...item, lock: optimisticLockFor(item, currentUser) }));
-    }
+    })
+      .then((result) => {
+        if (!result.cancelled && updateDocument) {
+          updateDocument(doc.id, (item) => ({
+            ...item,
+            lock: optimisticLockFor(item, currentUser),
+          }));
+        }
+      })
+      .catch((err) => {
+        setError(err.message || "Checkout failed.");
+        refresh();
+      });
   }
 
   return { handleLock, handleRelease, handleSave, handleStartEdit, handleVersionUpload };

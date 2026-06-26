@@ -1,6 +1,8 @@
 import asyncio
+import hashlib
 import os
 import tempfile
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -9,6 +11,7 @@ from pathlib import Path
 from fastapi import Response
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
+from starlette.testclient import TestClient as StarletteTestClient
 
 import app.auth as auth_module
 import app.db as db_module
@@ -27,6 +30,10 @@ ENV_KEYS = (
     "VAULT_DB_PATH",
     "VAULT_OBJECTS_PATH",
     "VAULT_MAX_UPLOAD_BYTES",
+    "VAULT_TRANSFER_CHUNK_BYTES",
+    "VAULT_TRANSFER_SESSION_TTL_SECONDS",
+    "VAULT_EXPORT_TTL_SECONDS",
+    "VAULT_TRANSFERS_PATH",
     "VAULT_STORAGE_BACKEND",
 )
 
@@ -55,8 +62,12 @@ class RuntimeSnapshot:
     session_max_age_seconds: int
     base_domain: str
     dev_mode: bool
+    export_ttl_seconds: int
     max_upload_bytes: int
     site_name: str
+    transfer_chunk_bytes: int
+    transfer_session_ttl_seconds: int
+    transfers_path: Path
     ttl_sweep_interval_seconds: int
     env: dict[str, str | None]
 
@@ -213,8 +224,12 @@ def snapshot_runtime() -> RuntimeSnapshot:
         session_max_age_seconds=auth_module.SESSION_MAX_AGE_SECONDS,
         base_domain=routers_module.BASE_DOMAIN,
         dev_mode=routers_module.DEV_MODE,
+        export_ttl_seconds=routers_module.EXPORT_TTL_SECONDS,
         max_upload_bytes=routers_module.MAX_UPLOAD_BYTES,
         site_name=routers_module.SITE_NAME,
+        transfer_chunk_bytes=routers_module.TRANSFER_CHUNK_BYTES,
+        transfer_session_ttl_seconds=routers_module.TRANSFER_SESSION_TTL_SECONDS,
+        transfers_path=routers_module.TRANSFERS_PATH,
         ttl_sweep_interval_seconds=routers_module.TTL_SWEEP_INTERVAL_SECONDS,
         env={key: os.environ.get(key) for key in ENV_KEYS},
     )
@@ -249,8 +264,12 @@ def restore_runtime(snapshot: RuntimeSnapshot) -> None:
         auth_mode=snapshot.auth_mode,
         base_domain=snapshot.base_domain,
         dev_mode=snapshot.dev_mode,
+        export_ttl_seconds=snapshot.export_ttl_seconds,
         max_upload_bytes=snapshot.max_upload_bytes,
         site_name=snapshot.site_name,
+        transfer_chunk_bytes=snapshot.transfer_chunk_bytes,
+        transfer_session_ttl_seconds=snapshot.transfer_session_ttl_seconds,
+        transfers_path=snapshot.transfers_path,
         ttl_sweep_interval_seconds=snapshot.ttl_sweep_interval_seconds,
     )
     for key, value in snapshot.env.items():
@@ -272,6 +291,7 @@ def vault_runtime(
         temp_dir = Path(temp_dir_name)
         db_path = temp_dir / "vault.db"
         objects_path = temp_dir / "objects"
+        transfers_path = temp_dir / "transfers"
         os.environ.update(
             {
                 "BASE_DOMAIN": "localhost",
@@ -280,6 +300,7 @@ def vault_runtime(
                 "VAULT_DEV_MODE": "1" if runtime_dev_mode else "0",
                 "VAULT_DB_PATH": str(db_path),
                 "VAULT_OBJECTS_PATH": str(objects_path),
+                "VAULT_TRANSFERS_PATH": str(transfers_path),
                 "VAULT_STORAGE_BACKEND": "local",
             },
         )
@@ -295,7 +316,11 @@ def vault_runtime(
             auth_mode=auth_mode,
             base_domain="localhost",
             dev_mode=runtime_dev_mode,
+            export_ttl_seconds=86400,
             max_upload_bytes=5 * 1024 * 1024 * 1024,
+            transfer_chunk_bytes=4,
+            transfer_session_ttl_seconds=86400,
+            transfers_path=transfers_path,
             site_name="Vault",
             ttl_sweep_interval_seconds=10,
         )
@@ -320,6 +345,81 @@ async def read_response_body(response: Response) -> bytes:
 
 def collect_response_body(response: Response) -> bytes:
     return asyncio.run(read_response_body(response))
+
+
+def sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def upload_file_via_session(
+    client: StarletteTestClient,
+    *,
+    headers: dict[str, str] | None = None,
+    filename: str = "upload.txt",
+    data: bytes = b"upload",
+    content_type: str = "text/plain",
+    folder: str = "",
+    mode: str = "create",
+    document_id: int | None = None,
+    note: str = "",
+    rename_to_upload: bool = False,
+) -> object:
+    session_response = client.post(
+        "/api/uploads",
+        json={
+            "document_id": document_id,
+            "filename": filename,
+            "folder": folder,
+            "mime_type": content_type,
+            "mode": mode,
+            "note": note,
+            "rename_to_upload": rename_to_upload,
+            "size_bytes": len(data),
+        },
+        headers=headers or {},
+    )
+    if session_response.status_code >= 400:
+        return session_response
+    session = session_response.json()
+    chunk_size = int(session["chunk_size"])
+    for index, offset in enumerate(range(0, len(data), chunk_size), start=1):
+        chunk = data[offset : offset + chunk_size]
+        part_response = client.put(
+            f"/api/uploads/{session['id']}/parts/{index}",
+            content=chunk,
+            headers={
+                **(headers or {}),
+                "Content-Type": "application/octet-stream",
+                "X-Upload-Offset": str(offset),
+                "X-Upload-Sha256": sha256_hex(chunk),
+                "X-Upload-Size": str(len(chunk)),
+            },
+        )
+        if part_response.status_code >= 400:
+            return part_response
+    return client.post(
+        f"/api/uploads/{session['id']}/complete",
+        json={"sha256": sha256_hex(data)},
+        headers=headers or {},
+    )
+
+
+def wait_for_export(
+    client: StarletteTestClient,
+    job_id: str,
+    *,
+    headers: dict[str, str] | None = None,
+    timeout_seconds: float = 5.0,
+) -> dict[str, object]:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        response = client.get(f"/api/exports/{job_id}", headers=headers or {})
+        response.raise_for_status()
+        payload = response.json()
+        if payload["status"] in {"complete", "failed", "cancelled"}:
+            return payload
+        time.sleep(0.05)
+    raise AssertionError("Export did not finish")
 
 
 @contextmanager

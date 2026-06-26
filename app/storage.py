@@ -5,7 +5,7 @@ import hashlib
 import shutil
 import threading
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,6 +47,10 @@ class StorageError(Exception):
     """Base class for storage backend errors."""
 
 
+class StorageChecksumMismatch(StorageError):
+    """Raised when supplied checksum metadata does not match stored bytes."""
+
+
 class StorageNotFoundError(StorageError):
     """Raised when a referenced blob is missing from the storage medium."""
 
@@ -69,6 +73,72 @@ class BlobReader(Protocol):
     def read(self, size: int = -1) -> bytes: ...
 
 
+StorageProgressCallback = Callable[[int], None]
+
+
+class LimitedBlobReader:
+    def __init__(self, source: BlobReader, remaining: int) -> None:
+        self.source = source
+        self.remaining = remaining
+
+    def read(self, size: int = -1) -> bytes:
+        if self.remaining <= 0:
+            return b""
+        if size < 0 or size > self.remaining:
+            size = self.remaining
+        data = self.source.read(size)
+        self.remaining -= len(data)
+        return data
+
+
+class PathSequenceReader:
+    def __init__(
+        self,
+        paths: Iterable[Path],
+        progress_callback: StorageProgressCallback | None = None,
+        progress_offset: int = 0,
+    ) -> None:
+        self.paths = iter(paths)
+        self.current: BlobReader | None = None
+        self.progress_callback = progress_callback
+        self.progress_offset = progress_offset
+        self.transferred = 0
+
+    def read(self, size: int = -1) -> bytes:
+        if size < 0:
+            size = STORAGE_CHUNK_SIZE
+        remaining = size
+        chunks: list[bytes] = []
+        while remaining > 0:
+            if self.current is None:
+                try:
+                    self.current = next(self.paths).open("rb")
+                except StopIteration:
+                    break
+            chunk = self.current.read(remaining)
+            if chunk:
+                chunks.append(chunk)
+                remaining -= len(chunk)
+                continue
+            cast_file = self.current
+            close = getattr(cast_file, "close", None)
+            if close:
+                close()
+            self.current = None
+        data = b"".join(chunks)
+        if data and self.progress_callback:
+            self.transferred += len(data)
+            self.progress_callback(self.progress_offset + self.transferred)
+        return data
+
+    def close(self) -> None:
+        if self.current is not None:
+            close = getattr(self.current, "close", None)
+            if close:
+                close()
+            self.current = None
+
+
 class BlobStorageBackend:
     name: str
     bucket: str
@@ -85,12 +155,30 @@ class BlobStorageBackend:
     ) -> StoredBlob:
         raise NotImplementedError
 
+    def put_part_files(
+        self,
+        part_paths: Iterable[Path],
+        content_type: str | None = None,
+        expected_digest: str | None = None,
+        progress_callback: StorageProgressCallback | None = None,
+    ) -> StoredBlob:
+        raise NotImplementedError
+
     def read_bytes(self, object_key: str, bucket: str | None = None) -> bytes:
         raise NotImplementedError
 
     def open_reader(
         self,
         object_key: str,
+        bucket: str | None = None,
+    ) -> AbstractContextManager[BlobReader]:
+        raise NotImplementedError
+
+    def open_range_reader(
+        self,
+        object_key: str,
+        start: int,
+        end: int,
         bucket: str | None = None,
     ) -> AbstractContextManager[BlobReader]:
         raise NotImplementedError
@@ -180,6 +268,55 @@ class LocalBlobStorage(BlobStorageBackend):
             object_key=object_key,
         )
 
+    def put_part_files(
+        self,
+        part_paths: Iterable[Path],
+        content_type: str | None = None,
+        expected_digest: str | None = None,
+        progress_callback: StorageProgressCallback | None = None,
+    ) -> StoredBlob:
+        del content_type
+        self.ensure()
+        staging_dir = self.root / ".vault-staging"
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        temp_path = staging_dir / f"upload-{uuid.uuid4().hex}.tmp"
+        digest = hashlib.sha256()
+        size_bytes = 0
+        try:
+            with temp_path.open("xb") as output:
+                for part_path in part_paths:
+                    with part_path.open("rb") as source:
+                        while True:
+                            chunk = source.read(STORAGE_CHUNK_SIZE)
+                            if not chunk:
+                                break
+                            digest.update(chunk)
+                            size_bytes += len(chunk)
+                            output.write(chunk)
+                            if progress_callback:
+                                progress_callback(size_bytes)
+            actual_digest = digest.hexdigest()
+            if expected_digest and actual_digest != expected_digest.lower():
+                raise StorageChecksumMismatch("Upload checksum mismatch")
+            object_key = object_key_for_hash("sha256", actual_digest)
+            target = self._object_path(object_key)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.exists():
+                temp_path.unlink(missing_ok=True)
+            else:
+                temp_path.replace(target)
+        except Exception:
+            temp_path.unlink(missing_ok=True)
+            raise
+        return StoredBlob(
+            hash_algo="sha256",
+            digest=actual_digest,
+            size_bytes=size_bytes,
+            backend=self.name,
+            bucket=self.bucket,
+            object_key=object_key,
+        )
+
     def read_bytes(self, object_key: str, bucket: str | None = None) -> bytes:
         del bucket
         with self.open_reader(object_key) as reader:
@@ -197,6 +334,24 @@ class LocalBlobStorage(BlobStorageBackend):
             raise StorageNotFoundError("Blob missing from storage")
         with target.open("rb") as source:
             yield source
+
+    @contextmanager
+    def open_range_reader(
+        self,
+        object_key: str,
+        start: int,
+        end: int,
+        bucket: str | None = None,
+    ) -> Iterator[BlobReader]:
+        del bucket
+        if start < 0 or end < start:
+            raise StorageConfigurationError("Invalid byte range")
+        target = self._object_path(object_key)
+        if not target.exists() or not target.is_file():
+            raise StorageNotFoundError("Blob missing from storage")
+        with target.open("rb") as source:
+            source.seek(start)
+            yield LimitedBlobReader(source, end - start + 1)
 
     def list_object_keys(self) -> list[str]:
         self.ensure()
@@ -303,6 +458,53 @@ class S3CompatibleBlobStorage(BlobStorageBackend):
             object_key=object_key,
         )
 
+    def put_part_files(
+        self,
+        part_paths: Iterable[Path],
+        content_type: str | None = None,
+        expected_digest: str | None = None,
+        progress_callback: StorageProgressCallback | None = None,
+    ) -> StoredBlob:
+        paths = list(part_paths)
+        digest = hashlib.sha256()
+        size_bytes = 0
+        for part_path in paths:
+            with part_path.open("rb") as source:
+                while True:
+                    chunk = source.read(STORAGE_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    size_bytes += len(chunk)
+                    if progress_callback:
+                        progress_callback(size_bytes)
+        actual_digest = digest.hexdigest()
+        if expected_digest and actual_digest != expected_digest.lower():
+            raise StorageChecksumMismatch("Upload checksum mismatch")
+        object_key = object_key_for_hash("sha256", actual_digest)
+        try:
+            self.client.head_object(Bucket=self.bucket, Key=object_key)
+        except Exception:
+            upload_kwargs: dict[str, Any] = {}
+            if content_type:
+                upload_kwargs["ExtraArgs"] = {"ContentType": content_type}
+            reader = PathSequenceReader(paths, progress_callback, size_bytes)
+            try:
+                self.client.upload_fileobj(reader, self.bucket, object_key, **upload_kwargs)
+            finally:
+                reader.close()
+        else:
+            if progress_callback:
+                progress_callback(size_bytes * 2)
+        return StoredBlob(
+            hash_algo="sha256",
+            digest=actual_digest,
+            size_bytes=size_bytes,
+            backend=self.name,
+            bucket=self.bucket,
+            object_key=object_key,
+        )
+
     def read_bytes(self, object_key: str, bucket: str | None = None) -> bytes:
         with self.open_reader(object_key, bucket) as reader:
             return reader.read()
@@ -315,6 +517,30 @@ class S3CompatibleBlobStorage(BlobStorageBackend):
     ) -> Iterator[BlobReader]:
         try:
             response = self.client.get_object(Bucket=bucket or self.bucket, Key=object_key)
+        except Exception as exc:
+            raise StorageNotFoundError("Blob missing from storage") from exc
+        body = response["Body"]
+        try:
+            yield body
+        finally:
+            body.close()
+
+    @contextmanager
+    def open_range_reader(
+        self,
+        object_key: str,
+        start: int,
+        end: int,
+        bucket: str | None = None,
+    ) -> Iterator[BlobReader]:
+        if start < 0 or end < start:
+            raise StorageConfigurationError("Invalid byte range")
+        try:
+            response = self.client.get_object(
+                Bucket=bucket or self.bucket,
+                Key=object_key,
+                Range=f"bytes={start}-{end}",
+            )
         except Exception as exc:
             raise StorageNotFoundError("Blob missing from storage") from exc
         body = response["Body"]

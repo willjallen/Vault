@@ -180,6 +180,32 @@ class DatabaseInitTests(unittest.TestCase):
                 db_module.engine.dispose()
                 restore_runtime(snapshot)
 
+    def test_missing_upload_verification_columns_are_added_without_dropping_data(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="vault-db-init-") as temp_dir:
+            db_path = Path(temp_dir) / "vault.db"
+            snapshot = snapshot_runtime()
+            try:
+                db_module.configure_database(db_path)
+                db_module.Base.metadata.create_all(bind=db_module.engine)
+                with sqlite3.connect(db_path) as conn:
+                    conn.execute("ALTER TABLE upload_sessions DROP COLUMN verification_total_bytes")
+                    conn.execute(
+                        "ALTER TABLE upload_sessions DROP COLUMN verification_processed_bytes",
+                    )
+
+                db_module.init_db()
+
+                with sqlite3.connect(db_path) as conn:
+                    columns = {
+                        row[1]
+                        for row in conn.execute("PRAGMA table_info(upload_sessions)").fetchall()
+                    }
+                self.assertIn("verification_total_bytes", columns)
+                self.assertIn("verification_processed_bytes", columns)
+            finally:
+                db_module.engine.dispose()
+                restore_runtime(snapshot)
+
     def test_missing_model_index_is_rejected_on_startup(self) -> None:
         with tempfile.TemporaryDirectory(prefix="vault-db-init-") as temp_dir:
             db_path = Path(temp_dir) / "vault.db"

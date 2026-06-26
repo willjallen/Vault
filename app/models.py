@@ -250,6 +250,79 @@ class BlobLocation(Base):
     blob: Mapped[Blob] = relationship("Blob", back_populates="locations")
 
 
+class UploadSession(Base):
+    __tablename__ = "upload_sessions"
+    __table_args__ = (
+        Index("ix_upload_sessions_owner_status", "created_by", "status"),
+        Index("ix_upload_sessions_expires_at", "expires_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    mode: Mapped[str] = mapped_column(String, nullable=False)
+    status: Mapped[str] = mapped_column(String, default="active", nullable=False)
+    folder_path: Mapped[str | None] = mapped_column(String, nullable=True)
+    document_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("documents.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    filename: Mapped[str] = mapped_column(String, nullable=False)
+    total_size: Mapped[int] = mapped_column(Integer, nullable=False)
+    chunk_size: Mapped[int] = mapped_column(Integer, nullable=False)
+    part_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    verification_total_bytes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    verification_processed_bytes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    mime_type: Mapped[str | None] = mapped_column(String, nullable=True)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    rename_to_upload: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_by: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    created_by_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    user_context: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
+    upload_ip: Mapped[str | None] = mapped_column(String, nullable=True)
+    upload_user_agent: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=utcnow)
+    expires_at: Mapped[datetime.datetime] = mapped_column(DateTime, nullable=False)
+    completed_at: Mapped[datetime.datetime | None] = mapped_column(DateTime, nullable=True)
+    aborted_at: Mapped[datetime.datetime | None] = mapped_column(DateTime, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    result_document_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    result_version_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    result_path: Mapped[str | None] = mapped_column(String, nullable=True)
+
+    document: Mapped["Document | None"] = relationship("Document")
+    parts: Mapped[list["UploadPart"]] = relationship(
+        "UploadPart",
+        back_populates="session",
+        cascade="all, delete-orphan",
+    )
+
+
+class UploadPart(Base):
+    __tablename__ = "upload_parts"
+    __table_args__ = (
+        UniqueConstraint("session_id", "part_number", name="uq_upload_part_number"),
+        Index("ix_upload_parts_session_offset", "session_id", "offset_bytes"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    session_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("upload_sessions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    part_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    offset_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    sha256: Mapped[str] = mapped_column(String, nullable=False)
+    storage_path: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=utcnow)
+
+    session: Mapped[UploadSession] = relationship("UploadSession", back_populates="parts")
+
+
 class Document(Base):
     __tablename__ = "documents"
     __table_args__ = (
@@ -392,6 +465,67 @@ class DocumentEvent(Base):
     user_agent: Mapped[str | None] = mapped_column(String, nullable=True)
 
     document: Mapped[Document] = relationship("Document", back_populates="events")
+
+
+class ExportJob(Base):
+    __tablename__ = "export_jobs"
+    __table_args__ = (
+        Index("ix_export_jobs_owner_status", "created_by", "status"),
+        Index("ix_export_jobs_expires_at", "expires_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    status: Mapped[str] = mapped_column(String, default="queued", nullable=False)
+    created_by: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    created_by_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    user_context: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
+    request_payload: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
+    filename: Mapped[str] = mapped_column(String, nullable=False)
+    total_items: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    processed_items: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    total_bytes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    processed_bytes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=utcnow)
+    expires_at: Mapped[datetime.datetime] = mapped_column(DateTime, nullable=False)
+    completed_at: Mapped[datetime.datetime | None] = mapped_column(DateTime, nullable=True)
+    cancelled_at: Mapped[datetime.datetime | None] = mapped_column(DateTime, nullable=True)
+
+    artifacts: Mapped[list["ExportArtifact"]] = relationship(
+        "ExportArtifact",
+        back_populates="job",
+        cascade="all, delete-orphan",
+    )
+
+
+class ExportArtifact(Base):
+    __tablename__ = "export_artifacts"
+    __table_args__ = (UniqueConstraint("job_id", name="uq_export_artifact_job"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    job_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("export_jobs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    blob_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("blobs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    filename: Mapped[str] = mapped_column(String, nullable=False)
+    mime_type: Mapped[str] = mapped_column(String, default="application/zip", nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    hash_algo: Mapped[str] = mapped_column(String, default="sha256", nullable=False)
+    hash: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=utcnow)
+    expires_at: Mapped[datetime.datetime] = mapped_column(DateTime, nullable=False, index=True)
+
+    job: Mapped[ExportJob] = relationship("ExportJob", back_populates="artifacts")
+    blob: Mapped[Blob] = relationship("Blob")
 
 
 class StateEvent(Base):

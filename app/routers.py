@@ -8,17 +8,31 @@ import logging
 import mimetypes
 import re
 import secrets
+import shutil
 import tempfile
+import threading
+import time
+import uuid
 import zipfile
 from collections import defaultdict
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, cast
+from typing import Any, Literal, cast
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Response, UploadFile
-from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Request,
+    Response,
+    UploadFile,
+)
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
@@ -38,8 +52,12 @@ from .config import (
     AUTH_MODE,
     BASE_DOMAIN,
     DEV_MODE,
+    EXPORT_TTL_SECONDS,
     MAX_UPLOAD_BYTES,
     SITE_NAME,
+    TRANSFER_CHUNK_BYTES,
+    TRANSFER_SESSION_TTL_SECONDS,
+    TRANSFERS_PATH,
     TTL_SWEEP_INTERVAL_SECONDS,
 )
 from .db import SessionLocal, get_db
@@ -50,11 +68,15 @@ from .models import (
     DocumentEvent,
     DocumentLock,
     DocumentVersion,
+    ExportArtifact,
+    ExportJob,
     Folder,
     FolderEvent,
     FolderPermission,
     ShareLink,
     StateEvent,
+    UploadPart,
+    UploadSession,
     VaultGroup,
     VaultGroupMembership,
     VaultUser,
@@ -70,9 +92,12 @@ from .site_settings import (
     site_settings_for_db,
 )
 from .storage import (
+    BlobReader,
+    StorageChecksumMismatch,
     StorageConfigurationError,
     StorageError,
     StorageNotFoundError,
+    StorageProgressCallback,
     StoredBlob,
     get_storage_backend,
     new_version_id,
@@ -118,12 +143,18 @@ def configure_router_runtime(
     auth_mode: str | None = None,
     base_domain: str | None = None,
     dev_mode: bool | None = None,
+    export_ttl_seconds: int | None = None,
     max_upload_bytes: int | None = None,
     site_name: str | None = None,
+    transfer_chunk_bytes: int | None = None,
+    transfers_path: str | Path | None = None,
+    transfer_session_ttl_seconds: int | None = None,
     ttl_sweep_interval_seconds: int | None = None,
 ) -> None:
     """Configure process-local route globals that are normally loaded from env."""
-    global AUTH_MODE, BASE_DOMAIN, DEV_MODE, MAX_UPLOAD_BYTES, SITE_NAME, TTL_SWEEP_INTERVAL_SECONDS
+    global AUTH_MODE, BASE_DOMAIN, DEV_MODE, EXPORT_TTL_SECONDS, MAX_UPLOAD_BYTES, SITE_NAME
+    global TRANSFER_CHUNK_BYTES, TRANSFERS_PATH, TRANSFER_SESSION_TTL_SECONDS
+    global TTL_SWEEP_INTERVAL_SECONDS
     global _debug_event_stream_generation, _debug_event_stream_retry_ms
 
     from . import config
@@ -145,6 +176,18 @@ def configure_router_runtime(
     if max_upload_bytes is not None:
         MAX_UPLOAD_BYTES = max(1, int(max_upload_bytes))
         config.MAX_UPLOAD_BYTES = MAX_UPLOAD_BYTES
+    if transfer_chunk_bytes is not None:
+        TRANSFER_CHUNK_BYTES = max(1, int(transfer_chunk_bytes))
+        config.TRANSFER_CHUNK_BYTES = TRANSFER_CHUNK_BYTES
+    if transfers_path is not None:
+        TRANSFERS_PATH = Path(transfers_path).resolve()
+        config.TRANSFERS_PATH = TRANSFERS_PATH
+    if transfer_session_ttl_seconds is not None:
+        TRANSFER_SESSION_TTL_SECONDS = max(60, int(transfer_session_ttl_seconds))
+        config.TRANSFER_SESSION_TTL_SECONDS = TRANSFER_SESSION_TTL_SECONDS
+    if export_ttl_seconds is not None:
+        EXPORT_TTL_SECONDS = max(60, int(export_ttl_seconds))
+        config.EXPORT_TTL_SECONDS = EXPORT_TTL_SECONDS
     if ttl_sweep_interval_seconds is not None:
         TTL_SWEEP_INTERVAL_SECONDS = max(10, ttl_sweep_interval_seconds)
         config.TTL_SWEEP_INTERVAL_SECONDS = TTL_SWEEP_INTERVAL_SECONDS
@@ -189,6 +232,10 @@ class TempDownload:
 
     def cleanup(self) -> None:
         self.path.unlink(missing_ok=True)
+
+
+class ExportCancelled(Exception):
+    """Raised when an export job is cancelled while writing bytes."""
 
 
 class ActionItem(BaseModel):
@@ -246,6 +293,21 @@ class ShareLinkPayload(BaseModel):
     document_id: int | None = None
     folder_id: int | None = None
     path: str | None = None
+
+
+class UploadSessionPayload(BaseModel):
+    mode: Literal["create", "checkin"] = "create"
+    filename: str
+    size_bytes: int
+    mime_type: str | None = None
+    folder: str = ""
+    document_id: int | None = None
+    note: str | None = None
+    rename_to_upload: bool = False
+
+
+class CompleteUploadPayload(BaseModel):
+    sha256: str | None = None
 
 
 class UserPreferencesPayload(BaseModel):
@@ -1182,6 +1244,41 @@ def get_or_create_blob_for_upload(
     return get_or_create_blob_for_stored_blob(db, stored)
 
 
+def upload_part_paths(session: UploadSession) -> list[Path]:
+    paths: list[Path] = []
+    for part_number in range(1, session.part_count + 1):
+        part_path = upload_part_path(session.id, part_number)
+        if not part_path.exists():
+            raise HTTPException(status_code=400, detail="Upload session has missing parts")
+        paths.append(part_path)
+    return paths
+
+
+def get_or_create_blob_for_upload_session(
+    db: Session,
+    session: UploadSession,
+    content_type: str | None,
+    expected_sha256: str | None,
+    progress_callback: StorageProgressCallback | None = None,
+) -> Blob:
+    try:
+        stored = get_storage_backend().put_part_files(
+            upload_part_paths(session),
+            content_type,
+            expected_sha256,
+            progress_callback,
+        )
+    except StorageChecksumMismatch as exc:
+        raise HTTPException(status_code=400, detail="Upload checksum mismatch") from exc
+    except StorageConfigurationError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except StorageError as exc:
+        raise HTTPException(status_code=500, detail="Storage write failed") from exc
+    if stored.size_bytes != session.total_size:
+        raise HTTPException(status_code=400, detail="Upload size does not match session")
+    return get_or_create_blob_for_stored_blob(db, stored)
+
+
 def create_document_version(
     db: Session,
     doc: Document,
@@ -1435,6 +1532,733 @@ def download_response(data: bytes, filename: str, mime_type: str | None = None) 
         media_type=content_type,
         headers=download_headers(safe_name, len(data)),
     )
+
+
+@dataclass(frozen=True)
+class ByteRange:
+    start: int
+    end: int
+    status_code: int
+
+
+def blob_etag(blob: Blob) -> str:
+    return f'"{blob.hash_algo}-{blob.hash}-{blob.size_bytes}"'
+
+
+def parse_range_header(
+    range_header: str | None,
+    if_range: str | None,
+    size_bytes: int,
+    etag: str,
+) -> ByteRange:
+    if size_bytes <= 0:
+        return ByteRange(start=0, end=-1, status_code=200)
+    if if_range and if_range.strip() != etag:
+        range_header = None
+    if not range_header:
+        return ByteRange(start=0, end=size_bytes - 1, status_code=200)
+    value = range_header.strip()
+    if not value.startswith("bytes=") or "," in value:
+        raise HTTPException(
+            status_code=416,
+            detail="Invalid byte range",
+            headers={"Content-Range": f"bytes */{size_bytes}"},
+        )
+    spec = value.removeprefix("bytes=").strip()
+    if "-" not in spec:
+        raise HTTPException(
+            status_code=416,
+            detail="Invalid byte range",
+            headers={"Content-Range": f"bytes */{size_bytes}"},
+        )
+    raw_start, raw_end = spec.split("-", 1)
+    try:
+        if raw_start == "":
+            suffix_length = int(raw_end)
+            if suffix_length <= 0:
+                raise ValueError
+            start = max(size_bytes - suffix_length, 0)
+            end = size_bytes - 1
+        else:
+            start = int(raw_start)
+            end = int(raw_end) if raw_end else size_bytes - 1
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=416,
+            detail="Invalid byte range",
+            headers={"Content-Range": f"bytes */{size_bytes}"},
+        ) from exc
+    if start < 0 or end < start or start >= size_bytes:
+        raise HTTPException(
+            status_code=416,
+            detail="Invalid byte range",
+            headers={"Content-Range": f"bytes */{size_bytes}"},
+        )
+    return ByteRange(start=start, end=min(end, size_bytes - 1), status_code=206)
+
+
+def iter_blob_reader(reader: object, close: object, limit: int) -> Iterator[bytes]:
+    remaining = limit
+    try:
+        while remaining > 0:
+            chunk_size = min(STREAM_CHUNK_SIZE, remaining)
+            chunk = cast(BlobReader, reader).read(chunk_size)
+            if not chunk:
+                break
+            remaining -= len(chunk)
+            yield chunk
+    finally:
+        cast(Any, close)(None, None, None)
+
+
+def blob_streaming_response(
+    blob: Blob,
+    filename: str,
+    mime_type: str | None,
+    request: Request,
+) -> StreamingResponse:
+    size_bytes = blob.size_bytes
+    etag = blob_etag(blob)
+    byte_range = parse_range_header(
+        request.headers.get("range"),
+        request.headers.get("if-range"),
+        size_bytes,
+        etag,
+    )
+    safe_name = safe_download_name(filename)
+    headers = download_headers(
+        safe_name,
+        0 if byte_range.end < byte_range.start else byte_range.end - byte_range.start + 1,
+    )
+    headers["Accept-Ranges"] = "bytes"
+    headers["ETag"] = etag
+    if byte_range.status_code == 206:
+        headers["Content-Range"] = f"bytes {byte_range.start}-{byte_range.end}/{size_bytes}"
+    if size_bytes <= 0:
+        return StreamingResponse(
+            iter(()),
+            media_type=sanitize_mime_type(mime_type, safe_name),
+            headers=headers,
+            status_code=200,
+        )
+    location = location_for_blob(blob)
+    try:
+        context = get_storage_backend(location.backend).open_range_reader(
+            location.object_key,
+            byte_range.start,
+            byte_range.end,
+            location.bucket,
+        )
+        reader = context.__enter__()
+    except StorageNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Blob missing from storage") from exc
+    except StorageConfigurationError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except StorageError as exc:
+        raise HTTPException(status_code=500, detail="Storage read failed") from exc
+    return StreamingResponse(
+        iter_blob_reader(
+            reader,
+            context.__exit__,
+            byte_range.end - byte_range.start + 1,
+        ),
+        media_type=sanitize_mime_type(mime_type, safe_name),
+        headers=headers,
+        status_code=byte_range.status_code,
+    )
+
+
+def version_streaming_response(
+    version: DocumentVersion,
+    filename: str,
+    mime_type: str | None,
+    request: Request,
+) -> StreamingResponse:
+    return blob_streaming_response(version.blob, filename, mime_type, request)
+
+
+def transfer_user_payload(user: UserContext) -> dict[str, object]:
+    return {
+        "id": user["id"],
+        "vault_user_id": user.get("vault_user_id", 0),
+        "issuer": user.get("issuer", ""),
+        "subject": user.get("subject", ""),
+        "name": user.get("name", ""),
+        "email": user.get("email", ""),
+        "groups": list(user.get("groups", [])),
+        "is_admin": bool(user.get("is_admin", False)),
+    }
+
+
+def transfer_user_context(session: UploadSession | ExportJob) -> UserContext:
+    payload = dict(session.user_context or {})
+    raw_vault_user_id = payload.get("vault_user_id", 0) or 0
+    raw_groups = payload.get("groups", [])
+    groups = raw_groups if isinstance(raw_groups, list) else []
+    return {
+        "id": str(payload.get("id", session.created_by)),
+        "vault_user_id": int(cast(int | str, raw_vault_user_id)),
+        "issuer": str(payload.get("issuer", "")),
+        "subject": str(payload.get("subject", "")),
+        "name": str(payload.get("name", session.created_by_name or session.created_by)),
+        "email": str(payload.get("email", "")),
+        "groups": [str(group) for group in groups],
+        "is_admin": bool(payload.get("is_admin", False)),
+    }
+
+
+def transfer_owner_required(owner_id: str, user: UserContext) -> None:
+    if str(user["id"]) != owner_id and not user["is_admin"]:
+        raise HTTPException(status_code=404, detail="Transfer not found")
+
+
+def transfer_expires_at(seconds: int) -> dt.datetime:
+    return now_utc() + dt.timedelta(seconds=seconds)
+
+
+def upload_session_dir(session_id: str) -> Path:
+    return TRANSFERS_PATH / "uploads" / session_id
+
+
+def upload_part_path(session_id: str, part_number: int) -> Path:
+    return upload_session_dir(session_id) / f"{part_number:08d}.part"
+
+
+def clear_upload_session_files(session_id: str) -> None:
+    shutil.rmtree(upload_session_dir(session_id), ignore_errors=True)
+
+
+def clear_upload_session_parts(session: UploadSession) -> None:
+    session.parts.clear()
+
+
+def uploaded_parts_by_number(session: UploadSession) -> dict[int, UploadPart]:
+    return {part.part_number: part for part in session.parts}
+
+
+def upload_session_payload(session: UploadSession) -> dict[str, object]:
+    uploaded_parts = [
+        {
+            "part_number": part.part_number,
+            "offset": part.offset_bytes,
+            "size_bytes": part.size_bytes,
+            "sha256": part.sha256,
+        }
+        for part in sorted(session.parts, key=lambda item: item.part_number)
+    ]
+    uploaded_bytes = sum(part.size_bytes for part in session.parts)
+    verification_total = session.verification_total_bytes
+    verification_processed = session.verification_processed_bytes
+    if session.status == "complete":
+        verification_total = session.total_size
+        verification_processed = session.total_size
+    verification = (
+        {
+            "processed_bytes": min(verification_processed, verification_total),
+            "total_bytes": verification_total,
+        }
+        if verification_total and session.status in {"completing", "complete"}
+        else None
+    )
+    return {
+        "id": session.id,
+        "mode": session.mode,
+        "status": session.status,
+        "filename": session.filename,
+        "size_bytes": session.total_size,
+        "chunk_size": session.chunk_size,
+        "part_count": session.part_count,
+        "uploaded_bytes": uploaded_bytes,
+        "uploaded_parts": uploaded_parts,
+        "verification": verification,
+        "expires_at": session.expires_at.isoformat() if session.expires_at else None,
+        "result": upload_session_result(session),
+    }
+
+
+def upload_session_result(session: UploadSession) -> dict[str, object] | None:
+    if session.status != "complete":
+        return None
+    return {
+        "id": session.result_document_id,
+        "version": session.result_version_id,
+        "path": session.result_path,
+    }
+
+
+def expected_part_bounds(session: UploadSession, part_number: int) -> tuple[int, int]:
+    if part_number < 1 or part_number > session.part_count:
+        raise HTTPException(status_code=400, detail="Invalid part number")
+    offset = (part_number - 1) * session.chunk_size
+    size = min(session.chunk_size, session.total_size - offset)
+    return offset, size
+
+
+def ensure_active_upload_session(session: UploadSession, db: Session | None = None) -> None:
+    if session.status != "active":
+        raise HTTPException(status_code=409, detail=f"Upload session is {session.status}")
+    expires_at = normalize_timestamp(session.expires_at)
+    if expires_at is not None and expires_at <= now_utc():
+        session.status = "expired"
+        session.updated_at = now_utc()
+        clear_upload_session_parts(session)
+        clear_upload_session_files(session.id)
+        if db is not None:
+            db.commit()
+        raise HTTPException(status_code=410, detail="Upload session expired")
+
+
+async def spool_upload_part_body(
+    request: Request,
+    expected_size: int,
+    expected_sha256: str | None,
+    temp_dir: Path,
+) -> tuple[Path, str, int]:
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    temp_file = tempfile.NamedTemporaryFile(
+        prefix="vault-upload-part-",
+        dir=temp_dir,
+        delete=False,
+    )
+    temp_path = Path(temp_file.name)
+    digest = hashlib.sha256()
+    size_bytes = 0
+    try:
+        with temp_file:
+            async for chunk in request.stream():
+                if not chunk:
+                    continue
+                size_bytes += len(chunk)
+                if size_bytes > expected_size:
+                    raise HTTPException(status_code=413, detail="Upload part is too large")
+                digest.update(chunk)
+                temp_file.write(chunk)
+    except HTTPException:
+        temp_path.unlink(missing_ok=True)
+        raise
+    except Exception as exc:
+        temp_path.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=400, detail="Upload failed while reading request body"
+        ) from exc
+    actual_sha256 = digest.hexdigest()
+    if size_bytes != expected_size:
+        temp_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="Upload part size does not match session")
+    if expected_sha256 and actual_sha256 != expected_sha256.lower():
+        temp_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="Upload part checksum mismatch")
+    return temp_path, actual_sha256, size_bytes
+
+
+def mark_upload_session_failed(session_id: str, message: str) -> None:
+    with SessionLocal() as db:
+        session = db.get(UploadSession, session_id)
+        if session and session.status not in {"complete", "aborted"}:
+            session.status = "failed"
+            session.error = message
+            session.updated_at = now_utc()
+            clear_upload_session_parts(session)
+            db.commit()
+            clear_upload_session_files(session.id)
+
+
+def reserve_upload_completion(session: UploadSession, db: Session) -> None:
+    ensure_active_upload_session(session, db)
+    parts_by_number = uploaded_parts_by_number(session)
+    missing = [
+        part_number
+        for part_number in range(1, session.part_count + 1)
+        if part_number not in parts_by_number
+    ]
+    if missing:
+        raise HTTPException(status_code=400, detail="Upload session has missing parts")
+    session.status = "completing"
+    session.verification_total_bytes = session.total_size
+    session.verification_processed_bytes = 0
+    session.updated_at = now_utc()
+    db.commit()
+
+
+def upload_verification_progress_callback(
+    db: Session,
+    session_id: str,
+    total_size: int,
+) -> StorageProgressCallback:
+    last_processed = -1
+    last_reported_at = 0.0
+    minimum_step = max(STREAM_CHUNK_SIZE * 8, total_size // 100 if total_size else 0)
+
+    def report(processed_bytes: int) -> None:
+        nonlocal last_processed, last_reported_at
+        processed = min(max(processed_bytes, 0), total_size)
+        monotonic_now = time.monotonic()
+        if (
+            processed < total_size
+            and processed - last_processed < minimum_step
+            and monotonic_now - last_reported_at < 0.25
+        ):
+            return
+        session = db.get(UploadSession, session_id)
+        if not session or session.status != "completing":
+            return
+        session.verification_total_bytes = total_size
+        session.verification_processed_bytes = processed
+        session.updated_at = now_utc()
+        db.commit()
+        last_processed = processed
+        last_reported_at = monotonic_now
+
+    return report
+
+
+def upload_completion_verification_multiplier() -> int:
+    backend = get_storage_backend()
+    return 2 if backend.name in {"s3", "r2"} else 1
+
+
+def complete_upload_session_document(
+    session: UploadSession,
+    expected_sha256: str | None,
+    user: UserContext,
+    db: Session,
+) -> dict[str, object]:
+    actor = transfer_user_context(session)
+    meta = {"ip": session.upload_ip, "user_agent": session.upload_user_agent}
+    mime_type = sanitize_mime_type(session.mime_type, session.filename)
+    verification_total = session.total_size * upload_completion_verification_multiplier()
+    if session.mode == "create":
+        folder_path_value = normalize_folder(session.folder_path or "")
+        require_write_for_folder_path(db, folder_path_value, user)
+        target_folder = get_or_create_folder_path(db, folder_path_value)
+        ensure_unique_document_path(db, target_folder.id, session.filename)
+        blob = get_or_create_blob_for_upload_session(
+            db,
+            session,
+            mime_type,
+            expected_sha256,
+            upload_verification_progress_callback(db, session.id, verification_total),
+        )
+        doc = Document(
+            folder_id=target_folder.id,
+            name=session.filename,
+            created_by=actor["id"],
+            created_by_name=actor["name"],
+            latest_modified_by=actor["id"],
+            latest_modified_at=now_utc(),
+        )
+        apply_folder_ttl(doc, target_folder, doc.latest_modified_at)
+        db.add(doc)
+        db.flush()
+        version = create_document_version(
+            db,
+            doc,
+            blob,
+            actor,
+            meta,
+            session.filename,
+            mime_type,
+            f"Uploaded {session.filename}",
+            "upload",
+        )
+        result_path = join_path(folder_path_value, session.filename)
+    elif session.mode == "checkin":
+        doc = get_document_or_404(session.document_id or 0, db)
+        refresh_editable_document(doc, db)
+        require_document_access(doc, user, db, 3)
+        lock = get_active_lock(doc, db)
+        if not lock or lock.locked_by != user["id"]:
+            raise HTTPException(
+                status_code=403,
+                detail="Check out the file before uploading a new version",
+            )
+        if session.rename_to_upload and session.filename != doc.name:
+            ensure_unique_document_path(db, doc.folder_id, session.filename, doc.id)
+            record_event(
+                doc,
+                actor,
+                "move",
+                f"Renamed {doc.name} to {session.filename}",
+                db,
+                meta=meta,
+            )
+            doc.name = session.filename
+        blob = get_or_create_blob_for_upload_session(
+            db,
+            session,
+            mime_type,
+            expected_sha256,
+            upload_verification_progress_callback(db, session.id, verification_total),
+        )
+        version = create_document_version(
+            db,
+            doc,
+            blob,
+            actor,
+            meta,
+            session.filename,
+            mime_type,
+            (session.note or "").strip() or f"Uploaded {session.filename}",
+            "checkin",
+        )
+        release_lock(lock, actor)
+        record_event(
+            doc,
+            actor,
+            "release",
+            f"Released lock for {document_path(doc)}",
+            db,
+            meta=meta,
+        )
+        result_path = document_path(doc)
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported upload session mode")
+    session.status = "complete"
+    session.verification_total_bytes = session.total_size
+    session.verification_processed_bytes = session.total_size
+    session.completed_at = now_utc()
+    session.updated_at = session.completed_at
+    session.result_document_id = doc.id
+    session.result_version_id = version.id
+    session.result_path = result_path
+    record_state_change(db, "document.upload.complete", ("contents", "sidebar", "document_detail"))
+    db.commit()
+    clear_upload_session_files(session.id)
+    return {"id": doc.id, "version": version.id, "path": result_path}
+
+
+def export_job_payload(job: ExportJob) -> dict[str, object]:
+    artifact = job.artifacts[0] if job.artifacts else None
+    return {
+        "id": job.id,
+        "status": job.status,
+        "filename": job.filename,
+        "total_items": job.total_items,
+        "processed_items": job.processed_items,
+        "total_bytes": job.total_bytes,
+        "processed_bytes": job.processed_bytes,
+        "error": job.error,
+        "expires_at": job.expires_at.isoformat() if job.expires_at else None,
+        "download_url": f"/api/exports/{job.id}/download" if artifact else None,
+        "size_bytes": artifact.size_bytes if artifact else None,
+    }
+
+
+def hash_file(path: Path) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    size_bytes = 0
+    with path.open("rb") as source:
+        while True:
+            chunk = source.read(STREAM_CHUNK_SIZE)
+            if not chunk:
+                break
+            size_bytes += len(chunk)
+            digest.update(chunk)
+    return digest.hexdigest(), size_bytes
+
+
+def write_version_to_zip(
+    archive: zipfile.ZipFile,
+    archive_name: str,
+    version: DocumentVersion,
+    *,
+    progress_callback: Callable[[int], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+) -> int:
+    location = location_for_blob(version.blob)
+    digest = hashlib.sha256()
+    size_bytes = 0
+    try:
+        with get_storage_backend(location.backend).open_reader(
+            location.object_key,
+            location.bucket,
+        ) as reader:
+            with archive.open(archive_name, "w") as target:
+                while True:
+                    if should_cancel and should_cancel():
+                        raise ExportCancelled
+                    chunk = reader.read(STREAM_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    size_bytes += len(chunk)
+                    digest.update(chunk)
+                    target.write(chunk)
+                    if progress_callback:
+                        progress_callback(len(chunk))
+    except StorageNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Blob missing from storage") from exc
+    except StorageConfigurationError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except StorageError as exc:
+        raise HTTPException(status_code=500, detail="Storage read failed") from exc
+    if (
+        version.blob.hash_algo != "sha256"
+        or size_bytes != version.blob.size_bytes
+        or digest.hexdigest() != version.blob.hash
+    ):
+        raise HTTPException(status_code=500, detail="Blob content does not match metadata")
+    return size_bytes
+
+
+def export_docs_for_job(job: ExportJob, db: Session) -> list[Document]:
+    raw_items_value = (job.request_payload or {}).get("items") or []
+    raw_items = raw_items_value if isinstance(raw_items_value, list) else []
+    action_items = [ActionItem(**item) for item in raw_items if isinstance(item, dict)]
+    items = normalize_action_items(require_action_items(ActionPayload(items=action_items)), db)
+    user = transfer_user_context(job)
+    docs_to_download: list[Document] = []
+    for item in items:
+        if item.type == "document":
+            doc = get_document_or_404(item.id or 0, db)
+            require_document_access(doc, user, db, 2)
+            docs_to_download.append(doc)
+        else:
+            folder_item = get_folder_for_action(item, db)
+            require_folder_access(folder_item, user, db, 2)
+            docs_to_download.extend(readable_docs_in_folder_subtree(db, folder_item, user))
+    unique_docs = list({doc.id: doc for doc in docs_to_download}.values())
+    for doc in unique_docs:
+        require_document_access(doc, user, db, 2)
+    return unique_docs
+
+
+def run_export_job(job_id: str) -> None:
+    zip_temp = tempfile.NamedTemporaryFile(prefix="vault-export-", suffix=".zip", delete=False)
+    zip_path = Path(zip_temp.name)
+    zip_temp.close()
+    try:
+        with SessionLocal() as db:
+            job = db.get(ExportJob, job_id)
+            if not job or job.status != "queued":
+                return
+            export_job = job
+            export_job.status = "running"
+            export_job.updated_at = now_utc()
+            db.commit()
+
+            user = transfer_user_context(export_job)
+            docs = export_docs_for_job(export_job, db)
+            versions: list[tuple[Document, DocumentVersion]] = []
+            total_bytes = 0
+            for doc in docs:
+                version = current_version(doc, db)
+                if not version:
+                    continue
+                versions.append((doc, version))
+                total_bytes += version.blob.size_bytes
+            export_job.total_items = len(versions)
+            export_job.total_bytes = total_bytes
+            export_job.updated_at = now_utc()
+            db.commit()
+
+            errors: list[str] = []
+            written: set[str] = set()
+            pending_processed_bytes = 0
+            last_cancel_check = 0.0
+            last_progress_commit = 0.0
+
+            def export_is_cancelled() -> bool:
+                nonlocal last_cancel_check
+                monotonic_now = time.monotonic()
+                if monotonic_now - last_cancel_check < 0.25:
+                    return export_job.status == "cancelled"
+                db.refresh(export_job)
+                last_cancel_check = monotonic_now
+                return export_job.status == "cancelled"
+
+            def flush_export_progress(force: bool = False) -> None:
+                nonlocal last_progress_commit, pending_processed_bytes
+                if pending_processed_bytes <= 0:
+                    return
+                monotonic_now = time.monotonic()
+                if not force and monotonic_now - last_progress_commit < 0.25:
+                    return
+                export_job.processed_bytes += pending_processed_bytes
+                pending_processed_bytes = 0
+                export_job.updated_at = now_utc()
+                db.commit()
+                last_progress_commit = monotonic_now
+
+            def record_export_progress(delta_bytes: int) -> None:
+                nonlocal pending_processed_bytes
+                pending_processed_bytes += delta_bytes
+                flush_export_progress()
+
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
+                for doc, version in versions:
+                    if export_is_cancelled():
+                        return
+                    archive_name = document_path(doc) or doc.name
+                    if archive_name in written:
+                        archive_name = f"{doc.id}-{archive_name}"
+                    try:
+                        write_version_to_zip(
+                            archive,
+                            archive_name,
+                            version,
+                            progress_callback=record_export_progress,
+                            should_cancel=export_is_cancelled,
+                        )
+                        flush_export_progress(force=True)
+                        written.add(archive_name)
+                        export_job.processed_items += 1
+                        record_event(
+                            doc,
+                            user,
+                            "download",
+                            f"Exported {document_path(doc)}",
+                            db,
+                            meta=SYSTEM_META,
+                            publish_state=False,
+                        )
+                    except HTTPException as exc:
+                        errors.append(f"{archive_name}: {response_detail(exc)}")
+                    export_job.updated_at = now_utc()
+                    db.commit()
+                if errors:
+                    archive.writestr("vault-download-errors.txt", "\n".join(errors))
+
+            db.refresh(export_job)
+            if export_job.status == "cancelled":
+                return
+            digest, size_bytes = hash_file(zip_path)
+            blob = get_or_create_blob_for_upload(
+                db,
+                UploadSpool(path=zip_path, digest=digest, size_bytes=size_bytes),
+                "application/zip",
+            )
+            artifact = ExportArtifact(
+                job_id=export_job.id,
+                blob_id=blob.id,
+                filename=export_job.filename,
+                mime_type="application/zip",
+                size_bytes=size_bytes,
+                hash_algo="sha256",
+                hash=digest,
+                expires_at=export_job.expires_at,
+            )
+            db.add(artifact)
+            export_job.status = "complete"
+            export_job.completed_at = now_utc()
+            export_job.updated_at = export_job.completed_at
+            db.commit()
+    except ExportCancelled:
+        return
+    except Exception as exc:
+        with SessionLocal() as db:
+            job = db.get(ExportJob, job_id)
+            if job:
+                job.status = "failed"
+                job.error = response_detail(exc) if isinstance(exc, HTTPException) else str(exc)
+                job.updated_at = now_utc()
+                db.commit()
+    finally:
+        zip_path.unlink(missing_ok=True)
+
+
+def start_export_job(job_id: str) -> None:
+    thread = threading.Thread(target=run_export_job, args=(job_id,), daemon=True)
+    thread.start()
 
 
 def sanitize_mime_type(mime_type: str | None, filename: str) -> str:
@@ -1841,6 +2665,9 @@ def document_row_payload(
         "created_at": doc.created_at.isoformat() if doc.created_at else None,
         "size_bytes": latest_size_bytes,
         "size_display": format_size(latest_size_bytes),
+        "download_url": f"/documents/{doc.id}/versions/{latest_version.id}/download"
+        if latest_version
+        else None,
         "lock": lock_payload(lock),
         "archived": archived,
     }
@@ -2860,11 +3687,72 @@ def sweep_expired_documents(limit: int = 250) -> dict[str, list[str]]:
             db.close()
 
 
+def sweep_expired_transfers(limit: int = 250) -> dict[str, list[str]]:
+    result: dict[str, list[str]] = {
+        "expired_uploads": [],
+        "deleted_uploads": [],
+        "cancelled_exports": [],
+        "deleted_exports": [],
+    }
+    with storage_write_lock():
+        db = SessionLocal()
+        try:
+            timestamp = now_utc()
+            upload_sessions = list(
+                db.execute(
+                    select(UploadSession)
+                    .where(UploadSession.expires_at <= timestamp)
+                    .order_by(UploadSession.expires_at)
+                    .limit(limit),
+                )
+                .scalars()
+                .all(),
+            )
+            for session in upload_sessions:
+                clear_upload_session_parts(session)
+                clear_upload_session_files(session.id)
+                if session.status in {"active", "completing"}:
+                    session.status = "expired"
+                    session.updated_at = timestamp
+                    result["expired_uploads"].append(session.id)
+                    continue
+                result["deleted_uploads"].append(session.id)
+                db.delete(session)
+
+            export_jobs = list(
+                db.execute(
+                    select(ExportJob)
+                    .where(ExportJob.expires_at <= timestamp)
+                    .order_by(ExportJob.expires_at)
+                    .limit(limit),
+                )
+                .scalars()
+                .all(),
+            )
+            for job in export_jobs:
+                if job.status in {"queued", "running"}:
+                    job.status = "cancelled"
+                    job.cancelled_at = timestamp
+                    job.updated_at = timestamp
+                    result["cancelled_exports"].append(job.id)
+                    continue
+                result["deleted_exports"].append(job.id)
+                db.delete(job)
+            db.commit()
+            return result
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+
 async def _ttl_sweeper_loop() -> None:
     while True:
         await asyncio.sleep(TTL_SWEEP_INTERVAL_SECONDS)
         try:
             sweep_expired_documents()
+            sweep_expired_transfers()
         except Exception:
             logger.exception("TTL sweep failed")
 
@@ -2890,9 +3778,13 @@ async def stop_ttl_sweeper() -> None:
 
 
 def storage_reconciliation_report(db: Session, apply: bool = False) -> dict[str, object]:
-    referenced_blob_ids = {
+    document_blob_ids = {
         row[0] for row in db.execute(select(DocumentVersion.blob_id)).all() if row[0] is not None
     }
+    export_artifact_blob_ids = {
+        row[0] for row in db.execute(select(ExportArtifact.blob_id)).all() if row[0] is not None
+    }
+    referenced_blob_ids = document_blob_ids | export_artifact_blob_ids
     referenced_blobs = (
         list(db.execute(select(Blob).where(Blob.id.in_(referenced_blob_ids))).scalars())
         if referenced_blob_ids
@@ -3140,7 +4032,13 @@ def api_admin_debug_sweep_ttl(
     user: UserContext = Depends(require_dev_admin),
 ) -> dict[str, object]:
     del user
-    return debug_action_result("sweep-ttl", result=sweep_expired_documents())
+    return debug_action_result(
+        "sweep-ttl",
+        result={
+            "documents": sweep_expired_documents(),
+            "transfers": sweep_expired_transfers(),
+        },
+    )
 
 
 @router.post("/api/admin/debug/storage-report")
@@ -3959,6 +4857,311 @@ def unlock_items(
     return result
 
 
+@router.post("/api/uploads")
+def create_upload_session(
+    payload: UploadSessionPayload,
+    request: Request,
+    user: UserContext = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    filename = normalize_item_name(payload.filename, "File name")
+    if payload.size_bytes < 0:
+        raise HTTPException(status_code=400, detail="Upload size must be non-negative")
+    if payload.size_bytes > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413, detail=f"Upload exceeds limit of {MAX_UPLOAD_BYTES} bytes"
+        )
+    mime_type = sanitize_mime_type(payload.mime_type, filename)
+    part_count = (payload.size_bytes + TRANSFER_CHUNK_BYTES - 1) // TRANSFER_CHUNK_BYTES
+    meta = client_meta(request)
+    with storage_write_lock():
+        if payload.mode == "create":
+            folder_path_value = normalize_folder(payload.folder)
+            ensure_document_upload_folder(folder_path_value)
+            require_write_for_folder_path(db, folder_path_value, user)
+            target_folder = get_or_create_folder_path(db, folder_path_value)
+            ensure_unique_document_path(db, target_folder.id, filename)
+            document_id = None
+        else:
+            doc = get_document_or_404(payload.document_id or 0, db)
+            require_document_access(doc, user, db, 3)
+            if document_is_archive(doc):
+                raise HTTPException(status_code=400, detail="Restore this file before editing")
+            lock = get_active_lock(doc, db)
+            if not lock or lock.locked_by != user["id"]:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Check out the file before uploading a new version",
+                )
+            if payload.rename_to_upload and filename != doc.name:
+                ensure_unique_document_path(db, doc.folder_id, filename, doc.id)
+            folder_path_value = None
+            document_id = doc.id
+        session = UploadSession(
+            id=uuid.uuid4().hex,
+            mode=payload.mode,
+            status="active",
+            folder_path=folder_path_value,
+            document_id=document_id,
+            filename=filename,
+            total_size=payload.size_bytes,
+            chunk_size=TRANSFER_CHUNK_BYTES,
+            part_count=part_count,
+            mime_type=mime_type,
+            note=(payload.note or "").strip() or None,
+            rename_to_upload=payload.rename_to_upload,
+            created_by=str(user["id"]),
+            created_by_name=str(user["name"]),
+            user_context=transfer_user_payload(user),
+            upload_ip=meta.get("ip"),
+            upload_user_agent=meta.get("user_agent"),
+            expires_at=transfer_expires_at(TRANSFER_SESSION_TTL_SECONDS),
+        )
+        db.add(session)
+        db.commit()
+        return upload_session_payload(session)
+
+
+@router.get("/api/uploads/{session_id}")
+def get_upload_session_status(
+    session_id: str,
+    user: UserContext = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    session = db.get(UploadSession, session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Upload session not found")
+    transfer_owner_required(session.created_by, user)
+    if session.status == "active":
+        ensure_active_upload_session(session, db)
+    return upload_session_payload(session)
+
+
+@router.put("/api/uploads/{session_id}/parts/{part_number}")
+async def upload_session_part(
+    session_id: str,
+    part_number: int,
+    request: Request,
+    x_upload_offset: int = Header(..., alias="X-Upload-Offset"),
+    x_upload_size: int = Header(..., alias="X-Upload-Size"),
+    x_upload_sha256: str | None = Header(None, alias="X-Upload-Sha256"),
+    user: UserContext = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    session = db.get(UploadSession, session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Upload session not found")
+    transfer_owner_required(session.created_by, user)
+    ensure_active_upload_session(session, db)
+    expected_offset, expected_size = expected_part_bounds(session, part_number)
+    if x_upload_offset != expected_offset or x_upload_size != expected_size:
+        raise HTTPException(status_code=400, detail="Upload part range does not match session")
+    existing = uploaded_parts_by_number(session).get(part_number)
+    if existing:
+        if x_upload_sha256 and existing.sha256 != x_upload_sha256.lower():
+            raise HTTPException(
+                status_code=409,
+                detail="Upload part already exists with different content",
+            )
+        if existing.offset_bytes == expected_offset and existing.size_bytes == expected_size:
+            return upload_session_payload(session)
+        raise HTTPException(
+            status_code=409, detail="Upload part already exists with different content"
+        )
+    final_path = upload_part_path(session.id, part_number)
+    temp_path, actual_sha256, size_bytes = await spool_upload_part_body(
+        request,
+        expected_size,
+        x_upload_sha256,
+        final_path.parent,
+    )
+    try:
+        with storage_write_lock():
+            session = db.get(UploadSession, session_id)
+            if not session:
+                raise HTTPException(status_code=404, detail="Upload session not found")
+            transfer_owner_required(session.created_by, user)
+            ensure_active_upload_session(session, db)
+            if uploaded_parts_by_number(session).get(part_number):
+                raise HTTPException(status_code=409, detail="Upload part already exists")
+            temp_path.replace(final_path)
+            db.add(
+                UploadPart(
+                    session_id=session.id,
+                    part_number=part_number,
+                    offset_bytes=expected_offset,
+                    size_bytes=size_bytes,
+                    sha256=actual_sha256,
+                    storage_path=str(final_path),
+                ),
+            )
+            session.updated_at = now_utc()
+            db.commit()
+            return upload_session_payload(session)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+@router.post("/api/uploads/{session_id}/complete")
+def complete_upload_session(
+    session_id: str,
+    payload: CompleteUploadPayload,
+    user: UserContext = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    session = db.get(UploadSession, session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Upload session not found")
+    transfer_owner_required(session.created_by, user)
+    if session.status == "complete":
+        result = upload_session_result(session)
+        if result is None:
+            raise HTTPException(
+                status_code=500, detail="Completed upload session is missing result"
+            )
+        return result
+    with storage_write_lock():
+        session = db.get(UploadSession, session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Upload session not found")
+        transfer_owner_required(session.created_by, user)
+        reserve_upload_completion(session, db)
+    try:
+        db.refresh(session)
+        with storage_write_lock():
+            session = db.get(UploadSession, session_id)
+            if not session:
+                raise HTTPException(status_code=404, detail="Upload session not found")
+            if session.status != "completing":
+                raise HTTPException(status_code=409, detail=f"Upload session is {session.status}")
+            return complete_upload_session_document(session, payload.sha256, user, db)
+    except Exception as exc:
+        db.rollback()
+        mark_upload_session_failed(
+            session_id, response_detail(exc) if isinstance(exc, HTTPException) else str(exc)
+        )
+        raise
+
+
+@router.delete("/api/uploads/{session_id}")
+def abort_upload_session(
+    session_id: str,
+    user: UserContext = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    with storage_write_lock():
+        session = db.get(UploadSession, session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Upload session not found")
+        transfer_owner_required(session.created_by, user)
+        if session.status != "complete":
+            session.status = "aborted"
+            session.aborted_at = now_utc()
+            session.updated_at = session.aborted_at
+            clear_upload_session_parts(session)
+        db.commit()
+        clear_upload_session_files(session.id)
+        return upload_session_payload(session)
+
+
+@router.post("/api/exports")
+def create_export_job(
+    payload: ActionPayload,
+    user: UserContext = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    with storage_write_lock():
+        items = normalize_action_items(require_action_items(payload), db)
+        docs_to_download: list[Document] = []
+        for item in items:
+            if item.type == "document":
+                doc = get_document_or_404(item.id or 0, db)
+                require_document_access(doc, user, db, 2)
+                docs_to_download.append(doc)
+            else:
+                folder_item = get_folder_for_action(item, db)
+                require_folder_access(folder_item, user, db, 2)
+                docs_to_download.extend(readable_docs_in_folder_subtree(db, folder_item, user))
+        unique_docs = list({doc.id: doc for doc in docs_to_download}.values())
+        for doc in unique_docs:
+            require_document_access(doc, user, db, 2)
+        if not unique_docs:
+            raise HTTPException(status_code=400, detail="Export has no downloadable files")
+        filename = "vault-download.zip"
+        current_versions = [current_version(doc, db) for doc in unique_docs]
+        job = ExportJob(
+            id=uuid.uuid4().hex,
+            status="queued",
+            created_by=str(user["id"]),
+            created_by_name=str(user["name"]),
+            user_context=transfer_user_payload(user),
+            request_payload={"items": [action_item_payload(item) for item in items]},
+            filename=filename,
+            total_items=len(unique_docs),
+            total_bytes=sum(
+                version.blob.size_bytes if version else 0 for version in current_versions
+            ),
+            expires_at=transfer_expires_at(EXPORT_TTL_SECONDS),
+        )
+        db.add(job)
+        db.commit()
+        response = export_job_payload(job)
+    start_export_job(job.id)
+    return response
+
+
+@router.get("/api/exports/{job_id}")
+def get_export_job(
+    job_id: str,
+    user: UserContext = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    job = db.get(ExportJob, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Export not found")
+    transfer_owner_required(job.created_by, user)
+    return export_job_payload(job)
+
+
+@router.delete("/api/exports/{job_id}")
+def cancel_export_job(
+    job_id: str,
+    user: UserContext = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    with storage_write_lock():
+        job = db.get(ExportJob, job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Export not found")
+        transfer_owner_required(job.created_by, user)
+        if job.status in {"queued", "running"}:
+            job.status = "cancelled"
+            job.cancelled_at = now_utc()
+            job.updated_at = job.cancelled_at
+            db.commit()
+        return export_job_payload(job)
+
+
+@router.get("/api/exports/{job_id}/download")
+def download_export_artifact(
+    job_id: str,
+    request: Request,
+    user: UserContext = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> StreamingResponse:
+    job = db.get(ExportJob, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Export not found")
+    transfer_owner_required(job.created_by, user)
+    expires_at = normalize_timestamp(job.expires_at)
+    if expires_at and expires_at <= now_utc():
+        raise HTTPException(status_code=410, detail="Export expired")
+    if job.status != "complete" or not job.artifacts:
+        raise HTTPException(status_code=409, detail="Export is not complete")
+    artifact = job.artifacts[0]
+    return blob_streaming_response(artifact.blob, artifact.filename, artifact.mime_type, request)
+
+
 @router.post("/api/download")
 def download_items(
     payload: ActionPayload,
@@ -3986,75 +5189,36 @@ def download_items(
             version = current_version(doc, db)
             if not version:
                 raise HTTPException(status_code=404, detail="Document has no versions")
-            temp_download = copy_authorized_version_to_temp(doc, version, user, db)
-            try:
-                record_event(
-                    doc,
-                    user,
-                    "download",
-                    f"Downloaded {document_path(doc)}",
-                    db,
-                    meta=client_meta(request),
-                    publish_state=False,
-                )
-                record_state_change(db, "document.download", ("document_detail",))
-                db.commit()
-                return streaming_download_response(temp_download, doc.name, version.mime_type)
-            except Exception:
-                temp_download.cleanup()
-                raise
-
-        zip_temp_file = tempfile.NamedTemporaryFile(
-            prefix="vault-download-",
-            suffix=".zip",
-            delete=False,
-        )
-        zip_temp_path = Path(zip_temp_file.name)
-        zip_temp_file.close()
-        errors: list[str] = []
-        written: set[str] = set()
-        try:
-            with zipfile.ZipFile(zip_temp_path, "w", zipfile.ZIP_DEFLATED) as archive:
-                for doc in unique_docs:
-                    archive_name = document_path(doc) or doc.name
-                    if archive_name in written:
-                        archive_name = f"{doc.id}-{archive_name}"
-                    entry_download: TempDownload | None = None
-                    try:
-                        version = current_version(doc, db)
-                        if not version:
-                            raise HTTPException(status_code=404, detail="Document has no versions")
-                        entry_download = copy_authorized_version_to_temp(doc, version, user, db)
-                        write_temp_file_to_zip(archive, archive_name, entry_download)
-                        written.add(archive_name)
-                        record_event(
-                            doc,
-                            user,
-                            "download",
-                            f"Downloaded {document_path(doc)}",
-                            db,
-                            meta=client_meta(request),
-                            publish_state=False,
-                        )
-                    except HTTPException as exc:
-                        errors.append(f"{archive_name}: {response_detail(exc)}")
-                    finally:
-                        if entry_download is not None:
-                            entry_download.cleanup()
-                if errors:
-                    archive.writestr("vault-download-errors.txt", "\n".join(errors))
-            if written:
-                record_state_change(db, "document.download", ("document_detail",))
-            db.commit()
-            zip_download = TempDownload(path=zip_temp_path, size_bytes=zip_temp_path.stat().st_size)
-            return streaming_download_response(
-                zip_download,
-                "vault-download.zip",
-                "application/zip",
+            refresh_document_location(doc, db)
+            require_document_access(doc, user, db, 2)
+            response = version_streaming_response(version, doc.name, version.mime_type, request)
+            record_event(
+                doc,
+                user,
+                "download",
+                f"Downloaded {document_path(doc)}",
+                db,
+                meta=client_meta(request),
+                publish_state=False,
             )
-        except Exception:
-            zip_temp_path.unlink(missing_ok=True)
-            raise
+            record_state_change(db, "document.download", ("document_detail",))
+            db.commit()
+            return response
+        job = ExportJob(
+            id=uuid.uuid4().hex,
+            status="queued",
+            created_by=str(user["id"]),
+            created_by_name=str(user["name"]),
+            user_context=transfer_user_payload(user),
+            request_payload={"items": [action_item_payload(item) for item in items]},
+            filename="vault-download.zip",
+            expires_at=transfer_expires_at(EXPORT_TTL_SECONDS),
+        )
+        db.add(job)
+        db.commit()
+        export_response = JSONResponse(export_job_payload(job), status_code=202)
+    start_export_job(job.id)
+    return export_response
 
 
 @router.post("/documents")
@@ -4065,44 +5229,8 @@ async def create_document(
     user: UserContext = Depends(current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
-    filename = normalize_item_name(file.filename, "File name")
-    folder_path_value = normalize_folder(folder)
-    ensure_document_upload_folder(folder_path_value)
-    upload = await spool_upload_file(file)
-    mime_type = sanitize_mime_type(file.content_type, filename)
-    meta = client_meta(request)
-    try:
-        with storage_write_lock():
-            require_write_for_folder_path(db, folder_path_value, user)
-            target_folder = get_or_create_folder_path(db, folder_path_value)
-            ensure_unique_document_path(db, target_folder.id, filename)
-            blob = get_or_create_blob_for_upload(db, upload, mime_type)
-            doc = Document(
-                folder_id=target_folder.id,
-                name=filename,
-                created_by=user["id"],
-                created_by_name=user["name"],
-                latest_modified_by=user["id"],
-                latest_modified_at=now_utc(),
-            )
-            apply_folder_ttl(doc, target_folder, doc.latest_modified_at)
-            db.add(doc)
-            db.flush()
-            create_document_version(
-                db,
-                doc,
-                blob,
-                user,
-                meta,
-                filename,
-                mime_type,
-                f"Uploaded {filename}",
-                "upload",
-            )
-            db.commit()
-            return {"id": doc.id, "path": join_path(folder_path_value, filename)}
-    finally:
-        upload.cleanup()
+    del request, file, folder, user, db
+    raise HTTPException(status_code=410, detail="Use resumable upload sessions")
 
 
 @router.get("/documents/{doc_id}")
@@ -4136,13 +5264,37 @@ def checkout_document(
             raise HTTPException(status_code=404, detail="Document has no versions")
         acquire_document_lock(doc, user, meta, db)
         record_event(doc, user, "checkout", f"Checked out {document_path(doc)}", db, meta=meta)
-        temp_download = copy_version_to_temp(version)
-        try:
-            db.commit()
-            return streaming_download_response(temp_download, doc.name, version.mime_type)
-        except Exception:
-            temp_download.cleanup()
-            raise
+        response = version_streaming_response(version, doc.name, version.mime_type, request)
+        db.commit()
+        return response
+
+
+@router.get("/documents/{doc_id}/download")
+def download_current_document_version(
+    doc_id: int,
+    request: Request,
+    user: UserContext = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> StreamingResponse:
+    with storage_write_lock():
+        doc = get_document_or_404(doc_id, db)
+        require_document_access(doc, user, db, 2)
+        version = current_version(doc, db)
+        if not version:
+            raise HTTPException(status_code=404, detail="Document has no versions")
+        refresh_document_location(doc, db)
+        require_document_access(doc, user, db, 2)
+        response = version_streaming_response(version, doc.name, version.mime_type, request)
+        record_event(
+            doc,
+            user,
+            "download",
+            f"Downloaded {document_path(doc)}",
+            db,
+            meta=client_meta(request),
+        )
+        db.commit()
+        return response
 
 
 @router.post("/documents/{doc_id}/checkin")
@@ -4155,67 +5307,8 @@ async def checkin_document(
     user: UserContext = Depends(current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
-    doc = get_document_or_404(doc_id, db)
-    require_document_access(doc, user, db, 3)
-    if document_is_archive(doc):
-        raise HTTPException(status_code=400, detail="Restore this file before editing")
-    lock = get_active_lock(doc, db)
-    if not lock or lock.locked_by != user["id"]:
-        raise HTTPException(
-            status_code=403,
-            detail="Check out the file before uploading a new version",
-        )
-    upload_name = normalize_item_name(file.filename, "File name")
-    upload = await spool_upload_file(file)
-    mime_type = sanitize_mime_type(file.content_type, upload_name)
-    meta = client_meta(request)
-    message = note.strip() or f"Uploaded {upload_name}"
-    try:
-        with storage_write_lock():
-            refresh_editable_document(doc, db)
-            require_document_access(doc, user, db, 3)
-            lock = get_active_lock(doc, db)
-            if not lock or lock.locked_by != user["id"]:
-                raise HTTPException(
-                    status_code=403,
-                    detail="Check out the file before uploading a new version",
-                )
-            if rename_to_upload and upload_name != doc.name:
-                ensure_unique_document_path(db, doc.folder_id, upload_name, doc.id)
-                record_event(
-                    doc,
-                    user,
-                    "move",
-                    f"Renamed {doc.name} to {upload_name}",
-                    db,
-                    meta=meta,
-                )
-                doc.name = upload_name
-            blob = get_or_create_blob_for_upload(db, upload, mime_type)
-            version = create_document_version(
-                db,
-                doc,
-                blob,
-                user,
-                meta,
-                upload_name,
-                mime_type,
-                message,
-                "checkin",
-            )
-            release_lock(lock, user)
-            record_event(
-                doc,
-                user,
-                "release",
-                f"Released lock for {document_path(doc)}",
-                db,
-                meta=meta,
-            )
-            db.commit()
-            return {"id": doc.id, "version": version.id, "path": document_path(doc)}
-    finally:
-        upload.cleanup()
+    del doc_id, request, file, note, rename_to_upload, user, db
+    raise HTTPException(status_code=410, detail="Use resumable upload sessions")
 
 
 @router.get("/documents/{doc_id}/versions/{version_id}/download")
@@ -4230,19 +5323,17 @@ def download_version(
         doc = get_document_or_404(doc_id, db)
         require_document_access(doc, user, db, 2)
         version = get_version_or_404(doc, version_id, db)
-        temp_download = copy_authorized_version_to_temp(doc, version, user, db)
+        refresh_document_location(doc, db)
+        require_document_access(doc, user, db, 2)
         filename = version.original_filename or doc.name
-        try:
-            record_event(
-                doc,
-                user,
-                "download",
-                f"Downloaded version v{version.version_number} of {document_path(doc)}",
-                db,
-                meta=client_meta(request),
-            )
-            db.commit()
-            return streaming_download_response(temp_download, filename, version.mime_type)
-        except Exception:
-            temp_download.cleanup()
-            raise
+        response = version_streaming_response(version, filename, version.mime_type, request)
+        record_event(
+            doc,
+            user,
+            "download",
+            f"Downloaded version v{version.version_number} of {document_path(doc)}",
+            db,
+            meta=client_meta(request),
+        )
+        db.commit()
+        return response

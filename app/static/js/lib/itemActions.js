@@ -31,6 +31,7 @@ export function docToItem(doc) {
     expiry_action: doc.expiry_action || "",
     size_bytes: doc.size_bytes || 0,
     size_display: doc.size_display || "",
+    download_url: doc.download_url || "",
     type: "document",
     version_count: doc.version_count || 0,
     versions: doc.versions || [],
@@ -149,13 +150,19 @@ export function createBulkActionHandlers({
       actionItems.length === 1 && actionItems[0].type === "document"
         ? actionItems[0].size_bytes || null
         : null;
+    if (actionItems.length === 1 && actionItems[0].type === "document") {
+      return downloadWithProgress({
+        name: label,
+        size,
+        url: actionItems[0].download_url || `/documents/${actionItems[0].id}/download`,
+      }).catch((err) => {
+        setError(err.message || "Download failed.");
+      });
+    }
     return downloadWithProgress({
-      body: JSON.stringify({ items: actionItems.map(apiItem) }),
-      headers: { "Content-Type": "application/json" },
-      method: "POST",
+      exportPayload: { items: actionItems.map(apiItem) },
       name: label,
       size,
-      url: "/api/download",
     }).catch((err) => {
       setError(err.message || "Download failed.");
     });

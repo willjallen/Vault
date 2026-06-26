@@ -1,163 +1,761 @@
-import asyncio
+import datetime as dt
 import io
+import tempfile
 import unittest
 import zipfile
+from pathlib import Path
+from unittest.mock import patch
 
-from fastapi import HTTPException
-from fastapi.responses import StreamingResponse
 from tests.support import (
-    FAKE_REQUEST,
-    collect_response_body,
+    auth_headers,
     create_versioned_document,
+    sha256_hex,
+    upload_file_via_session,
     user_context,
-    vault_runtime,
+    vault_test_client,
+    wait_for_export,
 )
 
 import app.routers as routers
-from app.models import Blob, BlobLocation, Document
+from app.models import (
+    Blob,
+    BlobLocation,
+    Document,
+    ExportArtifact,
+    ExportJob,
+    UploadPart,
+    UploadSession,
+)
 from app.routers import (
-    ActionItem,
-    ActionPayload,
-    create_document,
-    download_items,
+    ExportCancelled,
+    current_version,
     get_or_create_folder_path,
+    sweep_expired_transfers,
+    upload_session_dir,
+    write_version_to_zip,
 )
 from app.storage import get_storage_backend
 
 
-class ChunkedUpload:
-    filename = "chunked.txt"
-    content_type = "text/plain"
-
-    def __init__(self, chunks: list[bytes]) -> None:
-        self._chunks = list(chunks)
-        self.read_sizes: list[int] = []
-
-    async def read(self, size: int = -1) -> bytes:
-        self.read_sizes.append(size)
-        if not self._chunks:
-            return b""
-        return self._chunks.pop(0)
-
-
-class FailingUpload:
-    filename = "partial.txt"
-    content_type = "text/plain"
-
-    def __init__(self) -> None:
-        self._sent = False
-
-    async def read(self, size: int = -1) -> bytes:
-        del size
-        if not self._sent:
-            self._sent = True
-            return b"partial"
-        raise OSError("client disconnected")
-
-
 class StreamingTransferTests(unittest.TestCase):
-    def test_upload_streams_chunks_and_download_streams_file(self) -> None:
-        user = user_context("uploader")
-        upload = ChunkedUpload([b"hello ", b"world"])
+    def test_resumable_upload_completes_and_download_supports_ranges(self) -> None:
+        headers = auth_headers("uploader", ["vault-admin"])
+        data = b"hello world"
 
-        with vault_runtime() as ctx:
+        with vault_test_client() as ctx:
+            uploaded = upload_file_via_session(
+                ctx.client,
+                headers=headers,
+                filename="chunked.txt",
+                data=data,
+            )
+            self.assertEqual(uploaded.status_code, 200, uploaded.text)
+            doc_id = uploaded.json()["id"]
+
             with ctx.db() as db:
-                result = asyncio.run(create_document(FAKE_REQUEST, upload, "", user, db))
-                doc_id = int(result["id"])
+                session = db.query(UploadSession).one()
+                self.assertEqual(session.status, "complete")
+                self.assertGreater(db.query(UploadPart).count(), 1)
 
-                self.assertGreaterEqual(len(upload.read_sizes), 3)
-                self.assertTrue(
-                    all(size == routers.STREAM_CHUNK_SIZE for size in upload.read_sizes)
-                )
+            ranged = ctx.client.get(
+                f"/documents/{doc_id}/download",
+                headers={**headers, "Range": "bytes=6-10"},
+            )
+            self.assertEqual(ranged.status_code, 206, ranged.text)
+            self.assertEqual(ranged.content, b"world")
+            self.assertEqual(ranged.headers["content-range"], "bytes 6-10/11")
+            self.assertEqual(ranged.headers["accept-ranges"], "bytes")
 
-                response = download_items(
-                    ActionPayload(items=[ActionItem(type="document", id=doc_id)]),
-                    FAKE_REQUEST,
-                    user,
-                    db,
-                )
-
-            self.assertIsInstance(response, StreamingResponse)
-            self.assertEqual(collect_response_body(response), b"hello world")
+            invalid = ctx.client.get(
+                f"/documents/{doc_id}/download",
+                headers={**headers, "Range": "bytes=99-120"},
+            )
+            self.assertEqual(invalid.status_code, 416)
 
     def test_upload_size_limit_rejects_before_metadata_or_blob_write(self) -> None:
-        user = user_context("uploader")
+        headers = auth_headers("uploader", ["vault-admin"])
 
-        with vault_runtime() as ctx:
+        with vault_test_client() as ctx:
             routers.configure_router_runtime(max_upload_bytes=5)
+            response = ctx.client.post(
+                "/api/uploads",
+                json={
+                    "filename": "too-large.txt",
+                    "folder": "",
+                    "mime_type": "text/plain",
+                    "mode": "create",
+                    "size_bytes": 6,
+                },
+                headers=headers,
+            )
+            self.assertEqual(response.status_code, 413)
             with ctx.db() as db:
-                with self.assertRaises(HTTPException) as raised:
-                    asyncio.run(
-                        create_document(
-                            FAKE_REQUEST,
-                            ChunkedUpload([b"abc", b"def"]),
-                            "",
-                            user,
-                            db,
-                        ),
-                    )
-                db.rollback()
-
-                self.assertEqual(raised.exception.status_code, 413)
                 self.assertEqual(db.query(Document).count(), 0)
                 self.assertEqual(db.query(Blob).count(), 0)
                 self.assertEqual(db.query(BlobLocation).count(), 0)
+                self.assertEqual(db.query(UploadSession).count(), 0)
                 self.assertEqual(get_storage_backend("local").list_object_keys(), [])
 
-    def test_failed_upload_read_rejects_before_metadata_or_blob_write(self) -> None:
-        user = user_context("uploader")
+    def test_part_checksum_failure_leaves_no_blob_or_document_metadata(self) -> None:
+        headers = auth_headers("uploader", ["vault-admin"])
+        data = b"abcdef"
 
-        with vault_runtime() as ctx:
+        with vault_test_client() as ctx:
+            session_response = ctx.client.post(
+                "/api/uploads",
+                json={
+                    "filename": "partial.txt",
+                    "folder": "",
+                    "mime_type": "text/plain",
+                    "mode": "create",
+                    "size_bytes": len(data),
+                },
+                headers=headers,
+            )
+            self.assertEqual(session_response.status_code, 200, session_response.text)
+            session = session_response.json()
+            bad_part = ctx.client.put(
+                f"/api/uploads/{session['id']}/parts/1",
+                content=b"abcd",
+                headers={
+                    **headers,
+                    "Content-Type": "application/octet-stream",
+                    "X-Upload-Offset": "0",
+                    "X-Upload-Sha256": sha256_hex(b"wrong"),
+                    "X-Upload-Size": "4",
+                },
+            )
+            self.assertEqual(bad_part.status_code, 400)
             with ctx.db() as db:
-                with self.assertRaises(HTTPException) as raised:
-                    asyncio.run(create_document(FAKE_REQUEST, FailingUpload(), "", user, db))
-                db.rollback()
+                self.assertEqual(db.query(Document).count(), 0)
+                self.assertEqual(db.query(Blob).count(), 0)
+                self.assertEqual(db.query(BlobLocation).count(), 0)
+                self.assertEqual(db.query(UploadPart).count(), 0)
 
-                self.assertEqual(raised.exception.status_code, 400)
-                self.assertEqual(
-                    raised.exception.detail,
-                    "Upload failed while reading request body",
+    def test_upload_part_spools_inside_session_directory_before_replace(self) -> None:
+        headers = auth_headers("uploader", ["vault-admin"])
+        data = b"abcd"
+
+        with vault_test_client() as ctx:
+            session_response = ctx.client.post(
+                "/api/uploads",
+                json={
+                    "filename": "same-device.txt",
+                    "folder": "",
+                    "mime_type": "text/plain",
+                    "mode": "create",
+                    "size_bytes": len(data),
+                },
+                headers=headers,
+            )
+            self.assertEqual(session_response.status_code, 200, session_response.text)
+            session = session_response.json()
+            with patch(
+                "app.routers.tempfile.NamedTemporaryFile",
+                wraps=tempfile.NamedTemporaryFile,
+            ) as named_temp_file:
+                part_response = ctx.client.put(
+                    f"/api/uploads/{session['id']}/parts/1",
+                    content=data,
+                    headers={
+                        **headers,
+                        "Content-Type": "application/octet-stream",
+                        "X-Upload-Offset": "0",
+                        "X-Upload-Sha256": sha256_hex(data),
+                        "X-Upload-Size": str(len(data)),
+                    },
                 )
+            self.assertEqual(part_response.status_code, 200, part_response.text)
+            self.assertEqual(
+                named_temp_file.call_args.kwargs["dir"], upload_session_dir(session["id"])
+            )
+
+    def test_upload_part_does_not_require_client_checksum_header(self) -> None:
+        headers = auth_headers("uploader", ["vault-admin"])
+        data = b"abcd"
+
+        with vault_test_client() as ctx:
+            session_response = ctx.client.post(
+                "/api/uploads",
+                json={
+                    "filename": "no-client-hash.txt",
+                    "folder": "",
+                    "mime_type": "text/plain",
+                    "mode": "create",
+                    "size_bytes": len(data),
+                },
+                headers=headers,
+            )
+            self.assertEqual(session_response.status_code, 200, session_response.text)
+            session = session_response.json()
+
+            part_response = ctx.client.put(
+                f"/api/uploads/{session['id']}/parts/1",
+                content=data,
+                headers={
+                    **headers,
+                    "Content-Type": "application/octet-stream",
+                    "X-Upload-Offset": "0",
+                    "X-Upload-Size": str(len(data)),
+                },
+            )
+            self.assertEqual(part_response.status_code, 200, part_response.text)
+            self.assertEqual(part_response.json()["uploaded_parts"][0]["sha256"], sha256_hex(data))
+
+            completed = ctx.client.post(
+                f"/api/uploads/{session['id']}/complete",
+                json={},
+                headers=headers,
+            )
+            self.assertEqual(completed.status_code, 200, completed.text)
+            downloaded = ctx.client.get(
+                f"/documents/{completed.json()['id']}/download",
+                headers=headers,
+            )
+            self.assertEqual(downloaded.content, data)
+
+    def test_duplicate_part_upload_is_idempotent_but_conflicting_content_is_rejected(self) -> None:
+        headers = auth_headers("uploader", ["vault-admin"])
+        data = b"abcdef"
+
+        with vault_test_client() as ctx:
+            session_response = ctx.client.post(
+                "/api/uploads",
+                json={
+                    "filename": "retry.txt",
+                    "folder": "",
+                    "mime_type": "text/plain",
+                    "mode": "create",
+                    "size_bytes": len(data),
+                },
+                headers=headers,
+            )
+            self.assertEqual(session_response.status_code, 200, session_response.text)
+            session = session_response.json()
+            part_headers = {
+                **headers,
+                "Content-Type": "application/octet-stream",
+                "X-Upload-Offset": "0",
+                "X-Upload-Sha256": sha256_hex(b"abcd"),
+                "X-Upload-Size": "4",
+            }
+            first = ctx.client.put(
+                f"/api/uploads/{session['id']}/parts/1",
+                content=b"abcd",
+                headers=part_headers,
+            )
+            self.assertEqual(first.status_code, 200, first.text)
+            duplicate = ctx.client.put(
+                f"/api/uploads/{session['id']}/parts/1",
+                content=b"abcd",
+                headers=part_headers,
+            )
+            self.assertEqual(duplicate.status_code, 200, duplicate.text)
+            conflict = ctx.client.put(
+                f"/api/uploads/{session['id']}/parts/1",
+                content=b"wxyz",
+                headers={
+                    **part_headers,
+                    "X-Upload-Sha256": sha256_hex(b"wxyz"),
+                },
+            )
+            self.assertEqual(conflict.status_code, 409)
+
+    def test_upload_session_resume_reports_existing_parts_and_completes_without_final_hash(
+        self,
+    ) -> None:
+        headers = auth_headers("uploader", ["vault-admin"])
+        data = b"abcdefgh"
+
+        with vault_test_client() as ctx:
+            session_response = ctx.client.post(
+                "/api/uploads",
+                json={
+                    "filename": "resume.txt",
+                    "folder": "",
+                    "mime_type": "text/plain",
+                    "mode": "create",
+                    "size_bytes": len(data),
+                },
+                headers=headers,
+            )
+            self.assertEqual(session_response.status_code, 200, session_response.text)
+            session = session_response.json()
+            first_part = data[:4]
+            uploaded_part = ctx.client.put(
+                f"/api/uploads/{session['id']}/parts/1",
+                content=first_part,
+                headers={
+                    **headers,
+                    "Content-Type": "application/octet-stream",
+                    "X-Upload-Offset": "0",
+                    "X-Upload-Sha256": sha256_hex(first_part),
+                    "X-Upload-Size": str(len(first_part)),
+                },
+            )
+            self.assertEqual(uploaded_part.status_code, 200, uploaded_part.text)
+
+            resumed = ctx.client.get(f"/api/uploads/{session['id']}", headers=headers)
+            self.assertEqual(resumed.status_code, 200, resumed.text)
+            self.assertEqual(resumed.json()["uploaded_bytes"], len(first_part))
+            self.assertEqual(
+                resumed.json()["uploaded_parts"],
+                [
+                    {
+                        "offset": 0,
+                        "part_number": 1,
+                        "sha256": sha256_hex(first_part),
+                        "size_bytes": len(first_part),
+                    }
+                ],
+            )
+
+            second_part = data[4:]
+            uploaded_second_part = ctx.client.put(
+                f"/api/uploads/{session['id']}/parts/2",
+                content=second_part,
+                headers={
+                    **headers,
+                    "Content-Type": "application/octet-stream",
+                    "X-Upload-Offset": "4",
+                    "X-Upload-Sha256": sha256_hex(second_part),
+                    "X-Upload-Size": str(len(second_part)),
+                },
+            )
+            self.assertEqual(uploaded_second_part.status_code, 200, uploaded_second_part.text)
+
+            completed = ctx.client.post(
+                f"/api/uploads/{session['id']}/complete",
+                json={},
+                headers=headers,
+            )
+            self.assertEqual(completed.status_code, 200, completed.text)
+            downloaded = ctx.client.get(
+                f"/documents/{completed.json()['id']}/download",
+                headers=headers,
+            )
+            self.assertEqual(downloaded.status_code, 200, downloaded.text)
+            self.assertEqual(downloaded.content, data)
+
+    def test_upload_completion_finalizes_parts_without_assembled_temp_file(self) -> None:
+        headers = auth_headers("uploader", ["vault-admin"])
+        data = b"abcdefgh"
+
+        with vault_test_client() as ctx:
+            session_response = ctx.client.post(
+                "/api/uploads",
+                json={
+                    "filename": "direct-finalize.txt",
+                    "folder": "",
+                    "mime_type": "text/plain",
+                    "mode": "create",
+                    "size_bytes": len(data),
+                },
+                headers=headers,
+            )
+            self.assertEqual(session_response.status_code, 200, session_response.text)
+            session = session_response.json()
+            for index, offset in enumerate(range(0, len(data), 4), start=1):
+                chunk = data[offset : offset + 4]
+                part_response = ctx.client.put(
+                    f"/api/uploads/{session['id']}/parts/{index}",
+                    content=chunk,
+                    headers={
+                        **headers,
+                        "Content-Type": "application/octet-stream",
+                        "X-Upload-Offset": str(offset),
+                        "X-Upload-Size": str(len(chunk)),
+                    },
+                )
+                self.assertEqual(part_response.status_code, 200, part_response.text)
+
+            with patch(
+                "app.routers.tempfile.NamedTemporaryFile",
+                wraps=tempfile.NamedTemporaryFile,
+            ) as named_temp_file:
+                completed = ctx.client.post(
+                    f"/api/uploads/{session['id']}/complete",
+                    json={"sha256": sha256_hex(data)},
+                    headers=headers,
+                )
+            self.assertEqual(completed.status_code, 200, completed.text)
+            named_temp_file.assert_not_called()
+            with ctx.db() as db:
+                self.assertEqual(db.query(Document).count(), 1)
+                self.assertEqual(db.query(Blob).count(), 1)
+                self.assertEqual(db.query(BlobLocation).count(), 1)
+
+    def test_upload_completion_records_verification_progress(self) -> None:
+        headers = auth_headers("uploader", ["vault-admin"])
+        data = b"abcdefgh"
+
+        with vault_test_client() as ctx:
+            session_response = ctx.client.post(
+                "/api/uploads",
+                json={
+                    "filename": "verification-progress.txt",
+                    "folder": "",
+                    "mime_type": "text/plain",
+                    "mode": "create",
+                    "size_bytes": len(data),
+                },
+                headers=headers,
+            )
+            self.assertEqual(session_response.status_code, 200, session_response.text)
+            session = session_response.json()
+            for index, offset in enumerate(range(0, len(data), 4), start=1):
+                chunk = data[offset : offset + 4]
+                part_response = ctx.client.put(
+                    f"/api/uploads/{session['id']}/parts/{index}",
+                    content=chunk,
+                    headers={
+                        **headers,
+                        "Content-Type": "application/octet-stream",
+                        "X-Upload-Offset": str(offset),
+                        "X-Upload-Size": str(len(chunk)),
+                    },
+                )
+                self.assertEqual(part_response.status_code, 200, part_response.text)
+
+            completed = ctx.client.post(
+                f"/api/uploads/{session['id']}/complete",
+                json={"sha256": sha256_hex(data)},
+                headers=headers,
+            )
+            self.assertEqual(completed.status_code, 200, completed.text)
+
+            status = ctx.client.get(f"/api/uploads/{session['id']}", headers=headers)
+            self.assertEqual(status.status_code, 200, status.text)
+            self.assertEqual(
+                status.json()["verification"],
+                {"processed_bytes": len(data), "total_bytes": len(data)},
+            )
+            with ctx.db() as db:
+                upload_session = db.get(UploadSession, session["id"])
+                self.assertIsNotNone(upload_session)
+                self.assertEqual(upload_session.verification_total_bytes, len(data))
+                self.assertEqual(upload_session.verification_processed_bytes, len(data))
+
+    def test_upload_abort_cleans_parts_and_blocks_completion(self) -> None:
+        headers = auth_headers("uploader", ["vault-admin"])
+        data = b"abcdef"
+
+        with vault_test_client() as ctx:
+            session_response = ctx.client.post(
+                "/api/uploads",
+                json={
+                    "filename": "cancelled.txt",
+                    "folder": "",
+                    "mime_type": "text/plain",
+                    "mode": "create",
+                    "size_bytes": len(data),
+                },
+                headers=headers,
+            )
+            self.assertEqual(session_response.status_code, 200, session_response.text)
+            session = session_response.json()
+            first_part = data[:4]
+            part_response = ctx.client.put(
+                f"/api/uploads/{session['id']}/parts/1",
+                content=first_part,
+                headers={
+                    **headers,
+                    "Content-Type": "application/octet-stream",
+                    "X-Upload-Offset": "0",
+                    "X-Upload-Sha256": sha256_hex(first_part),
+                    "X-Upload-Size": str(len(first_part)),
+                },
+            )
+            self.assertEqual(part_response.status_code, 200, part_response.text)
+            self.assertTrue(upload_session_dir(session["id"]).exists())
+
+            aborted = ctx.client.delete(f"/api/uploads/{session['id']}", headers=headers)
+            self.assertEqual(aborted.status_code, 200, aborted.text)
+            self.assertEqual(aborted.json()["status"], "aborted")
+            self.assertEqual(aborted.json()["uploaded_bytes"], 0)
+            self.assertEqual(aborted.json()["uploaded_parts"], [])
+            self.assertFalse(upload_session_dir(session["id"]).exists())
+
+            completed = ctx.client.post(
+                f"/api/uploads/{session['id']}/complete",
+                json={},
+                headers=headers,
+            )
+            self.assertEqual(completed.status_code, 409)
+            self.assertEqual(completed.json()["detail"], "Upload session is aborted")
+            with ctx.db() as db:
                 self.assertEqual(db.query(Document).count(), 0)
                 self.assertEqual(db.query(Blob).count(), 0)
                 self.assertEqual(db.query(BlobLocation).count(), 0)
-                self.assertEqual(get_storage_backend("local").list_object_keys(), [])
+                self.assertEqual(db.query(UploadPart).count(), 0)
 
-    def test_zip_download_streams_from_temp_file(self) -> None:
+    def test_upload_abort_requires_owner_or_admin(self) -> None:
+        owner_headers = auth_headers("owner", ["vault-admin"])
+        intruder_headers = auth_headers("intruder", [])
+
+        with vault_test_client() as ctx:
+            session_response = ctx.client.post(
+                "/api/uploads",
+                json={
+                    "filename": "owned.txt",
+                    "folder": "",
+                    "mime_type": "text/plain",
+                    "mode": "create",
+                    "size_bytes": 4,
+                },
+                headers=owner_headers,
+            )
+            self.assertEqual(session_response.status_code, 200, session_response.text)
+            session_id = session_response.json()["id"]
+
+            blocked = ctx.client.delete(f"/api/uploads/{session_id}", headers=intruder_headers)
+            self.assertEqual(blocked.status_code, 404)
+            visible_to_owner = ctx.client.get(f"/api/uploads/{session_id}", headers=owner_headers)
+            self.assertEqual(visible_to_owner.status_code, 200, visible_to_owner.text)
+            self.assertEqual(visible_to_owner.json()["status"], "active")
+
+    def test_expired_upload_session_cleans_parts_and_is_not_resumable(self) -> None:
+        headers = auth_headers("uploader", ["vault-admin"])
+        data = b"abcdef"
+
+        with vault_test_client() as ctx:
+            session_response = ctx.client.post(
+                "/api/uploads",
+                json={
+                    "filename": "expired.txt",
+                    "folder": "",
+                    "mime_type": "text/plain",
+                    "mode": "create",
+                    "size_bytes": len(data),
+                },
+                headers=headers,
+            )
+            self.assertEqual(session_response.status_code, 200, session_response.text)
+            session = session_response.json()
+            first_part = data[:4]
+            part_response = ctx.client.put(
+                f"/api/uploads/{session['id']}/parts/1",
+                content=first_part,
+                headers={
+                    **headers,
+                    "Content-Type": "application/octet-stream",
+                    "X-Upload-Offset": "0",
+                    "X-Upload-Sha256": sha256_hex(first_part),
+                    "X-Upload-Size": str(len(first_part)),
+                },
+            )
+            self.assertEqual(part_response.status_code, 200, part_response.text)
+            with ctx.db() as db:
+                upload_session = db.get(UploadSession, session["id"])
+                self.assertIsNotNone(upload_session)
+                upload_session.expires_at = routers.now_utc() - dt.timedelta(seconds=1)
+                db.commit()
+
+            expired = ctx.client.get(f"/api/uploads/{session['id']}", headers=headers)
+            self.assertEqual(expired.status_code, 410)
+            self.assertEqual(expired.json()["detail"], "Upload session expired")
+            self.assertFalse(upload_session_dir(session["id"]).exists())
+            with ctx.db() as db:
+                upload_session = db.get(UploadSession, session["id"])
+                self.assertIsNotNone(upload_session)
+                self.assertEqual(upload_session.status, "expired")
+                self.assertEqual(db.query(UploadPart).count(), 0)
+
+    def test_transfer_sweeper_cleans_abandoned_upload_parts(self) -> None:
+        headers = auth_headers("uploader", ["vault-admin"])
+        data = b"abcdef"
+
+        with vault_test_client() as ctx:
+            session_response = ctx.client.post(
+                "/api/uploads",
+                json={
+                    "filename": "abandoned.txt",
+                    "folder": "",
+                    "mime_type": "text/plain",
+                    "mode": "create",
+                    "size_bytes": len(data),
+                },
+                headers=headers,
+            )
+            self.assertEqual(session_response.status_code, 200, session_response.text)
+            session = session_response.json()
+            first_part = data[:4]
+            part_response = ctx.client.put(
+                f"/api/uploads/{session['id']}/parts/1",
+                content=first_part,
+                headers={
+                    **headers,
+                    "Content-Type": "application/octet-stream",
+                    "X-Upload-Offset": "0",
+                    "X-Upload-Sha256": sha256_hex(first_part),
+                    "X-Upload-Size": str(len(first_part)),
+                },
+            )
+            self.assertEqual(part_response.status_code, 200, part_response.text)
+            with ctx.db() as db:
+                upload_session = db.get(UploadSession, session["id"])
+                self.assertIsNotNone(upload_session)
+                upload_session.expires_at = routers.now_utc() - dt.timedelta(seconds=1)
+                db.commit()
+            self.assertTrue(upload_session_dir(session["id"]).exists())
+
+            expired = sweep_expired_transfers()
+
+            self.assertEqual(expired["expired_uploads"], [session["id"]])
+            self.assertFalse(upload_session_dir(session["id"]).exists())
+            with ctx.db() as db:
+                upload_session = db.get(UploadSession, session["id"])
+                self.assertIsNotNone(upload_session)
+                self.assertEqual(upload_session.status, "expired")
+                self.assertEqual(db.query(UploadPart).count(), 0)
+
+            deleted = sweep_expired_transfers()
+
+            self.assertEqual(deleted["deleted_uploads"], [session["id"]])
+            with ctx.db() as db:
+                self.assertIsNone(db.get(UploadSession, session["id"]))
+
+    def test_expired_export_artifact_is_not_downloadable_and_is_swept(self) -> None:
         user = user_context("downloader")
+        headers = auth_headers("downloader", ["vault-admin"])
 
-        with vault_runtime() as ctx:
+        with vault_test_client() as ctx:
             with ctx.db() as db:
                 folder = get_or_create_folder_path(db, "Project")
-                create_versioned_document(
-                    db,
-                    folder,
-                    name="one.txt",
-                    data=b"one",
-                    actor=user,
-                )
-                create_versioned_document(
-                    db,
-                    folder,
-                    name="two.txt",
-                    data=b"two",
-                    actor=user,
-                )
+                create_versioned_document(db, folder, name="one.txt", data=b"one", actor=user)
+                create_versioned_document(db, folder, name="two.txt", data=b"two", actor=user)
                 db.commit()
                 folder_id = folder.id
 
+            export_response = ctx.client.post(
+                "/api/exports",
+                json={"items": [{"type": "folder", "id": folder_id}]},
+                headers=headers,
+            )
+            self.assertEqual(export_response.status_code, 200, export_response.text)
+            export = wait_for_export(ctx.client, export_response.json()["id"], headers=headers)
+            self.assertEqual(export["status"], "complete")
             with ctx.db() as db:
-                response = download_items(
-                    ActionPayload(items=[ActionItem(type="folder", id=folder_id)]),
-                    FAKE_REQUEST,
-                    user,
-                    db,
-                )
+                self.assertEqual(db.query(ExportArtifact).count(), 1)
 
-            self.assertIsInstance(response, StreamingResponse)
-            with zipfile.ZipFile(io.BytesIO(collect_response_body(response))) as archive:
+            with ctx.db() as db:
+                job = db.get(ExportJob, export["id"])
+                self.assertIsNotNone(job)
+                job.expires_at = routers.now_utc() - dt.timedelta(seconds=1)
+                for artifact in job.artifacts:
+                    artifact.expires_at = job.expires_at
+                db.commit()
+            expired_download = ctx.client.get(str(export["download_url"]), headers=headers)
+            self.assertEqual(expired_download.status_code, 410)
+            self.assertEqual(expired_download.json()["detail"], "Export expired")
+
+            swept = sweep_expired_transfers()
+            self.assertEqual(swept["deleted_exports"], [export["id"]])
+            with ctx.db() as db:
+                self.assertIsNone(db.get(ExportJob, export["id"]))
+                self.assertEqual(db.query(ExportArtifact).count(), 0)
+
+    def test_export_zip_write_checks_cancellation_between_chunks(self) -> None:
+        user = user_context("downloader")
+        data = b"x" * (routers.STREAM_CHUNK_SIZE + 1)
+
+        with vault_test_client() as ctx:
+            with ctx.db() as db:
+                folder = get_or_create_folder_path(db, "Project")
+                doc = create_versioned_document(db, folder, name="large.bin", data=data, actor=user)
+                db.flush()
+                version = current_version(doc, db)
+                self.assertIsNotNone(version)
+                checks = 0
+
+                def should_cancel() -> bool:
+                    nonlocal checks
+                    checks += 1
+                    return checks > 1
+
+                zip_temp = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+                zip_path = zip_temp.name
+                zip_temp.close()
+                try:
+                    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
+                        with self.assertRaises(ExportCancelled):
+                            write_version_to_zip(
+                                archive,
+                                "Project/large.bin",
+                                version,
+                                should_cancel=should_cancel,
+                            )
+                finally:
+                    Path(zip_path).unlink(missing_ok=True)
+                self.assertGreater(checks, 1)
+
+    def test_export_job_creates_downloadable_zip_artifact(self) -> None:
+        user = user_context("downloader")
+        headers = auth_headers("downloader", ["vault-admin"])
+
+        with vault_test_client() as ctx:
+            with ctx.db() as db:
+                folder = get_or_create_folder_path(db, "Project")
+                create_versioned_document(db, folder, name="one.txt", data=b"one", actor=user)
+                create_versioned_document(db, folder, name="two.txt", data=b"two", actor=user)
+                db.commit()
+                folder_id = folder.id
+
+            export_response = ctx.client.post(
+                "/api/exports",
+                json={"items": [{"type": "folder", "id": folder_id}]},
+                headers=headers,
+            )
+            self.assertEqual(export_response.status_code, 200, export_response.text)
+            export = wait_for_export(ctx.client, export_response.json()["id"], headers=headers)
+            self.assertEqual(export["status"], "complete")
+            ranged = ctx.client.get(
+                str(export["download_url"]), headers={**headers, "Range": "bytes=0-1"}
+            )
+            self.assertEqual(ranged.status_code, 206)
+            self.assertEqual(ranged.content, b"PK")
+            response = ctx.client.get(str(export["download_url"]), headers=headers)
+            self.assertEqual(response.status_code, 200, response.text)
+            with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
                 self.assertEqual(archive.read("Project/one.txt"), b"one")
                 self.assertEqual(archive.read("Project/two.txt"), b"two")
+
+    def test_export_cancel_requires_owner_and_blocks_artifact_download(self) -> None:
+        user = user_context("owner")
+        owner_headers = auth_headers("owner", ["vault-admin"])
+        intruder_headers = auth_headers("intruder", [])
+
+        with vault_test_client() as ctx:
+            with ctx.db() as db:
+                folder = get_or_create_folder_path(db, "Project")
+                create_versioned_document(db, folder, name="one.txt", data=b"one", actor=user)
+                db.commit()
+                folder_id = folder.id
+
+            with patch("app.routers.start_export_job"):
+                export_response = ctx.client.post(
+                    "/api/exports",
+                    json={"items": [{"type": "folder", "id": folder_id}]},
+                    headers=owner_headers,
+                )
+            self.assertEqual(export_response.status_code, 200, export_response.text)
+            job_id = export_response.json()["id"]
+            self.assertEqual(export_response.json()["status"], "queued")
+
+            blocked = ctx.client.delete(f"/api/exports/{job_id}", headers=intruder_headers)
+            self.assertEqual(blocked.status_code, 404)
+            cancelled = ctx.client.delete(f"/api/exports/{job_id}", headers=owner_headers)
+            self.assertEqual(cancelled.status_code, 200, cancelled.text)
+            self.assertEqual(cancelled.json()["status"], "cancelled")
+
+            download = ctx.client.get(f"/api/exports/{job_id}/download", headers=owner_headers)
+            self.assertEqual(download.status_code, 409)
+            self.assertEqual(download.json()["detail"], "Export is not complete")
+            with ctx.db() as db:
+                job = db.get(ExportJob, job_id)
+                self.assertIsNotNone(job)
+                self.assertEqual(job.status, "cancelled")
+                self.assertEqual(db.query(ExportArtifact).count(), 0)
 
 
 if __name__ == "__main__":

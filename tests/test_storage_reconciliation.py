@@ -1,12 +1,15 @@
+import datetime as dt
 import unittest
 
 from fastapi import HTTPException
 from tests.support import create_versioned_document, user_context, vault_runtime
 
-from app.models import Blob, BlobLocation, DocumentVersion
+from app.models import Blob, BlobLocation, DocumentVersion, ExportArtifact, ExportJob
 from app.routers import (
     current_version,
+    get_or_create_blob_for_data,
     get_or_create_folder_path,
+    now_utc,
     read_version_bytes,
     storage_reconciliation_report,
 )
@@ -276,6 +279,52 @@ class StorageReconciliationTests(unittest.TestCase):
             self.assertEqual(location.blob_id, blob_id)
             self.assertEqual(location.backend, "s3")
             self.assertEqual(location.object_key, "objects/sha256/remote-only")
+
+    def test_apply_preserves_export_artifact_blob(self) -> None:
+        user = user_context("exporter", groups=["vault-admin"], is_admin=True)
+
+        with vault_runtime() as ctx, ctx.db() as db:
+            blob = get_or_create_blob_for_data(db, b"zip bytes", "application/zip")
+            job = ExportJob(
+                id="export-artifact",
+                status="complete",
+                created_by=str(user["id"]),
+                created_by_name=str(user["name"]),
+                user_context={
+                    "id": user["id"],
+                    "name": user["name"],
+                    "groups": list(user["groups"]),
+                    "is_admin": user["is_admin"],
+                },
+                request_payload={"items": []},
+                filename="vault-download.zip",
+                expires_at=now_utc() + dt.timedelta(hours=1),
+            )
+            db.add(job)
+            db.flush()
+            db.add(
+                ExportArtifact(
+                    job_id=job.id,
+                    blob_id=blob.id,
+                    filename=job.filename,
+                    mime_type="application/zip",
+                    size_bytes=blob.size_bytes,
+                    hash_algo=blob.hash_algo,
+                    hash=blob.hash,
+                    expires_at=job.expires_at,
+                ),
+            )
+            db.commit()
+            object_keys = get_storage_backend("local").list_object_keys()
+
+            report = storage_reconciliation_report(db, apply=True)
+            db.commit()
+
+            self.assertEqual(report["orphan_blob_ids"], [])
+            self.assertEqual(report["deleted_local_keys"], [])
+            self.assertEqual(get_storage_backend("local").list_object_keys(), object_keys)
+            self.assertEqual(db.query(Blob).count(), 1)
+            self.assertEqual(db.query(ExportArtifact).count(), 1)
 
 
 if __name__ == "__main__":

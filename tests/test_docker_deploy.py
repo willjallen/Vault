@@ -162,8 +162,13 @@ class DockerDeployTests(unittest.TestCase):
         self.assertIn("VAULT_OBJECTS_PATH=/data/objects", dockerfile)
         self.assertIn("VAULT_DOCKER_RUNTIME=1", dockerfile)
         self.assertIn('VOLUME ["/data"]', dockerfile)
+        self.assertIn("EXPOSE 8000", dockerfile)
         self.assertIn("USER vault", dockerfile)
         self.assertIn("HEALTHCHECK", dockerfile)
+        self.assertIn(
+            'CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]',
+            dockerfile,
+        )
         self.assertNotIn("VAULT_VERSION", dockerfile)
         self.assertNotIn("/vault-metadata", dockerfile)
         self.assertNotIn("/vault-objects", dockerfile)

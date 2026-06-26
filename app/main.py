@@ -9,7 +9,13 @@ from fastapi.staticfiles import StaticFiles
 
 from . import config
 from .db import init_db
-from .routers import router, start_ttl_sweeper, stop_ttl_sweeper, sweep_expired_documents
+from .routers import (
+    router,
+    start_ttl_sweeper,
+    stop_ttl_sweeper,
+    sweep_expired_documents,
+    sweep_expired_transfers,
+)
 from .storage import ensure_storage
 from .version import APP_VERSION
 
@@ -34,6 +40,7 @@ def create_app(*, enable_ttl_sweeper: bool = True) -> FastAPI:
         init_db()
         ensure_storage()
         sweep_expired_documents()
+        sweep_expired_transfers()
         if enable_ttl_sweeper:
             start_ttl_sweeper()
 

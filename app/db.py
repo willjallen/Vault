@@ -83,6 +83,33 @@ def _apply_known_additive_migrations() -> None:
     tables = set(inspector.get_table_names())
     if "vault_users" in tables and "vault_settings" not in tables:
         cast(Any, models.VaultSetting.__table__).create(bind=engine, checkfirst=True)
+    if "vault_users" in tables:
+        for model in (
+            models.UploadSession,
+            models.UploadPart,
+            models.ExportJob,
+            models.ExportArtifact,
+        ):
+            if model.__tablename__ not in tables:
+                cast(Any, model.__table__).create(bind=engine, checkfirst=True)
+    if "upload_sessions" in tables:
+        upload_session_columns = {
+            column["name"] for column in inspector.get_columns("upload_sessions")
+        }
+        upload_session_migrations = {
+            "verification_total_bytes": (
+                "ALTER TABLE upload_sessions "
+                "ADD COLUMN verification_total_bytes INTEGER NOT NULL DEFAULT 0"
+            ),
+            "verification_processed_bytes": (
+                "ALTER TABLE upload_sessions "
+                "ADD COLUMN verification_processed_bytes INTEGER NOT NULL DEFAULT 0"
+            ),
+        }
+        with engine.begin() as connection:
+            for column_name, statement in upload_session_migrations.items():
+                if column_name not in upload_session_columns:
+                    connection.exec_driver_sql(statement)
     if "vault_users" not in tables:
         return
     vault_user_columns = {column["name"] for column in inspector.get_columns("vault_users")}

@@ -145,12 +145,17 @@ export function App({ initial }) {
     setFileDetailsTarget(null);
   }, []);
 
-  const { apiFetch, downloadWithProgress, logoutUrl, transfers, uploadWithProgress } = useAuthFetch(
-    {
-      initialBootstrap,
-      showNotice,
-    }
-  );
+  const {
+    apiFetch,
+    cancelTransfer,
+    downloadWithProgress,
+    logoutUrl,
+    transfers,
+    uploadWithProgress,
+  } = useAuthFetch({
+    initialBootstrap,
+    showNotice,
+  });
   const {
     alternateRows,
     doubleClickDownload,
@@ -524,16 +529,17 @@ export function App({ initial }) {
     }
     setUploading(true);
     setError("");
-    const form = new FormData();
-    form.append("file", file);
-    form.append("folder", targetFolder || "");
     try {
-      await uploadWithProgress({
-        formData: form,
+      const result = await uploadWithProgress({
+        file,
+        folder: targetFolder || "",
+        mode: "create",
         name: file.name,
         size: file.size,
-        url: "/documents",
       });
+      if (result.cancelled) {
+        return;
+      }
       await refresh(targetFolder || "", { invalidateContents: true });
     } catch (err) {
       setError(err.message || "Upload failed. Please try again.");
@@ -950,7 +956,7 @@ export function App({ initial }) {
       className: "hidden-input",
       onChange: (e) => handleVersionUploadInput(e.target.files[0]),
     }),
-    h(TransferDock, { transfers }),
+    h(TransferDock, { onCancelTransfer: cancelTransfer, transfers }),
     h(NotificationDock, { notices, onDismiss: dismissNotice }),
     h(DragPreview, { drag: dragBundle }),
     settingsOpen

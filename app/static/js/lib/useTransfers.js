@@ -1,4 +1,9 @@
-import { downloadBlob, uploadForm } from "./transferClient.js";
+import {
+  TransferCancelledError,
+  downloadUrl,
+  exportAndDownload,
+  uploadFileResumable,
+} from "./transferClient.js";
 
 const { useCallback, useEffect, useRef, useState } = React;
 
@@ -10,6 +15,7 @@ export function useTransfers({ onUnauthorized } = {}) {
   const [transfers, setTransfers] = useState([]);
   const nextId = useRef(1);
   const timers = useRef(new Set());
+  const controllers = useRef(new Map());
 
   const schedule = useCallback((callback, delay) => {
     const timer = setTimeout(() => {
@@ -40,6 +46,8 @@ export function useTransfers({ onUnauthorized } = {}) {
     () => () => {
       timers.current.forEach((timer) => clearTimeout(timer));
       timers.current.clear();
+      controllers.current.forEach((controller) => controller.abort());
+      controllers.current.clear();
     },
     []
   );
@@ -48,6 +56,8 @@ export function useTransfers({ onUnauthorized } = {}) {
     (kind, displayName, size) => {
       const id = nextId.current;
       nextId.current += 1;
+      const controller = new AbortController();
+      controllers.current.set(id, controller);
       setTransfers((current) => [
         ...current,
         {
@@ -60,6 +70,7 @@ export function useTransfers({ onUnauthorized } = {}) {
           percent: size ? 0 : null,
           phase: "entering",
           size: size || null,
+          stage: kind === "upload" ? "uploading" : "starting",
           status: "active",
           total: size || null,
         },
@@ -73,7 +84,7 @@ export function useTransfers({ onUnauthorized } = {}) {
           )
         );
       }, 16);
-      return id;
+      return { id, signal: controller.signal };
     },
     [schedule]
   );
@@ -91,6 +102,7 @@ export function useTransfers({ onUnauthorized } = {}) {
         etaSeconds: progress.etaSeconds,
         loaded: progress.loaded,
         percent: progress.percent,
+        stage: progress.stage || "transfer",
         total: progress.total,
       });
     },
@@ -99,6 +111,7 @@ export function useTransfers({ onUnauthorized } = {}) {
 
   const failTransfer = useCallback(
     (id, err) => {
+      controllers.current.delete(id);
       updateTransfer(id, {
         error: err.message || "Transfer failed",
         etaSeconds: null,
@@ -113,8 +126,38 @@ export function useTransfers({ onUnauthorized } = {}) {
     [onUnauthorized, removeTransfer, updateTransfer]
   );
 
+  const cancelTransfer = useCallback(
+    (id) => {
+      const controller = controllers.current.get(id);
+      if (!controller || controller.signal.aborted) {
+        return;
+      }
+      controller.abort();
+      updateTransfer(id, {
+        etaSeconds: null,
+        phase: "visible",
+        status: "cancelling",
+      });
+    },
+    [updateTransfer]
+  );
+
+  const markTransferCancelled = useCallback(
+    (id) => {
+      controllers.current.delete(id);
+      updateTransfer(id, {
+        etaSeconds: null,
+        phase: "visible",
+        status: "cancelled",
+      });
+      removeTransfer(id, 900);
+    },
+    [removeTransfer, updateTransfer]
+  );
+
   const completeTransfer = useCallback(
     (id, result = {}) => {
+      controllers.current.delete(id);
       updateTransfer(id, {
         etaSeconds: null,
         loaded: result.size || result.total || null,
@@ -132,47 +175,68 @@ export function useTransfers({ onUnauthorized } = {}) {
   );
 
   const uploadWithProgress = useCallback(
-    async ({ url, formData, name: displayName, size }) => {
-      const id = createTransfer("upload", displayName || "Upload", size || null);
+    async ({ file, folder, mode, documentId, note, renameToUpload, name: displayName, size }) => {
+      const transfer = createTransfer(
+        "upload",
+        displayName || file?.name || "Upload",
+        size || file?.size || null
+      );
+      const { id, signal } = transfer;
       try {
-        const result = await uploadForm({
-          fallbackTotal: size || null,
-          formData,
+        const result = await uploadFileResumable({
+          documentId,
+          file,
+          folder,
+          mode,
+          note,
           onProgress: (progress) => updateProgress(id, progress),
-          url,
+          renameToUpload,
+          signal,
         });
-        completeTransfer(id, { size: size || null });
+        completeTransfer(id, { size: result.size || size || file?.size || null });
         return result;
       } catch (err) {
+        if (err instanceof TransferCancelledError || err.cancelled) {
+          markTransferCancelled(id);
+          return { cancelled: true, status: 0 };
+        }
         failTransfer(id, err);
         throw err;
       }
     },
-    [completeTransfer, createTransfer, failTransfer, updateProgress]
+    [completeTransfer, createTransfer, failTransfer, markTransferCancelled, updateProgress]
   );
 
   const downloadWithProgress = useCallback(
-    async ({ url, name: displayName, size, method, body, headers }) => {
-      const id = createTransfer("download", displayName || "Download", size || null);
+    async ({ url, name: displayName, size, exportPayload }) => {
+      const { id, signal } = createTransfer("download", displayName || "Download", size || null);
       try {
-        const result = await downloadBlob({
-          body,
-          fallbackName: displayName,
-          fallbackTotal: size || null,
-          headers,
-          method,
-          onProgress: (progress) => updateProgress(id, progress),
-          url,
-        });
+        const result = exportPayload
+          ? await exportAndDownload({
+              payload: exportPayload,
+              onProgress: (progress) => updateProgress(id, progress),
+              signal,
+            })
+          : await downloadUrl({
+              fallbackName: displayName || "download",
+              fallbackTotal: size || null,
+              onProgress: (progress) => updateProgress(id, progress),
+              signal,
+              url,
+            });
         completeTransfer(id, { size: result.size || size || null });
         return result;
       } catch (err) {
+        if (err instanceof TransferCancelledError || err.cancelled) {
+          markTransferCancelled(id);
+          return { cancelled: true, status: 0 };
+        }
         failTransfer(id, err);
         throw err;
       }
     },
-    [completeTransfer, createTransfer, failTransfer, updateProgress]
+    [completeTransfer, createTransfer, failTransfer, markTransferCancelled, updateProgress]
   );
 
-  return { downloadWithProgress, transfers, uploadWithProgress };
+  return { cancelTransfer, downloadWithProgress, transfers, uploadWithProgress };
 }

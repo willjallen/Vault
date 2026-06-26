@@ -2,6 +2,7 @@ import { normalizeFolderName } from "./utils.js";
 
 export const LOCAL_PREFERENCES_STORAGE_KEY = "vault.localPreferences";
 const LOCAL_PREFERENCE_DEFAULTS = {
+  contentsColumnWidths: null,
   lastFolder: "",
 };
 
@@ -26,12 +27,16 @@ export function readLocalPreferences() {
   const stored = readLocalPreferencesObject();
   return {
     ...LOCAL_PREFERENCE_DEFAULTS,
+    ...stored,
     lastFolder: normalizeFolderName(stored.lastFolder || ""),
   };
 }
 
 export function readLocalPreference(key, fallback = "") {
   const preferences = readLocalPreferences();
+  if (key === "contentsColumnWidths") {
+    return preferences.contentsColumnWidths || fallback;
+  }
   if (key === "lastFolder") {
     return preferences.lastFolder;
   }
@@ -39,11 +44,15 @@ export function readLocalPreference(key, fallback = "") {
 }
 
 export function writeLocalPreference(key, value) {
-  const current = readLocalPreferences();
+  const current = readLocalPreferencesObject();
   const next = { ...current };
   if (key === "lastFolder") {
     next.lastFolder = normalizeFolderName(value || "");
+  } else if (key === "contentsColumnWidths") {
+    next.contentsColumnWidths = value;
+  } else {
+    return readLocalPreferences();
   }
   writeLocalPreferencesObject(next);
-  return next;
+  return readLocalPreferences();
 }

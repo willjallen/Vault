@@ -1,5 +1,14 @@
+import { writeLocalPreference } from "../../lib/localPreferences.js";
 import { classNames, formatBytes, isArchiveRootPath } from "../../lib/utils.js";
 import { Icon } from "../common/Icon.js";
+import {
+  COLUMN_RESIZE_HANDLES,
+  COLUMN_WIDTH_STORAGE_KEY,
+  columnWidthsForResize,
+  contentColumnStyle,
+  measuredColumnWidths,
+  readStoredColumnWidths,
+} from "./contentColumns.js";
 import { FolderRow } from "./FolderRow.js";
 import { FileRow } from "./FileRow.js";
 import { EmptyState } from "./EmptyState.js";
@@ -112,6 +121,45 @@ function ContentsSortButton({ column, sort, onSortChange }) {
   );
 }
 
+function ContentsHeaderCell({
+  children,
+  columnKey,
+  onResizeEnd,
+  onResizeMove,
+  onResizeStart,
+  resizeHandle,
+}) {
+  return h(
+    "div",
+    {
+      className: classNames(
+        "contents-head-cell",
+        columnKey === "name" ? "name-column" : "",
+        columnKey === "actions" ? "actions-column" : "",
+        columnKey !== "name" && columnKey !== "actions" ? "detail-column" : ""
+      ),
+      "data-column-key": columnKey,
+    },
+    [
+      h(React.Fragment, { key: "content" }, children),
+      resizeHandle
+        ? h("button", {
+            "aria-label": `Resize ${resizeHandle.left} and ${resizeHandle.right} columns`,
+            className: "contents-column-resizer",
+            key: "resize",
+            onClick: (e) => e.stopPropagation(),
+            onPointerCancel: onResizeEnd,
+            onPointerDown: (e) => onResizeStart(resizeHandle, e),
+            onPointerMove: onResizeMove,
+            onPointerUp: onResizeEnd,
+            title: "Resize column",
+            type: "button",
+          })
+        : null,
+    ]
+  );
+}
+
 export function VaultFileList({
   folder,
   subfolders,
@@ -157,10 +205,13 @@ export function VaultFileList({
   onCanvasDragLeave,
   onUploadClick,
 }) {
+  const headerRef = useRef(null);
   const fileListRef = useRef(null);
   const marqueeDragRef = useRef(null);
   const marqueeFrameRef = useRef(null);
+  const resizeDragRef = useRef(null);
   const suppressClickRef = useRef(false);
+  const [columnWidths, setColumnWidths] = useState(readStoredColumnWidths);
   const [marquee, setMarquee] = useState(null);
   const inArchive = isArchiveRootPath(folder);
   const draftInFolder = inlineFolderDraft && inlineFolderDraft.parent === (folder || "");
@@ -284,6 +335,51 @@ export function VaultFileList({
     }, 0);
   }
 
+  function beginColumnResize(handle, e) {
+    if (!handle || e.button !== 0) {
+      return;
+    }
+    e.preventDefault();
+    e.stopPropagation();
+    resizeDragRef.current = {
+      ...handle,
+      nextWidths: null,
+      pointerId: e.pointerId,
+      startColumnWidths: columnWidths,
+      startWidths: measuredColumnWidths(headerRef.current),
+      startX: e.clientX,
+    };
+    e.currentTarget.setPointerCapture?.(e.pointerId);
+    document.body.classList.add("contents-column-resizing");
+  }
+
+  function moveColumnResize(e) {
+    const drag = resizeDragRef.current;
+    if (!drag || drag.pointerId !== e.pointerId) {
+      return;
+    }
+    e.preventDefault();
+    e.stopPropagation();
+    const nextWidths = columnWidthsForResize(drag, e.clientX);
+    drag.nextWidths = nextWidths;
+    setColumnWidths(nextWidths);
+  }
+
+  function endColumnResize(e) {
+    const drag = resizeDragRef.current;
+    if (!drag || drag.pointerId !== e.pointerId) {
+      return;
+    }
+    e.preventDefault();
+    e.stopPropagation();
+    if (drag.nextWidths) {
+      writeLocalPreference(COLUMN_WIDTH_STORAGE_KEY, drag.nextWidths);
+    }
+    e.currentTarget.releasePointerCapture?.(e.pointerId);
+    resizeDragRef.current = null;
+    document.body.classList.remove("contents-column-resizing");
+  }
+
   function commitInlineEditBeforePointer(e) {
     if (
       !inlineFolderDraft ||
@@ -384,6 +480,7 @@ export function VaultFileList({
   useEffect(
     () => () => {
       cancelMarqueeFrame();
+      document.body.classList.remove("contents-column-resizing");
     },
     []
   );
@@ -577,6 +674,7 @@ export function VaultFileList({
       onDragLeave: onCanvasDragLeave,
       onDrop: onCanvasDrop,
       onClick: handleBackgroundClick,
+      style: contentColumnStyle(columnWidths),
     },
     [
       h("div", { className: "browser-head" }, [
@@ -645,6 +743,7 @@ export function VaultFileList({
           className: "contents-table-head",
           onClick: (e) => e.stopPropagation(),
           onMouseDown: (e) => e.stopPropagation(),
+          ref: headerRef,
         },
         [
           h(
@@ -661,20 +760,45 @@ export function VaultFileList({
               type: "checkbox",
             })
           ),
-          h(ContentsSortButton, {
-            column: NAME_COLUMN,
-            key: NAME_COLUMN.key,
-            onSortChange,
-            sort,
-          }),
-          ...DETAIL_SORT_COLUMNS.map((column) =>
+          h(
+            ContentsHeaderCell,
+            {
+              columnKey: NAME_COLUMN.key,
+              key: NAME_COLUMN.key,
+              onResizeEnd: endColumnResize,
+              onResizeMove: moveColumnResize,
+              onResizeStart: beginColumnResize,
+              resizeHandle: COLUMN_RESIZE_HANDLES.name,
+            },
             h(ContentsSortButton, {
-              column,
-              key: column.key,
+              column: NAME_COLUMN,
               onSortChange,
               sort,
             })
           ),
+          ...DETAIL_SORT_COLUMNS.map((column) =>
+            h(
+              ContentsHeaderCell,
+              {
+                columnKey: column.className,
+                key: column.key,
+                onResizeEnd: endColumnResize,
+                onResizeMove: moveColumnResize,
+                onResizeStart: beginColumnResize,
+                resizeHandle: COLUMN_RESIZE_HANDLES[column.className],
+              },
+              h(ContentsSortButton, {
+                column,
+                onSortChange,
+                sort,
+              })
+            )
+          ),
+          h("div", {
+            className: "contents-head-actions",
+            "data-column-key": "actions",
+            key: "actions",
+          }),
         ]
       ),
       h(

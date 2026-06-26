@@ -955,8 +955,14 @@ body.sidebar-resizing {
 }
 
 .finder-browser {
-  --contents-grid-template: 32px minmax(196px, 1fr) minmax(168px, 210px) minmax(86px, 126px)
-    minmax(72px, 96px) minmax(196px, 236px) minmax(138px, 162px);
+  --contents-actions-width: 162px;
+  --contents-modified-width: 210px;
+  --contents-size-width: 96px;
+  --contents-status-width: 236px;
+  --contents-user-width: 126px;
+  --contents-grid-template: 32px minmax(196px, 1fr) minmax(128px, var(--contents-modified-width))
+    minmax(76px, var(--contents-user-width)) minmax(64px, var(--contents-size-width))
+    minmax(152px, var(--contents-status-width)) minmax(138px, var(--contents-actions-width));
 
   background: var(--surface-panel);
   border: 1px solid var(--outline);
@@ -1041,6 +1047,69 @@ body.sidebar-resizing {
   margin: -2px 0 6px;
   border-bottom: 1px solid var(--border-extra-subtle);
   color: var(--text-muted);
+}
+
+.contents-head-cell {
+  position: relative;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+}
+
+.contents-head-cell > .contents-sort-button {
+  width: 100%;
+}
+
+.contents-head-actions {
+  min-width: 0;
+}
+
+.contents-column-resizer {
+  position: absolute;
+  top: 4px;
+  right: -11px;
+  z-index: 3;
+  width: 10px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.contents-column-resizer::before {
+  position: absolute;
+  top: 3px;
+  bottom: 3px;
+  left: 50%;
+  width: 1px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--border-subtle) 64%, transparent);
+  content: "";
+  opacity: 0.18;
+  transform: translateX(-50%);
+  transition:
+    background 0.12s ease,
+    opacity 0.12s ease;
+}
+
+.contents-column-resizer:hover::before,
+.contents-column-resizer:focus-visible::before,
+body.contents-column-resizing .contents-column-resizer::before {
+  background: color-mix(in srgb, var(--accent-border) 56%, transparent);
+  opacity: 0.58;
+}
+
+.contents-column-resizer:focus-visible {
+  outline: 2px solid var(--focus-ring-strong);
+  outline-offset: 2px;
+}
+
+body.contents-column-resizing {
+  cursor: col-resize;
+  user-select: none;
 }
 
 .contents-sort-button {
@@ -4844,6 +4913,11 @@ input[type="file"]::file-selector-button:hover {
     grid-template-columns: var(--contents-grid-template);
     padding-left: 10px;
     padding-right: 10px;
+  }
+
+  .contents-head-cell.detail-column,
+  .contents-column-resizer {
+    display: none;
   }
 
   .contents-sort-modified,

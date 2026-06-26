@@ -2170,35 +2170,62 @@ input[type="file"]::file-selector-button:hover {
   background: var(--surface-raised-hover);
 }
 
-.history-toggle {
-  width: 100%;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 0;
-  border: none;
-  background: transparent;
-  color: inherit;
-  text-align: left;
-  cursor: pointer;
+.history-head {
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+
+.history-title {
+  min-width: 0;
 }
 
 .history-label {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: 6px;
   flex-wrap: wrap;
 }
 
-.history-toggle .chevron {
-  display: inline-block;
-  color: var(--muted);
-  transition: transform 0.2s ease;
+.history-mode-note {
+  margin: 3px 0 0;
 }
 
-.history-toggle .chevron.open {
-  transform: rotate(90deg);
+.history-mode-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  min-height: 28px;
+  padding: 5px 10px;
+  border: 1px solid var(--border-extra-subtle);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 0.78rem;
+  font-weight: 750;
+  cursor: pointer;
+  transition:
+    border-color 0.12s ease,
+    background 0.12s ease,
+    color 0.12s ease;
+}
+
+.history-mode-toggle:hover {
+  border-color: var(--border-subtle);
+  background: var(--surface-raised);
+  color: var(--text-secondary);
+}
+
+.history-mode-toggle.active {
+  border-color: var(--accent-border);
+  background: var(--accent-soft-hover);
+  color: var(--accent-fill);
+}
+
+.history-mode-toggle:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
 }
 
 .history-list {
@@ -2237,6 +2264,28 @@ input[type="file"]::file-selector-button:hover {
   margin-top: 4px;
   background: var(--surface-raised-hover);
   border: 1px solid var(--border-strong);
+}
+
+.history-row.version .history-dot {
+  background: var(--accent-soft-hover);
+  border-color: var(--accent-border);
+}
+
+.history-row.activity {
+  opacity: 0.84;
+}
+
+.history-row.activity .history-dot {
+  width: 6px;
+  height: 6px;
+  margin-top: 5px;
+  background: var(--outline);
+  border-color: transparent;
+}
+
+.history-row.activity .history-action {
+  color: var(--text-secondary);
+  font-weight: 650;
 }
 
 .history-stem {

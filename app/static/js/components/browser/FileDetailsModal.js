@@ -77,27 +77,16 @@ function joinMetaPieces(pieces) {
   }, []);
 }
 
-function filterHistoryItems(historyItems) {
-  if (!historyItems || !historyItems.length) {
-    return [];
-  }
+function isVersionEntry(item) {
+  return item?.type === "version";
+}
 
-  const versionTimestamps = new Set(
-    historyItems
-      .filter((item) => item.type === "version" && item.timestamp)
-      .map((item) => item.timestamp)
-  );
-  const redundantTypes = new Set(["upload", "checkin", "archive", "unarchive", "move"]);
+function isDownloadableVersionEntry(item) {
+  return isVersionEntry(item) && Boolean(item.download_url);
+}
 
-  return historyItems.filter((item) => {
-    if (item.type === "version" || !item.timestamp) {
-      return true;
-    }
-    if (versionTimestamps.has(item.timestamp) && redundantTypes.has(item.type)) {
-      return false;
-    }
-    return true;
-  });
+function countLabel(count, singular, plural) {
+  return `${count} ${count === 1 ? singular : plural}`;
 }
 
 function locationPartsFor(doc) {
@@ -124,7 +113,7 @@ function MetadataLine({ children }) {
 
 export function FileDetailsModal({ actions, doc, onClose }) {
   const [phase, setPhase] = useState("entering");
-  const [historyOpen, setHistoryOpen] = useState(true);
+  const [showFullHistory, setShowFullHistory] = useState(false);
   const closeTimer = useRef(null);
   const closeButton = useRef(null);
 
@@ -157,7 +146,7 @@ export function FileDetailsModal({ actions, doc, onClose }) {
   }, [closeModal]);
 
   useEffect(() => {
-    setHistoryOpen(true);
+    setShowFullHistory(false);
   }, [doc?.id]);
 
   const historyItems = useMemo(() => doc?.versions || [], [doc?.versions]);
@@ -166,7 +155,12 @@ export function FileDetailsModal({ actions, doc, onClose }) {
     [historyItems]
   );
   const versionCount = doc?.version_count || Math.max(versionEntries.length || 0, 1);
-  const filteredHistoryItems = useMemo(() => filterHistoryItems(historyItems), [historyItems]);
+  const downloadableVersionItems = useMemo(
+    () => historyItems.filter(isDownloadableVersionEntry),
+    [historyItems]
+  );
+  const visibleHistoryItems = showFullHistory ? historyItems : downloadableVersionItems;
+  const hiddenHistoryCount = Math.max(historyItems.length - downloadableVersionItems.length, 0);
   const versionPositions = useMemo(() => {
     const map = new Map();
     versionEntries.forEach((item, idx) => {
@@ -254,69 +248,85 @@ export function FileDetailsModal({ actions, doc, onClose }) {
               : null,
           ]),
           h("section", { className: "file-details-card", key: "history" }, [
-            h(
-              "button",
-              {
-                className: "history-toggle",
-                onClick: () => setHistoryOpen((current) => !current),
-                type: "button",
-              },
-              [
+            h("div", { className: "file-details-card-head history-head" }, [
+              h("div", { className: "history-title" }, [
                 h("div", { className: "history-label" }, [
                   h("h3", null, "History"),
                   h(
                     "span",
                     { className: "muted tiny history-count" },
-                    `· ${filteredHistoryItems.length} ${
-                      filteredHistoryItems.length === 1 ? "event" : "events"
-                    }`
+                    showFullHistory
+                      ? `· ${countLabel(historyItems.length, "event", "events")}`
+                      : `· ${countLabel(downloadableVersionItems.length, "version", "versions")}`
                   ),
                 ]),
-                h(
-                  "span",
-                  { className: classNames("chevron", historyOpen ? "open" : "") },
-                  h(Icon, { icon: "chevron-right", size: 12 })
-                ),
-              ]
-            ),
-            historyOpen
-              ? filteredHistoryItems.length
-                ? h(
-                    "ul",
-                    { className: "history-list timeline" },
-                    filteredHistoryItems.map((item, idx) => {
-                      const versionNumber =
-                        versionPositions.get(item.id) ||
-                        (item.type === "version" ? versionCount : null);
-                      const actionText = describeEvent(item, versionNumber);
-                      const timestampLabel = formatTimestamp(item.timestamp || item.display);
-                      const detailText = item.note && item.note !== actionText ? item.note : null;
-                      const metaPieces = [];
-                      if (item.type === "version" && item.original_filename) {
-                        metaPieces.push(item.original_filename);
-                      }
-                      if (item.type === "version" && versionNumber) {
-                        metaPieces.push(
-                          h(
-                            "span",
-                            { className: "version-pill tiny", key: `${item.id}-v` },
-                            `v${versionNumber}`
-                          )
-                        );
-                      }
-                      if (item.by) {
-                        metaPieces.push(item.by);
-                      }
-                      if (timestampLabel) {
-                        metaPieces.push(timestampLabel);
-                      }
-                      if (detailText) {
-                        metaPieces.push(detailText);
-                      }
-                      return h("li", { className: "history-row timeline", key: item.id }, [
+                !showFullHistory && hiddenHistoryCount > 0
+                  ? h(
+                      "p",
+                      { className: "muted tiny history-mode-note" },
+                      `${countLabel(hiddenHistoryCount, "activity event", "activity events")} hidden`
+                    )
+                  : null,
+              ]),
+              h(
+                "button",
+                {
+                  "aria-pressed": String(showFullHistory),
+                  className: classNames("history-mode-toggle", showFullHistory ? "active" : ""),
+                  onClick: () => setShowFullHistory((current) => !current),
+                  type: "button",
+                },
+                "Full history"
+              ),
+            ]),
+            visibleHistoryItems.length
+              ? h(
+                  "ul",
+                  { className: "history-list timeline" },
+                  visibleHistoryItems.map((item, idx) => {
+                    const isVersion = isVersionEntry(item);
+                    const versionNumber =
+                      versionPositions.get(item.id) ||
+                      (item.type === "version" ? versionCount : null);
+                    const actionText = describeEvent(item, versionNumber);
+                    const timestampLabel = formatTimestamp(item.timestamp || item.display);
+                    const detailText = item.note && item.note !== actionText ? item.note : null;
+                    const metaPieces = [];
+                    if (item.type === "version" && item.original_filename) {
+                      metaPieces.push(item.original_filename);
+                    }
+                    if (item.type === "version" && versionNumber) {
+                      metaPieces.push(
+                        h(
+                          "span",
+                          { className: "version-pill tiny", key: `${item.id}-v` },
+                          `v${versionNumber}`
+                        )
+                      );
+                    }
+                    if (item.by) {
+                      metaPieces.push(item.by);
+                    }
+                    if (timestampLabel) {
+                      metaPieces.push(timestampLabel);
+                    }
+                    if (detailText) {
+                      metaPieces.push(detailText);
+                    }
+                    return h(
+                      "li",
+                      {
+                        className: classNames(
+                          "history-row",
+                          "timeline",
+                          isVersion ? "version" : "activity"
+                        ),
+                        key: item.id,
+                      },
+                      [
                         h("div", { className: "history-marker" }, [
                           h("span", { className: "history-dot" }),
-                          idx < filteredHistoryItems.length - 1
+                          idx < visibleHistoryItems.length - 1
                             ? h("span", { className: "history-stem" })
                             : null,
                         ]),
@@ -338,11 +348,15 @@ export function FileDetailsModal({ actions, doc, onClose }) {
                           ]),
                           h("div", { className: "history-meta-line" }, joinMetaPieces(metaPieces)),
                         ]),
-                      ]);
-                    })
-                  )
-                : h("p", { className: "muted tiny" }, "No previous versions yet.")
-              : null,
+                      ]
+                    );
+                  })
+                )
+              : h(
+                  "p",
+                  { className: "muted tiny" },
+                  showFullHistory ? "No history yet." : "No downloadable versions yet."
+                ),
           ]),
         ]),
       ]

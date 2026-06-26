@@ -40,10 +40,13 @@ async function errorFromResponse(response, fallback) {
 function progressFromValues(loaded, total, startedAt, options = {}) {
   const elapsedSeconds = Math.max((performance.now() - startedAt) / 1000, 0.01);
   const bytesPerSecond = loaded / elapsedSeconds;
+  const finalizing = options.stage === "finalizing";
   const etaSeconds =
-    total && bytesPerSecond > 0 && loaded < total ? (total - loaded) / bytesPerSecond : null;
+    total && bytesPerSecond > 0 && loaded < total && !finalizing
+      ? (total - loaded) / bytesPerSecond
+      : null;
   return {
-    bytesPerSecond,
+    bytesPerSecond: finalizing ? 0 : bytesPerSecond,
     etaSeconds,
     lengthComputable: Boolean(total),
     loaded,
@@ -564,6 +567,7 @@ async function streamResponseToFile({ response, writer, total, onProgress, signa
       onProgress(progressFromValues(loaded, total, startedAt, { stage: "downloading" }));
     }
     await flushPendingChunks();
+    onProgress(progressFromValues(loaded, total, startedAt, { stage: "finalizing" }));
     await writer.close();
     return loaded;
   } catch (error) {

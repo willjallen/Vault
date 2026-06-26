@@ -40,6 +40,9 @@ function transferTitle(transfer) {
   if (transfer.kind === "download" && transfer.stage === "starting") {
     return "Starting download";
   }
+  if (transfer.kind === "download" && transfer.stage === "finalizing") {
+    return "Saving download";
+  }
   return transfer.kind === "upload" ? "Uploading" : "Downloading";
 }
 
@@ -52,6 +55,9 @@ function transferStageLabel(transfer) {
   }
   if (transfer.kind === "download" && transfer.stage === "starting") {
     return "Browser handoff";
+  }
+  if (transfer.kind === "download" && transfer.stage === "finalizing") {
+    return "File save";
   }
   return transfer.kind === "upload" ? "File upload" : "Download";
 }
@@ -81,6 +87,9 @@ function transferMeta(transfer) {
   }
   if (transfer.status === "complete") {
     return transfer.total ? `${formatBytes(transfer.total)} complete` : "Complete";
+  }
+  if (transfer.kind === "download" && transfer.stage === "finalizing") {
+    return transfer.total ? `${formatBytes(transfer.total)} received` : "Finalizing";
   }
 
   const pieces = [];

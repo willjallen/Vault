@@ -2431,8 +2431,6 @@ input[type="file"]::file-selector-button:hover {
 
 .version-chip-button:hover,
 .version-chip-button:focus-visible {
-  border-color: var(--accent-border);
-  background: var(--accent-soft-hover);
   color: var(--accent-fill);
 }
 

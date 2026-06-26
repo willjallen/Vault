@@ -3754,6 +3754,10 @@ input[type="file"]::file-selector-button:hover {
   font-weight: 760;
 }
 
+.folder-permission-check.disabled {
+  opacity: 0.58;
+}
+
 .folder-permission-remove {
   border: 1px solid var(--danger-border);
   border-radius: 9px;

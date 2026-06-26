@@ -19,15 +19,19 @@ async function responseError(res) {
 }
 
 function PermissionCheck({ checked, disabled, label, onChange }) {
-  return h("label", { className: "folder-permission-check" }, [
-    h("input", {
-      checked,
-      disabled,
-      onChange: (evt) => onChange(evt.target.checked),
-      type: "checkbox",
-    }),
-    h("span", null, label),
-  ]);
+  return h(
+    "label",
+    { className: classNames("folder-permission-check", disabled ? "disabled" : "") },
+    [
+      h("input", {
+        checked,
+        disabled,
+        onChange: (evt) => onChange(evt.target.checked),
+        type: "checkbox",
+      }),
+      h("span", null, label),
+    ]
+  );
 }
 
 function permissionKey(permission) {
@@ -36,6 +40,30 @@ function permissionKey(permission) {
 
 function sortPermissions(items) {
   return [...items].sort((a, b) => a.group_name.localeCompare(b.group_name));
+}
+
+function normalizePermission(permission) {
+  const canWrite = Boolean(permission.can_write);
+  const canRead = Boolean(permission.can_read || canWrite);
+  const canView = Boolean(permission.can_view || canRead);
+  return {
+    ...permission,
+    can_view: canView,
+    can_read: canRead,
+    can_write: canWrite,
+  };
+}
+
+function nextPermission(permission, key, value) {
+  const next = normalizePermission({ ...permission, [key]: value });
+  if (key === "can_view" && !value) {
+    next.can_read = false;
+    next.can_write = false;
+  }
+  if (key === "can_read" && !value) {
+    next.can_write = false;
+  }
+  return normalizePermission(next);
 }
 
 function RetentionSegmented({ disabled, value, onChange }) {
@@ -106,7 +134,7 @@ export function FolderPropertiesModal({ apiFetch, folder, onClose, onUpdated }) 
       setIcon(data.icon || "");
       setTtlAction(data.default_ttl_action || "none");
       setTtlDays(data.default_ttl_days ? String(data.default_ttl_days) : "30");
-      setPermissions(sortPermissions(data.permissions || []));
+      setPermissions(sortPermissions((data.permissions || []).map(normalizePermission)));
     } catch (err) {
       setError(err.message || "Could not load folder properties");
     } finally {
@@ -144,7 +172,7 @@ export function FolderPropertiesModal({ apiFetch, folder, onClose, onUpdated }) 
     setPermissions((current) =>
       sortPermissions(
         current.map((permission) =>
-          permission.group_id === groupId ? { ...permission, [key]: value } : permission
+          permission.group_id === groupId ? nextPermission(permission, key, value) : permission
         )
       )
     );
@@ -163,13 +191,13 @@ export function FolderPropertiesModal({ apiFetch, folder, onClose, onUpdated }) 
     setPermissions((current) =>
       sortPermissions([
         ...current,
-        {
+        normalizePermission({
           group_id: group.id,
           group_name: group.name,
           can_view: true,
           can_read: true,
           can_write: false,
-        },
+        }),
       ])
     );
     setSelectedGroupId("");
@@ -193,7 +221,7 @@ export function FolderPropertiesModal({ apiFetch, folder, onClose, onUpdated }) 
       setIcon(data.icon || "");
       setTtlAction(data.default_ttl_action || "none");
       setTtlDays(data.default_ttl_days ? String(data.default_ttl_days) : "30");
-      setPermissions(sortPermissions(data.permissions || []));
+      setPermissions(sortPermissions((data.permissions || []).map(normalizePermission)));
       onUpdated?.();
     } catch (err) {
       setError(err.message || "Could not save folder appearance");
@@ -245,12 +273,15 @@ export function FolderPropertiesModal({ apiFetch, folder, onClose, onUpdated }) 
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           path: detail.path,
-          permissions: permissions.map((permission) => ({
-            group_id: permission.group_id,
-            can_view: permission.can_view,
-            can_read: permission.can_read,
-            can_write: permission.can_write,
-          })),
+          permissions: permissions.map((permission) => {
+            const normalized = normalizePermission(permission);
+            return {
+              group_id: normalized.group_id,
+              can_view: normalized.can_view,
+              can_read: normalized.can_read,
+              can_write: normalized.can_write,
+            };
+          }),
         }),
       });
       if (!res.ok) {
@@ -258,7 +289,7 @@ export function FolderPropertiesModal({ apiFetch, folder, onClose, onUpdated }) 
       }
       const data = await res.json();
       setDetail(data);
-      setPermissions(sortPermissions(data.permissions || []));
+      setPermissions(sortPermissions((data.permissions || []).map(normalizePermission)));
       onUpdated?.();
     } catch (err) {
       setError(err.message || "Could not save folder permissions");
@@ -454,7 +485,8 @@ export function FolderPropertiesModal({ apiFetch, folder, onClose, onUpdated }) 
                             h("strong", { key: "name" }, permission.group_name),
                             h(PermissionCheck, {
                               checked: permission.can_view,
-                              disabled: Boolean(saving),
+                              disabled:
+                                Boolean(saving) || permission.can_read || permission.can_write,
                               key: "view",
                               label: "View",
                               onChange: (value) =>
@@ -462,7 +494,7 @@ export function FolderPropertiesModal({ apiFetch, folder, onClose, onUpdated }) 
                             }),
                             h(PermissionCheck, {
                               checked: permission.can_read,
-                              disabled: Boolean(saving),
+                              disabled: Boolean(saving) || permission.can_write,
                               key: "read",
                               label: "Read",
                               onChange: (value) =>

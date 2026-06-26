@@ -8,6 +8,8 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+APP_VERSION = (ROOT / "VERSION").read_text().strip()
+RELEASE_IMAGE = f"ghcr.io/willjallen/vault:v{APP_VERSION}"
 
 
 class DockerDeployTests(unittest.TestCase):
@@ -144,7 +146,7 @@ class DockerDeployTests(unittest.TestCase):
     def test_compose_uses_single_data_volume_and_production_auth_defaults(self) -> None:
         compose = (ROOT / "docker-compose.yml").read_text()
 
-        self.assertIn("ghcr.io/willjallen/vault:v0.1.0", compose)
+        self.assertIn(RELEASE_IMAGE, compose)
         self.assertIn("- vault-data:/data", compose)
         self.assertIn("vault-data:", compose)
         self.assertEqual(compose.count(":/data"), 1)

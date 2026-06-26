@@ -58,7 +58,6 @@ export function FinderShell({
   draggingFolderPath,
   currentUser,
   doubleClickDownload,
-  openFoldersOnClick,
   canGoBack,
   canGoForward,
   canGoUp,
@@ -269,7 +268,6 @@ export function FinderShell({
             onSelectFolder(doc.folder || "");
             onSelectDoc(doc.id);
           },
-          openFoldersOnClick,
           onContextMenu: onFolderContextMenu,
           onSidebarLayoutChange,
           onSidebarSectionSizesChange,

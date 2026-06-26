@@ -457,25 +457,14 @@ export function App({ initial }) {
   }
 
   function handleSelectFolderItem(item, pointerEvent, orderedItems) {
-    const key = keyForItem(item);
     if (isSelectionClick(pointerEvent)) {
       setContentsSelection([]);
       setContentsAnchor(null);
       applyPaneSelection("folders", item, pointerEvent, orderedItems);
       return;
     }
-    if (folderSelection.includes(key)) {
-      clearAllSelections();
-      return;
-    }
-    if (openFoldersOnClick) {
-      clearAllSelections();
-      navigateToFolder(item.path || "");
-      return;
-    }
-    setContentsSelection([]);
-    setContentsAnchor(null);
-    applyPaneSelection("folders", item, pointerEvent, orderedItems);
+    clearAllSelections();
+    navigateToFolder(item.path || "");
   }
 
   function handleSelectFavoriteDocument(item) {
@@ -892,7 +881,6 @@ export function App({ initial }) {
       currentUser,
       doubleClickDownload,
       isAdmin,
-      openFoldersOnClick,
       canGoBack,
       canGoForward,
       canGoUp,

@@ -20,7 +20,14 @@ export function buildFileMenuItems(actions) {
   const { doc, currentUser, busy } = actions;
   const lock = doc.lock || {};
   const lockedByOther = lock && lock.by && lock.by !== currentUser.id;
+  const lockedByMe = lock && lock.by && lock.by === currentUser.id;
   return compactMenuItems([
+    { label: "Download", action: () => actions.handleView(doc) },
+    {
+      label: "Replace",
+      action: () => actions.handleVersionUploadClick(doc, { renameToUploadedName: !lockedByMe }),
+      disabled: busy || doc.archived || lockedByOther,
+    },
     actions.openFileDetails
       ? { label: "History", action: () => actions.openFileDetails(doc) }
       : null,

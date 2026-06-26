@@ -28,6 +28,7 @@ import {
   keyForItem,
 } from "./lib/itemActions.js";
 import { favoriteItemsToSidebarItems } from "./lib/favoriteItems.js";
+import { markFavoriteContextTarget } from "./lib/menuTargets.js";
 import { folderBaseName, isArchiveRootPath } from "./lib/utils.js";
 import {
   initialFolderForApp,
@@ -774,12 +775,16 @@ export function App({ initial }) {
     }
     const item = docToItem(doc);
     const key = keyForItem(item);
-    const selectedItems = contentsSelection.includes(key) ? selectedContentsItems : [item];
+    const selectedItems =
+      contentsSelection.includes(key) && selectedContentsItems.length
+        ? selectedContentsItems
+        : [item];
+    const menuItems = markFavoriteContextTarget(selectedItems, item);
     if (options.select !== false && !contentsSelection.includes(key)) {
       setContentsSelection([key]);
       setContentsAnchor(key);
     }
-    const items = buildSelectionMenuItems(contextActions({ selectedItems }));
+    const items = buildSelectionMenuItems(contextActions({ selectedItems: menuItems }));
     setContextMenu({ x: evt.clientX, y: evt.clientY, items });
   }
 
@@ -809,13 +814,7 @@ export function App({ initial }) {
     const paneSelection = useFolderPane ? folderSelection : contentsSelection;
     const paneItems = useFolderPane ? selectedFolderItems : selectedContentsItems;
     const selectedItems = paneSelection.includes(key) && paneItems.length ? paneItems : [item];
-    const menuItems = item.favorite
-      ? selectedItems.map((selectedItem) =>
-          selectedItem.type === "folder" && selectedItem.path === item.path
-            ? { ...selectedItem, favorite: true }
-            : selectedItem
-        )
-      : selectedItems;
+    const menuItems = markFavoriteContextTarget(selectedItems, item);
     if (options.select !== false && !paneSelection.includes(key)) {
       if (useFolderPane) {
         setFolderSelection([key]);

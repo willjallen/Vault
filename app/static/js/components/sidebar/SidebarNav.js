@@ -836,7 +836,6 @@ export function SidebarNav({
       onToggleCollapsed: () => toggleSectionCollapsed("favorites"),
       sectionDragProps: {
         "data-vault-drop-kind": "favorites",
-        "data-drop-active": activeDropTarget?.kind === "favorites" ? "true" : undefined,
       },
       dropActive: activeDropTarget?.kind === "favorites",
       dropAvailable: dragActive && favoriteDropAvailable,

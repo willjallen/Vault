@@ -640,6 +640,10 @@ class StreamingTransferTests(unittest.TestCase):
             self.assertEqual(export["status"], "complete")
             with ctx.db() as db:
                 self.assertEqual(db.query(ExportArtifact).count(), 1)
+                artifact = db.query(ExportArtifact).one()
+                artifact_blob_id = artifact.blob_id
+                artifact_object_keys = [location.object_key for location in artifact.blob.locations]
+                self.assertTrue(artifact_object_keys)
 
             with ctx.db() as db:
                 job = db.get(ExportJob, export["id"])
@@ -654,9 +658,20 @@ class StreamingTransferTests(unittest.TestCase):
 
             swept = sweep_expired_transfers()
             self.assertEqual(swept["deleted_exports"], [export["id"]])
+            self.assertEqual(swept["deleted_export_objects"], artifact_object_keys)
             with ctx.db() as db:
                 self.assertIsNone(db.get(ExportJob, export["id"]))
+                self.assertIsNone(db.get(Blob, artifact_blob_id))
                 self.assertEqual(db.query(ExportArtifact).count(), 0)
+                self.assertEqual(
+                    db.query(BlobLocation)
+                    .filter(BlobLocation.object_key.in_(artifact_object_keys))
+                    .count(),
+                    0,
+                )
+            self.assertFalse(
+                set(artifact_object_keys) & set(get_storage_backend("local").list_object_keys()),
+            )
 
     def test_export_zip_write_checks_cancellation_between_chunks(self) -> None:
         user = user_context("downloader")

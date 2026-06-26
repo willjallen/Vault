@@ -3735,12 +3735,38 @@ def sweep_expired_documents(limit: int = 250) -> dict[str, list[str]]:
             db.close()
 
 
+def blob_is_referenced(db: Session, blob_id: int) -> bool:
+    document_reference = db.execute(
+        select(DocumentVersion.id).where(DocumentVersion.blob_id == blob_id).limit(1),
+    ).first()
+    if document_reference:
+        return True
+    artifact_reference = db.execute(
+        select(ExportArtifact.id).where(ExportArtifact.blob_id == blob_id).limit(1),
+    ).first()
+    return bool(artifact_reference)
+
+
+def delete_unreferenced_blob(db: Session, blob: Blob) -> list[str]:
+    if blob_is_referenced(db, blob.id):
+        return []
+    deleted_keys: list[str] = []
+    for location in list(blob.locations):
+        backend = get_storage_backend(location.backend)
+        backend.delete_object(location.object_key, location.bucket)
+        deleted_keys.append(location.object_key)
+        db.delete(location)
+    db.delete(blob)
+    return deleted_keys
+
+
 def sweep_expired_transfers(limit: int = 250) -> dict[str, list[str]]:
     result: dict[str, list[str]] = {
         "expired_uploads": [],
         "deleted_uploads": [],
         "cancelled_exports": [],
         "deleted_exports": [],
+        "deleted_export_objects": [],
     }
     with storage_write_lock():
         db = SessionLocal()
@@ -3777,6 +3803,7 @@ def sweep_expired_transfers(limit: int = 250) -> dict[str, list[str]]:
                 .scalars()
                 .all(),
             )
+            expired_artifact_blobs: dict[int, Blob] = {}
             for job in export_jobs:
                 if job.status in {"queued", "running", "finalizing"}:
                     job.status = "cancelled"
@@ -3784,8 +3811,13 @@ def sweep_expired_transfers(limit: int = 250) -> dict[str, list[str]]:
                     job.updated_at = timestamp
                     result["cancelled_exports"].append(job.id)
                     continue
+                for artifact in job.artifacts:
+                    expired_artifact_blobs[artifact.blob_id] = artifact.blob
                 result["deleted_exports"].append(job.id)
                 db.delete(job)
+            db.flush()
+            for blob in expired_artifact_blobs.values():
+                result["deleted_export_objects"].extend(delete_unreferenced_blob(db, blob))
             db.commit()
             return result
         except Exception:

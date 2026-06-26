@@ -186,7 +186,7 @@ class BlobStorageBackend:
     def list_object_keys(self) -> list[str]:
         raise NotImplementedError
 
-    def delete_object(self, object_key: str) -> None:
+    def delete_object(self, object_key: str, bucket: str | None = None) -> None:
         raise NotImplementedError
 
     def ensure(self) -> None:
@@ -362,7 +362,8 @@ class LocalBlobStorage(BlobStorageBackend):
             keys.append(str(path.relative_to(self.root)).replace("\\", "/"))
         return sorted(keys)
 
-    def delete_object(self, object_key: str) -> None:
+    def delete_object(self, object_key: str, bucket: str | None = None) -> None:
+        del bucket
         target = self._object_path(object_key)
         if target.exists() and target.is_file():
             target.unlink()
@@ -552,9 +553,11 @@ class S3CompatibleBlobStorage(BlobStorageBackend):
     def list_object_keys(self) -> list[str]:
         raise StorageConfigurationError("Object listing is only implemented for local storage")
 
-    def delete_object(self, object_key: str) -> None:
-        del object_key
-        raise StorageConfigurationError("Object deletion is only implemented for local storage")
+    def delete_object(self, object_key: str, bucket: str | None = None) -> None:
+        try:
+            self.client.delete_object(Bucket=bucket or self.bucket, Key=object_key)
+        except Exception as exc:
+            raise StorageError("Storage delete failed") from exc
 
 
 def _build_backend(name: str) -> BlobStorageBackend:

@@ -80,6 +80,23 @@ class DockerDeployTests(unittest.TestCase):
             "Studio Vault",
         )
 
+    def test_app_version_comes_only_from_version_file(self) -> None:
+        env = os.environ.copy()
+        env["VAULT_VERSION"] = "9.9.9"
+        script = "from app.version import APP_VERSION; print(APP_VERSION)"
+
+        completed = subprocess.run(  # noqa: S603 - fixed interpreter and repo-local import check
+            [sys.executable, "-c", script],
+            cwd=ROOT,
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
+        self.assertEqual(completed.stdout.strip(), (ROOT / "VERSION").read_text().strip())
+
     def test_docker_runtime_requires_explicit_session_secret(self) -> None:
         env = os.environ.copy()
         env.pop("VAULT_REQUIRE_SESSION_SECRET", None)
@@ -129,6 +146,7 @@ class DockerDeployTests(unittest.TestCase):
         self.assertIn("VAULT_AUTH_MODE: dev", dev_compose)
         self.assertIn("VAULT_SITE_NAME: ${VAULT_SITE_NAME:-Vault}", dev_compose)
         self.assertIn('VAULT_DEV_MODE: "1"', dev_compose)
+        self.assertNotIn("VAULT_VERSION", dev_compose)
         self.assertIn(
             "VAULT_TTL_SWEEP_INTERVAL_SECONDS: ${VAULT_TTL_SWEEP_INTERVAL_SECONDS:-60}",
             dev_compose,
@@ -146,6 +164,7 @@ class DockerDeployTests(unittest.TestCase):
         self.assertIn('VOLUME ["/data"]', dockerfile)
         self.assertIn("USER vault", dockerfile)
         self.assertIn("HEALTHCHECK", dockerfile)
+        self.assertNotIn("VAULT_VERSION", dockerfile)
         self.assertNotIn("/vault-metadata", dockerfile)
         self.assertNotIn("/vault-objects", dockerfile)
 
@@ -160,6 +179,7 @@ class DockerDeployTests(unittest.TestCase):
         self.assertIn("docker/metadata-action@v5", workflow)
         self.assertIn("docker/build-push-action@v6", workflow)
         self.assertIn("push: true", workflow)
+        self.assertNotIn("VAULT_VERSION", workflow)
         self.assertIn("type=semver,pattern={{version}}", workflow)
         self.assertIn(
             "type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}",

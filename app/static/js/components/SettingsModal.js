@@ -1021,7 +1021,7 @@ function SectionPanel({
 
 export function SettingsModal({
   apiFetch,
-  appVersion = "0.0.0-dev",
+  appVersion,
   alternateRows = false,
   currentUser,
   devMode = false,

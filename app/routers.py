@@ -134,7 +134,7 @@ SYSTEM_META: dict[str, str | None] = {"ip": None, "user_agent": None}
 _ttl_sweeper_task: asyncio.Task[None] | None = None
 _debug_event_stream_generation = 0
 _debug_event_stream_retry_ms = 3000
-STREAM_CHUNK_SIZE = 1024 * 1024
+STREAM_CHUNK_SIZE = 8 * 1024 * 1024
 ResolvedFavoriteTarget = tuple[Literal["folder"], Folder] | tuple[Literal["document"], Document]
 
 

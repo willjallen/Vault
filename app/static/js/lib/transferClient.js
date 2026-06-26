@@ -1,8 +1,9 @@
 const UPLOAD_SESSION_STORAGE_KEY = "vault.uploadSessions";
 const UPLOAD_CONCURRENCY = 8;
 const UPLOAD_RETRY_LIMIT = 3;
+const DOWNLOAD_WRITE_BUFFER_BYTES = 8 * 1024 * 1024;
 const EXPORT_POLL_MS = 900;
-const PROGRESS_TICK_MS = 120;
+const PROGRESS_TICK_MS = 80;
 const VERIFICATION_POLL_MS = 240;
 
 export class TransferCancelledError extends Error {
@@ -171,65 +172,115 @@ async function createUploadSession({
   );
 }
 
-async function uploadPart({ session, partNumber, chunk, offset, signal }) {
+function uploadPartRequest({ session, partNumber, chunk, offset, onProgress, signal }) {
+  throwIfAborted(signal);
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    let settled = false;
+
+    function cleanup() {
+      signal?.removeEventListener("abort", abortRequest);
+    }
+
+    function settle(callback, value) {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      callback(value);
+    }
+
+    function abortRequest() {
+      xhr.abort();
+    }
+
+    xhr.upload.onprogress = (progressEvent) => {
+      if (!onProgress) {
+        return;
+      }
+      const loaded = Number.isFinite(progressEvent.loaded) ? progressEvent.loaded : 0;
+      onProgress(Math.min(chunk.size, Math.max(0, loaded)));
+    };
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        onProgress?.(chunk.size);
+        settle(resolve, parseJson(xhr.responseText));
+        return;
+      }
+      settle(reject, errorFromText(xhr.responseText, xhr.status, "Upload part failed"));
+    };
+    xhr.onerror = () => {
+      const error = new Error("Network error during upload");
+      error.networkError = true;
+      settle(reject, error);
+    };
+    xhr.onabort = () => {
+      settle(reject, new TransferCancelledError());
+    };
+    xhr.ontimeout = () => {
+      const error = new Error("Upload part timed out");
+      error.networkError = true;
+      settle(reject, error);
+    };
+
+    signal?.addEventListener("abort", abortRequest, { once: true });
+    xhr.open("PUT", `/api/uploads/${session.id}/parts/${partNumber}`);
+    xhr.withCredentials = true;
+    xhr.setRequestHeader("Content-Type", "application/octet-stream");
+    xhr.setRequestHeader("X-Upload-Offset", String(offset));
+    xhr.setRequestHeader("X-Upload-Size", String(chunk.size));
+    xhr.send(chunk);
+  });
+}
+
+function shouldRetryUploadPart(error) {
+  if (isAbortError(error)) {
+    return false;
+  }
+  if (error?.networkError || !error?.status) {
+    return true;
+  }
+  return [408, 429, 500, 502, 503, 504].includes(error.status);
+}
+
+async function uploadPart({
+  session,
+  partNumber,
+  chunk,
+  offset,
+  onAttemptStart,
+  onProgress,
+  signal,
+}) {
   for (let attempt = 1; attempt <= UPLOAD_RETRY_LIMIT; attempt += 1) {
     throwIfAborted(signal);
-    const response = await fetch(`/api/uploads/${session.id}/parts/${partNumber}`, {
-      method: "PUT",
-      credentials: "include",
-      headers: {
-        "Content-Type": "application/octet-stream",
-        "X-Upload-Offset": String(offset),
-        "X-Upload-Size": String(chunk.size),
-      },
-      body: chunk,
-      signal,
-    }).catch((error) => {
-      if (isAbortError(error)) {
-        throw new TransferCancelledError();
+    onAttemptStart?.();
+    try {
+      return await uploadPartRequest({
+        chunk,
+        offset,
+        onProgress,
+        partNumber,
+        session,
+        signal,
+      });
+    } catch (error) {
+      if (!shouldRetryUploadPart(error) || attempt >= UPLOAD_RETRY_LIMIT) {
+        throw error;
       }
-      return { ok: false, networkError: error, status: 0 };
-    });
-    if (response.ok) {
-      return response.json();
-    }
-    if (response.networkError && attempt < UPLOAD_RETRY_LIMIT) {
       await waitFor(attempt * 700, signal);
-      continue;
     }
-    if (response.networkError) {
-      throw new Error("Network error during upload");
-    }
-    throw await errorFromResponse(response, "Upload part failed");
   }
   throw new Error("Upload part failed");
 }
 
-function smoothLoadedBytes({ activeParts, averageBytesPerSecond, completedBytes, fileSize }) {
-  if (!averageBytesPerSecond || !activeParts.size) {
-    return completedBytes;
-  }
-  const now = performance.now();
-  const bytesPerActivePart = averageBytesPerSecond / activeParts.size;
-  const estimatedActiveBytes = [...activeParts.values()].reduce((total, part) => {
-    const elapsedSeconds = Math.max((now - part.startedAt) / 1000, 0);
-    return total + Math.min(part.size * 0.94, elapsedSeconds * bytesPerActivePart);
-  }, 0);
-  return Math.min(fileSize, Math.max(completedBytes, completedBytes + estimatedActiveBytes));
-}
-
-function recordThroughputSample(currentAverage, bytes, elapsedMs) {
-  if (elapsedMs <= 0) {
-    return currentAverage;
-  }
-  const sample = bytes / Math.max(elapsedMs / 1000, 0.001);
-  if (!Number.isFinite(sample) || sample <= 0) {
-    return currentAverage;
-  }
-  if (!currentAverage) {
-    return sample;
-  }
-  return currentAverage * 0.72 + sample * 0.28;
+function currentUploadLoadedBytes({ activeParts, completedBytes, fileSize }) {
+  const activeBytes = [...activeParts.values()].reduce(
+    (total, part) => total + Math.min(part.size, Math.max(0, part.loaded || 0)),
+    0
+  );
+  return Math.min(fileSize, Math.max(completedBytes, completedBytes + activeBytes));
 }
 
 async function completeUploadSession(session, sha256, signal) {
@@ -313,15 +364,18 @@ export async function uploadFileResumable({
       0
     );
     const activeParts = new Map();
-    let averageBytesPerSecond = 0;
-    let progressTimer = null;
+    let lastProgressEmittedAt = 0;
 
-    function emitUploadProgress() {
+    function emitUploadProgress(options = {}) {
+      const now = performance.now();
+      if (!options.force && now - lastProgressEmittedAt < PROGRESS_TICK_MS) {
+        return;
+      }
+      lastProgressEmittedAt = now;
       onProgress(
         progressFromValues(
-          smoothLoadedBytes({
+          currentUploadLoadedBytes({
             activeParts,
-            averageBytesPerSecond,
             completedBytes,
             fileSize: file.size,
           }),
@@ -334,27 +388,20 @@ export async function uploadFileResumable({
       );
     }
 
-    function startProgressTimer() {
-      if (progressTimer !== null) {
+    function updateActivePartProgress(partNumber, loaded, options = {}) {
+      const current = activeParts.get(partNumber);
+      if (!current) {
         return;
       }
-      progressTimer = setInterval(() => {
-        if (activeParts.size) {
-          emitUploadProgress();
-        }
-      }, PROGRESS_TICK_MS);
+      const nextLoaded = Math.min(current.size, Math.max(0, loaded));
+      activeParts.set(partNumber, {
+        ...current,
+        loaded: options.reset ? nextLoaded : Math.max(current.loaded || 0, nextLoaded),
+      });
+      emitUploadProgress({ force: Boolean(options.reset) });
     }
 
-    function stopProgressTimer() {
-      if (progressTimer === null) {
-        return;
-      }
-      clearInterval(progressTimer);
-      progressTimer = null;
-    }
-
-    emitUploadProgress();
-    startProgressTimer();
+    emitUploadProgress({ force: true });
 
     let nextPartNumber = 1;
     async function uploadWorker() {
@@ -369,11 +416,13 @@ export async function uploadFileResumable({
         if (existing) {
           continue;
         }
-        const partStartedAt = performance.now();
-        activeParts.set(partNumber, { size: chunk.size, startedAt: partStartedAt });
+        activeParts.set(partNumber, { loaded: 0, size: chunk.size });
+        emitUploadProgress({ force: true });
         try {
           session = await uploadPart({
             chunk,
+            onAttemptStart: () => updateActivePartProgress(partNumber, 0, { reset: true }),
+            onProgress: (loaded) => updateActivePartProgress(partNumber, loaded),
             offset,
             partNumber,
             session,
@@ -382,24 +431,13 @@ export async function uploadFileResumable({
         } finally {
           activeParts.delete(partNumber);
         }
-        averageBytesPerSecond = recordThroughputSample(
-          averageBytesPerSecond,
-          chunk.size,
-          performance.now() - partStartedAt
-        );
         completedBytes += chunk.size;
-        emitUploadProgress();
+        emitUploadProgress({ force: true });
       }
     }
-    try {
-      await Promise.all(
-        Array.from({ length: Math.min(UPLOAD_CONCURRENCY, session.part_count) }, () =>
-          uploadWorker()
-        )
-      );
-    } finally {
-      stopProgressTimer();
-    }
+    await Promise.all(
+      Array.from({ length: Math.min(UPLOAD_CONCURRENCY, session.part_count) }, () => uploadWorker())
+    );
 
     const verificationStartedAt = performance.now();
     onProgress(progressFromValues(0, file.size, verificationStartedAt, { stage: "verifying" }));
@@ -491,6 +529,22 @@ async function streamResponseToFile({ response, writer, total, onProgress, signa
     throw new Error("Streaming downloads are not supported by this browser.");
   }
   let loaded = 0;
+  let pendingChunks = [];
+  let pendingBytes = 0;
+
+  async function flushPendingChunks() {
+    if (!pendingBytes) {
+      return;
+    }
+    const payload =
+      pendingChunks.length === 1
+        ? pendingChunks[0]
+        : new Blob(pendingChunks, { type: "application/octet-stream" });
+    pendingChunks = [];
+    pendingBytes = 0;
+    await writer.write(payload);
+  }
+
   try {
     while (true) {
       throwIfAborted(signal);
@@ -501,10 +555,15 @@ async function streamResponseToFile({ response, writer, total, onProgress, signa
       if (!value) {
         continue;
       }
-      await writer.write(value);
       loaded += value.byteLength || value.length || 0;
+      pendingChunks.push(value);
+      pendingBytes += value.byteLength || value.length || 0;
+      if (pendingBytes >= DOWNLOAD_WRITE_BUFFER_BYTES) {
+        await flushPendingChunks();
+      }
       onProgress(progressFromValues(loaded, total, startedAt, { stage: "downloading" }));
     }
+    await flushPendingChunks();
     await writer.close();
     return loaded;
   } catch (error) {

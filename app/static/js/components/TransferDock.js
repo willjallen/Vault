@@ -92,6 +92,9 @@ function transferMeta(transfer) {
   } else if (transfer.loaded) {
     pieces.push(formatBytes(transfer.loaded));
   }
+  if (transfer.bytesPerSecond > 0) {
+    pieces.push(`${formatBytes(transfer.bytesPerSecond, { emptyForZero: false })}/s`);
+  }
   const eta = formatEta(transfer.etaSeconds);
   if (eta) {
     pieces.push(eta);

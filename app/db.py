@@ -2,7 +2,7 @@
 
 from collections.abc import Generator
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from sqlalchemy import (
     CheckConstraint,
@@ -82,14 +82,14 @@ def _apply_known_additive_migrations() -> None:
     inspector = inspect(engine)
     tables = set(inspector.get_table_names())
     if "vault_users" in tables and "vault_settings" not in tables:
-        models.VaultSetting.__table__.create(bind=engine, checkfirst=True)
+        cast(Any, models.VaultSetting.__table__).create(bind=engine, checkfirst=True)
     if "vault_users" not in tables:
         return
     vault_user_columns = {column["name"] for column in inspector.get_columns("vault_users")}
     if "preferences" not in vault_user_columns:
         with engine.begin() as connection:
             connection.exec_driver_sql(
-                "ALTER TABLE vault_users " "ADD COLUMN preferences JSON NOT NULL DEFAULT '{}'",
+                "ALTER TABLE vault_users ADD COLUMN preferences JSON NOT NULL DEFAULT '{}'",
             )
 
 
@@ -168,11 +168,12 @@ def _schema_needs_reset() -> bool:
                 continue
             if not expected_constraint.name:
                 continue
-            existing_columns = existing_unique_constraints.get(expected_constraint.name)
-            if existing_columns is None:
+            constraint_name = str(expected_constraint.name)
+            unique_existing_columns = existing_unique_constraints.get(constraint_name)
+            if unique_existing_columns is None:
                 return True
-            expected_columns = tuple(column.name for column in expected_constraint.columns)
-            if existing_columns != expected_columns:
+            unique_expected_columns = tuple(column.name for column in expected_constraint.columns)
+            if unique_existing_columns != unique_expected_columns:
                 return True
         existing_check_constraints = {
             (
@@ -231,7 +232,7 @@ def _normalize_sql_expression(expression: object | None) -> str:
     return " ".join(str(expression).strip().split()).lower()
 
 
-def _index_signature(index: dict[str, Any]) -> tuple[tuple[str, ...], bool, str]:
+def _index_signature(index: Any) -> tuple[tuple[str, ...], bool, str]:
     sqlite_where = (index.get("dialect_options") or {}).get("sqlite_where")
     return (
         tuple(index.get("column_names") or []),

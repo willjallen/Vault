@@ -49,19 +49,19 @@ function isContentsPending({
 }) {
   return Boolean(
     (searchQuery || recursiveSearch) &&
-      storedContentsKey !== activeContentsKey &&
-      !activeContentsCached &&
-      (contents.folder || "") === (folder || "")
+    storedContentsKey !== activeContentsKey &&
+    !activeContentsCached &&
+    (contents.folder || "") === (folder || "")
   );
 }
 
 function isPendingEmptySearch({ contents, contentsPending, recursiveSearch, searchQuery }) {
   return Boolean(
     contentsPending &&
-      (searchQuery || recursiveSearch) &&
-      (contents.q || contents.recursive) &&
-      !(contents.documents || []).length &&
-      !(contents.folders || []).length
+    (searchQuery || recursiveSearch) &&
+    (contents.q || contents.recursive) &&
+    !(contents.documents || []).length &&
+    !(contents.folders || []).length
   );
 }
 

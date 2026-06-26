@@ -11,8 +11,10 @@ import re
 import secrets
 import zipfile
 from collections import defaultdict
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal, cast
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Response, UploadFile
@@ -95,10 +97,11 @@ SYSTEM_USER: UserContext = {
     "groups": [],
     "is_admin": True,
 }
-SYSTEM_META = {"ip": None, "user_agent": None}
+SYSTEM_META: dict[str, str | None] = {"ip": None, "user_agent": None}
 _ttl_sweeper_task: asyncio.Task[None] | None = None
 _debug_event_stream_generation = 0
 _debug_event_stream_retry_ms = 3000
+ResolvedFavoriteTarget = tuple[Literal["folder"], Folder] | tuple[Literal["document"], Document]
 
 
 def configure_router_runtime(
@@ -409,13 +412,15 @@ def validate_permission_flags(can_view: bool, can_read: bool, can_write: bool) -
 
 
 def default_root_folder_permissions(db: Session, folder: Folder) -> None:
-    if folder.id is None:
+    folder_id = cast(int | None, folder.id)
+    if folder_id is None:
         db.flush()
+        folder_id = folder.id
     groups = list(db.execute(select(VaultGroup)).scalars().all())
     for group in groups:
         db.add(
             FolderPermission(
-                folder_id=folder.id,
+                folder_id=folder_id,
                 group_id=group.id,
                 can_view=True,
                 can_read=True,
@@ -1267,7 +1272,7 @@ def item_label(item: NormalizedActionItem) -> str:
 
 
 def action_result(item: NormalizedActionItem, detail: str | None = None) -> dict[str, object]:
-    result = {"item": action_item_payload(item)}
+    result: dict[str, object] = {"item": action_item_payload(item)}
     if detail:
         result["detail"] = detail
     return result
@@ -2266,7 +2271,7 @@ def build_initial_state(
     share_code: str | None = None,
 ) -> dict[str, object]:
     normalized = normalize_folder(folder)
-    state = {
+    state: dict[str, object] = {
         "bootstrap": build_bootstrap_payload(user, normalized, db),
         "contents": build_contents_payload(db, normalized, user),
         "sidebar": build_sidebar_payload(db, user),
@@ -2311,7 +2316,7 @@ def resolved_favorite_items(
     raw_items = preferences.get("favoriteItems")
     if not isinstance(raw_items, list) or not raw_items:
         return []
-    resolved_targets: list[tuple[str, Folder | Document]] = []
+    resolved_targets: list[ResolvedFavoriteTarget] = []
     for item in raw_items:
         if not isinstance(item, dict):
             continue
@@ -2347,7 +2352,7 @@ def resolved_favorite_items(
     resolved: list[dict[str, object]] = []
     for item_type, target in resolved_targets:
         if item_type == "folder":
-            folder = target
+            folder = cast(Folder, target)
             row = folder_summary_payload(folder, folder_path(folder, path_cache), stats)
             row.update(
                 {
@@ -2359,7 +2364,7 @@ def resolved_favorite_items(
             resolved.append(row)
             continue
         if item_type == "document":
-            doc = target
+            doc = cast(Document, target)
             row = document_row_payload(doc, db, path_cache, locks, user)
             row["type"] = "document"
             resolved.append(row)
@@ -2435,8 +2440,10 @@ def create_share_target(
 def resolved_share_payload(link: ShareLink, user: UserContext, db: Session) -> dict[str, object]:
     if link.disabled_at:
         raise HTTPException(status_code=404, detail="Share link not found")
-    if link.expires_at and normalize_timestamp(link.expires_at) <= now_utc():
-        raise HTTPException(status_code=404, detail="Share link expired")
+    if link.expires_at:
+        expires_at = normalize_timestamp(link.expires_at)
+        if expires_at and expires_at <= now_utc():
+            raise HTTPException(status_code=404, detail="Share link expired")
 
     if link.target_type == "document" and link.document_id is not None:
         doc = get_document_or_404(link.document_id, db)
@@ -2732,15 +2739,15 @@ def storage_reconciliation_report(db: Session, apply: bool = False) -> dict[str,
         else:
             corrupt_local_keys.add(object_key)
     for location in local_locations:
-        blob = referenced_blobs_by_id.get(location.blob_id)
-        if blob is None or location.object_key not in local_keys:
+        referenced_blob = referenced_blobs_by_id.get(location.blob_id)
+        if referenced_blob is None or location.object_key not in local_keys:
             continue
         try:
             data = local_backend.read_bytes(location.object_key, location.bucket)
         except StorageError:
             corrupt_local_keys.add(location.object_key)
             continue
-        if not blob_bytes_match(blob, data):
+        if not blob_bytes_match(referenced_blob, data):
             corrupt_local_keys.add(location.object_key)
     recoverable_referenced_local_keys = {
         object_key for _, object_key in recoverable_referenced_local_locations
@@ -3153,7 +3160,7 @@ def index(
     ensure_root_folders(db)
     commit_state(db)
     state = build_initial_state(user, "", db)
-    return templates.TemplateResponse("index.html", index_template_context(request, state))
+    return templates.TemplateResponse(request, "index.html", index_template_context(request, state))
 
 
 @router.get("/s/{code}", response_class=HTMLResponse, name="share_entry")
@@ -3168,7 +3175,7 @@ def share_entry(
     ensure_root_folders(db)
     commit_state(db)
     state = build_initial_state(user, "", db, share_code=code)
-    return templates.TemplateResponse("index.html", index_template_context(request, state))
+    return templates.TemplateResponse(request, "index.html", index_template_context(request, state))
 
 
 @router.get("/api/bootstrap")
@@ -3424,7 +3431,7 @@ async def api_events_stream(
     except ValueError:
         last_id = latest_state_event_id()
 
-    async def event_generator() -> object:
+    async def event_generator() -> AsyncIterator[str]:
         nonlocal last_id
         heartbeat_interval = 25.0
         last_heartbeat = dt.datetime.now(tz=dt.UTC)
@@ -3437,11 +3444,7 @@ async def api_events_stream(
             if events:
                 for event in events:
                     last_id = event.id
-                    yield (
-                        f"id: {event.id}\n"
-                        "event: state\n"
-                        f"data: {json.dumps(event.payload)}\n\n"
-                    )
+                    yield (f"id: {event.id}\nevent: state\ndata: {json.dumps(event.payload)}\n\n")
                 last_heartbeat = dt.datetime.now(tz=dt.UTC)
             now = dt.datetime.now(tz=dt.UTC)
             if (now - last_heartbeat).total_seconds() >= heartbeat_interval:

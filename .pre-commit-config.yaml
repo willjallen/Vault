@@ -1,9 +1,9 @@
-minimum_pre_commit_version: "3.8.0"
-default_stages: [commit, push]
+minimum_pre_commit_version: "4.6.0"
+default_stages: [pre-commit, pre-push]
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v4.6.0
+    rev: v6.0.0
     hooks:
       - id: trailing-whitespace
       - id: end-of-file-fixer
@@ -13,37 +13,40 @@ repos:
       - id: check-added-large-files
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.7.0
+    rev: v0.15.20
     hooks:
       - id: ruff-format
-        args: ["--config", "vault-service/pyproject.toml", "--check"]
+        args: ["--config", "pyproject.toml", "--check"]
       - id: ruff
-        args: ["--config", "vault-service/pyproject.toml", "--exit-non-zero-on-fix"]
+        args: ["--config", "pyproject.toml", "--exit-non-zero-on-fix"]
 
   - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.13.0
+    rev: v2.1.0
     hooks:
       - id: mypy
-        files: ^vault-service/app/
-        args: ["--config-file", "vault-service/pyproject.toml"]
+        files: ^app/
+        args: ["--config-file", "pyproject.toml"]
         additional_dependencies:
-          - fastapi==0.115.5
-          - uvicorn[standard]==0.32.0
-          - SQLAlchemy==2.0.36
-          - sqlalchemy[mypy]==2.0.36
-          - python-multipart==0.0.9
-          - jinja2==3.1.4
+          - fastapi==0.138.1
+          - starlette==1.3.1
+          - uvicorn[standard]==0.49.0
+          - SQLAlchemy==2.0.51
+          - sqlalchemy[mypy]==2.0.51
+          - python-multipart==0.0.32
+          - jinja2==3.1.6
+          - boto3==1.43.36
+          - joserfc==1.7.1
 
   - repo: https://github.com/PyCQA/bandit
-    rev: 1.7.10
+    rev: 1.9.4
     hooks:
       - id: bandit
         args:
           [
             "-r",
-            "vault-service/app",
+            "app",
             "-x",
-            "vault-service/app/static",
+            "app/static",
             "--severity-level",
             "low",
             "--confidence-level",
@@ -52,27 +55,52 @@ repos:
         pass_filenames: false
 
   - repo: https://github.com/pypa/pip-audit
-    rev: v2.7.2
+    rev: v2.10.1
     hooks:
       - id: pip-audit
         args:
           [
             "-r",
-            "vault-service/requirements.txt",
+            "requirements.txt",
             "-r",
-            "vault-service/requirements-dev.txt",
+            "requirements-dev.txt",
             "--strict",
             "--progress-spinner=off",
           ]
 
   - repo: local
     hooks:
+      - id: pip-check
+        name: pip check
+        entry: bash
+        language: system
+        pass_filenames: false
+        always_run: true
+        args:
+          - "-c"
+          - ".venv/bin/python -m pip check"
+      - id: unit-tests
+        name: python unit tests
+        entry: bash
+        language: system
+        pass_filenames: false
+        always_run: true
+        args:
+          - "-c"
+          - ".venv/bin/python -m unittest discover -s tests"
+      - id: npm-audit
+        name: npm audit
+        entry: npm
+        language: system
+        pass_filenames: false
+        always_run: true
+        args: ["audit", "--audit-level=moderate"]
       - id: npm-lint
         name: npm run lint (JS/CSS format + ESLint + Stylelint)
         entry: bash
         language: system
         pass_filenames: false
-        files: ^vault-service/app/static/
+        always_run: true
         args:
           - "-c"
-          - "cd vault-service && npm run lint"
+          - "npm run lint"

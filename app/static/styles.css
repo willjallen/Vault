@@ -1727,7 +1727,6 @@ body.contents-column-resizing {
   color: var(--text);
   min-width: 0;
   overflow-wrap: anywhere;
-  word-break: break-word;
 }
 
 .file-name-line {
@@ -1861,7 +1860,6 @@ body.contents-column-resizing {
   color: var(--muted);
   font-size: 0.66rem;
   overflow-wrap: anywhere;
-  word-break: break-word;
 }
 
 .file-cell.user {

@@ -58,9 +58,9 @@ function marqueeModeFromEvent(evt) {
 function shouldIgnoreMarqueeTarget(target) {
   return Boolean(
     target.closest &&
-      target.closest(
-        ".contents-table-head, .contents-toolbar, .contents-selection-readout, button, input, textarea, select, a, [role='button'], [contenteditable='true']"
-      )
+    target.closest(
+      ".contents-table-head, .contents-toolbar, .contents-selection-readout, button, input, textarea, select, a, [role='button'], [contenteditable='true']"
+    )
   );
 }
 
@@ -160,6 +160,53 @@ function ContentsHeaderCell({
   );
 }
 
+function fileListState({
+  contentsPending,
+  contentsPendingEmptySearch,
+  files,
+  folder,
+  inlineFolderDraft,
+  orderedItems,
+  recursiveSearch,
+  searchQuery,
+  selectedKeys,
+  subfolders,
+}) {
+  const inArchive = isArchiveRootPath(folder);
+  const draftInFolder = inlineFolderDraft && inlineFolderDraft.parent === (folder || "");
+  const createDraft = draftInFolder && inlineFolderDraft.mode === "create";
+  const hasRows = files.length > 0 || subfolders.length > 0 || createDraft;
+  const searchActive = Boolean(searchQuery || recursiveSearch);
+  const emptyState = !hasRows && (!contentsPending || contentsPendingEmptySearch);
+  const selectedSet = new Set(selectedKeys);
+  const orderedKeys = orderedItems.map(itemSelectionKey);
+  const selectedItems = orderedItems.filter((item) => selectedSet.has(itemSelectionKey(item)));
+  const selectedFiles = selectedItems.filter((item) => item.type === "document");
+  const selectedFolders = selectedItems.filter((item) => item.type === "folder");
+  const selectedSizeDisplay = formatBytes(
+    selectedItems.reduce((sum, item) => sum + (item.size_bytes || 0), 0),
+    { emptyForZero: false }
+  );
+  const visibleKeys = orderedKeys;
+  const allVisibleSelected =
+    visibleKeys.length > 0 && visibleKeys.every((key) => selectedSet.has(key));
+  return {
+    allVisibleSelected,
+    createDraft,
+    draftInFolder,
+    emptyState,
+    inArchive,
+    orderedKeys,
+    searchActive,
+    selectedFiles,
+    selectedFolders,
+    selectedItems,
+    selectedSet,
+    selectedSizeDisplay,
+    visibleKeys,
+  };
+}
+
 export function VaultFileList({
   folder,
   subfolders,
@@ -213,24 +260,32 @@ export function VaultFileList({
   const suppressClickRef = useRef(false);
   const [columnWidths, setColumnWidths] = useState(readStoredColumnWidths);
   const [marquee, setMarquee] = useState(null);
-  const inArchive = isArchiveRootPath(folder);
-  const draftInFolder = inlineFolderDraft && inlineFolderDraft.parent === (folder || "");
-  const createDraft = draftInFolder && inlineFolderDraft.mode === "create";
-  const hasRows = files.length > 0 || subfolders.length > 0 || createDraft;
-  const searchActive = Boolean(searchQuery || recursiveSearch);
-  const emptyState = !hasRows && (!contentsPending || contentsPendingEmptySearch);
-  const selectedSet = new Set(selectedKeys);
-  const orderedKeys = orderedItems.map(itemSelectionKey);
-  const selectedItems = orderedItems.filter((item) => selectedSet.has(itemSelectionKey(item)));
-  const selectedFiles = selectedItems.filter((item) => item.type === "document");
-  const selectedFolders = selectedItems.filter((item) => item.type === "folder");
-  const selectedSizeDisplay = formatBytes(
-    selectedItems.reduce((sum, item) => sum + (item.size_bytes || 0), 0),
-    { emptyForZero: false }
-  );
-  const visibleKeys = orderedKeys;
-  const allVisibleSelected =
-    visibleKeys.length > 0 && visibleKeys.every((key) => selectedSet.has(key));
+  const {
+    allVisibleSelected,
+    createDraft,
+    draftInFolder,
+    emptyState,
+    inArchive,
+    orderedKeys,
+    searchActive,
+    selectedFiles,
+    selectedFolders,
+    selectedItems,
+    selectedSet,
+    selectedSizeDisplay,
+    visibleKeys,
+  } = fileListState({
+    contentsPending,
+    contentsPendingEmptySearch,
+    files,
+    folder,
+    inlineFolderDraft,
+    orderedItems,
+    recursiveSearch,
+    searchQuery,
+    selectedKeys,
+    subfolders,
+  });
 
   const updateMarqueeSelection = useCallback(() => {
     marqueeFrameRef.current = null;

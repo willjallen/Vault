@@ -1,6 +1,6 @@
 services:
   vault:
-    image: ${VAULT_IMAGE:-ghcr.io/willjallen/vault:latest}
+    image: ${VAULT_IMAGE:-ghcr.io/willjallen/vault:v0.1.0}
     container_name: ${VAULT_CONTAINER_NAME:-vault}
     restart: unless-stopped
     ports:

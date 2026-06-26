@@ -134,7 +134,7 @@ import {
   faUpload,
   faUsers,
   faVault,
-  faVectorSquare,
+  faVectorPolygon,
   faVideo,
   faVolumeHigh,
   faVrCardboard,
@@ -152,11 +152,11 @@ function labelFromIconName(iconName) {
     .join(" ");
 }
 
-function iconEntry(icon, label = "", keywords = "") {
+function iconEntry(icon, label = "", keywords = "", id = icon.iconName) {
   return {
     kind: "fontawesome",
     icon,
-    id: icon.iconName,
+    id,
     keywords,
     label: label || labelFromIconName(icon.iconName),
   };
@@ -187,7 +187,7 @@ const folderIconEntries = [
   iconEntry(faBrush, "Paint", "illustration material texture"),
   iconEntry(faPenNib, "Illustration", "ink concept sketch"),
   iconEntry(faPencil, "Sketches", "rough draft storyboard"),
-  iconEntry(faVectorSquare, "Vector Art", "shape spline ui"),
+  iconEntry(faVectorPolygon, "Vector Art", "shape spline ui", "vector-square"),
   iconEntry(faBezierCurve, "Splines", "curve path vector"),
   iconEntry(faDrawPolygon, "Polygons", "mesh polygon outline"),
   iconEntry(faCube, "3D Assets", "model mesh prop"),

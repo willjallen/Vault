@@ -1,4 +1,3 @@
-/* eslint-disable max-lines */
 import { FinderShell } from "./components/FinderShell.js";
 import { DragPreview } from "./components/DragPreview.js";
 import { ConfirmToast } from "./components/ConfirmToast.js";

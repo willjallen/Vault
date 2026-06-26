@@ -36,6 +36,159 @@ function folderRetentionStatus(folder) {
   };
 }
 
+function folderRowAttributes({
+  editing,
+  folder,
+  isArchived,
+  isDraft,
+  isDragging,
+  isDropTarget,
+  onContextMenu,
+  onDragEnd,
+  onDragStart,
+  onDrop,
+  onDropEnter,
+  onDropLeave,
+  onOpen,
+  onSelect,
+  selected,
+  selectionKey,
+}) {
+  return {
+    className: classNames(
+      "file-row",
+      "folder",
+      isArchived ? "archived" : "",
+      selected ? "selected" : "",
+      isDropTarget ? "drop-target" : "",
+      isDragging ? "dragging" : "",
+      editing ? "editing" : ""
+    ),
+    "data-selection-key": selectionKey || undefined,
+    ...folderDropAttributes({ editing, folder, isDraft, isDropTarget }),
+    draggable: !editing && !isDraft && selected,
+    tabIndex: editing ? undefined : 0,
+    onClick: editing ? undefined : onSelect,
+    onDoubleClick: editing || isDraft ? undefined : onOpen,
+    onKeyDown: editing
+      ? undefined
+      : (e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            onOpen();
+          }
+        },
+    onContextMenu: (e) => {
+      if (editing) {
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
+      e.preventDefault();
+      e.stopPropagation();
+      if (onContextMenu) {
+        onContextMenu(e);
+      }
+    },
+    onDragStart,
+    onDragEnd,
+    onDragEnter: editing ? undefined : onDropEnter,
+    onDragOver: (e) => {
+      e.preventDefault();
+      if (!editing) {
+        e.dataTransfer.dropEffect = "move";
+      }
+    },
+    onDragLeave: (e) => {
+      if (!editing && !e.currentTarget.contains(e.relatedTarget)) {
+        onDropLeave();
+      }
+    },
+    onDrop: editing ? undefined : onDrop,
+  };
+}
+
+function folderNameCell({
+  cancelEdit,
+  commitEdit,
+  editValue,
+  editing,
+  folder,
+  inputRef,
+  isArchived,
+  onEditChange,
+}) {
+  return h("div", { className: "file-cell main" }, [
+    editing
+      ? h("input", {
+          ref: inputRef,
+          className: "inline-name-editor",
+          type: "text",
+          value: editValue,
+          onClick: (e) => e.stopPropagation(),
+          onChange: (e) => onEditChange && onEditChange(e.target.value),
+          onBlur: commitEdit,
+          onKeyDown: (e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              commitEdit();
+            }
+            if (e.key === "Escape") {
+              e.preventDefault();
+              cancelEdit();
+            }
+          },
+        })
+      : h(
+          "div",
+          { className: classNames("name", isArchived ? "archived-text" : "") },
+          folder.name || "Folder"
+        ),
+  ]);
+}
+
+function folderStatusCell(retention) {
+  return h("div", { className: "file-cell status-col" }, [
+    h("span", { className: "status-pill subtle status-version" }, "Folder"),
+    h("span", {
+      "aria-hidden": "true",
+      className: "status-empty status-lock",
+      key: "lock",
+    }),
+    retention.labels
+      ? h(TtlStatusLabel, {
+          className: "policy status-ttl folder-status-ttl",
+          labels: retention.labels,
+          title: retention.title,
+        })
+      : h("span", {
+          "aria-hidden": "true",
+          className: "status-empty status-ttl",
+          key: "ttl",
+        }),
+  ]);
+}
+
+function folderActionsCell({ folder, isDraft, onMore, stopRowAction }) {
+  return h(
+    "div",
+    { className: "file-cell row-actions" },
+    isDraft
+      ? null
+      : h(
+          "button",
+          {
+            "aria-label": `More actions for ${folder.name}`,
+            className: "row-action-button more",
+            onClick: (e) => stopRowAction(e, onMore),
+            title: "More actions",
+            type: "button",
+          },
+          h(Icon, { icon: "ellipsis", size: 14 })
+        )
+  );
+}
+
 export function FolderRow({
   folder,
   editing,
@@ -63,6 +216,24 @@ export function FolderRow({
   const committingRef = useRef(false);
   const isArchived = isArchiveRootPath(folder.path || "");
   const retention = folderRetentionStatus(folder);
+  const rowAttributes = folderRowAttributes({
+    editing,
+    folder,
+    isArchived,
+    isDraft,
+    isDragging,
+    isDropTarget,
+    onContextMenu,
+    onDragEnd,
+    onDragStart,
+    onDrop,
+    onDropEnter,
+    onDropLeave,
+    onOpen,
+    onSelect,
+    selected,
+    selectionKey,
+  });
 
   useEffect(() => {
     if (!editing || !inputRef.current) {
@@ -103,154 +274,48 @@ export function FolderRow({
     }
   }
 
-  return h(
-    "div",
-    {
-      className: classNames(
-        "file-row",
-        "folder",
-        isArchived ? "archived" : "",
-        selected ? "selected" : "",
-        isDropTarget ? "drop-target" : "",
-        isDragging ? "dragging" : "",
-        editing ? "editing" : ""
-      ),
-      "data-selection-key": selectionKey || undefined,
-      ...folderDropAttributes({ editing, folder, isDraft, isDropTarget }),
-      draggable: !editing && !isDraft && selected,
-      tabIndex: editing ? undefined : 0,
-      onClick: editing ? undefined : onSelect,
-      onDoubleClick: editing || isDraft ? undefined : onOpen,
-      onKeyDown: editing
-        ? undefined
-        : (e) => {
-            if (e.key === "Enter") {
-              e.preventDefault();
-              onOpen();
-            }
-          },
-      onContextMenu: (e) => {
-        if (editing) {
-          e.preventDefault();
-          e.stopPropagation();
-          return;
-        }
-        e.preventDefault();
-        e.stopPropagation();
-        if (onContextMenu) {
-          onContextMenu(e);
-        }
-      },
-      onDragStart,
-      onDragEnd,
-      onDragEnter: editing ? undefined : onDropEnter,
-      onDragOver: (e) => {
-        e.preventDefault();
-        if (!editing) {
-          e.dataTransfer.dropEffect = "move";
-        }
-      },
-      onDragLeave: (e) => {
-        if (!editing && !e.currentTarget.contains(e.relatedTarget)) {
-          onDropLeave();
-        }
-      },
-      onDrop: editing ? undefined : onDrop,
-    },
-    [
-      h(
-        "div",
-        { className: "file-cell icon" },
-        h(RowSelectionIcon, {
-          color: folder.color,
-          disabled: editing,
-          folderIcon: folder.icon,
-          interactive: !isDraft,
-          kind: "folder",
-          label: selected ? `Deselect ${folder.name}` : `Select ${folder.name}`,
-          onSelect: onToggleSelect,
-          selected,
-          size: 12,
-        })
-      ),
-      h("div", { className: "file-cell main" }, [
-        editing
-          ? h("input", {
-              ref: inputRef,
-              className: "inline-name-editor",
-              type: "text",
-              value: editValue,
-              onClick: (e) => e.stopPropagation(),
-              onChange: (e) => onEditChange && onEditChange(e.target.value),
-              onBlur: commitEdit,
-              onKeyDown: (e) => {
-                if (e.key === "Enter") {
-                  e.preventDefault();
-                  commitEdit();
-                }
-                if (e.key === "Escape") {
-                  e.preventDefault();
-                  cancelEdit();
-                }
-              },
-            })
-          : h(
-              "div",
-              { className: classNames("name", isArchived ? "archived-text" : "") },
-              folder.name || "Folder"
-            ),
-      ]),
-      h(
-        "div",
-        { className: "file-cell meta" },
-        h("span", { className: "muted tiny" }, formatDate(folder.modified_at))
-      ),
-      h(
-        "div",
-        { className: "file-cell user" },
-        h("span", { className: "muted tiny" }, folder.latest_by || "-")
-      ),
-      h(
-        "div",
-        { className: "file-cell size" },
-        h("span", { className: "muted tiny" }, folder.size_display || "0 B")
-      ),
-      h("div", { className: "file-cell status-col" }, [
-        h("span", { className: "status-pill subtle status-version" }, "Folder"),
-        h("span", {
-          "aria-hidden": "true",
-          className: "status-empty status-lock",
-          key: "lock",
-        }),
-        retention.labels
-          ? h(TtlStatusLabel, {
-              className: "policy status-ttl folder-status-ttl",
-              labels: retention.labels,
-              title: retention.title,
-            })
-          : h("span", {
-              "aria-hidden": "true",
-              className: "status-empty status-ttl",
-              key: "ttl",
-            }),
-      ]),
-      h(
-        "div",
-        { className: "file-cell row-actions" },
-        isDraft
-          ? null
-          : h(
-              "button",
-              {
-                "aria-label": `More actions for ${folder.name}`,
-                className: "row-action-button more",
-                onClick: (e) => stopRowAction(e, onMore),
-                title: "More actions",
-                type: "button",
-              },
-              h(Icon, { icon: "ellipsis", size: 14 })
-            )
-      ),
-    ]
-  );
+  return h("div", rowAttributes, [
+    h(
+      "div",
+      { className: "file-cell icon" },
+      h(RowSelectionIcon, {
+        color: folder.color,
+        disabled: editing,
+        folderIcon: folder.icon,
+        interactive: !isDraft,
+        kind: "folder",
+        label: selected ? `Deselect ${folder.name}` : `Select ${folder.name}`,
+        onSelect: onToggleSelect,
+        selected,
+        size: 12,
+      })
+    ),
+    folderNameCell({
+      cancelEdit,
+      commitEdit,
+      editValue,
+      editing,
+      folder,
+      inputRef,
+      isArchived,
+      onEditChange,
+    }),
+    h(
+      "div",
+      { className: "file-cell meta" },
+      h("span", { className: "muted tiny" }, formatDate(folder.modified_at))
+    ),
+    h(
+      "div",
+      { className: "file-cell user" },
+      h("span", { className: "muted tiny" }, folder.latest_by || "-")
+    ),
+    h(
+      "div",
+      { className: "file-cell size" },
+      h("span", { className: "muted tiny" }, folder.size_display || "0 B")
+    ),
+    folderStatusCell(retention),
+    folderActionsCell({ folder, isDraft, onMore, stopRowAction }),
+  ]);
 }

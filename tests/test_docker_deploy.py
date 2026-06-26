@@ -119,7 +119,7 @@ class DockerDeployTests(unittest.TestCase):
     def test_compose_uses_single_data_volume_and_production_auth_defaults(self) -> None:
         compose = (ROOT / "docker-compose.yml").read_text()
 
-        self.assertIn("ghcr.io/willjallen/vault:latest", compose)
+        self.assertIn("ghcr.io/willjallen/vault:v0.1.0", compose)
         self.assertIn("- vault-data:/data", compose)
         self.assertIn("vault-data:", compose)
         self.assertEqual(compose.count(":/data"), 1)
@@ -181,10 +181,9 @@ class DockerDeployTests(unittest.TestCase):
         self.assertIn("push: true", workflow)
         self.assertNotIn("VAULT_VERSION", workflow)
         self.assertIn("type=semver,pattern={{version}}", workflow)
-        self.assertIn(
-            "type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}",
-            workflow,
-        )
+        self.assertNotIn("type=semver,pattern={{major}}.{{minor}}", workflow)
+        self.assertNotIn("type=semver,pattern={{major}}", workflow)
+        self.assertNotIn("type=raw,value=latest", workflow)
 
 
 if __name__ == "__main__":

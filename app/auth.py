@@ -12,7 +12,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import TypedDict
+from typing import Any, TypedDict, cast
 
 from fastapi import Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse
@@ -481,8 +481,13 @@ def _oidc_discovery() -> dict[str, object]:
     if not OIDC_ISSUER or not OIDC_CLIENT_ID:
         raise HTTPException(status_code=500, detail="OIDC is not configured")
     cached_config = _DISCOVERY_CACHE.get("config")
-    if cached_config and float(_DISCOVERY_CACHE.get("expires_at", 0)) > time.time():
-        return cached_config  # type: ignore[return-value]
+    expires_at = _DISCOVERY_CACHE.get("expires_at", 0)
+    if (
+        isinstance(cached_config, dict)
+        and isinstance(expires_at, int | float)
+        and float(expires_at) > time.time()
+    ):
+        return cached_config
     config = _http_json(f"{OIDC_ISSUER}/.well-known/openid-configuration")
     _DISCOVERY_CACHE["config"] = config
     _DISCOVERY_CACHE["expires_at"] = time.time() + OIDC_DISCOVERY_TTL_SECONDS
@@ -500,7 +505,11 @@ def _http_json(
     body = urllib.parse.urlencode(data).encode("utf-8") if data is not None else None
     request = urllib.request.Request(url, data=body, headers=headers or {})  # noqa: S310
     try:
-        with urllib.request.urlopen(request, timeout=OIDC_HTTP_TIMEOUT_SECONDS) as response:  # noqa: S310
+        # OIDC URLs are restricted to http/https before this request.
+        with urllib.request.urlopen(  # noqa: S310  # nosec B310
+            request,
+            timeout=OIDC_HTTP_TIMEOUT_SECONDS,
+        ) as response:
             parsed = json.loads(response.read().decode("utf-8"))
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=502, detail="OIDC provider request failed") from exc
@@ -580,7 +589,7 @@ def _verified_id_claims(
     try:
         token = jwt.decode(
             id_token,
-            jwk.KeySet.import_key_set(_http_json(jwks_uri)),
+            jwk.KeySet.import_key_set(cast(Any, _http_json(jwks_uri))),
             algorithms=["RS256", "RS384", "RS512", "ES256", "ES384", "ES512"],
         )
         claims = dict(token.claims)

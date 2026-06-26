@@ -10,7 +10,7 @@ cp .env.example .env
 docker compose up -d
 ```
 
-By default `docker-compose.yml` runs `ghcr.io/willjallen/vault:latest`, binds the service to `127.0.0.1:8000`, uses header-based auth for a trusted reverse proxy, and mounts a single named volume at `/data`. Set `VAULT_SITE_NAME` in `.env` to customize the displayed site name. `VAULT_TTL_SWEEP_INTERVAL_SECONDS` controls how often file expiry policies are applied.
+By default `docker-compose.yml` runs the pinned image tag `ghcr.io/willjallen/vault:v0.1.0`, binds the service to `127.0.0.1:8000`, uses header-based auth for a trusted reverse proxy, and mounts a single named volume at `/data`. Set `VAULT_IMAGE` in `.env` when intentionally upgrading to a newer release. Set `VAULT_SITE_NAME` in `.env` to customize the displayed site name. `VAULT_TTL_SWEEP_INTERVAL_SECONDS` controls how often file expiry policies are applied.
 
 For local development with the built image, dev mode, and dev auth enabled:
 

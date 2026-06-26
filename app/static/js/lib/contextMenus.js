@@ -1,4 +1,4 @@
-import { isArchivePath } from "./utils.js";
+import { isArchiveRootPath } from "./utils.js";
 import { canDeleteForeverItem } from "./siteSettings.js";
 
 function compactMenuItems(items) {
@@ -33,11 +33,13 @@ export function buildFileMenuItems(actions) {
         }
       : null,
     { label: "Share", action: () => actions.handleShareItem(doc), disabled: busy },
-    {
-      label: "Move...",
-      action: () => actions.openMoveDialogForDoc(doc),
-      disabled: busy || lockedByOther,
-    },
+    doc.archived
+      ? null
+      : {
+          label: "Move...",
+          action: () => actions.openMoveDialogForDoc(doc),
+          disabled: busy || lockedByOther,
+        },
     doc.archived
       ? { label: "Restore to Vault", action: () => actions.handleUnarchive(doc.id), disabled: busy }
       : { label: "Archive", action: () => actions.handleArchive(doc.id), disabled: busy },
@@ -73,13 +75,12 @@ export function buildFolderMenuItems(actions) {
   const { folderItem, busy } = actions;
   const folderPath = folderItem.path || "";
   const hasPath = Boolean(folderPath);
-  const isArchivedFolder = Boolean(folderItem.archived) || isArchivePath(folderPath);
+  const isArchivedFolder = Boolean(folderItem.archived) || isArchiveRootPath(folderPath);
   const isRoot = !folderPath || folderPath === "Archive";
-  const canPermanentDeleteFolder =
-    hasPath && isArchivedFolder && !isRoot && canDeleteForeverItem(folderItem, actions);
+  const canMoveFolder = hasPath && !isRoot && !isArchivedFolder;
   return compactMenuItems([
     { label: "Open", action: () => actions.navigateToFolder(folderPath) },
-    hasPath && !isRoot
+    canMoveFolder
       ? { label: "Rename", action: () => actions.beginRenameFolder(folderPath), disabled: busy }
       : null,
     folderItem.favorite && actions.handleRemoveFavoriteItem
@@ -95,31 +96,17 @@ export function buildFolderMenuItems(actions) {
       action: () => actions.openFolderProperties(folderItem),
       disabled: busy,
     },
-    hasPath && !isRoot
+    canMoveFolder
       ? {
           label: "Move...",
           action: () => actions.openMoveDialogForFolder(folderItem),
           disabled: busy,
         }
       : null,
-    hasPath && !isRoot
-      ? isArchivedFolder
-        ? {
-            label: "Restore to Vault",
-            action: () => actions.handleUnarchiveFolder(folderPath, { navigate: false }),
-            disabled: busy,
-          }
-        : {
-            label: "Move to Archive",
-            action: () => actions.handleArchiveFolder(folderPath, { navigate: false }),
-            disabled: busy,
-          }
-      : null,
-    canPermanentDeleteFolder
+    canMoveFolder
       ? {
-          label: "Delete forever",
-          action: () => actions.handlePermanentDeleteFolder(folderPath),
-          danger: true,
+          label: "Move to Archive",
+          action: () => actions.handleArchiveFolder(folderPath, { navigate: false }),
           disabled: busy,
         }
       : null,
@@ -159,6 +146,7 @@ export function buildSelectionMenuItems(actions) {
   const sameLocationScope = allArchived || noneArchived;
   const canMove =
     noRoots &&
+    noneArchived &&
     sameLocationScope &&
     selectedItems.every((item) => item.type === "folder" || !isLockedByOther(item, currentUser));
   const canLock = allDocs && docs.every((doc) => !doc.archived && !doc.lock?.by);
@@ -218,16 +206,17 @@ export function buildSelectionMenuItems(actions) {
 
 export function buildPageMenuItems(actions) {
   const currentFolder = actions.folder || "";
+  const inArchive = isArchiveRootPath(currentFolder);
   return [
     {
       label: "Upload file",
       action: actions.handleUploadClick,
-      disabled: actions.busy || actions.uploading,
+      disabled: actions.busy || actions.uploading || inArchive,
     },
     {
       label: "New folder",
       action: () => actions.beginCreateFolder(currentFolder),
-      disabled: actions.busy || actions.creatingFolder,
+      disabled: actions.busy || actions.creatingFolder || inArchive,
     },
   ];
 }

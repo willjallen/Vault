@@ -1,4 +1,4 @@
-import { folderNameFromPath, isArchivePath } from "./utils.js";
+import { folderNameFromPath, isArchivedPath, isArchiveRootPath } from "./utils.js";
 
 function getDocFromDrag(dragEvent, docs) {
   const docId =
@@ -34,7 +34,7 @@ function getSelectionFromDrag(dragEvent) {
 }
 
 function itemInArchive(item) {
-  return item.archived || isArchivePath(item.path || item.folder || "");
+  return item.archived || isArchivedPath(item.path || item.folder || "");
 }
 
 function selectionHasFolders(items) {
@@ -62,12 +62,18 @@ function handleSelectionDrop({
     setUploadHover(false);
     return true;
   }
-  const targetArchived = isArchivePath(target);
+  const targetArchived = isArchiveRootPath(target);
   const allVault = items.every((item) => !itemInArchive(item));
   if (target === "Archive" && allVault) {
     setDropHint(null);
     setUploadHover(false);
     handleArchiveItems(items);
+    return true;
+  }
+  if (targetArchived && !allVault) {
+    setError("Restore archived files before moving them.");
+    setDropHint(null);
+    setUploadHover(false);
     return true;
   }
   if (items.some((item) => itemInArchive(item) !== targetArchived)) {
@@ -114,8 +120,8 @@ function handleFolderDrop({
     setUploadHover(false);
     return;
   }
-  const sourceArchived = isArchivePath(draggedFolder);
-  const targetArchived = isArchivePath(target);
+  const sourceArchived = isArchiveRootPath(draggedFolder);
+  const targetArchived = isArchiveRootPath(target);
   if (target === "Archive" && !sourceArchived) {
     dropEvent.preventDefault();
     if (isPreview) {
@@ -190,6 +196,13 @@ function handleDocDrop({
     }
     setDropHint(null);
     handleArchive(doc.id);
+    return;
+  }
+  if (doc.archived) {
+    dropEvent.preventDefault();
+    if (!isPreview) {
+      setDropHint(null);
+    }
     return;
   }
   dropEvent.preventDefault();

@@ -34,31 +34,19 @@ export function formatBytes(bytes, options = {}) {
 
 export function toBreadcrumbs(folder) {
   const safeFolder = folder || "";
-  const inArchive = isArchivePath(safeFolder);
-  if (!inArchive) {
-    const vaultCrumbs = [{ name: "Vault", path: "" }];
-    if (!safeFolder) {
-      return vaultCrumbs;
-    }
-    const vaultParts = safeFolder.split("/").filter(Boolean);
-    vaultParts.forEach((part, idx) => {
-      vaultCrumbs.push({ name: part, path: vaultParts.slice(0, idx + 1).join("/") });
-    });
-    return vaultCrumbs;
+  if (isArchivedPath(safeFolder)) {
+    return [{ name: "Archive", path: "Archive" }];
   }
 
-  const archiveCrumbs = [{ name: "Archive", path: "Archive" }];
-  const archivePath = safeFolder.replace(/^Archive\/?/, "");
-  if (!archivePath) {
-    return archiveCrumbs;
+  const vaultCrumbs = [{ name: "Vault", path: "" }];
+  if (!safeFolder) {
+    return vaultCrumbs;
   }
-  const archiveParts = archivePath.split("/").filter(Boolean);
-  let current = "Archive";
-  archiveParts.forEach((part) => {
-    current = `${current}/${part}`;
-    archiveCrumbs.push({ name: part, path: current });
+  const vaultParts = safeFolder.split("/").filter(Boolean);
+  vaultParts.forEach((part, idx) => {
+    vaultCrumbs.push({ name: part, path: vaultParts.slice(0, idx + 1).join("/") });
   });
-  return archiveCrumbs;
+  return vaultCrumbs;
 }
 
 export function buildTree(childrenMap, nodePath = "") {
@@ -213,8 +201,17 @@ export function expiryStatusLabels(expiresAt, action) {
   return ttlDisplayLabels(verb, "in", Math.ceil(remainingMs / 86400000), "day");
 }
 
-export function isArchivePath(path) {
-  return typeof path === "string" && (path === "Archive" || path.startsWith("Archive/"));
+const ARCHIVE_ROOT_PATH = "Archive";
+
+export function isArchiveRootPath(path) {
+  return path === ARCHIVE_ROOT_PATH;
+}
+
+export function isArchivedPath(path) {
+  return (
+    typeof path === "string" &&
+    (isArchiveRootPath(path) || path.startsWith(`${ARCHIVE_ROOT_PATH}/`))
+  );
 }
 
 export function folderNameFromPath(path) {

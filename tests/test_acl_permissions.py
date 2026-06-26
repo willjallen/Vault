@@ -313,7 +313,7 @@ class AclPermissionTests(unittest.TestCase):
                     build_contents_payload(db, "Secret/Plans", writer)
                 self.assertEqual(raised.exception.status_code, 404)
 
-    def test_failed_folder_archive_does_not_stamp_stale_source_acl(self) -> None:
+    def test_failed_folder_archive_does_not_change_source_acl(self) -> None:
         admin = user_context("admin", groups=["vault-admin"], is_admin=True)
         outsider = user_context("outsider", groups=["outsiders"], is_admin=False)
 
@@ -322,27 +322,22 @@ class AclPermissionTests(unittest.TestCase):
                 vault_root = get_root_folder(db, "vault")
                 archive_root = get_root_folder(db, "archive")
                 outsiders = VaultGroup(name="outsiders")
-                db.add(outsiders)
+                confidential = VaultGroup(name="confidential")
+                db.add_all([outsiders, confidential])
                 db.flush()
                 add_permission(db, vault_root, outsiders, write=True)
                 add_permission(db, archive_root, outsiders, write=True)
 
                 secret = get_or_create_folder_path(db, "Secret")
                 plans = get_or_create_folder_path(db, "Secret/Plans")
+                db.flush()
+                add_permission(db, secret, outsiders, write=True)
+                add_permission(db, plans, confidential, write=True)
                 create_versioned_document(
                     db,
                     plans,
                     name="roadmap.txt",
                     data=b"secret roadmap",
-                    actor=admin,
-                )
-
-                archive_conflict = get_or_create_folder_path(db, "Archive/Secret/Plans")
-                create_versioned_document(
-                    db,
-                    archive_conflict,
-                    name="existing.txt",
-                    data=b"existing archive content",
                     actor=admin,
                 )
                 secret_id = secret.id
@@ -353,7 +348,7 @@ class AclPermissionTests(unittest.TestCase):
                 result = archive_items(
                     ActionPayload(items=[ActionItem(type="folder", id=plans_id)]),
                     FAKE_REQUEST,
-                    admin,
+                    outsider,
                     db,
                 )
                 self.assertEqual(result["ok"], [])
@@ -441,9 +436,9 @@ class AclPermissionTests(unittest.TestCase):
                 db.commit()
 
             with ctx.db() as db:
-                with self.assertRaises(HTTPException) as raised:
-                    build_contents_payload(db, "Archive/Secret", outsider)
-                self.assertEqual(raised.exception.status_code, 404)
+                payload = build_contents_payload(db, "Archive", outsider)
+                self.assertEqual(payload["folders"], [])
+                self.assertEqual(payload["documents"], [])
 
     def test_restoring_document_does_not_overwrite_current_vault_folder_acl(self) -> None:
         admin = user_context("admin", groups=["vault-admin"], is_admin=True)

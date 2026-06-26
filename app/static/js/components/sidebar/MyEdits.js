@@ -1,4 +1,4 @@
-import { classNames, isArchivePath } from "../../lib/utils.js";
+import { classNames, isArchiveRootPath } from "../../lib/utils.js";
 import { Icon } from "../common/Icon.js";
 
 const h = React.createElement;
@@ -40,7 +40,7 @@ export function MyEdits({
           { className: "my-edits-list" },
           edits.length
             ? edits.map((doc) => {
-                const inArchive = isArchivePath(doc.folder || "");
+                const inArchive = isArchiveRootPath(doc.folder || "");
                 return h(
                   "button",
                   {

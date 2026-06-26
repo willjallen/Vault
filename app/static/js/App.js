@@ -29,7 +29,7 @@ import {
   keyForItem,
 } from "./lib/itemActions.js";
 import { favoriteItemsToSidebarItems } from "./lib/favoriteItems.js";
-import { folderBaseName, isArchivePath } from "./lib/utils.js";
+import { folderBaseName, isArchiveRootPath } from "./lib/utils.js";
 import {
   initialFolderForApp,
   shareCodeFromLocation,
@@ -322,14 +322,13 @@ export function App({ initial }) {
         name: initialBootstrap.site_name || "Vault",
         path: "",
       }),
-      ...childrenFor("", (path) => !isArchivePath(path)),
+      ...childrenFor("", (path) => !isArchiveRootPath(path)),
       folderToItem({
         ...archiveMetadata,
         icon: archiveMetadata.icon || "box-archive",
         name: "Archive",
         path: "Archive",
       }),
-      ...childrenFor("Archive", (path) => isArchivePath(path)),
     ];
   }, [folderChildren, folderMetadata, initialBootstrap.site_name]);
   const favoriteSidebarItems = useMemo(
@@ -615,16 +614,12 @@ export function App({ initial }) {
     handleCancelInlineFolder,
     handleCommitInlineFolder,
     handleInlineFolderNameChange,
-    handlePermanentDeleteFolder,
     handleRenameFile,
     handleRenameFolder,
-    handleUnarchiveFolder,
   } = createFolderActionHandlers({
     apiFetch,
     folder,
     handleArchiveItems,
-    handleDeleteForeverItems,
-    handleRestoreItems,
     inlineFolderDraft,
     postAction,
     refresh,
@@ -749,7 +744,6 @@ export function App({ initial }) {
       handleLockItems,
       handleLock,
       handlePermanentDelete,
-      handlePermanentDeleteFolder,
       handleRelease,
       handleRemoveFavoriteItem,
       handleRestoreItems,
@@ -759,7 +753,6 @@ export function App({ initial }) {
       handleShareItem,
       handleStartEdit,
       handleUnarchive,
-      handleUnarchiveFolder,
       handleUnlockItems,
       handleUploadClick,
       openFolderProperties,

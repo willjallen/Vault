@@ -29,7 +29,7 @@ from app.routers import (
 
 
 class RetentionTtlTests(unittest.TestCase):
-    def test_expired_document_is_archived_to_matching_archive_folder(self) -> None:
+    def test_expired_document_is_archived_to_flat_archive_with_origin_metadata(self) -> None:
         admin = user_context("alice", groups=["vault-admin"])
 
         with vault_runtime() as ctx:
@@ -46,13 +46,15 @@ class RetentionTtlTests(unittest.TestCase):
                 doc_id = doc.id
 
             result = sweep_expired_documents()
-            self.assertEqual(result["archived"], ["Archive/Project/plan.txt"])
+            self.assertEqual(result["archived"], ["Archive/plan.txt"])
             self.assertEqual(result["deleted"], [])
 
             with ctx.db() as db:
                 doc = db.get(Document, doc_id)
                 self.assertIsNotNone(doc)
-                self.assertEqual(folder_path(doc.folder), "Archive/Project")
+                self.assertEqual(folder_path(doc.folder), "Archive")
+                self.assertEqual(doc.archived_from_folder, "Project")
+                self.assertEqual(doc.archived_original_name, "plan.txt")
                 self.assertIsNone(doc.expires_at)
                 self.assertIsNone(doc.expiry_action)
                 event = db.query(StateEvent).filter_by(event_type="retention.expired").one()

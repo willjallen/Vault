@@ -244,7 +244,7 @@ class AdminSettingsTests(unittest.TestCase):
             with ctx.db() as db:
                 self.assertIsNotNone(db.get(Document, doc_id))
 
-    def test_relaxed_policy_allows_writer_to_delete_archived_folder_forever(self) -> None:
+    def test_relaxed_policy_allows_writer_to_delete_file_archived_from_folder(self) -> None:
         admin_headers = auth_headers("admin", ["vault-admin"])
         writer_headers = auth_headers("writer", ["writers"])
         admin = user_context("admin", groups=["vault-admin"], is_admin=True)
@@ -263,9 +263,10 @@ class AdminSettingsTests(unittest.TestCase):
 
             with ctx.db() as db:
                 folder = get_or_create_folder_path(db, "Project")
-                create_versioned_document(db, folder, actor=admin)
+                doc = create_versioned_document(db, folder, actor=admin)
                 archived_path = archive_folder_item(folder, FAKE_REQUEST, admin, db)
                 db.commit()
+                doc_id = doc.id
 
             archive_contents = ctx.client.get(
                 "/api/folders/contents",
@@ -273,23 +274,28 @@ class AdminSettingsTests(unittest.TestCase):
                 headers=writer_headers,
             )
             self.assertEqual(archive_contents.status_code, 200, archive_contents.text)
-            [folder_row] = archive_contents.json()["folders"]
-            self.assertEqual(folder_row["path"], "Archive/Project")
-            self.assertTrue(folder_row["access"]["write"])
+            self.assertEqual(archive_contents.json()["folders"], [])
+            [doc_row] = archive_contents.json()["documents"]
+            self.assertEqual(doc_row["path"], "Archive/plan.txt")
+            self.assertEqual(doc_row["archived_from_folder"], "Project")
+            self.assertTrue(doc_row["access"]["write"])
 
             deleted = ctx.client.post(
                 "/api/delete-forever",
-                json={"items": [{"type": "folder", "path": archived_path}]},
+                json={"items": [{"type": "document", "id": doc_id}]},
                 headers=writer_headers,
             )
             self.assertEqual(deleted.status_code, 200, deleted.text)
             self.assertEqual(deleted.json()["failed"], [])
             self.assertEqual(
                 deleted.json()["ok"][0]["item"],
-                {"type": "folder", "id": folder_row["id"], "path": "Archive/Project"},
+                {"type": "document", "id": doc_id},
             )
+            self.assertEqual(deleted.json()["ok"][0]["detail"], "Archive/plan.txt")
 
             with ctx.db() as db:
+                self.assertEqual(archived_path, "Archive")
+                self.assertIsNone(db.get(Document, doc_id))
                 self.assertIsNone(get_folder_by_path(db, "Archive/Project"))
 
     def test_non_admin_cannot_change_archive_delete_policy(self) -> None:

@@ -1,4 +1,4 @@
-import { folderNameFromPath, isArchivePath } from "./utils.js";
+import { folderNameFromPath, isArchivedPath, isArchiveRootPath } from "./utils.js";
 
 const { useState } = React;
 
@@ -17,23 +17,24 @@ export function useMoveDialog({
   const [moveNewFolderName, setMoveNewFolderName] = useState("");
   const [creatingMoveFolder, setCreatingMoveFolder] = useState(false);
 
-  const movingTargetInArchive =
-    moveTarget?.archived || isArchivePath(moveTarget?.path || moveTarget?.folder || "");
-
   function openMoveDialogForDoc(doc) {
     if (!doc) {
       return;
     }
-    const baseFolder = doc.folder || (doc.archived ? "Archive" : "");
+    if (doc.archived) {
+      setError("Restore this file before moving it.");
+      return;
+    }
+    const baseFolder = doc.folder || "";
     setMoveTarget({
       type: "doc",
       id: doc.id,
       name: doc.name,
       path: doc.path,
       folder: doc.folder || "",
-      archived: Boolean(doc.archived),
+      archived: false,
     });
-    setMoveDestination(baseFolder || (doc.archived ? "Archive" : ""));
+    setMoveDestination(baseFolder);
     setMoveNewFolderName("");
   }
 
@@ -42,14 +43,18 @@ export function useMoveDialog({
       return;
     }
     const parentPath = folderItem.path.split("/").slice(0, -1).join("/");
-    const inArchive = isArchivePath(folderItem.path);
+    const inArchive = isArchiveRootPath(folderItem.path);
+    if (inArchive) {
+      setError("Archive folders cannot be moved.");
+      return;
+    }
     setMoveTarget({
       type: "folder",
       path: folderItem.path,
       name: folderItem.name || folderNameFromPath(folderItem.path),
-      archived: inArchive,
+      archived: false,
     });
-    setMoveDestination(parentPath || (inArchive ? "Archive" : ""));
+    setMoveDestination(parentPath);
     setMoveNewFolderName("");
   }
 
@@ -58,7 +63,10 @@ export function useMoveDialog({
       return;
     }
     const first = items[0];
-    const archived = items.every((item) => item.archived);
+    if (items.some((item) => item.archived)) {
+      setError("Restore archived files before moving them.");
+      return;
+    }
     const baseFolder =
       first.type === "folder" ? first.path.split("/").slice(0, -1).join("/") : first.folder || "";
     setMoveTarget({
@@ -67,9 +75,9 @@ export function useMoveDialog({
       name: `${items.length} items`,
       path: first.path || "",
       folder: baseFolder,
-      archived,
+      archived: false,
     });
-    setMoveDestination(baseFolder || (archived ? "Archive" : ""));
+    setMoveDestination(baseFolder);
     setMoveNewFolderName("");
   }
 
@@ -85,15 +93,7 @@ export function useMoveDialog({
       return;
     }
     const normalized = (nextPath || "").replace(/^\/+|\/+$/g, "");
-    if (!movingTargetInArchive && isArchivePath(normalized)) {
-      return;
-    }
-    if (movingTargetInArchive && normalized && !isArchivePath(normalized)) {
-      setMoveDestination(`Archive/${normalized}`);
-      return;
-    }
-    if (movingTargetInArchive && !normalized) {
-      setMoveDestination("Archive");
+    if (isArchivedPath(normalized)) {
       return;
     }
     setMoveDestination(normalized);
@@ -112,7 +112,7 @@ export function useMoveDialog({
       setError("Folder name cannot contain slashes.");
       return;
     }
-    const base = moveDestination || (movingTargetInArchive ? "Archive" : "");
+    const base = moveDestination || "";
     const newPath = base ? `${base}/${trimmed}` : trimmed;
     setCreatingMoveFolder(true);
     setError("");
@@ -138,7 +138,7 @@ export function useMoveDialog({
     if (!moveTarget) {
       return;
     }
-    const destinationFolder = moveDestination || (movingTargetInArchive ? "Archive" : "");
+    const destinationFolder = moveDestination || "";
     const targetName =
       moveTarget.type === "selection"
         ? ""

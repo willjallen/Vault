@@ -1,4 +1,4 @@
-import { folderBaseName, folderParent, isArchivePath } from "./utils.js";
+import { folderBaseName, folderParent, isArchivedPath, isArchiveRootPath } from "./utils.js";
 
 export function keyForItem(item) {
   if (item.type === "document") {
@@ -13,6 +13,9 @@ export function docToItem(doc) {
   }
   return {
     archived: Boolean(doc.archived),
+    archived_from_folder: doc.archived_from_folder || "",
+    archived_original_name: doc.archived_original_name || "",
+    archived_original_path: doc.archived_original_path || "",
     access: doc.access || {},
     folder: doc.folder || "",
     favorite: Boolean(doc.favorite),
@@ -36,7 +39,7 @@ export function docToItem(doc) {
 
 export function folderToItem(folderItem) {
   return {
-    archived: isArchivePath(folderItem.path || ""),
+    archived: isArchiveRootPath(folderItem.path || ""),
     access: folderItem.access || {},
     color: folderItem.color || "",
     default_ttl_action: folderItem.default_ttl_action || "none",
@@ -80,20 +83,16 @@ function selectionLabel(items) {
   return `${items.length} items${files ? `, ${files} files` : ""}${folders ? `, ${folders} folders` : ""}`;
 }
 
-function firstFailureMessage(payload, fallback) {
-  if (payload?.failed?.length) {
-    return payload.failed[0].detail || fallback;
-  }
-  return "";
-}
-
-function successSummary(action, payload) {
+function actionWarning(action, payload) {
   const ok = payload?.ok?.length || 0;
   const failed = payload?.failed?.length || 0;
   if (!failed) {
-    return "";
+    return null;
   }
-  return `${action}: ${ok} succeeded, ${failed} failed. ${firstFailureMessage(payload, "")}`;
+  return {
+    detail: payload.failed[0]?.detail || "",
+    title: `${action}: ${ok} succeeded, ${failed} failed`,
+  };
 }
 
 export function createBulkActionHandlers({
@@ -134,7 +133,7 @@ export function createBulkActionHandlers({
 
   function missingFolderFallbackForDelete() {
     const currentFolder = folder || "";
-    if (!isArchivePath(currentFolder) || currentFolder === "Archive") {
+    if (!isArchivedPath(currentFolder) || currentFolder === "Archive") {
       return "";
     }
     return folderParent(currentFolder) || "Archive";
@@ -178,11 +177,11 @@ export function createBulkActionHandlers({
       setError("Document not found.");
       return false;
     }
-    const targetInArchive = isArchivePath((newPath || "").trim());
-    if (doc.archived && !targetInArchive) {
-      setError("Restore this file before moving it out of Archive.");
+    if (doc.archived) {
+      setError("Restore this file before moving it.");
       return false;
     }
+    const targetInArchive = isArchivedPath((newPath || "").trim());
     if (!doc.archived && targetInArchive) {
       setError("Use Move to Archive instead of dragging items into Archive.");
       return false;
@@ -210,13 +209,17 @@ export function createBulkActionHandlers({
   }
 
   async function handleMoveSelection(items, destinationFolder) {
+    if ((items || []).some((item) => item.archived)) {
+      setError("Restore archived files before moving them.");
+      return false;
+    }
     setBusy(true);
     setError("");
     try {
       const payload = await postAction("move", items, {
         destination_folder: destinationFolder || "",
       });
-      const warning = successSummary("Move", payload);
+      const warning = actionWarning("Move", payload);
       if (warning) {
         setError(warning);
       }
@@ -247,7 +250,7 @@ export function createBulkActionHandlers({
     setError("");
     try {
       const payload = await postAction("archive", items);
-      const warning = successSummary("Archive", payload);
+      const warning = actionWarning("Archive", payload);
       if (warning) {
         setError(warning);
       }
@@ -275,7 +278,7 @@ export function createBulkActionHandlers({
     setError("");
     try {
       const payload = await postAction("restore", items);
-      const warning = successSummary("Restore", payload);
+      const warning = actionWarning("Restore", payload);
       if (warning) {
         setError(warning);
       }
@@ -304,7 +307,7 @@ export function createBulkActionHandlers({
     setError("");
     try {
       const payload = await postAction("delete-forever", items);
-      const warning = successSummary("Delete", payload);
+      const warning = actionWarning("Delete", payload);
       if (warning) {
         setError(warning);
       }
@@ -327,7 +330,7 @@ export function createBulkActionHandlers({
     setError("");
     try {
       const payload = await postAction("lock", items);
-      const warning = successSummary("Lock", payload);
+      const warning = actionWarning("Lock", payload);
       if (warning) {
         setError(warning);
       }
@@ -346,7 +349,7 @@ export function createBulkActionHandlers({
     setError("");
     try {
       const payload = await postAction("unlock", items);
-      const warning = successSummary("Unlock", payload);
+      const warning = actionWarning("Unlock", payload);
       if (warning) {
         setError(warning);
       }

@@ -1,4 +1,4 @@
-import { classNames, isArchivePath } from "../../lib/utils.js";
+import { classNames, isArchiveRootPath } from "../../lib/utils.js";
 
 const h = React.createElement;
 
@@ -16,7 +16,7 @@ export function Breadcrumbs({ breadcrumbs, activePath, onSelect, onDropOnFolder,
             className: classNames(
               "crumb",
               crumb.path === activePath ? "active" : "",
-              isArchivePath(crumb.path) ? "archived" : ""
+              isArchiveRootPath(crumb.path) ? "archived" : ""
             ),
             onClick: () => onSelect(crumb.path),
             onDragEnter: (e) => onDropOnFolder(crumb.path, e, true),

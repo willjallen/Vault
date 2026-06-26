@@ -252,7 +252,15 @@ class BlobLocation(Base):
 
 class Document(Base):
     __tablename__ = "documents"
-    __table_args__ = (UniqueConstraint("folder_id", "name", name="uq_documents_folder_name"),)
+    __table_args__ = (
+        Index(
+            "uq_documents_active_folder_name",
+            "folder_id",
+            "name",
+            unique=True,
+            sqlite_where=text("archived_from_folder IS NULL"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     folder_id: Mapped[int] = mapped_column(
@@ -277,6 +285,9 @@ class Document(Base):
         index=True,
     )
     expiry_action: Mapped[str | None] = mapped_column(String, nullable=True)
+    archived_from_folder: Mapped[str | None] = mapped_column(String, nullable=True)
+    archived_original_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    archived_access: Mapped[dict[str, int] | None] = mapped_column(JSON, nullable=True)
 
     folder: Mapped[Folder] = relationship("Folder", back_populates="documents")
     locks: Mapped[list["DocumentLock"]] = relationship(

@@ -3,7 +3,7 @@ import {
   folderBaseName,
   folderParent,
   folderPathForName,
-  isArchivePath,
+  isArchivedPath,
   normalizeFolderName,
 } from "./utils.js";
 
@@ -11,8 +11,6 @@ export function createFolderActionHandlers({
   apiFetch,
   folder,
   handleArchiveItems,
-  handleDeleteForeverItems,
-  handleRestoreItems,
   inlineFolderDraft,
   postAction,
   refresh,
@@ -24,62 +22,17 @@ export function createFolderActionHandlers({
   setInlineFolderDraft,
   setSelectedId,
 }) {
-  async function handlePermanentDeleteFolder(targetFolder = folder, options = {}) {
-    const selectedFolder = typeof targetFolder === "string" ? targetFolder : folder || "";
-    const currentFolder = folder || "";
-    const withinSelected =
-      selectedFolder &&
-      (currentFolder === selectedFolder || currentFolder.startsWith(`${selectedFolder}/`));
-    const shouldNavigate = options.navigate ?? withinSelected;
-    if (!selectedFolder) {
-      setError("Choose a folder to delete.");
-      return;
-    }
-    if (selectedFolder === "Archive") {
-      setError("Cannot delete the Archive root.");
-      return;
-    }
-    if (!isArchivePath(selectedFolder)) {
-      setError("Delete forever is only available in Archive.");
-      return;
-    }
-    const success = await handleDeleteForeverItems([folderToItem({ path: selectedFolder })]);
-    if (success) {
-      const parentFolder = selectedFolder.split("/").slice(0, -1).join("/");
-      if (shouldNavigate) {
-        replaceFolder(parentFolder);
-      }
-    }
-  }
-
   async function handleArchiveFolder(targetFolder = folder, options = {}) {
     const selectedFolder = typeof targetFolder === "string" ? targetFolder : folder || "";
     const shouldNavigate = options.navigate ?? selectedFolder === folder;
-    if (!selectedFolder || isArchivePath(selectedFolder)) {
+    if (!selectedFolder || isArchivedPath(selectedFolder)) {
       setError("Pick a Vault folder to move into Archive.");
       return;
     }
     const success = await handleArchiveItems([folderToItem({ path: selectedFolder })]);
     if (success) {
-      const archivedPath = `Archive/${selectedFolder}`;
       if (shouldNavigate) {
-        replaceFolder(archivedPath);
-      }
-    }
-  }
-
-  async function handleUnarchiveFolder(targetFolder = folder, options = {}) {
-    const selectedFolder = typeof targetFolder === "string" ? targetFolder : folder || "";
-    const shouldNavigate = options.navigate ?? selectedFolder === folder;
-    if (!selectedFolder || !isArchivePath(selectedFolder)) {
-      setError("Choose an archived folder to restore.");
-      return;
-    }
-    const success = await handleRestoreItems([folderToItem({ path: selectedFolder })]);
-    if (success) {
-      const restoredPath = selectedFolder.replace(/^Archive\/?/, "");
-      if (shouldNavigate) {
-        replaceFolder(restoredPath);
+        replaceFolder("Archive");
       }
     }
   }
@@ -301,9 +254,7 @@ export function createFolderActionHandlers({
     handleCommitInlineFolder,
     handleCreateFolder,
     handleInlineFolderNameChange,
-    handlePermanentDeleteFolder,
     handleRenameFile,
     handleRenameFolder,
-    handleUnarchiveFolder,
   };
 }

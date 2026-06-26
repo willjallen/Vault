@@ -1,4 +1,4 @@
-import { classNames, isArchivePath } from "../../lib/utils.js";
+import { classNames, isArchiveRootPath } from "../../lib/utils.js";
 import { Icon } from "../common/Icon.js";
 
 const h = React.createElement;
@@ -17,7 +17,7 @@ export function FolderNode({
 }) {
   const offset = Math.min(12 + depth * 10, 78);
   const isActive = activePath === node.path;
-  const isArchived = isArchivePath(node.path);
+  const isArchived = isArchiveRootPath(node.path);
   const icon = node.icon || (isArchived ? "box-archive" : "folder");
   return h(
     React.Fragment,

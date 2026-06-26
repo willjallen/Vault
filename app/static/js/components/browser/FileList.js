@@ -1,4 +1,4 @@
-import { classNames, formatBytes, isArchivePath } from "../../lib/utils.js";
+import { classNames, formatBytes, isArchiveRootPath } from "../../lib/utils.js";
 import { Icon } from "../common/Icon.js";
 import { FolderRow } from "./FolderRow.js";
 import { FileRow } from "./FileRow.js";
@@ -162,7 +162,7 @@ export function VaultFileList({
   const marqueeFrameRef = useRef(null);
   const suppressClickRef = useRef(false);
   const [marquee, setMarquee] = useState(null);
-  const inArchive = isArchivePath(folder);
+  const inArchive = isArchiveRootPath(folder);
   const draftInFolder = inlineFolderDraft && inlineFolderDraft.parent === (folder || "");
   const createDraft = draftInFolder && inlineFolderDraft.mode === "create";
   const hasRows = files.length > 0 || subfolders.length > 0 || createDraft;
@@ -397,6 +397,9 @@ export function VaultFileList({
       type === "document"
         ? {
             archived: Boolean(item.archived),
+            archived_from_folder: item.archived_from_folder || "",
+            archived_original_name: item.archived_original_name || "",
+            archived_original_path: item.archived_original_path || "",
             folder: item.folder || "",
             id: item.id,
             lock: item.lock || {},
@@ -406,7 +409,7 @@ export function VaultFileList({
             type: "document",
           }
         : {
-            archived: isArchivePath(item.path || ""),
+            archived: isArchiveRootPath(item.path || ""),
             id: item.id || null,
             name: item.name,
             path: item.path || "",

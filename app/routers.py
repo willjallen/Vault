@@ -19,7 +19,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Resp
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from . import db as db_runtime
@@ -478,84 +478,41 @@ def group_access_context(group: VaultGroup) -> UserContext:
     }
 
 
-def permission_flags_for_level(level: int) -> tuple[bool, bool, bool]:
-    return level >= 1, level >= 2, level >= 3
-
-
-def replace_folder_permissions_with_effective_access(
-    source: Folder,
-    target: Folder,
-    db: Session,
-) -> None:
+def archive_access_snapshot(folder: Folder, db: Session) -> dict[str, int]:
     db.flush()
-    groups = list(db.execute(select(VaultGroup)).scalars().all())
-    effective_levels = {
-        group.id: folder_access_level(source, group_access_context(group), db) for group in groups
-    }
-    existing = {
-        permission.group_id: permission
-        for permission in db.execute(
-            select(FolderPermission).where(FolderPermission.folder_id == target.id),
-        )
-        .scalars()
-        .all()
-    }
-    for group in groups:
-        permission = existing.pop(group.id, None)
-        if not permission:
-            permission = FolderPermission(folder_id=target.id, group_id=group.id)
-            db.add(permission)
-        can_view, can_read, can_write = permission_flags_for_level(effective_levels[group.id])
-        permission.can_view = can_view
-        permission.can_read = can_read
-        permission.can_write = can_write
-        permission.updated_at = now_utc()
-    for permission in existing.values():
-        db.delete(permission)
+    snapshot: dict[str, int] = {}
+    for group in db.execute(select(VaultGroup)).scalars().all():
+        level = folder_access_level(folder, group_access_context(group), db)
+        if level > 0:
+            snapshot[str(group.id)] = level
+    return snapshot
 
 
-def non_root_folder_chain(folder: Folder) -> list[Folder]:
-    chain: list[Folder] = []
-    current: Folder | None = folder
-    seen: set[int] = set()
-    while current and not current.is_root and current.id not in seen:
-        seen.add(current.id)
-        chain.append(current)
-        current = current.parent
-    return list(reversed(chain))
-
-
-def mirror_folder_permission_chain(source: Folder, target: Folder, db: Session) -> None:
-    source_chain = non_root_folder_chain(source)
-    target_chain = non_root_folder_chain(target)
-    if len(source_chain) != len(target_chain):
-        replace_folder_permissions_with_effective_access(source, target, db)
-        return
-    for source_folder, target_folder in zip(source_chain, target_chain, strict=True):
-        replace_folder_permissions_with_effective_access(source_folder, target_folder, db)
-
-
-def mirror_created_folder_permission_chain(
-    source: Folder,
-    target: Folder,
-    created_folders: list[Folder],
-    db: Session,
-) -> None:
-    created_ids = {folder.id for folder in created_folders}
-    if not created_ids:
-        return
-    source_chain = non_root_folder_chain(source)
-    target_chain = non_root_folder_chain(target)
-    if len(source_chain) != len(target_chain):
-        if target.id in created_ids:
-            replace_folder_permissions_with_effective_access(source, target, db)
-        return
-    for source_folder, target_folder in zip(source_chain, target_chain, strict=True):
-        if target_folder.id in created_ids:
-            replace_folder_permissions_with_effective_access(source_folder, target_folder, db)
+def archived_access_level(doc: Document, user: UserContext, db: Session) -> int:
+    archive_level = folder_access_level(doc.folder, user, db)
+    if archive_level <= 0:
+        return 0
+    snapshot = doc.archived_access or {}
+    groups = user_group_names(user)
+    if not groups:
+        return 0
+    user_groups = db.execute(select(VaultGroup).order_by(VaultGroup.name)).scalars().all()
+    source_level = max(
+        (
+            int(snapshot.get(str(group.id), 0) or 0)
+            for group in user_groups
+            if group.name.strip().lower() in groups
+        ),
+        default=0,
+    )
+    return min(archive_level, source_level)
 
 
 def document_access_level(doc: Document, user: UserContext, db: Session) -> int:
+    if user["is_admin"]:
+        return 3
+    if document_is_archive(doc):
+        return archived_access_level(doc, user, db)
     return folder_access_level(doc.folder, user, db)
 
 
@@ -664,6 +621,7 @@ def document_is_archive(doc: Document) -> bool:
 
 
 def refresh_document_location(doc: Document, db: Session) -> None:
+    db.flush()
     db.refresh(doc)
     db.expire(doc, ["folder"])
 
@@ -684,6 +642,8 @@ def find_child_folder(db: Session, parent_id: int, name: str) -> Folder | None:
 
 def get_folder_by_path(db: Session, path: str | None) -> Folder | None:
     ref = parse_public_folder_path(path)
+    if ref.root_key == ARCHIVE_ROOT_KEY and ref.relative_path:
+        return None
     current = get_root_folder(db, ref.root_key)
     if not ref.relative_path:
         return current
@@ -700,6 +660,8 @@ def get_or_create_folder_path_with_created(
     path: str | None,
 ) -> tuple[Folder, list[Folder]]:
     ref = parse_public_folder_path(path)
+    if ref.root_key == ARCHIVE_ROOT_KEY and ref.relative_path:
+        raise HTTPException(status_code=400, detail="Archive does not contain folders")
     current = get_root_folder(db, ref.root_key)
     created: list[Folder] = []
     if not ref.relative_path:
@@ -848,21 +810,6 @@ def ensure_unique_folder_name(
         raise HTTPException(status_code=400, detail="A folder already exists at that path")
 
 
-def remove_empty_folder_conflict(
-    db: Session,
-    parent_id: int,
-    name: str,
-    exclude_folder_id: int | None = None,
-    user: UserContext | None = None,
-) -> None:
-    existing = find_child_folder(db, parent_id, name)
-    if existing and existing.id != exclude_folder_id and not folder_has_items(db, existing):
-        if user is not None:
-            require_folder_access(existing, user, db, 3)
-        db.delete(existing)
-        db.flush()
-
-
 def document_in_folder(
     db: Session,
     folder_id: int,
@@ -941,38 +888,6 @@ def docs_in_unlocked_folder_subtree(db: Session, root: Folder, user: UserContext
 def reapply_ttl_for_folder_subtree(folder: Folder, db: Session) -> None:
     for doc in docs_in_folder_subtree(db, folder):
         apply_folder_ttl(doc, doc.folder, doc.latest_modified_at)
-
-
-def set_subtree_root_key(db: Session, root: Folder, root_key: str) -> None:
-    ids = subtree_folder_ids(root, all_folders(db))
-    for folder in db.execute(select(Folder).where(Folder.id.in_(ids))).scalars():
-        folder.root_key = root_key
-
-
-def folder_has_items(db: Session, folder: Folder) -> bool:
-    child = db.execute(select(Folder.id).where(Folder.parent_id == folder.id).limit(1)).first()
-    if child is not None:
-        return True
-    doc = db.execute(select(Document.id).where(Document.folder_id == folder.id).limit(1)).first()
-    return doc is not None
-
-
-def prune_empty_archive_folders(
-    db: Session,
-    folder: Folder | None,
-    user: UserContext | None = None,
-) -> None:
-    current = folder
-    while current and folder_is_archive(current) and not current.is_root:
-        db.flush()
-        if folder_has_items(db, current):
-            return
-        if user is not None and folder_access_level(current, user, db) < 3:
-            return
-        parent = current.parent
-        db.delete(current)
-        db.flush()
-        current = parent
 
 
 def get_active_lock(doc: Document, db: Session) -> DocumentLock | None:
@@ -1474,22 +1389,26 @@ def archive_doc_item(doc: Document, request: Request, user: UserContext, db: Ses
     if document_is_archive(doc):
         raise HTTPException(status_code=400, detail="Document is already archived")
     source_path = document_path(doc)
+    source_folder_path = document_folder_path(doc)
+    source_name = doc.name
     lock = ensure_not_locked_by_other(doc, user, db)
-    target_folder_path = public_folder_path(ARCHIVE_ROOT_KEY, folder_relative_path(doc.folder))
-    require_write_for_folder_path(db, target_folder_path, user)
-    target_folder = get_or_create_folder_path(db, target_folder_path)
-    mirror_folder_permission_chain(doc.folder, target_folder, db)
+    target_folder = get_root_folder(db, ARCHIVE_ROOT_KEY)
+    require_folder_access(target_folder, user, db, 3)
+    doc.archived_from_folder = source_folder_path
+    doc.archived_original_name = source_name
+    doc.archived_access = archive_access_snapshot(doc.folder, db)
     release_lock(lock, user)
     mutate_doc_location(
         doc,
         target_folder,
-        doc.name,
+        source_name,
         user,
         db,
         client_meta(request),
         "archive",
         f"Archived from {source_path}",
         publish_state=False,
+        allow_duplicate_name=True,
     )
     return document_path(doc)
 
@@ -1501,15 +1420,17 @@ def restore_doc_item(doc: Document, request: Request, user: UserContext, db: Ses
         raise HTTPException(status_code=400, detail="Document is not archived")
     source_path = document_path(doc)
     ensure_not_locked_by_other(doc, user, db)
-    archive_folder = doc.folder
-    target_folder_path = folder_relative_path(doc.folder)
+    if doc.archived_from_folder is None or doc.archived_original_name is None:
+        raise HTTPException(status_code=400, detail="Archived document is missing restore metadata")
+    target_folder_path = normalize_folder(doc.archived_from_folder)
+    target_name = normalize_item_name(doc.archived_original_name, "File name")
     require_write_for_folder_path(db, target_folder_path, user)
     target_folder, created_folders = get_or_create_folder_path_with_created(db, target_folder_path)
-    mirror_created_folder_permission_chain(doc.folder, target_folder, created_folders, db)
+    del created_folders
     mutate_doc_location(
         doc,
         target_folder,
-        doc.name,
+        target_name,
         user,
         db,
         client_meta(request),
@@ -1517,7 +1438,9 @@ def restore_doc_item(doc: Document, request: Request, user: UserContext, db: Ses
         f"Restored to Vault from {source_path}",
         publish_state=False,
     )
-    prune_empty_archive_folders(db, archive_folder, user)
+    doc.archived_from_folder = None
+    doc.archived_original_name = None
+    doc.archived_access = None
     return document_path(doc)
 
 
@@ -1528,81 +1451,15 @@ def archive_folder_item(source: Folder, request: Request, user: UserContext, db:
         raise HTTPException(status_code=400, detail="Folder is already archived")
     require_folder_access(source, user, db, 3)
     require_folder_subtree_access(source, user, db, 3)
-    source_path = folder_path(source)
+    source_folder_ids = subtree_folder_ids(source, all_folders(db))
     docs = docs_in_unlocked_folder_subtree(db, source, user)
-    target_path = public_folder_path(ARCHIVE_ROOT_KEY, folder_relative_path(source))
-    require_write_for_folder_path(db, "/".join(target_path.split("/")[:-1]), user)
-    target_parent = get_or_create_folder_path(db, "/".join(target_path.split("/")[:-1]))
-    target_name = normalize_item_name(target_path.split("/")[-1], "Folder name")
-    if source.parent and not source.parent.is_root and target_parent is not None:
-        mirror_folder_permission_chain(source.parent, target_parent, db)
-    remove_empty_folder_conflict(db, target_parent.id, target_name, source.id, user)
-    ensure_unique_folder_name(db, target_parent.id, target_name, source.id)
-    replace_folder_permissions_with_effective_access(source, source, db)
-    meta = client_meta(request)
+    if not docs:
+        raise HTTPException(status_code=400, detail="Folder has no files to archive")
     for doc in docs:
-        release_lock(get_active_lock(doc, db), user)
-        record_event(
-            doc,
-            user,
-            "archive",
-            f"Archived from {document_path(doc)}",
-            db,
-            meta=meta,
-            publish_state=False,
-        )
-        doc.latest_modified_at = now_utc()
-    source.parent = target_parent
-    source.parent_id = target_parent.id
-    source.name = target_name
-    set_subtree_root_key(db, source, ARCHIVE_ROOT_KEY)
-    for doc in docs:
-        apply_folder_ttl(doc, doc.folder, doc.latest_modified_at)
-    record_folder_event(source, user, "archive", f"Moved to Archive from {source_path}", db)
-    return target_path
-
-
-def restore_folder_item(source: Folder, request: Request, user: UserContext, db: Session) -> str:
-    if source.is_root or not folder_is_archive(source):
-        raise HTTPException(status_code=400, detail="Choose an archived folder to restore")
-    require_folder_access(source, user, db, 3)
-    require_folder_subtree_access(source, user, db, 3)
-    source_path = folder_path(source)
-    docs = docs_in_unlocked_folder_subtree(db, source, user)
-    target_path = folder_relative_path(source)
-    require_write_for_folder_path(db, "/".join(target_path.split("/")[:-1]), user)
-    target_parent, created_parents = get_or_create_folder_path_with_created(
-        db,
-        "/".join(target_path.split("/")[:-1]),
-    )
-    target_name = normalize_item_name(target_path.split("/")[-1], "Folder name")
-    if source.parent and not source.parent.is_root:
-        mirror_created_folder_permission_chain(source.parent, target_parent, created_parents, db)
-    remove_empty_folder_conflict(db, target_parent.id, target_name, source.id, user)
-    ensure_unique_folder_name(db, target_parent.id, target_name, source.id)
-    replace_folder_permissions_with_effective_access(source, source, db)
-    archive_parent = source.parent
-    meta = client_meta(request)
-    for doc in docs:
-        record_event(
-            doc,
-            user,
-            "unarchive",
-            f"Restored to Vault from {document_path(doc)}",
-            db,
-            meta=meta,
-            publish_state=False,
-        )
-        doc.latest_modified_at = now_utc()
-    source.parent = target_parent
-    source.parent_id = target_parent.id
-    source.name = target_name
-    set_subtree_root_key(db, source, VAULT_ROOT_KEY)
-    for doc in docs:
-        apply_folder_ttl(doc, doc.folder, doc.latest_modified_at)
-    prune_empty_archive_folders(db, archive_parent, user)
-    record_folder_event(source, user, "restore", f"Restored to Vault from {source_path}", db)
-    return target_path
+        archive_doc_item(doc, request, user, db)
+    db.flush()
+    db.execute(delete(Folder).where(Folder.id.in_(source_folder_ids)))
+    return ARCHIVE_ROOT
 
 
 def move_doc_item(
@@ -1633,6 +1490,7 @@ def move_doc_item(
         "move",
         f"Moved from {old_path} to {join_path(folder_path(target_folder), target_name)}",
         publish_state=False,
+        allow_duplicate_name=folder_is_archive(target_folder),
     )
     return document_path(doc)
 
@@ -1756,12 +1614,20 @@ def document_row_payload(
     modified_at = normalize_timestamp(latest_version.committed_at if latest_version else None)
     doc_folder = document_folder_path(doc, path_cache)
     doc_path = document_path(doc, path_cache)
+    archived = document_is_archive(doc)
+    archived_from_folder = normalize_folder(doc.archived_from_folder) if archived else ""
+    archived_original_name = doc.archived_original_name or ""
     lock = (locks or {}).get(doc.id)
     payload: dict[str, object] = {
         "id": doc.id,
         "name": doc.name,
         "path": doc_path,
         "folder": doc_folder,
+        "archived_from_folder": archived_from_folder,
+        "archived_original_name": archived_original_name,
+        "archived_original_path": join_path(archived_from_folder, archived_original_name)
+        if archived_original_name
+        else archived_from_folder,
         "modified_at": modified_at.isoformat() if modified_at else None,
         "modified_display": format_mtime(modified_at),
         "latest_by": (latest_version.committed_by_name or latest_version.committed_by)
@@ -1778,7 +1644,7 @@ def document_row_payload(
         "size_bytes": latest_size_bytes,
         "size_display": format_size(latest_size_bytes),
         "lock": lock_payload(lock),
-        "archived": document_is_archive(doc),
+        "archived": archived,
     }
     payload.update(document_expiry_payload(doc))
     if user is not None:
@@ -2061,7 +1927,9 @@ def build_contents_payload(
     locks = active_locks_by_document(db)
     stats = docs_stats_for_folder_payloads(docs, db, path_cache)
 
-    if search_query and recursive:
+    if folder_is_archive(current_folder):
+        folder_candidates = []
+    elif search_query and recursive:
         folder_candidates = [
             item
             for item in folders
@@ -2096,7 +1964,20 @@ def build_contents_payload(
         if not folder_is_in_scope(normalized_folder, doc_folder, bool(search_query and recursive)):
             continue
         doc_path = document_path(doc, path_cache)
-        if search_query and not matches_query(search_query, doc.name, doc_path, doc_folder):
+        archived_original_path = ""
+        if document_is_archive(doc):
+            archived_original_path = join_path(
+                normalize_folder(doc.archived_from_folder),
+                doc.archived_original_name or doc.name,
+            )
+        if search_query and not matches_query(
+            search_query,
+            doc.name,
+            doc_path,
+            doc_folder,
+            doc.archived_from_folder,
+            archived_original_path,
+        ):
             continue
         doc_rows.append(document_row_payload(doc, db, path_cache, locks, user))
 
@@ -2114,7 +1995,6 @@ def build_contents_payload(
 def build_sidebar_payload(db: Session, user: UserContext) -> dict[str, object]:
     ensure_root_folders(db)
     vault_root = get_root_folder(db, VAULT_ROOT_KEY)
-    archive_root = get_root_folder(db, ARCHIVE_ROOT_KEY)
     folders = all_folders(db)
     path_cache = build_folder_path_cache(folders)
     children = {
@@ -2123,11 +2003,7 @@ def build_sidebar_payload(db: Session, user: UserContext) -> dict[str, object]:
             for child in vault_root.children
             if folder_access_level(child, user, db) >= 1
         ),
-        ARCHIVE_ROOT: sorted(
-            folder_path(child, path_cache)
-            for child in archive_root.children
-            if folder_access_level(child, user, db) >= 1
-        ),
+        ARCHIVE_ROOT: [],
     }
     metadata = {
         folder_path(item, path_cache): {
@@ -2689,8 +2565,10 @@ def mutate_doc_location(
     event_type: str,
     message: str,
     publish_state: bool = True,
+    allow_duplicate_name: bool = False,
 ) -> None:
-    ensure_unique_document_path(db, target_folder.id, target_name, doc.id)
+    if not allow_duplicate_name:
+        ensure_unique_document_path(db, target_folder.id, target_name, doc.id)
     doc.folder = target_folder
     doc.folder_id = target_folder.id
     doc.name = target_name
@@ -2699,50 +2577,31 @@ def mutate_doc_location(
     record_event(doc, user, event_type, message, db, meta=meta, publish_state=publish_state)
 
 
-def unique_document_name(
-    db: Session,
-    folder_id: int,
-    desired_name: str,
-    exclude_doc_id: int | None = None,
-) -> str:
-    if not document_in_folder(db, folder_id, desired_name, exclude_doc_id):
-        return desired_name
-    stem, dot, suffix = desired_name.rpartition(".")
-    base = stem if dot else desired_name
-    extension = f".{suffix}" if dot else ""
-    for index in range(1, 1000):
-        candidate = f"{base} (expired {index}){extension}"
-        if not document_in_folder(db, folder_id, candidate, exclude_doc_id):
-            return candidate
-    raise HTTPException(status_code=400, detail="Could not choose an archive name")
-
-
 def archive_expired_document(doc: Document, db: Session, timestamp: dt.datetime) -> str:
     source_path = document_path(doc)
-    target_folder_path = public_folder_path(ARCHIVE_ROOT_KEY, folder_relative_path(doc.folder))
-    target_folder = get_or_create_folder_path(db, target_folder_path)
-    mirror_folder_permission_chain(doc.folder, target_folder, db)
-    target_name = unique_document_name(db, target_folder.id, doc.name, doc.id)
+    source_folder_path = document_folder_path(doc)
+    target_folder = get_root_folder(db, ARCHIVE_ROOT_KEY)
+    doc.archived_from_folder = source_folder_path
+    doc.archived_original_name = doc.name
+    doc.archived_access = archive_access_snapshot(doc.folder, db)
     mutate_doc_location(
         doc,
         target_folder,
-        target_name,
+        doc.name,
         SYSTEM_USER,
         db,
         SYSTEM_META,
         "archive",
         f"Expired at {timestamp.strftime('%Y-%m-%d %H:%M UTC')}; archived from {source_path}",
         publish_state=False,
+        allow_duplicate_name=True,
     )
     return document_path(doc)
 
 
 def delete_expired_document(doc: Document, db: Session) -> str:
     deleted_path = document_path(doc)
-    archive_folder = doc.folder if document_is_archive(doc) else None
     db.delete(doc)
-    if archive_folder is not None:
-        prune_empty_archive_folders(db, archive_folder)
     return deleted_path
 
 
@@ -3763,8 +3622,10 @@ def restore_items(
                         doc = get_document_or_404(item.id or 0, db)
                         detail = restore_doc_item(doc, request, user, db)
                     else:
-                        folder_item = get_folder_for_action(item, db)
-                        detail = restore_folder_item(folder_item, request, user, db)
+                        raise HTTPException(
+                            status_code=400,
+                            detail="Restore archived files, not folders",
+                        )
                 result["ok"].append(action_result(item, detail))
                 changed = True
             except HTTPException as exc:
@@ -3803,23 +3664,12 @@ def delete_items_forever(
                             )
                         ensure_not_locked_by_other(doc, user, db)
                         detail = document_path(doc)
-                        archive_folder = doc.folder
                         db.delete(doc)
-                        prune_empty_archive_folders(db, archive_folder, user)
                     else:
-                        folder_item = get_folder_for_action(item, db)
-                        if folder_item.is_root or not folder_is_archive(folder_item):
-                            raise HTTPException(
-                                status_code=400,
-                                detail="Delete forever is only available in Archive",
-                            )
-                        if not user["is_admin"]:
-                            require_folder_subtree_access(folder_item, user, db, 3)
-                        docs_in_unlocked_folder_subtree(db, folder_item, user)
-                        detail = folder_path(folder_item)
-                        archive_parent = folder_item.parent
-                        db.delete(folder_item)
-                        prune_empty_archive_folders(db, archive_parent, user)
+                        raise HTTPException(
+                            status_code=400,
+                            detail="Delete forever is only available for archived files",
+                        )
                 result["ok"].append(action_result(item, detail))
                 changed = True
             except HTTPException as exc:

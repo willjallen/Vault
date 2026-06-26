@@ -1,7 +1,7 @@
 import {
   classNames,
   formatDate,
-  isArchivePath,
+  isArchiveRootPath,
   retentionPolicyLabel,
   retentionPolicyStatusLabels,
 } from "../../lib/utils.js";
@@ -61,7 +61,7 @@ export function FolderRow({
 }) {
   const inputRef = useRef(null);
   const committingRef = useRef(false);
-  const isArchived = isArchivePath(folder.path || "");
+  const isArchived = isArchiveRootPath(folder.path || "");
   const retention = folderRetentionStatus(folder);
 
   useEffect(() => {

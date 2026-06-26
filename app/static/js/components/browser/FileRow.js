@@ -101,7 +101,8 @@ export function FileRow({
   const expiryDateLabel = doc.expires_at ? formatDate(doc.expires_at) : "";
   const expiryTitle =
     expiryLabel && expiryDateLabel ? `${expiryLabel} · ${expiryDateLabel}` : expiryDateLabel;
-  const searchPath = showSearchPath ? recursiveSearchPath(doc.folder) : "";
+  const archivedSourcePath = isArchived ? recursiveSearchPath(doc.archived_from_folder) : "";
+  const searchPath = archivedSourcePath || (showSearchPath ? recursiveSearchPath(doc.folder) : "");
 
   useEffect(() => {
     if (!editing || !inputRef.current) {

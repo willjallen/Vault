@@ -2523,12 +2523,12 @@ input[type="file"]::file-selector-button:hover {
 
 .notification-detail {
   min-width: 0;
-  overflow: hidden;
+  overflow: visible;
+  overflow-wrap: anywhere;
   color: var(--text-secondary);
   font-size: 0.78rem;
   line-height: 1.25;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  white-space: normal;
 }
 
 .notification-row.error .notification-detail {

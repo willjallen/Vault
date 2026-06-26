@@ -99,16 +99,20 @@ export function useNotifications(defaultDuration = DEFAULT_NOTICE_MS) {
 
   const showError = useCallback(
     (message, duration = defaultDuration) => {
-      const normalizedMessage = String(message || "").trim();
-      if (!normalizedMessage) {
+      const source = typeof message === "string" ? { detail: message } : message || {};
+      const detail = String(source.detail || "").trim();
+      const title = String(source.title || "").trim();
+      if (!title && !detail) {
         clearNotice();
         return;
       }
       showNotice({
-        detail: normalizedMessage,
-        duration,
+        detail,
+        dismissible: source.dismissible,
+        duration: source.duration ?? duration,
         kind: "error",
-        title: "Error",
+        progress: source.progress,
+        title: title || "Error",
       });
     },
     [clearNotice, defaultDuration, showNotice]

@@ -1,4 +1,4 @@
-import { classNames, isArchivePath, toBreadcrumbs } from "../../lib/utils.js";
+import { classNames, isArchiveRootPath, toBreadcrumbs } from "../../lib/utils.js";
 import { Icon } from "../common/Icon.js";
 
 const { useMemo, useState } = React;
@@ -18,7 +18,7 @@ function BreadcrumbLine({ crumbs, onSelect }) {
             type: "button",
             className: classNames(
               "crumb",
-              isArchivePath(crumb.path) ? "archived" : "",
+              isArchiveRootPath(crumb.path) ? "archived" : "",
               crumb.active ? "active" : ""
             ),
             onClick: () => onSelect && onSelect(crumb.path),
@@ -143,9 +143,7 @@ export function MoveDialog({
 }) {
   const [showNewFolder, setShowNewFolder] = useState(Boolean(newFolderName));
   const safeTarget = target || EMPTY_TARGET;
-  const movingInArchive =
-    safeTarget.archived || isArchivePath(safeTarget.path || safeTarget.folder || "");
-  const destinationPath = destination || (movingInArchive ? "Archive" : "");
+  const destinationPath = destination || "";
   const targetFolder = safeTarget.type === "folder" ? safeTarget.path : safeTarget.folder || "";
   const targetBaseName =
     safeTarget.type === "folder"
@@ -154,9 +152,7 @@ export function MoveDialog({
 
   const destinationCrumbs = toBreadcrumbs(destinationPath);
   const currentCrumbs = toBreadcrumbs(
-    safeTarget.type === "folder"
-      ? targetFolder
-      : safeTarget.folder || (movingInArchive ? "Archive" : "")
+    safeTarget.type === "folder" ? targetFolder : safeTarget.folder || ""
   );
 
   const childFolders = useMemo(() => {
@@ -169,16 +165,15 @@ export function MoveDialog({
           folderChildren[destinationPath]
         : [];
     return list
-      .filter((path) => isArchivePath(path) === movingInArchive)
+      .filter((path) => !isArchiveRootPath(path))
       .map((path) => ({
         path,
-        name:
-          path.split("/").filter(Boolean).slice(-1)[0] || (movingInArchive ? "Archive" : "Vault"),
+        name: path.split("/").filter(Boolean).slice(-1)[0] || "Vault",
         blocked:
           safeTarget.type === "folder" &&
           (path === targetFolder || path.startsWith(`${targetFolder}/`)),
       }));
-  }, [destinationPath, folderChildren, movingInArchive, safeTarget.type, targetFolder]);
+  }, [destinationPath, folderChildren, safeTarget.type, targetFolder]);
 
   const finalPath = destinationPath ? `${destinationPath}/${targetBaseName}` : targetBaseName;
   const invalidDestination =
@@ -188,9 +183,7 @@ export function MoveDialog({
     safeTarget.type === "doc" ? finalPath === safeTarget.path : finalPath === targetFolder;
   const hasNewFolderName = Boolean((newFolderName || "").trim());
 
-  const headerNote = movingInArchive
-    ? "Moving within Archive. Use Restore to send items back to Vault."
-    : "Choose a new folder inside your Vault.";
+  const headerNote = "Choose a new folder inside your Vault.";
   const footerHint = invalidDestination
     ? "Pick a folder outside the one you're moving."
     : noOp
@@ -218,10 +211,7 @@ export function MoveDialog({
           h(
             "p",
             { className: "muted tiny quiet-text current-location" },
-            `Current location: ${
-              currentCrumbs.map((crumb) => crumb.name).join(" / ") ||
-              (movingInArchive ? "Archive" : "Vault")
-            }`
+            `Current location: ${currentCrumbs.map((crumb) => crumb.name).join(" / ") || "Vault"}`
           ),
         ]),
         h("div", { className: "modal-body" }, [

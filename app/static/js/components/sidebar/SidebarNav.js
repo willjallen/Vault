@@ -1,4 +1,4 @@
-import { classNames, isArchivePath } from "../../lib/utils.js";
+import { classNames, isArchivedPath, isArchiveRootPath } from "../../lib/utils.js";
 import { favoriteItemKey } from "../../lib/favoriteItems.js";
 import { keyForItem } from "../../lib/itemActions.js";
 import {
@@ -250,7 +250,7 @@ function SidebarFolderShortcut({
   onClearDropHint,
 }) {
   const isActive = isActiveShortcut(item.path, currentFolder || "");
-  const isArchived = isArchivePath(item.path);
+  const isArchived = isArchiveRootPath(item.path);
   const dropFolder = item.path || "";
   const isDropTarget = isFolderDropTarget({
     activeDropTarget,
@@ -420,7 +420,7 @@ function SidebarFavoriteShortcut({
   draggingFolderPath,
 }) {
   const isDocument = item.type === "document";
-  const isArchived = isArchivePath(item.path || item.folder || "");
+  const isArchived = isArchivedPath(item.path || item.folder || "");
   const title = item.path || item.name;
   const icon = isDocument ? "file" : folderShortcutIcon(item, isArchived);
 
@@ -780,16 +780,13 @@ export function SidebarNav({
 
   const allItems = folderItems || [
     { name: "Vault", path: "" },
-    ...directChildren(folderChildren || {}, "", (child) => !isArchivePath(child)),
+    ...directChildren(folderChildren || {}, "", (child) => !isArchiveRootPath(child)),
     { name: "Archive", path: "Archive" },
-    ...directChildren(folderChildren || {}, "Archive", (child) => isArchivePath(child)),
   ];
   const vaultItems = allItems.filter(
-    (item) => item.path !== "Archive" && !isArchivePath(item.path)
+    (item) => item.path !== "Archive" && !isArchiveRootPath(item.path)
   );
-  const archiveItems = allItems.filter(
-    (item) => item.path === "Archive" || isArchivePath(item.path)
-  );
+  const archiveItems = allItems.filter((item) => item.path === "Archive");
   const favoriteShortcutItems = favoriteItems.map((item) => ({
     ...item,
     favorite: true,

@@ -1,181 +1,111 @@
 import unittest
 
-from fastapi import HTTPException
-from tests.support import (
-    FAKE_REQUEST,
-    add_permission,
-    create_versioned_document,
-    user_context,
-    vault_runtime,
-)
+from tests.support import FAKE_REQUEST, create_versioned_document, user_context, vault_runtime
 
-from app.models import Folder, FolderPermission, VaultGroup
+from app.models import Document
 from app.routers import (
+    archive_doc_item,
     archive_folder_item,
+    build_contents_payload,
+    document_path,
+    folder_path,
     get_folder_by_path,
     get_or_create_folder_path,
     get_root_folder,
     restore_doc_item,
-    restore_folder_item,
 )
 
 
-class ArchiveFolderPlaceholderTests(unittest.TestCase):
-    def test_archive_folder_reuses_empty_archive_placeholder(self) -> None:
-        user = user_context("user")
+class FlatArchiveTests(unittest.TestCase):
+    def test_archiving_document_moves_to_archive_root_with_origin_metadata(self) -> None:
+        admin = user_context("admin", groups=["vault-admin"], is_admin=True)
 
         with vault_runtime() as ctx, ctx.db() as db:
-            get_or_create_folder_path(db, "Project")
-            get_or_create_folder_path(db, "Archive/Project")
+            source = get_or_create_folder_path(db, "Project/Sub")
+            doc = create_versioned_document(db, source, name="plan.txt", actor=admin)
+
+            result = archive_doc_item(doc, FAKE_REQUEST, admin, db)
             db.commit()
 
-            source = get_folder_by_path(db, "Project")
-            result = archive_folder_item(source, FAKE_REQUEST, user, db)
-            db.commit()
-            self.assertEqual(result, "Archive/Project")
+            self.assertEqual(result, "Archive/plan.txt")
+            self.assertEqual(folder_path(doc.folder), "Archive")
+            self.assertEqual(doc.archived_from_folder, "Project/Sub")
+            self.assertEqual(doc.archived_original_name, "plan.txt")
+            self.assertEqual(doc.archived_access, {})
 
-            rows = db.query(Folder).filter_by(name="Project").all()
-            self.assertEqual(len(rows), 1)
-            self.assertEqual(rows[0].root_key, "archive")
-            self.assertIsNotNone(rows[0].parent)
-            self.assertTrue(rows[0].parent.is_root)
-
-    def test_archive_folder_keeps_nonempty_archive_target_as_conflict(self) -> None:
-        user = user_context("user")
+    def test_archiving_folder_flattens_documents_and_removes_source_tree(self) -> None:
+        admin = user_context("admin", groups=["vault-admin"], is_admin=True)
 
         with vault_runtime() as ctx, ctx.db() as db:
-            get_or_create_folder_path(db, "Project")
-            get_or_create_folder_path(db, "Archive/Project/Existing")
+            project = get_or_create_folder_path(db, "Project")
+            sub = get_or_create_folder_path(db, "Project/Sub")
+            root_doc = create_versioned_document(db, project, name="root.txt", actor=admin)
+            sub_doc = create_versioned_document(db, sub, name="nested.txt", actor=admin)
+
+            result = archive_folder_item(project, FAKE_REQUEST, admin, db)
             db.commit()
 
-            with self.assertRaises(HTTPException) as raised:
-                source = get_folder_by_path(db, "Project")
-                archive_folder_item(source, FAKE_REQUEST, user, db)
+            self.assertEqual(result, "Archive")
+            self.assertIsNone(get_folder_by_path(db, "Project"))
+            self.assertIsNone(get_folder_by_path(db, "Archive/Project"))
+            self.assertEqual(folder_path(root_doc.folder), "Archive")
+            self.assertEqual(folder_path(sub_doc.folder), "Archive")
+            self.assertEqual(root_doc.archived_from_folder, "Project")
+            self.assertEqual(sub_doc.archived_from_folder, "Project/Sub")
 
-            self.assertEqual(raised.exception.status_code, 400)
-            self.assertEqual(raised.exception.detail, "A folder already exists at that path")
-
-            rows = db.query(Folder).filter_by(name="Project").all()
-            self.assertEqual(sorted(row.root_key for row in rows), ["archive", "vault"])
-
-    def test_archive_folder_cannot_replace_inaccessible_empty_placeholder(self) -> None:
-        writer = user_context("writer", groups=["writers"], is_admin=False)
+    def test_archive_allows_duplicate_display_names_from_different_folders(self) -> None:
+        admin = user_context("admin", groups=["vault-admin"], is_admin=True)
 
         with vault_runtime() as ctx, ctx.db() as db:
-            vault_root = get_root_folder(db, "vault")
+            one = get_or_create_folder_path(db, "One")
+            two = get_or_create_folder_path(db, "Two")
+            first = create_versioned_document(db, one, name="plan.txt", actor=admin)
+            second = create_versioned_document(db, two, name="plan.txt", actor=admin)
+
+            archive_doc_item(first, FAKE_REQUEST, admin, db)
+            archive_doc_item(second, FAKE_REQUEST, admin, db)
+            db.commit()
+
             archive_root = get_root_folder(db, "archive")
-            writers = VaultGroup(name="writers")
-            confidential = VaultGroup(name="confidential")
-            db.add_all([writers, confidential])
-            db.flush()
-            add_permission(db, vault_root, writers, write=True)
-            add_permission(db, archive_root, writers, write=True)
+            rows = db.query(Document).filter_by(folder_id=archive_root.id, name="plan.txt").all()
+            self.assertEqual({row.id for row in rows}, {first.id, second.id})
+            self.assertEqual({row.archived_from_folder for row in rows}, {"One", "Two"})
 
-            source = get_or_create_folder_path(db, "Project")
-            placeholder = get_or_create_folder_path(db, "Archive/Project")
-            add_permission(db, placeholder, confidential, write=True)
-            source_id = source.id
-            placeholder_id = placeholder.id
-            db.commit()
-
-            with self.assertRaises(HTTPException) as raised:
-                archive_folder_item(source, FAKE_REQUEST, writer, db)
-
-            self.assertEqual(raised.exception.status_code, 404)
-            self.assertEqual(raised.exception.detail, "Folder not found")
-            db.commit()
-
-            self.assertEqual(get_folder_by_path(db, "Project").id, source_id)
-            self.assertEqual(get_folder_by_path(db, "Archive/Project").id, placeholder_id)
-            self.assertEqual(
-                db.query(FolderPermission).filter_by(folder_id=placeholder_id).count(),
-                1,
-            )
-            self.assertEqual(db.query(FolderPermission).filter_by(folder_id=source_id).count(), 0)
-
-    def test_unarchive_folder_reuses_empty_vault_placeholder(self) -> None:
-        user = user_context("user")
+    def test_restore_document_uses_original_location_metadata(self) -> None:
+        admin = user_context("admin", groups=["vault-admin"], is_admin=True)
 
         with vault_runtime() as ctx, ctx.db() as db:
-            get_or_create_folder_path(db, "Project")
+            source = get_or_create_folder_path(db, "Project/Sub")
+            doc = create_versioned_document(db, source, name="restore.txt", actor=admin)
+            archive_doc_item(doc, FAKE_REQUEST, admin, db)
+            db.delete(source)
             db.commit()
 
-            source = get_folder_by_path(db, "Project")
-            archive_folder_item(source, FAKE_REQUEST, user, db)
-            db.commit()
-            get_or_create_folder_path(db, "Project")
+            result = restore_doc_item(doc, FAKE_REQUEST, admin, db)
             db.commit()
 
-            source = get_folder_by_path(db, "Archive/Project")
-            result = restore_folder_item(source, FAKE_REQUEST, user, db)
-            db.commit()
-            self.assertEqual(result, "Project")
-
-            rows = db.query(Folder).filter_by(name="Project").all()
-            self.assertEqual(len(rows), 1)
-            self.assertEqual(rows[0].root_key, "vault")
-            self.assertIsNotNone(rows[0].parent)
-            self.assertTrue(rows[0].parent.is_root)
-
-    def test_unarchive_folder_keeps_nonempty_vault_target_as_conflict(self) -> None:
-        user = user_context("user")
-
-        with vault_runtime() as ctx, ctx.db() as db:
-            get_or_create_folder_path(db, "Project")
-            db.commit()
-
-            source = get_folder_by_path(db, "Project")
-            archive_folder_item(source, FAKE_REQUEST, user, db)
-            db.commit()
-            get_or_create_folder_path(db, "Project/Existing")
-            db.commit()
-
-            with self.assertRaises(HTTPException) as raised:
-                source = get_folder_by_path(db, "Archive/Project")
-                restore_folder_item(source, FAKE_REQUEST, user, db)
-
-            self.assertEqual(raised.exception.status_code, 400)
-            self.assertEqual(raised.exception.detail, "A folder already exists at that path")
-
-            rows = db.query(Folder).filter_by(name="Project").all()
-            self.assertEqual(sorted(row.root_key for row in rows), ["archive", "vault"])
-
-    def test_restore_document_does_not_prune_inaccessible_empty_archive_parent(self) -> None:
-        writer = user_context("writer", groups=["writers"], is_admin=False)
-
-        with vault_runtime() as ctx, ctx.db() as db:
-            vault_root = get_root_folder(db, "vault")
-            writers = VaultGroup(name="writers")
-            confidential = VaultGroup(name="confidential")
-            db.add_all([writers, confidential])
-            db.flush()
-            add_permission(db, vault_root, writers, write=True)
-
-            archive_project = get_or_create_folder_path(db, "Archive/Project")
-            archive_sub = get_or_create_folder_path(db, "Archive/Project/Sub")
-            add_permission(db, archive_project, confidential, write=True)
-            add_permission(db, archive_sub, writers, write=True)
-            doc = create_versioned_document(
-                db,
-                archive_sub,
-                name="restore.txt",
-                data=b"restore",
-                actor=writer,
-            )
-            archive_project_id = archive_project.id
-            archive_sub_id = archive_sub.id
-            db.commit()
-
-            result = restore_doc_item(doc, FAKE_REQUEST, writer, db)
             self.assertEqual(result, "Project/Sub/restore.txt")
+            self.assertEqual(document_path(doc), "Project/Sub/restore.txt")
+            self.assertIsNone(doc.archived_from_folder)
+            self.assertIsNone(doc.archived_original_name)
+            self.assertIsNone(doc.archived_access)
+
+    def test_archive_contents_returns_files_without_folders(self) -> None:
+        admin = user_context("admin", groups=["vault-admin"], is_admin=True)
+
+        with vault_runtime() as ctx, ctx.db() as db:
+            source = get_or_create_folder_path(db, "Project/Sub")
+            doc = create_versioned_document(db, source, name="plan.txt", actor=admin)
+            archive_doc_item(doc, FAKE_REQUEST, admin, db)
             db.commit()
 
-            self.assertIsNone(db.get(Folder, archive_sub_id))
-            self.assertIsNotNone(db.get(Folder, archive_project_id))
-            self.assertIsNotNone(get_folder_by_path(db, "Archive/Project"))
+            payload = build_contents_payload(db, "Archive", admin)
+
+            self.assertEqual(payload["folders"], [])
+            self.assertEqual([row["id"] for row in payload["documents"]], [doc.id])
+            self.assertEqual(payload["documents"][0]["archived_from_folder"], "Project/Sub")
             self.assertEqual(
-                db.query(FolderPermission).filter_by(folder_id=archive_project_id).count(),
-                1,
+                payload["documents"][0]["archived_original_path"], "Project/Sub/plan.txt"
             )
 
 

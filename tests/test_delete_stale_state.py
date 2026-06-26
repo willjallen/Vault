@@ -21,7 +21,6 @@ from app.routers import (
     get_or_create_folder_path,
     get_root_folder,
     restore_doc_item,
-    restore_folder_item,
     storage_reconciliation_report,
 )
 from app.site_settings import merge_site_settings
@@ -80,7 +79,7 @@ class DeleteStaleStateTests(unittest.TestCase):
                 self.assertEqual(active_locks.count(), 1)
                 self.assertEqual(db.query(DocumentVersion).filter_by(document_id=doc_id).count(), 1)
 
-    def test_delete_forever_rejects_folder_with_descendant_lock_by_other_user(self) -> None:
+    def test_delete_forever_rejects_file_archived_from_folder_locked_by_other_user(self) -> None:
         admin = user_context("admin", groups=["vault-admin"], is_admin=True)
         writer = user_context("writer", groups=["writers"], is_admin=False)
 
@@ -106,11 +105,10 @@ class DeleteStaleStateTests(unittest.TestCase):
                     ),
                 )
                 db.commit()
-                folder_id = folder.id
                 doc_id = doc.id
 
                 result = delete_items_forever(
-                    ActionPayload(items=[ActionItem(type="folder", path="Archive/Project")]),
+                    ActionPayload(items=[ActionItem(type="document", id=doc_id)]),
                     writer,
                     db,
                 )
@@ -123,7 +121,9 @@ class DeleteStaleStateTests(unittest.TestCase):
 
             with ctx.db() as db:
                 self.assertIsNotNone(db.get(Document, doc_id))
-                self.assertEqual(get_folder_by_path(db, "Archive/Project").id, folder_id)
+                self.assertIsNone(get_folder_by_path(db, "Project"))
+                self.assertIsNone(get_folder_by_path(db, "Archive/Project"))
+                self.assertEqual(db.get(Document, doc_id).folder.root_key, "archive")
                 active_locks = db.query(DocumentLock).filter_by(
                     document_id=doc_id,
                     is_active=True,
@@ -180,7 +180,7 @@ class DeleteStaleStateTests(unittest.TestCase):
                 events = db.query(DocumentEvent).filter_by(document_id=doc_id).all()
                 self.assertEqual([event.event_type for event in events], ["archive", "unarchive"])
 
-    def test_stale_archive_delete_refreshes_folder_restores_with_same_folder_id(self) -> None:
+    def test_stale_archive_delete_refreshes_document_restored_after_folder_archive(self) -> None:
         admin = user_context("alice", groups=["vault-admin"])
 
         with vault_runtime():
@@ -199,8 +199,8 @@ class DeleteStaleStateTests(unittest.TestCase):
                 self.assertEqual(stale_doc.folder.root_key, "archive")
 
                 with SessionLocal() as restore_db:
-                    source = get_folder_by_path(restore_db, "Archive/Project")
-                    restore_folder_item(source, FAKE_REQUEST, admin, restore_db)
+                    doc = restore_db.get(Document, doc_id)
+                    restore_doc_item(doc, FAKE_REQUEST, admin, restore_db)
                     restore_db.commit()
 
                 result = delete_items_forever(

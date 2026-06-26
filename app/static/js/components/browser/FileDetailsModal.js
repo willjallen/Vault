@@ -103,13 +103,12 @@ function filterHistoryItems(historyItems) {
 function locationPartsFor(doc) {
   const isArchived = Boolean(doc?.archived);
   const folderPath = doc?.folder || "";
-  const trimmedFolder = isArchived ? folderPath.replace(/^Archive\/?/, "") : folderPath;
   const parts = [{ label: isArchived ? "Archive" : "Vault", path: isArchived ? "Archive" : "" }];
-  if (!trimmedFolder) {
+  if (isArchived || !folderPath) {
     return parts;
   }
   let running = parts[0].path;
-  trimmedFolder
+  folderPath
     .split("/")
     .filter(Boolean)
     .forEach((segment) => {

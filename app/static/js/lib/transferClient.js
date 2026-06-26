@@ -1,7 +1,7 @@
 const UPLOAD_SESSION_STORAGE_KEY = "vault.uploadSessions";
 const UPLOAD_CONCURRENCY = 8;
 const UPLOAD_RETRY_LIMIT = 3;
-const DOWNLOAD_WRITE_BUFFER_BYTES = 8 * 1024 * 1024;
+const DOWNLOAD_WRITE_BUFFER_BYTES = 32 * 1024 * 1024;
 const EXPORT_POLL_MS = 900;
 const PROGRESS_TICK_MS = 80;
 const VERIFICATION_POLL_MS = 240;
@@ -534,6 +534,16 @@ async function streamResponseToFile({ response, writer, total, onProgress, signa
   let loaded = 0;
   let pendingChunks = [];
   let pendingBytes = 0;
+  let lastProgressEmittedAt = 0;
+
+  function emitDownloadProgress(stage = "downloading", options = {}) {
+    const now = performance.now();
+    if (!options.force && now - lastProgressEmittedAt < PROGRESS_TICK_MS) {
+      return;
+    }
+    lastProgressEmittedAt = now;
+    onProgress(progressFromValues(loaded, total, startedAt, { stage }));
+  }
 
   async function flushPendingChunks() {
     if (!pendingBytes) {
@@ -564,10 +574,10 @@ async function streamResponseToFile({ response, writer, total, onProgress, signa
       if (pendingBytes >= DOWNLOAD_WRITE_BUFFER_BYTES) {
         await flushPendingChunks();
       }
-      onProgress(progressFromValues(loaded, total, startedAt, { stage: "downloading" }));
+      emitDownloadProgress();
     }
     await flushPendingChunks();
-    onProgress(progressFromValues(loaded, total, startedAt, { stage: "finalizing" }));
+    emitDownloadProgress("finalizing", { force: true });
     await writer.close();
     return loaded;
   } catch (error) {

@@ -347,7 +347,7 @@ export function useVaultResources({
             suppressMissingFolderError: options.suppressMissingFolderError,
           })
         ),
-        options.sidebar ? criticalRefresh(fetchSidebar()) : Promise.resolve(true),
+        options.sidebar ? criticalRefresh(fetchSidebar()) : Promise.resolve({ ok: true }),
         optionalRefresh(fetchMyEdits()),
         selectedIdRef.current
           ? optionalRefresh(fetchDocumentDetail(selectedIdRef.current))

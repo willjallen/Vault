@@ -1,4 +1,5 @@
 import { classNames, expiryStatusLabel, expiryStatusLabels, formatDate } from "../../lib/utils.js";
+import { selectFileRenamePrefix } from "../../lib/fileNames.js";
 import { Icon } from "../common/Icon.js";
 import { RowSelectionIcon } from "./RowSelectionIcon.js";
 import { TtlStatusLabel } from "./TtlStatusLabel.js";
@@ -110,7 +111,7 @@ export function FileRow({
       return;
     }
     inputRef.current.focus();
-    inputRef.current.select();
+    selectFileRenamePrefix(inputRef.current);
   }, [editing]);
 
   function commitEdit() {

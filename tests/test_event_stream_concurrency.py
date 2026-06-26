@@ -7,10 +7,10 @@ from collections.abc import Iterator
 
 import httpx
 import uvicorn
+from tests.support import auth_headers, vault_runtime
 
 import app.routers as routers_module
 from app.main import create_app
-from tests.support import auth_headers, vault_runtime
 
 
 def free_tcp_port() -> int:

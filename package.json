@@ -6,11 +6,12 @@
   "scripts": {
     "build:assets": "node scripts/build-assets.mjs",
     "check:assets": "node scripts/build-assets.mjs --check",
+    "test:js": "node --test tests/js/*.test.mjs",
     "lint:js": "eslint \"app/static/js/**/*.js\" --max-warnings 0",
     "lint:css": "stylelint \"app/static/**/*.css\" --ignore-pattern \"app/static/dist/**\" --max-warnings 0",
     "check:css-tokens": "node scripts/check-css-tokens.mjs",
-    "format:js": "prettier --check \"app/static/**/*.{js,css,html}\" \"scripts/**/*.mjs\" \"!app/static/dist/**\"",
-    "lint": "npm run lint:js && npm run lint:css && npm run check:css-tokens && npm run check:assets && npm run format:js"
+    "format:js": "prettier --check \"app/static/**/*.{js,css,html}\" \"scripts/**/*.mjs\" \"tests/js/**/*.mjs\" \"!app/static/dist/**\"",
+    "lint": "npm run test:js && npm run lint:js && npm run lint:css && npm run check:css-tokens && npm run check:assets && npm run format:js"
   },
   "devDependencies": {
     "@eslint/js": "9.39.4",

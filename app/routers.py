@@ -2568,6 +2568,19 @@ def sanitize_mime_type(mime_type: str | None, filename: str) -> str:
     return candidate
 
 
+def zip_download_name(name: str | None) -> str:
+    base_name = safe_download_name(name or "folder").replace("/", "_").replace("\\", "_")
+    base_name = base_name.strip() or "folder"
+    return base_name if base_name.lower().endswith(".zip") else f"{base_name}.zip"
+
+
+def export_filename_for_items(items: list[NormalizedActionItem], db: Session) -> str:
+    if len(items) == 1 and items[0].type == "folder":
+        folder = get_folder_for_action(items[0], db)
+        return zip_download_name(folder.name)
+    return "vault-download.zip"
+
+
 def action_item_payload(item: NormalizedActionItem) -> dict[str, object]:
     payload: dict[str, object] = {"type": item.type}
     if item.id is not None:
@@ -5505,7 +5518,7 @@ def create_export_job(
             require_document_access(doc, user, db, 2)
         if not unique_docs:
             raise HTTPException(status_code=400, detail="Export has no downloadable files")
-        filename = "vault-download.zip"
+        filename = export_filename_for_items(items, db)
         current_versions = [current_version(doc, db) for doc in unique_docs]
         job = ExportJob(
             id=uuid.uuid4().hex,
@@ -5629,7 +5642,7 @@ def download_items(
             created_by_name=str(user["name"]),
             user_context=transfer_user_payload(user),
             request_payload={"items": [action_item_payload(item) for item in items]},
-            filename="vault-download.zip",
+            filename=export_filename_for_items(items, db),
             expires_at=transfer_expires_at(EXPORT_TTL_SECONDS),
         )
         db.add(job)

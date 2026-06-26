@@ -884,13 +884,18 @@ async function cancelExportJob(jobId) {
   }
 }
 
-export async function exportAndDownload({ payload, onProgress, signal }) {
+export async function exportAndDownload({
+  payload,
+  onProgress,
+  signal,
+  suggestedName = "vault-download.zip",
+}) {
   const startedAt = performance.now();
   let job = null;
   let writer = null;
   try {
     onProgress(progressFromValues(0, null, startedAt, { stage: "starting" }));
-    writer = await openDownloadWriter("vault-download.zip", signal);
+    writer = await openDownloadWriter(suggestedName, signal);
     job = await requestJson(
       "/api/exports",
       {
@@ -918,7 +923,7 @@ export async function exportAndDownload({ payload, onProgress, signal }) {
     const downloadWriter = writer;
     writer = null;
     return downloadUrl({
-      fallbackName: current.filename || "vault-download.zip",
+      fallbackName: current.filename || suggestedName || "vault-download.zip",
       fallbackTotal: current.size_bytes || current.total_bytes || null,
       onProgress,
       signal,

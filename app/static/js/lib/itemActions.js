@@ -96,6 +96,19 @@ function actionWarning(action, payload) {
   };
 }
 
+function zipDownloadName(itemName) {
+  const baseName = (itemName || "folder").trim() || "folder";
+  return baseName.toLowerCase().endsWith(".zip") ? baseName : `${baseName}.zip`;
+}
+
+function downloadNameForItems(items) {
+  if (items.length !== 1) {
+    return "vault-download.zip";
+  }
+  const item = items[0];
+  return item.type === "folder" ? zipDownloadName(item.name) : item.name;
+}
+
 export function createBulkActionHandlers({
   apiFetch,
   clearAllSelections,
@@ -145,7 +158,7 @@ export function createBulkActionHandlers({
     if (!actionItems.length) {
       return Promise.resolve();
     }
-    const label = actionItems.length === 1 ? actionItems[0].name : "vault-download.zip";
+    const label = downloadNameForItems(actionItems);
     const size =
       actionItems.length === 1 && actionItems[0].type === "document"
         ? actionItems[0].size_bytes || null

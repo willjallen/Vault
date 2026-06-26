@@ -934,8 +934,10 @@ class StreamingTransferTests(unittest.TestCase):
                 headers=headers,
             )
             self.assertEqual(export_response.status_code, 200, export_response.text)
+            self.assertEqual(export_response.json()["filename"], "Project.zip")
             export = wait_for_export(ctx.client, export_response.json()["id"], headers=headers)
             self.assertEqual(export["status"], "complete")
+            self.assertEqual(export["filename"], "Project.zip")
             ranged = ctx.client.get(
                 str(export["download_url"]),
                 headers={**headers, "Accept-Encoding": "gzip", "Range": "bytes=0-1"},
@@ -945,6 +947,7 @@ class StreamingTransferTests(unittest.TestCase):
             self.assertEqual(ranged.content, b"PK")
             response = ctx.client.get(str(export["download_url"]), headers=headers)
             self.assertEqual(response.status_code, 200, response.text)
+            self.assertIn('filename="Project.zip"', response.headers["content-disposition"])
             with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
                 self.assertEqual(
                     archive.getinfo("Project/one.txt").compress_type,

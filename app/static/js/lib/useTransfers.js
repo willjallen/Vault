@@ -216,6 +216,7 @@ export function useTransfers({ onUnauthorized } = {}) {
               payload: exportPayload,
               onProgress: (progress) => updateProgress(id, progress),
               signal,
+              suggestedName: displayName || "vault-download.zip",
             })
           : await downloadUrl({
               fallbackName: displayName || "download",

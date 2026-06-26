@@ -160,6 +160,8 @@ class DockerDeployTests(unittest.TestCase):
         self.assertIn("VAULT_SESSION_SECRET: ${VAULT_SESSION_SECRET:-}", compose)
         self.assertIn("VAULT_SESSION_COOKIE_SECURE: ${VAULT_SESSION_COOKIE_SECURE:-auto}", compose)
         self.assertIn("FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-127.0.0.1}", compose)
+        self.assertIn("VAULT_GZIP_MINIMUM_SIZE: ${VAULT_GZIP_MINIMUM_SIZE:-1024}", compose)
+        self.assertIn("VAULT_GZIP_COMPRESSLEVEL: ${VAULT_GZIP_COMPRESSLEVEL:-6}", compose)
         self.assertIn("VAULT_AUTH_MODE: ${VAULT_AUTH_MODE:-headers}", compose)
         self.assertNotIn("VAULT_DEV_AUTH", compose)
         self.assertNotIn("dev-insecure-session-secret", compose)
@@ -184,6 +186,10 @@ class DockerDeployTests(unittest.TestCase):
     def test_dockerfile_declares_clean_runtime_contract(self) -> None:
         dockerfile = (ROOT / "Dockerfile").read_text()
 
+        self.assertIn("FROM node:22-slim AS assets", dockerfile)
+        self.assertIn("RUN npm ci", dockerfile)
+        self.assertIn("RUN npm run build:assets", dockerfile)
+        self.assertIn("COPY --from=assets --chown=vault:vault /build/app/static/dist", dockerfile)
         self.assertIn("VAULT_DATA_DIR=/data", dockerfile)
         self.assertIn("VAULT_DB_PATH=/data/vault.db", dockerfile)
         self.assertIn("VAULT_OBJECTS_PATH=/data/objects", dockerfile)

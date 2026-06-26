@@ -1,14 +1,17 @@
 """FastAPI entrypoint for the vault service."""
 
 import logging
+import secrets
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.gzip import GZipMiddleware
 
 from . import config
+from .assets import validate_static_assets
 from .db import init_db
 from .routers import (
     router,
@@ -41,6 +44,23 @@ def _hsts_header_value() -> str:
     return value
 
 
+def _content_security_policy(nonce: str) -> str:
+    if config.CONTENT_SECURITY_POLICY:
+        return config.CONTENT_SECURITY_POLICY.replace("{nonce}", nonce)
+    return (
+        "default-src 'self'; "
+        "base-uri 'self'; "
+        "object-src 'none'; "
+        "frame-ancestors 'none'; "
+        "form-action 'self'; "
+        "img-src 'self' data: blob:; "
+        "style-src 'self' 'unsafe-inline'; "
+        f"script-src 'self' 'nonce-{nonce}'; "
+        "connect-src 'self'; "
+        "font-src 'self' data:"
+    )
+
+
 def apply_security_headers(request: Request, response: Response) -> None:
     if not config.SECURITY_HEADERS_ENABLED:
         return
@@ -52,8 +72,8 @@ def apply_security_headers(request: Request, response: Response) -> None:
         "Permissions-Policy",
         "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
     )
-    if config.CONTENT_SECURITY_POLICY:
-        _set_default_header(response, "Content-Security-Policy", config.CONTENT_SECURITY_POLICY)
+    nonce = str(getattr(request.state, "csp_nonce", ""))
+    _set_default_header(response, "Content-Security-Policy", _content_security_policy(nonce))
     if (
         not config.DEV_MODE
         and config.HSTS_MAX_AGE_SECONDS > 0
@@ -64,6 +84,12 @@ def apply_security_headers(request: Request, response: Response) -> None:
 
 def create_app(*, enable_ttl_sweeper: bool = True) -> FastAPI:
     application = FastAPI(title=config.SITE_NAME, version=APP_VERSION)
+    if config.GZIP_MINIMUM_SIZE > 0:
+        application.add_middleware(
+            GZipMiddleware,
+            compresslevel=config.GZIP_COMPRESSLEVEL,
+            minimum_size=config.GZIP_MINIMUM_SIZE,
+        )
     application.mount(
         "/static",
         StaticFiles(directory=Path(__file__).parent / "static"),
@@ -75,6 +101,7 @@ def create_app(*, enable_ttl_sweeper: bool = True) -> FastAPI:
         request: Request,
         call_next: Callable[[Request], Awaitable[Response]],
     ) -> Response:
+        request.state.csp_nonce = secrets.token_urlsafe(16)
         response = await call_next(request)
         apply_security_headers(request, response)
         return response
@@ -82,6 +109,7 @@ def create_app(*, enable_ttl_sweeper: bool = True) -> FastAPI:
     @application.on_event("startup")
     async def startup_event() -> None:
         config.validate_runtime_config()
+        validate_static_assets()
         if config.DEV_MODE:
             logger.warning("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
             logger.warning("VAULT IS RUNNING IN DEVELOPMENT MODE. DEBUG TOOLS ARE ENABLED.")

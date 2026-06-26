@@ -22,4 +22,6 @@ Do not use the dev override for production. `VAULT_DEV_MODE=1` exposes admin-onl
 
 For OIDC behind TLS termination, set `VAULT_PUBLIC_URL` to the external `https://` origin and leave `VAULT_SESSION_COOKIE_SECURE=auto` so session and OIDC state cookies are marked `Secure` even when the container receives internal HTTP. Configure `FORWARDED_ALLOW_IPS` to the source IP or CIDR of the trusted reverse proxy so Uvicorn accepts `X-Forwarded-*` headers only from that proxy. The app emits baseline security headers by default and adds HSTS when the public request origin is HTTPS; tune `VAULT_HSTS_MAX_AGE_SECONDS` and `VAULT_HSTS_INCLUDE_SUBDOMAINS` for your domain.
 
+The production image builds local, minified, content-hashed frontend assets with `npm run build:assets`; browsers do not load React, Font Awesome, fonts, or modules from public CDNs. The repository gate checks the generated bundle with `npm run check:assets`.
+
 Embedded hosts can force the first-paint appearance without changing the user's stored browser preference by sending `X-Vault-Palette: winui` and, if needed, `X-Vault-Theme: light|dark|system` on the HTML request.

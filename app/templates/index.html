@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>{{ state.bootstrap.site_name or "Vault" }}</title>
-    <script>
+    <script nonce="{{ csp_nonce }}">
       (() => {
         const appearanceOverride = {{ appearance_override | tojson }};
         const syncedPreferences = {{ state.bootstrap.preferences | tojson }};
@@ -73,28 +73,14 @@
         document.documentElement.style.colorScheme = resolved;
       })();
     </script>
-    <link rel="stylesheet" href="/static/styles.css" />
+    <link rel="stylesheet" href="{{ asset_url('styles.css') }}" />
   </head>
   <body class="app-root-page">
     <div id="app-root" class="app-root"></div>
 
-    <script>
+    <script nonce="{{ csp_nonce }}">
       window.__INITIAL_STATE__ = {{ state | tojson }};
     </script>
-    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-    <script
-      crossorigin
-      src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"
-    ></script>
-    <script type="importmap">
-      {
-        "imports": {
-          "@fortawesome/fontawesome-svg-core": "https://esm.sh/@fortawesome/fontawesome-svg-core@7.3.0",
-          "@fortawesome/free-brands-svg-icons": "https://esm.sh/@fortawesome/free-brands-svg-icons@7.3.0",
-          "@fortawesome/free-solid-svg-icons": "https://esm.sh/@fortawesome/free-solid-svg-icons@7.3.0"
-        }
-      }
-    </script>
-    <script type="module" src="/static/js/main.js"></script>
+    <script type="module" src="{{ asset_url('app.js') }}"></script>
   </body>
 </html>

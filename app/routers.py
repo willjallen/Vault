@@ -39,6 +39,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from . import db as db_runtime
+from .assets import static_asset_path
 from .auth import (
     UserContext,
     current_user,
@@ -3329,6 +3330,8 @@ def build_appearance_override(request: Request) -> dict[str, str | None]:
 def index_template_context(request: Request, state: dict[str, object]) -> dict[str, object]:
     return {
         "appearance_override": build_appearance_override(request),
+        "asset_url": static_asset_path,
+        "csp_nonce": getattr(request.state, "csp_nonce", ""),
         "request": request,
         "state": state,
     }

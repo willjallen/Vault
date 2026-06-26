@@ -35,7 +35,11 @@ class HttpApiContractTests(unittest.TestCase):
                 self.assertEqual(response.headers["x-content-type-options"], "nosniff")
                 self.assertEqual(response.headers["x-frame-options"], "DENY")
                 self.assertEqual(response.headers["referrer-policy"], "no-referrer")
-                self.assertIn("frame-ancestors 'none'", response.headers["content-security-policy"])
+                csp = response.headers["content-security-policy"]
+                self.assertIn("frame-ancestors 'none'", csp)
+                self.assertIn("script-src 'self' 'nonce-", csp)
+                self.assertNotIn("unpkg.com", csp)
+                self.assertNotIn("esm.sh", csp)
                 self.assertNotIn("strict-transport-security", response.headers)
 
                 config_module.PUBLIC_URL = "https://vault.example.com"
@@ -43,6 +47,22 @@ class HttpApiContractTests(unittest.TestCase):
                 self.assertIn("max-age=", secure_response.headers["strict-transport-security"])
         finally:
             config_module.PUBLIC_URL = original_public_url
+
+    def test_app_shell_uses_local_built_assets_without_cdns(self) -> None:
+        admin_headers = auth_headers("admin", ["vault-admin"])
+
+        with vault_test_client() as ctx:
+            response = ctx.client.get("/", headers=admin_headers)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIn('href="/static/dist/styles-', response.text)
+        self.assertIn('type="module" src="/static/dist/app-', response.text)
+        self.assertIn("<script nonce=", response.text)
+        self.assertNotIn("https://unpkg.com", response.text)
+        self.assertNotIn("https://esm.sh", response.text)
+        self.assertNotIn("importmap", response.text)
+        self.assertNotIn("/static/js/main.js", response.text)
+        self.assertNotIn("/static/styles.css", response.text)
 
     def test_file_api_permissions_over_real_http(self) -> None:
         admin_headers = auth_headers("admin", ["vault-admin"])

@@ -134,24 +134,12 @@ R2_ENDPOINT_URL = os.getenv("VAULT_R2_ENDPOINT_URL", "").strip() or (
 )
 
 SECURITY_HEADERS_ENABLED = _env_flag("VAULT_SECURITY_HEADERS_ENABLED", "1")
-CONTENT_SECURITY_POLICY = os.getenv(
-    "VAULT_CONTENT_SECURITY_POLICY",
-    (
-        "default-src 'self'; "
-        "base-uri 'self'; "
-        "object-src 'none'; "
-        "frame-ancestors 'none'; "
-        "form-action 'self'; "
-        "img-src 'self' data: blob:; "
-        "style-src 'self' 'unsafe-inline'; "
-        "script-src 'self' 'unsafe-inline' https://unpkg.com https://esm.sh; "
-        "connect-src 'self'; "
-        "font-src 'self' data:"
-    ),
-).strip()
+CONTENT_SECURITY_POLICY = os.getenv("VAULT_CONTENT_SECURITY_POLICY", "").strip()
 HSTS_MAX_AGE_SECONDS = max(0, int(os.getenv("VAULT_HSTS_MAX_AGE_SECONDS", "31536000")))
 HSTS_INCLUDE_SUBDOMAINS = _env_flag("VAULT_HSTS_INCLUDE_SUBDOMAINS")
 HSTS_PRELOAD = _env_flag("VAULT_HSTS_PRELOAD")
+GZIP_MINIMUM_SIZE = max(0, int(os.getenv("VAULT_GZIP_MINIMUM_SIZE", "1024")))
+GZIP_COMPRESSLEVEL = min(9, max(1, int(os.getenv("VAULT_GZIP_COMPRESSLEVEL", "6"))))
 
 
 def is_local_hostname(hostname: str | None) -> bool:

@@ -1,3 +1,14 @@
+FROM node:22-slim AS assets
+
+WORKDIR /build
+
+COPY package.json package-lock.json ./
+RUN npm ci
+
+COPY scripts ./scripts
+COPY app/static ./app/static
+RUN npm run build:assets
+
 FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -22,6 +33,7 @@ RUN pip install --root-user-action=ignore --no-cache-dir -r requirements.txt \
 
 COPY --chown=vault:vault VERSION /app/VERSION
 COPY --chown=vault:vault app /app/app
+COPY --from=assets --chown=vault:vault /build/app/static/dist /app/app/static/dist
 
 USER vault
 VOLUME ["/data"]

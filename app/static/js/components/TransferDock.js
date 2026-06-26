@@ -37,6 +37,9 @@ function transferTitle(transfer) {
   if (transfer.kind === "download" && transfer.stage === "preparing") {
     return "Preparing download";
   }
+  if (transfer.kind === "download" && transfer.stage === "server-finalizing") {
+    return "Finalizing export";
+  }
   if (transfer.kind === "download" && transfer.stage === "starting") {
     return "Starting download";
   }
@@ -52,6 +55,9 @@ function transferStageLabel(transfer) {
   }
   if (transfer.kind === "download" && transfer.stage === "preparing") {
     return "Server export";
+  }
+  if (transfer.kind === "download" && transfer.stage === "server-finalizing") {
+    return "Server finalization";
   }
   if (transfer.kind === "download" && transfer.stage === "starting") {
     return "Browser handoff";
@@ -90,6 +96,9 @@ function transferMeta(transfer) {
   }
   if (transfer.kind === "download" && transfer.stage === "finalizing") {
     return transfer.total ? `${formatBytes(transfer.total)} received` : "Finalizing";
+  }
+  if (transfer.kind === "download" && transfer.stage === "server-finalizing") {
+    return transfer.total ? `${formatBytes(transfer.total)} packaged` : "Finalizing";
   }
 
   const pieces = [];

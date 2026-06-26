@@ -44,7 +44,7 @@ async function errorFromResponse(response, fallback) {
 function progressFromValues(loaded, total, startedAt, options = {}) {
   const elapsedSeconds = Math.max((performance.now() - startedAt) / 1000, 0.01);
   const bytesPerSecond = loaded / elapsedSeconds;
-  const finalizing = options.stage === "finalizing";
+  const finalizing = options.stage === "finalizing" || options.stage === "server-finalizing";
   const etaSeconds =
     total && bytesPerSecond > 0 && loaded < total && !finalizing
       ? (total - loaded) / bytesPerSecond
@@ -900,7 +900,7 @@ export async function exportAndDownload({ payload, onProgress, signal }) {
       throwIfAborted(signal);
       onProgress(
         progressFromValues(current.processed_bytes || 0, current.total_bytes || null, startedAt, {
-          stage: "preparing",
+          stage: current.status === "finalizing" ? "server-finalizing" : "preparing",
         })
       );
       await waitFor(EXPORT_POLL_MS, signal);

@@ -64,6 +64,11 @@ TRANSFER_SESSION_TTL_SECONDS = max(
     int(os.getenv("VAULT_TRANSFER_SESSION_TTL_SECONDS", "86400")),
 )
 EXPORT_TTL_SECONDS = max(60, int(os.getenv("VAULT_EXPORT_TTL_SECONDS", "86400")))
+EXPORT_ZIP_COMPRESSION_THRESHOLD_BYTES = max(
+    0,
+    int(os.getenv("VAULT_EXPORT_ZIP_COMPRESSION_THRESHOLD_BYTES", str(3 * 1024 * 1024 * 1024))),
+)
+EXPORT_ZIP_COMPRESSLEVEL = min(9, max(1, int(os.getenv("VAULT_EXPORT_ZIP_COMPRESSLEVEL", "1"))))
 BOOTSTRAP_ADMIN_EMAILS = {
     item.strip().lower()
     for item in os.getenv("VAULT_BOOTSTRAP_ADMIN_EMAILS", "").split(",")

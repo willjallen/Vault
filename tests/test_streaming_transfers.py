@@ -1,6 +1,7 @@
 import datetime as dt
 import io
 import tempfile
+import threading
 import unittest
 import zipfile
 from contextlib import contextmanager
@@ -752,9 +753,11 @@ class StreamingTransferTests(unittest.TestCase):
             export = wait_for_export(ctx.client, export_response.json()["id"], headers=headers)
             self.assertEqual(export["status"], "complete")
             ranged = ctx.client.get(
-                str(export["download_url"]), headers={**headers, "Range": "bytes=0-1"}
+                str(export["download_url"]),
+                headers={**headers, "Accept-Encoding": "gzip", "Range": "bytes=0-1"},
             )
             self.assertEqual(ranged.status_code, 206)
+            self.assertEqual(ranged.headers["content-encoding"], "identity")
             self.assertEqual(ranged.content, b"PK")
             response = ctx.client.get(str(export["download_url"]), headers=headers)
             self.assertEqual(response.status_code, 200, response.text)
@@ -765,6 +768,78 @@ class StreamingTransferTests(unittest.TestCase):
                 )
                 self.assertEqual(archive.read("Project/one.txt"), b"one")
                 self.assertEqual(archive.read("Project/two.txt"), b"two")
+
+    def test_large_export_threshold_uses_zip_deflate(self) -> None:
+        user = user_context("downloader")
+        headers = auth_headers("downloader", ["vault-admin"])
+
+        with vault_test_client() as ctx:
+            routers.configure_router_runtime(
+                export_zip_compression_threshold_bytes=1,
+                export_zip_compresslevel=1,
+            )
+            with ctx.db() as db:
+                folder = get_or_create_folder_path(db, "Project")
+                create_versioned_document(
+                    db,
+                    folder,
+                    name="compressible.txt",
+                    data=b"compress me\n" * 256,
+                    actor=user,
+                )
+                db.commit()
+                folder_id = folder.id
+
+            export_response = ctx.client.post(
+                "/api/exports",
+                json={"items": [{"type": "folder", "id": folder_id}]},
+                headers=headers,
+            )
+            self.assertEqual(export_response.status_code, 200, export_response.text)
+            export = wait_for_export(ctx.client, export_response.json()["id"], headers=headers)
+            self.assertEqual(export["status"], "complete")
+            response = ctx.client.get(str(export["download_url"]), headers=headers)
+            self.assertEqual(response.status_code, 200, response.text)
+            with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+                info = archive.getinfo("Project/compressible.txt")
+                self.assertEqual(info.compress_type, zipfile.ZIP_DEFLATED)
+                self.assertLess(info.compress_size, info.file_size)
+
+    def test_export_reports_finalizing_while_artifact_is_promoted(self) -> None:
+        user = user_context("downloader")
+        headers = auth_headers("downloader", ["vault-admin"])
+        entered_hash = threading.Event()
+        release_hash = threading.Event()
+        real_hash_file = routers.hash_file
+
+        def blocking_hash_file(path: Path) -> tuple[str, int]:
+            entered_hash.set()
+            if not release_hash.wait(5):
+                raise AssertionError("Timed out waiting to release export hash")
+            return real_hash_file(path)
+
+        with vault_test_client() as ctx:
+            with ctx.db() as db:
+                folder = get_or_create_folder_path(db, "Project")
+                create_versioned_document(db, folder, name="one.txt", data=b"one", actor=user)
+                db.commit()
+                folder_id = folder.id
+
+            with patch("app.routers.hash_file", side_effect=blocking_hash_file):
+                export_response = ctx.client.post(
+                    "/api/exports",
+                    json={"items": [{"type": "folder", "id": folder_id}]},
+                    headers=headers,
+                )
+                self.assertEqual(export_response.status_code, 200, export_response.text)
+                job_id = export_response.json()["id"]
+                self.assertTrue(entered_hash.wait(5))
+                status_response = ctx.client.get(f"/api/exports/{job_id}", headers=headers)
+                self.assertEqual(status_response.status_code, 200, status_response.text)
+                self.assertEqual(status_response.json()["status"], "finalizing")
+                release_hash.set()
+                export = wait_for_export(ctx.client, job_id, headers=headers)
+                self.assertEqual(export["status"], "complete")
 
     def test_export_cancel_requires_owner_and_blocks_artifact_download(self) -> None:
         user = user_context("owner")

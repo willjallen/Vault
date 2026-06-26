@@ -54,6 +54,8 @@ from .config import (
     BASE_DOMAIN,
     DEV_MODE,
     EXPORT_TTL_SECONDS,
+    EXPORT_ZIP_COMPRESSION_THRESHOLD_BYTES,
+    EXPORT_ZIP_COMPRESSLEVEL,
     MAX_UPLOAD_BYTES,
     PUBLIC_URL,
     SITE_NAME,
@@ -146,6 +148,8 @@ def configure_router_runtime(
     base_domain: str | None = None,
     dev_mode: bool | None = None,
     export_ttl_seconds: int | None = None,
+    export_zip_compression_threshold_bytes: int | None = None,
+    export_zip_compresslevel: int | None = None,
     max_upload_bytes: int | None = None,
     public_url: str | None = None,
     site_name: str | None = None,
@@ -156,6 +160,7 @@ def configure_router_runtime(
 ) -> None:
     """Configure process-local route globals that are normally loaded from env."""
     global AUTH_MODE, BASE_DOMAIN, DEV_MODE, EXPORT_TTL_SECONDS, MAX_UPLOAD_BYTES, PUBLIC_URL
+    global EXPORT_ZIP_COMPRESSION_THRESHOLD_BYTES, EXPORT_ZIP_COMPRESSLEVEL
     global SITE_NAME
     global TRANSFER_CHUNK_BYTES, TRANSFERS_PATH, TRANSFER_SESSION_TTL_SECONDS
     global TTL_SWEEP_INTERVAL_SECONDS
@@ -195,6 +200,12 @@ def configure_router_runtime(
     if export_ttl_seconds is not None:
         EXPORT_TTL_SECONDS = max(60, int(export_ttl_seconds))
         config.EXPORT_TTL_SECONDS = EXPORT_TTL_SECONDS
+    if export_zip_compression_threshold_bytes is not None:
+        EXPORT_ZIP_COMPRESSION_THRESHOLD_BYTES = max(0, int(export_zip_compression_threshold_bytes))
+        config.EXPORT_ZIP_COMPRESSION_THRESHOLD_BYTES = EXPORT_ZIP_COMPRESSION_THRESHOLD_BYTES
+    if export_zip_compresslevel is not None:
+        EXPORT_ZIP_COMPRESSLEVEL = min(9, max(1, int(export_zip_compresslevel)))
+        config.EXPORT_ZIP_COMPRESSLEVEL = EXPORT_ZIP_COMPRESSLEVEL
     if ttl_sweep_interval_seconds is not None:
         TTL_SWEEP_INTERVAL_SECONDS = max(10, ttl_sweep_interval_seconds)
         config.TTL_SWEEP_INTERVAL_SECONDS = TTL_SWEEP_INTERVAL_SECONDS
@@ -1638,6 +1649,7 @@ def blob_streaming_response(
         0 if byte_range.end < byte_range.start else byte_range.end - byte_range.start + 1,
     )
     headers["Accept-Ranges"] = "bytes"
+    headers["Content-Encoding"] = "identity"
     headers["ETag"] = etag
     if byte_range.status_code == 206:
         headers["Content-Range"] = f"bytes {byte_range.start}-{byte_range.end}/{size_bytes}"
@@ -2107,6 +2119,15 @@ def write_version_to_zip(
     return size_bytes
 
 
+def export_zip_compression(total_bytes: int) -> int:
+    if (
+        EXPORT_ZIP_COMPRESSION_THRESHOLD_BYTES > 0
+        and total_bytes >= EXPORT_ZIP_COMPRESSION_THRESHOLD_BYTES
+    ):
+        return zipfile.ZIP_DEFLATED
+    return zipfile.ZIP_STORED
+
+
 def export_docs_for_job(job: ExportJob, db: Session) -> list[Document]:
     raw_items_value = (job.request_payload or {}).get("items") or []
     raw_items = raw_items_value if isinstance(raw_items_value, list) else []
@@ -2191,7 +2212,17 @@ def run_export_job(job_id: str) -> None:
                 pending_processed_bytes += delta_bytes
                 flush_export_progress()
 
-            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED, allowZip64=True) as archive:
+            compression = export_zip_compression(total_bytes)
+            compresslevel = (
+                EXPORT_ZIP_COMPRESSLEVEL if compression == zipfile.ZIP_DEFLATED else None
+            )
+            with zipfile.ZipFile(
+                zip_path,
+                "w",
+                compression,
+                allowZip64=True,
+                compresslevel=compresslevel,
+            ) as archive:
                 for doc, version in versions:
                     if export_is_cancelled():
                         return
@@ -2224,11 +2255,17 @@ def run_export_job(job_id: str) -> None:
                     db.commit()
                 if errors:
                     archive.writestr("vault-download-errors.txt", "\n".join(errors))
+                export_job.status = "finalizing"
+                export_job.updated_at = now_utc()
+                db.commit()
 
             db.refresh(export_job)
             if export_job.status == "cancelled":
                 return
             digest, size_bytes = hash_file(zip_path)
+            db.refresh(export_job)
+            if export_job.status == "cancelled":
+                return
             blob = get_or_create_blob_for_upload(
                 db,
                 UploadSpool(path=zip_path, digest=digest, size_bytes=size_bytes),
@@ -3741,7 +3778,7 @@ def sweep_expired_transfers(limit: int = 250) -> dict[str, list[str]]:
                 .all(),
             )
             for job in export_jobs:
-                if job.status in {"queued", "running"}:
+                if job.status in {"queued", "running", "finalizing"}:
                     job.status = "cancelled"
                     job.cancelled_at = timestamp
                     job.updated_at = timestamp
@@ -5145,7 +5182,7 @@ def cancel_export_job(
         if not job:
             raise HTTPException(status_code=404, detail="Export not found")
         transfer_owner_required(job.created_by, user)
-        if job.status in {"queued", "running"}:
+        if job.status in {"queued", "running", "finalizing"}:
             job.status = "cancelled"
             job.cancelled_at = now_utc()
             job.updated_at = job.cancelled_at

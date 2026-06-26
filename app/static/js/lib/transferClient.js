@@ -801,14 +801,17 @@ export async function downloadUrl({
   onProgress,
   fallbackTotal = null,
   signal,
+  writer: existingWriter = null,
 }) {
   const startedAt = performance.now();
   let response = null;
-  let writer = null;
+  let writer = existingWriter;
   try {
     throwIfAborted(signal);
     onProgress(progressFromValues(0, fallbackTotal, startedAt, { stage: "starting" }));
-    writer = await openDownloadWriter(fallbackName, signal);
+    if (!writer) {
+      writer = await openDownloadWriter(fallbackName, signal);
+    }
     response = await fetch(url, {
       credentials: "include",
       headers: { Range: "bytes=0-0" },
@@ -884,7 +887,10 @@ async function cancelExportJob(jobId) {
 export async function exportAndDownload({ payload, onProgress, signal }) {
   const startedAt = performance.now();
   let job = null;
+  let writer = null;
   try {
+    onProgress(progressFromValues(0, null, startedAt, { stage: "starting" }));
+    writer = await openDownloadWriter("vault-download.zip", signal);
     job = await requestJson(
       "/api/exports",
       {
@@ -909,14 +915,20 @@ export async function exportAndDownload({ payload, onProgress, signal }) {
     if (current.status !== "complete" || !current.download_url) {
       throw new Error(current.error || `Export ${current.status}`);
     }
+    const downloadWriter = writer;
+    writer = null;
     return downloadUrl({
       fallbackName: current.filename || "vault-download.zip",
       fallbackTotal: current.size_bytes || current.total_bytes || null,
       onProgress,
       signal,
       url: current.download_url,
+      writer: downloadWriter,
     });
   } catch (error) {
+    if (writer) {
+      await writer.abort().catch(() => {});
+    }
     if (isAbortError(error)) {
       if (job?.id) {
         await cancelExportJob(job.id);

@@ -7,6 +7,7 @@ from fastapi import HTTPException
 from tests.support import (
     FAKE_REQUEST,
     add_permission,
+    collect_response_body,
     create_versioned_document,
     user_context,
     vault_runtime,
@@ -37,7 +38,14 @@ class Upload:
     filename = "writer.txt"
     content_type = "text/plain"
 
-    async def read(self):
+    def __init__(self) -> None:
+        self._sent = False
+
+    async def read(self, size: int = -1) -> bytes:
+        del size
+        if self._sent:
+            return b""
+        self._sent = True
         return b"writer"
 
 
@@ -121,7 +129,7 @@ class AclPermissionTests(unittest.TestCase):
                     reader,
                     db,
                 )
-                self.assertEqual(response.body, b"secret")
+                self.assertEqual(collect_response_body(response), b"secret")
 
                 result = unlock_items(
                     ActionPayload(items=[ActionItem(type="document", id=doc_id)]),
@@ -187,7 +195,7 @@ class AclPermissionTests(unittest.TestCase):
                     db,
                 )
 
-            with zipfile.ZipFile(io.BytesIO(response.body)) as archive:
+            with zipfile.ZipFile(io.BytesIO(collect_response_body(response))) as archive:
                 self.assertEqual(archive.namelist(), ["Project/visible.txt"])
                 self.assertEqual(archive.read("Project/visible.txt"), b"visible")
 

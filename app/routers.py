@@ -3,15 +3,15 @@
 import asyncio
 import datetime as dt
 import hashlib
-import io
 import json
 import logging
 import mimetypes
 import re
 import secrets
+import tempfile
 import zipfile
 from collections import defaultdict
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
@@ -34,7 +34,14 @@ from .auth import (
     require_admin,
     vault_user_is_effective_admin,
 )
-from .config import AUTH_MODE, BASE_DOMAIN, DEV_MODE, SITE_NAME, TTL_SWEEP_INTERVAL_SECONDS
+from .config import (
+    AUTH_MODE,
+    BASE_DOMAIN,
+    DEV_MODE,
+    MAX_UPLOAD_BYTES,
+    SITE_NAME,
+    TTL_SWEEP_INTERVAL_SECONDS,
+)
 from .db import SessionLocal, get_db
 from .models import (
     Blob,
@@ -66,6 +73,7 @@ from .storage import (
     StorageConfigurationError,
     StorageError,
     StorageNotFoundError,
+    StoredBlob,
     get_storage_backend,
     new_version_id,
     object_key_for_hash,
@@ -101,6 +109,7 @@ SYSTEM_META: dict[str, str | None] = {"ip": None, "user_agent": None}
 _ttl_sweeper_task: asyncio.Task[None] | None = None
 _debug_event_stream_generation = 0
 _debug_event_stream_retry_ms = 3000
+STREAM_CHUNK_SIZE = 1024 * 1024
 ResolvedFavoriteTarget = tuple[Literal["folder"], Folder] | tuple[Literal["document"], Document]
 
 
@@ -109,11 +118,12 @@ def configure_router_runtime(
     auth_mode: str | None = None,
     base_domain: str | None = None,
     dev_mode: bool | None = None,
+    max_upload_bytes: int | None = None,
     site_name: str | None = None,
     ttl_sweep_interval_seconds: int | None = None,
 ) -> None:
     """Configure process-local route globals that are normally loaded from env."""
-    global AUTH_MODE, BASE_DOMAIN, DEV_MODE, SITE_NAME, TTL_SWEEP_INTERVAL_SECONDS
+    global AUTH_MODE, BASE_DOMAIN, DEV_MODE, MAX_UPLOAD_BYTES, SITE_NAME, TTL_SWEEP_INTERVAL_SECONDS
     global _debug_event_stream_generation, _debug_event_stream_retry_ms
 
     from . import config
@@ -132,6 +142,9 @@ def configure_router_runtime(
     if site_name is not None:
         SITE_NAME = site_name.strip() or "Vault"
         config.SITE_NAME = SITE_NAME
+    if max_upload_bytes is not None:
+        MAX_UPLOAD_BYTES = max(1, int(max_upload_bytes))
+        config.MAX_UPLOAD_BYTES = MAX_UPLOAD_BYTES
     if ttl_sweep_interval_seconds is not None:
         TTL_SWEEP_INTERVAL_SECONDS = max(10, ttl_sweep_interval_seconds)
         config.TTL_SWEEP_INTERVAL_SECONDS = TTL_SWEEP_INTERVAL_SECONDS
@@ -157,6 +170,25 @@ class NormalizedActionItem:
     id: int | None = None
     path: str | None = None
     strict_path: bool = False
+
+
+@dataclass(frozen=True)
+class UploadSpool:
+    path: Path
+    digest: str
+    size_bytes: int
+
+    def cleanup(self) -> None:
+        self.path.unlink(missing_ok=True)
+
+
+@dataclass(frozen=True)
+class TempDownload:
+    path: Path
+    size_bytes: int
+
+    def cleanup(self) -> None:
+        self.path.unlink(missing_ok=True)
 
 
 class ActionItem(BaseModel):
@@ -1038,18 +1070,38 @@ def next_version_number(doc: Document, db: Session) -> int:
     return (latest_number or 0) + 1
 
 
-def get_or_create_blob_for_data(
-    db: Session,
-    data: bytes,
-    content_type: str | None,
-) -> Blob:
+async def spool_upload_file(file: UploadFile) -> UploadSpool:
+    temp_file = tempfile.NamedTemporaryFile(prefix="vault-upload-", delete=False)
+    temp_path = Path(temp_file.name)
+    digest = hashlib.sha256()
+    size_bytes = 0
     try:
-        stored = get_storage_backend().put_bytes(data, content_type)
-    except StorageConfigurationError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-    except StorageError as exc:
-        raise HTTPException(status_code=500, detail="Storage write failed") from exc
+        with temp_file:
+            while True:
+                try:
+                    chunk = await file.read(STREAM_CHUNK_SIZE)
+                except Exception as exc:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Upload failed while reading request body",
+                    ) from exc
+                if not chunk:
+                    break
+                size_bytes += len(chunk)
+                if size_bytes > MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Upload exceeds limit of {MAX_UPLOAD_BYTES} bytes",
+                    )
+                digest.update(chunk)
+                temp_file.write(chunk)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+    return UploadSpool(path=temp_path, digest=digest.hexdigest(), size_bytes=size_bytes)
 
+
+def get_or_create_blob_for_stored_blob(db: Session, stored: StoredBlob) -> Blob:
     blob = (
         db.execute(
             select(Blob).where(
@@ -1094,6 +1146,40 @@ def get_or_create_blob_for_data(
         )
         db.flush()
     return blob
+
+
+def get_or_create_blob_for_data(
+    db: Session,
+    data: bytes,
+    content_type: str | None,
+) -> Blob:
+    try:
+        stored = get_storage_backend().put_bytes(data, content_type)
+    except StorageConfigurationError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except StorageError as exc:
+        raise HTTPException(status_code=500, detail="Storage write failed") from exc
+
+    return get_or_create_blob_for_stored_blob(db, stored)
+
+
+def get_or_create_blob_for_upload(
+    db: Session,
+    upload: UploadSpool,
+    content_type: str | None,
+) -> Blob:
+    try:
+        stored = get_storage_backend().put_file(
+            upload.path,
+            upload.digest,
+            upload.size_bytes,
+            content_type,
+        )
+    except StorageConfigurationError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except StorageError as exc:
+        raise HTTPException(status_code=500, detail="Storage write failed") from exc
+    return get_or_create_blob_for_stored_blob(db, stored)
 
 
 def create_document_version(
@@ -1197,6 +1283,46 @@ def blob_bytes_match(blob: Blob, data: bytes) -> bool:
     )
 
 
+def copy_version_to_temp(version: DocumentVersion) -> TempDownload:
+    location = location_for_blob(version.blob)
+    temp_file = tempfile.NamedTemporaryFile(prefix="vault-download-", delete=False)
+    temp_path = Path(temp_file.name)
+    digest = hashlib.sha256()
+    size_bytes = 0
+    try:
+        with temp_file:
+            try:
+                with get_storage_backend(location.backend).open_reader(
+                    location.object_key,
+                    location.bucket,
+                ) as reader:
+                    while True:
+                        chunk = reader.read(STREAM_CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        size_bytes += len(chunk)
+                        digest.update(chunk)
+                        temp_file.write(chunk)
+            except StorageNotFoundError as exc:
+                raise HTTPException(status_code=404, detail="Blob missing from storage") from exc
+            except StorageConfigurationError as exc:
+                raise HTTPException(status_code=500, detail=str(exc)) from exc
+            except StorageError as exc:
+                raise HTTPException(status_code=500, detail="Storage read failed") from exc
+            except OSError as exc:
+                raise HTTPException(status_code=500, detail="Storage read failed") from exc
+        if (
+            version.blob.hash_algo != "sha256"
+            or size_bytes != version.blob.size_bytes
+            or digest.hexdigest() != version.blob.hash
+        ):
+            raise HTTPException(status_code=500, detail="Blob content does not match metadata")
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+    return TempDownload(path=temp_path, size_bytes=size_bytes)
+
+
 def read_version_bytes(version: DocumentVersion) -> bytes:
     location = location_for_blob(version.blob)
     try:
@@ -1213,6 +1339,22 @@ def read_version_bytes(version: DocumentVersion) -> bytes:
     return data
 
 
+def copy_authorized_version_to_temp(
+    doc: Document,
+    version: DocumentVersion,
+    user: UserContext,
+    db: Session,
+) -> TempDownload:
+    temp_download = copy_version_to_temp(version)
+    try:
+        refresh_document_location(doc, db)
+        require_document_access(doc, user, db, 2)
+    except Exception:
+        temp_download.cleanup()
+        raise
+    return temp_download
+
+
 def read_authorized_version_bytes(
     doc: Document,
     version: DocumentVersion,
@@ -1225,22 +1367,73 @@ def read_authorized_version_bytes(
     return data
 
 
-def download_response(data: bytes, filename: str, mime_type: str | None = None) -> Response:
-    safe_name = (
+def safe_download_name(filename: str) -> str:
+    return (
         "".join(
             "_" if ord(char) < 32 or ord(char) == 127 else char
             for char in filename.replace('"', "")
         ).strip()
         or "download"
     )
+
+
+def download_headers(filename: str, content_length: int | None = None) -> dict[str, str]:
+    safe_name = safe_download_name(filename)
     ascii_name = "".join(char if 32 <= ord(char) < 127 else "_" for char in safe_name).strip()
     ascii_name = ascii_name or "download"
-    content_type = sanitize_mime_type(mime_type, safe_name)
     disposition = f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(safe_name)}"
+    headers = {"Content-Disposition": disposition}
+    if content_length is not None:
+        headers["Content-Length"] = str(content_length)
+    return headers
+
+
+def iter_temp_file(path: Path) -> Iterator[bytes]:
+    try:
+        with path.open("rb") as source:
+            while True:
+                chunk = source.read(STREAM_CHUNK_SIZE)
+                if not chunk:
+                    break
+                yield chunk
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def streaming_download_response(
+    temp_download: TempDownload,
+    filename: str,
+    mime_type: str | None = None,
+) -> StreamingResponse:
+    safe_name = safe_download_name(filename)
+    content_type = sanitize_mime_type(mime_type, safe_name)
+    return StreamingResponse(
+        iter_temp_file(temp_download.path),
+        media_type=content_type,
+        headers=download_headers(safe_name, temp_download.size_bytes),
+    )
+
+
+def write_temp_file_to_zip(
+    archive: zipfile.ZipFile,
+    archive_name: str,
+    temp_download: TempDownload,
+) -> None:
+    with temp_download.path.open("rb") as source, archive.open(archive_name, "w") as target:
+        while True:
+            chunk = source.read(STREAM_CHUNK_SIZE)
+            if not chunk:
+                break
+            target.write(chunk)
+
+
+def download_response(data: bytes, filename: str, mime_type: str | None = None) -> Response:
+    safe_name = safe_download_name(filename)
+    content_type = sanitize_mime_type(mime_type, safe_name)
     return Response(
         content=data,
         media_type=content_type,
-        headers={"Content-Disposition": disposition, "Content-Length": str(len(data))},
+        headers=download_headers(safe_name, len(data)),
     )
 
 
@@ -3793,54 +3986,75 @@ def download_items(
             version = current_version(doc, db)
             if not version:
                 raise HTTPException(status_code=404, detail="Document has no versions")
-            data = read_authorized_version_bytes(doc, version, user, db)
-            record_event(
-                doc,
-                user,
-                "download",
-                f"Downloaded {document_path(doc)}",
-                db,
-                meta=client_meta(request),
-                publish_state=False,
-            )
-            record_state_change(db, "document.download", ("document_detail",))
-            db.commit()
-            return download_response(data, doc.name, version.mime_type)
+            temp_download = copy_authorized_version_to_temp(doc, version, user, db)
+            try:
+                record_event(
+                    doc,
+                    user,
+                    "download",
+                    f"Downloaded {document_path(doc)}",
+                    db,
+                    meta=client_meta(request),
+                    publish_state=False,
+                )
+                record_state_change(db, "document.download", ("document_detail",))
+                db.commit()
+                return streaming_download_response(temp_download, doc.name, version.mime_type)
+            except Exception:
+                temp_download.cleanup()
+                raise
 
-        buffer = io.BytesIO()
+        zip_temp_file = tempfile.NamedTemporaryFile(
+            prefix="vault-download-",
+            suffix=".zip",
+            delete=False,
+        )
+        zip_temp_path = Path(zip_temp_file.name)
+        zip_temp_file.close()
         errors: list[str] = []
         written: set[str] = set()
-        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
-            for doc in unique_docs:
-                archive_name = document_path(doc) or doc.name
-                if archive_name in written:
-                    archive_name = f"{doc.id}-{archive_name}"
-                try:
-                    version = current_version(doc, db)
-                    if not version:
-                        raise HTTPException(status_code=404, detail="Document has no versions")
-                    archive.writestr(
-                        archive_name,
-                        read_authorized_version_bytes(doc, version, user, db),
-                    )
-                    written.add(archive_name)
-                    record_event(
-                        doc,
-                        user,
-                        "download",
-                        f"Downloaded {document_path(doc)}",
-                        db,
-                        meta=client_meta(request),
-                        publish_state=False,
-                    )
-                except HTTPException as exc:
-                    errors.append(f"{archive_name}: {response_detail(exc)}")
-            if errors:
-                archive.writestr("vault-download-errors.txt", "\n".join(errors))
-        if written:
-            record_state_change(db, "document.download", ("document_detail",))
-        db.commit()
-        return download_response(buffer.getvalue(), "vault-download.zip", "application/zip")
+        try:
+            with zipfile.ZipFile(zip_temp_path, "w", zipfile.ZIP_DEFLATED) as archive:
+                for doc in unique_docs:
+                    archive_name = document_path(doc) or doc.name
+                    if archive_name in written:
+                        archive_name = f"{doc.id}-{archive_name}"
+                    entry_download: TempDownload | None = None
+                    try:
+                        version = current_version(doc, db)
+                        if not version:
+                            raise HTTPException(status_code=404, detail="Document has no versions")
+                        entry_download = copy_authorized_version_to_temp(doc, version, user, db)
+                        write_temp_file_to_zip(archive, archive_name, entry_download)
+                        written.add(archive_name)
+                        record_event(
+                            doc,
+                            user,
+                            "download",
+                            f"Downloaded {document_path(doc)}",
+                            db,
+                            meta=client_meta(request),
+                            publish_state=False,
+                        )
+                    except HTTPException as exc:
+                        errors.append(f"{archive_name}: {response_detail(exc)}")
+                    finally:
+                        if entry_download is not None:
+                            entry_download.cleanup()
+                if errors:
+                    archive.writestr("vault-download-errors.txt", "\n".join(errors))
+            if written:
+                record_state_change(db, "document.download", ("document_detail",))
+            db.commit()
+            zip_download = TempDownload(path=zip_temp_path, size_bytes=zip_temp_path.stat().st_size)
+            return streaming_download_response(
+                zip_download,
+                "vault-download.zip",
+                "application/zip",
+            )
+        except Exception:
+            zip_temp_path.unlink(missing_ok=True)
+            raise
 
 
 @router.post("/documents")
@@ -3854,38 +4068,41 @@ async def create_document(
     filename = normalize_item_name(file.filename, "File name")
     folder_path_value = normalize_folder(folder)
     ensure_document_upload_folder(folder_path_value)
-    data = await file.read()
+    upload = await spool_upload_file(file)
     mime_type = sanitize_mime_type(file.content_type, filename)
     meta = client_meta(request)
-    with storage_write_lock():
-        require_write_for_folder_path(db, folder_path_value, user)
-        target_folder = get_or_create_folder_path(db, folder_path_value)
-        ensure_unique_document_path(db, target_folder.id, filename)
-        blob = get_or_create_blob_for_data(db, data, mime_type)
-        doc = Document(
-            folder_id=target_folder.id,
-            name=filename,
-            created_by=user["id"],
-            created_by_name=user["name"],
-            latest_modified_by=user["id"],
-            latest_modified_at=now_utc(),
-        )
-        apply_folder_ttl(doc, target_folder, doc.latest_modified_at)
-        db.add(doc)
-        db.flush()
-        create_document_version(
-            db,
-            doc,
-            blob,
-            user,
-            meta,
-            filename,
-            mime_type,
-            f"Uploaded {filename}",
-            "upload",
-        )
-        db.commit()
-    return {"id": doc.id, "path": join_path(folder_path_value, filename)}
+    try:
+        with storage_write_lock():
+            require_write_for_folder_path(db, folder_path_value, user)
+            target_folder = get_or_create_folder_path(db, folder_path_value)
+            ensure_unique_document_path(db, target_folder.id, filename)
+            blob = get_or_create_blob_for_upload(db, upload, mime_type)
+            doc = Document(
+                folder_id=target_folder.id,
+                name=filename,
+                created_by=user["id"],
+                created_by_name=user["name"],
+                latest_modified_by=user["id"],
+                latest_modified_at=now_utc(),
+            )
+            apply_folder_ttl(doc, target_folder, doc.latest_modified_at)
+            db.add(doc)
+            db.flush()
+            create_document_version(
+                db,
+                doc,
+                blob,
+                user,
+                meta,
+                filename,
+                mime_type,
+                f"Uploaded {filename}",
+                "upload",
+            )
+            db.commit()
+            return {"id": doc.id, "path": join_path(folder_path_value, filename)}
+    finally:
+        upload.cleanup()
 
 
 @router.get("/documents/{doc_id}")
@@ -3919,9 +4136,13 @@ def checkout_document(
             raise HTTPException(status_code=404, detail="Document has no versions")
         acquire_document_lock(doc, user, meta, db)
         record_event(doc, user, "checkout", f"Checked out {document_path(doc)}", db, meta=meta)
-        data = read_version_bytes(version)
-        db.commit()
-    return download_response(data, doc.name, version.mime_type)
+        temp_download = copy_version_to_temp(version)
+        try:
+            db.commit()
+            return streaming_download_response(temp_download, doc.name, version.mime_type)
+        except Exception:
+            temp_download.cleanup()
+            raise
 
 
 @router.post("/documents/{doc_id}/checkin")
@@ -3945,46 +4166,56 @@ async def checkin_document(
             detail="Check out the file before uploading a new version",
         )
     upload_name = normalize_item_name(file.filename, "File name")
-    data = await file.read()
+    upload = await spool_upload_file(file)
     mime_type = sanitize_mime_type(file.content_type, upload_name)
     meta = client_meta(request)
     message = note.strip() or f"Uploaded {upload_name}"
-    with storage_write_lock():
-        refresh_editable_document(doc, db)
-        require_document_access(doc, user, db, 3)
-        lock = get_active_lock(doc, db)
-        if not lock or lock.locked_by != user["id"]:
-            raise HTTPException(
-                status_code=403,
-                detail="Check out the file before uploading a new version",
+    try:
+        with storage_write_lock():
+            refresh_editable_document(doc, db)
+            require_document_access(doc, user, db, 3)
+            lock = get_active_lock(doc, db)
+            if not lock or lock.locked_by != user["id"]:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Check out the file before uploading a new version",
+                )
+            if rename_to_upload and upload_name != doc.name:
+                ensure_unique_document_path(db, doc.folder_id, upload_name, doc.id)
+                record_event(
+                    doc,
+                    user,
+                    "move",
+                    f"Renamed {doc.name} to {upload_name}",
+                    db,
+                    meta=meta,
+                )
+                doc.name = upload_name
+            blob = get_or_create_blob_for_upload(db, upload, mime_type)
+            version = create_document_version(
+                db,
+                doc,
+                blob,
+                user,
+                meta,
+                upload_name,
+                mime_type,
+                message,
+                "checkin",
             )
-        if rename_to_upload and upload_name != doc.name:
-            ensure_unique_document_path(db, doc.folder_id, upload_name, doc.id)
+            release_lock(lock, user)
             record_event(
                 doc,
                 user,
-                "move",
-                f"Renamed {doc.name} to {upload_name}",
+                "release",
+                f"Released lock for {document_path(doc)}",
                 db,
                 meta=meta,
             )
-            doc.name = upload_name
-        blob = get_or_create_blob_for_data(db, data, mime_type)
-        version = create_document_version(
-            db,
-            doc,
-            blob,
-            user,
-            meta,
-            upload_name,
-            mime_type,
-            message,
-            "checkin",
-        )
-        release_lock(lock, user)
-        record_event(doc, user, "release", f"Released lock for {document_path(doc)}", db, meta=meta)
-        db.commit()
-    return {"id": doc.id, "version": version.id, "path": document_path(doc)}
+            db.commit()
+            return {"id": doc.id, "version": version.id, "path": document_path(doc)}
+    finally:
+        upload.cleanup()
 
 
 @router.get("/documents/{doc_id}/versions/{version_id}/download")
@@ -3999,15 +4230,19 @@ def download_version(
         doc = get_document_or_404(doc_id, db)
         require_document_access(doc, user, db, 2)
         version = get_version_or_404(doc, version_id, db)
-        data = read_authorized_version_bytes(doc, version, user, db)
+        temp_download = copy_authorized_version_to_temp(doc, version, user, db)
         filename = version.original_filename or doc.name
-        record_event(
-            doc,
-            user,
-            "download",
-            f"Downloaded version v{version.version_number} of {document_path(doc)}",
-            db,
-            meta=client_meta(request),
-        )
-        db.commit()
-        return download_response(data, filename, version.mime_type)
+        try:
+            record_event(
+                doc,
+                user,
+                "download",
+                f"Downloaded version v{version.version_number} of {document_path(doc)}",
+                db,
+                meta=client_meta(request),
+            )
+            db.commit()
+            return streaming_download_response(temp_download, filename, version.mime_type)
+        except Exception:
+            temp_download.cleanup()
+            raise

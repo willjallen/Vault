@@ -1,3 +1,4 @@
+import asyncio
 import os
 import tempfile
 from collections.abc import Iterator
@@ -5,6 +6,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
+from fastapi import Response
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
@@ -24,6 +26,7 @@ ENV_KEYS = (
     "VAULT_DEV_MODE",
     "VAULT_DB_PATH",
     "VAULT_OBJECTS_PATH",
+    "VAULT_MAX_UPLOAD_BYTES",
     "VAULT_STORAGE_BACKEND",
 )
 
@@ -52,6 +55,7 @@ class RuntimeSnapshot:
     session_max_age_seconds: int
     base_domain: str
     dev_mode: bool
+    max_upload_bytes: int
     site_name: str
     ttl_sweep_interval_seconds: int
     env: dict[str, str | None]
@@ -209,6 +213,7 @@ def snapshot_runtime() -> RuntimeSnapshot:
         session_max_age_seconds=auth_module.SESSION_MAX_AGE_SECONDS,
         base_domain=routers_module.BASE_DOMAIN,
         dev_mode=routers_module.DEV_MODE,
+        max_upload_bytes=routers_module.MAX_UPLOAD_BYTES,
         site_name=routers_module.SITE_NAME,
         ttl_sweep_interval_seconds=routers_module.TTL_SWEEP_INTERVAL_SECONDS,
         env={key: os.environ.get(key) for key in ENV_KEYS},
@@ -244,6 +249,7 @@ def restore_runtime(snapshot: RuntimeSnapshot) -> None:
         auth_mode=snapshot.auth_mode,
         base_domain=snapshot.base_domain,
         dev_mode=snapshot.dev_mode,
+        max_upload_bytes=snapshot.max_upload_bytes,
         site_name=snapshot.site_name,
         ttl_sweep_interval_seconds=snapshot.ttl_sweep_interval_seconds,
     )
@@ -289,6 +295,7 @@ def vault_runtime(
             auth_mode=auth_mode,
             base_domain="localhost",
             dev_mode=runtime_dev_mode,
+            max_upload_bytes=5 * 1024 * 1024 * 1024,
             site_name="Vault",
             ttl_sweep_interval_seconds=10,
         )
@@ -299,6 +306,20 @@ def vault_runtime(
         finally:
             db_module.engine.dispose()
             restore_runtime(snapshot)
+
+
+async def read_response_body(response: Response) -> bytes:
+    body = getattr(response, "body", None)
+    if body is not None:
+        return body
+    chunks: list[bytes] = []
+    async for chunk in response.body_iterator:
+        chunks.append(chunk.encode() if isinstance(chunk, str) else chunk)
+    return b"".join(chunks)
+
+
+def collect_response_body(response: Response) -> bytes:
+    return asyncio.run(read_response_body(response))
 
 
 @contextmanager

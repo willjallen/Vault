@@ -424,7 +424,14 @@ class RetentionTtlTests(unittest.TestCase):
             filename = "draft.txt"
             content_type = "text/plain"
 
-            async def read(self) -> bytes:
+            def __init__(self) -> None:
+                self._sent = False
+
+            async def read(self, size: int = -1) -> bytes:
+                del size
+                if self._sent:
+                    return b""
+                self._sent = True
                 return b"fresh content"
 
         with vault_runtime() as ctx:

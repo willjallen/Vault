@@ -2,13 +2,14 @@
 
 import datetime
 import hashlib
+import shutil
 import threading
 import uuid
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from .config import (
     OBJECTS_PATH,
@@ -28,6 +29,7 @@ from .config import (
 
 storage_lock = threading.Lock()
 FILES_LOCK_PATH = OBJECTS_PATH / ".vault-storage.lock"
+STORAGE_CHUNK_SIZE = 1024 * 1024
 
 msvcrt: Any = None
 try:
@@ -63,6 +65,10 @@ class StoredBlob:
     object_key: str
 
 
+class BlobReader(Protocol):
+    def read(self, size: int = -1) -> bytes: ...
+
+
 class BlobStorageBackend:
     name: str
     bucket: str
@@ -70,7 +76,23 @@ class BlobStorageBackend:
     def put_bytes(self, data: bytes, content_type: str | None = None) -> StoredBlob:
         raise NotImplementedError
 
+    def put_file(
+        self,
+        source_path: Path,
+        digest: str,
+        size_bytes: int,
+        content_type: str | None = None,
+    ) -> StoredBlob:
+        raise NotImplementedError
+
     def read_bytes(self, object_key: str, bucket: str | None = None) -> bytes:
+        raise NotImplementedError
+
+    def open_reader(
+        self,
+        object_key: str,
+        bucket: str | None = None,
+    ) -> AbstractContextManager[BlobReader]:
         raise NotImplementedError
 
     def list_object_keys(self) -> list[str]:
@@ -127,12 +149,54 @@ class LocalBlobStorage(BlobStorageBackend):
             object_key=object_key,
         )
 
+    def put_file(
+        self,
+        source_path: Path,
+        digest: str,
+        size_bytes: int,
+        content_type: str | None = None,
+    ) -> StoredBlob:
+        del content_type
+        if source_path.stat().st_size != size_bytes:
+            raise StorageError("Source file size changed before storage write")
+        object_key = object_key_for_hash("sha256", digest)
+        target = self._object_path(object_key)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if not target.exists():
+            temp_path = target.with_name(f"{target.name}.tmp-{uuid.uuid4().hex}")
+            try:
+                with source_path.open("rb") as source, temp_path.open("xb") as output:
+                    shutil.copyfileobj(source, output, STORAGE_CHUNK_SIZE)
+                temp_path.replace(target)
+            except Exception:
+                temp_path.unlink(missing_ok=True)
+                raise
+        return StoredBlob(
+            hash_algo="sha256",
+            digest=digest,
+            size_bytes=size_bytes,
+            backend=self.name,
+            bucket=self.bucket,
+            object_key=object_key,
+        )
+
     def read_bytes(self, object_key: str, bucket: str | None = None) -> bytes:
+        del bucket
+        with self.open_reader(object_key) as reader:
+            return reader.read()
+
+    @contextmanager
+    def open_reader(
+        self,
+        object_key: str,
+        bucket: str | None = None,
+    ) -> Iterator[BlobReader]:
         del bucket
         target = self._object_path(object_key)
         if not target.exists() or not target.is_file():
             raise StorageNotFoundError("Blob missing from storage")
-        return target.read_bytes()
+        with target.open("rb") as source:
+            yield source
 
     def list_object_keys(self) -> list[str]:
         self.ensure()
@@ -212,12 +276,52 @@ class S3CompatibleBlobStorage(BlobStorageBackend):
             object_key=object_key,
         )
 
+    def put_file(
+        self,
+        source_path: Path,
+        digest: str,
+        size_bytes: int,
+        content_type: str | None = None,
+    ) -> StoredBlob:
+        if source_path.stat().st_size != size_bytes:
+            raise StorageError("Source file size changed before storage write")
+        object_key = object_key_for_hash("sha256", digest)
+        try:
+            self.client.head_object(Bucket=self.bucket, Key=object_key)
+        except Exception:
+            upload_kwargs: dict[str, Any] = {}
+            if content_type:
+                upload_kwargs["ExtraArgs"] = {"ContentType": content_type}
+            with source_path.open("rb") as source:
+                self.client.upload_fileobj(source, self.bucket, object_key, **upload_kwargs)
+        return StoredBlob(
+            hash_algo="sha256",
+            digest=digest,
+            size_bytes=size_bytes,
+            backend=self.name,
+            bucket=self.bucket,
+            object_key=object_key,
+        )
+
     def read_bytes(self, object_key: str, bucket: str | None = None) -> bytes:
+        with self.open_reader(object_key, bucket) as reader:
+            return reader.read()
+
+    @contextmanager
+    def open_reader(
+        self,
+        object_key: str,
+        bucket: str | None = None,
+    ) -> Iterator[BlobReader]:
         try:
             response = self.client.get_object(Bucket=bucket or self.bucket, Key=object_key)
-            return response["Body"].read()
         except Exception as exc:
             raise StorageNotFoundError("Blob missing from storage") from exc
+        body = response["Body"]
+        try:
+            yield body
+        finally:
+            body.close()
 
     def list_object_keys(self) -> list[str]:
         raise StorageConfigurationError("Object listing is only implemented for local storage")

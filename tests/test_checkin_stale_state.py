@@ -19,8 +19,13 @@ class CheckinStaleStateTests(unittest.TestCase):
 
             def __init__(self, doc_id: int) -> None:
                 self.doc_id = doc_id
+                self._sent = False
 
-            async def read(self) -> bytes:
+            async def read(self, size: int = -1) -> bytes:
+                del size
+                if self._sent:
+                    return b""
+                self._sent = True
                 with SessionLocal() as archive_db:
                     doc = archive_db.get(Document, self.doc_id)
                     archive_doc_item(doc, FAKE_REQUEST, user, archive_db)

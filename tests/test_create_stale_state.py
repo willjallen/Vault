@@ -40,7 +40,14 @@ class CreateDocumentStaleStateTests(unittest.TestCase):
             filename = "race.txt"
             content_type = "text/plain"
 
-            async def read(self) -> bytes:
+            def __init__(self) -> None:
+                self._sent = False
+
+            async def read(self, size: int = -1) -> bytes:
+                del size
+                if self._sent:
+                    return b""
+                self._sent = True
                 create_competing_document()
                 return b"loser"
 

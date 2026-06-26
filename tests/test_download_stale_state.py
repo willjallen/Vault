@@ -63,18 +63,18 @@ class DownloadStaleStateTests(unittest.TestCase):
     def test_direct_download_rechecks_access_after_blob_read(self) -> None:
         with vault_runtime():
             doc_id, _version_id, reader = self._create_hidden_move_fixture()
-            original_read = routers.read_version_bytes
+            original_copy = routers.copy_version_to_temp
             moved = False
 
-            def move_before_read(version):
+            def move_before_copy(version):
                 nonlocal moved
                 if not moved:
                     moved = True
                     self._move_document_under_hidden_acl(doc_id)
-                return original_read(version)
+                return original_copy(version)
 
             with SessionLocal() as db:
-                with patch.object(routers, "read_version_bytes", side_effect=move_before_read):
+                with patch.object(routers, "copy_version_to_temp", side_effect=move_before_copy):
                     with self.assertRaises(HTTPException) as raised:
                         download_items(
                             ActionPayload(items=[ActionItem(type="document", id=doc_id)]),
@@ -90,18 +90,18 @@ class DownloadStaleStateTests(unittest.TestCase):
     def test_version_download_rechecks_access_after_blob_read(self) -> None:
         with vault_runtime():
             doc_id, version_id, reader = self._create_hidden_move_fixture()
-            original_read = routers.read_version_bytes
+            original_copy = routers.copy_version_to_temp
             moved = False
 
-            def move_before_read(version):
+            def move_before_copy(version):
                 nonlocal moved
                 if not moved:
                     moved = True
                     self._move_document_under_hidden_acl(doc_id)
-                return original_read(version)
+                return original_copy(version)
 
             with SessionLocal() as db:
-                with patch.object(routers, "read_version_bytes", side_effect=move_before_read):
+                with patch.object(routers, "copy_version_to_temp", side_effect=move_before_copy):
                     with self.assertRaises(HTTPException) as raised:
                         download_version(doc_id, version_id, FAKE_REQUEST, reader, db)
 

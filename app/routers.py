@@ -9,7 +9,6 @@ import mimetypes
 import queue
 import re
 import secrets
-import shutil
 import tempfile
 import threading
 import time
@@ -45,6 +44,7 @@ from .assets import static_asset_path
 from .auth import (
     UserContext,
     current_user,
+    current_user_snapshot,
     logout_response,
     oidc_callback_response,
     oidc_login_response,
@@ -100,6 +100,7 @@ from .site_settings import (
 )
 from .storage import (
     BlobReader,
+    BlobStorageBackend,
     StorageChecksumMismatch,
     StorageConfigurationError,
     StorageError,
@@ -111,6 +112,16 @@ from .storage import (
     object_key_for_hash,
     storage_write_lock,
 )
+from .transfers import configure_transfer_store, get_transfer_engine, get_transfer_store
+from .transfers.models import (
+    CompletedAssembly,
+    InvalidTransferPart,
+    TransferConflict,
+    TransferNotFound,
+    TransferPart,
+    TransferSession,
+)
+from .transfers.tokens import TransferTokenError, sign_upload_token, verify_upload_token
 from .version import APP_VERSION
 
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
@@ -266,6 +277,7 @@ def configure_router_runtime(
     if transfers_path is not None:
         TRANSFERS_PATH = Path(transfers_path).resolve()
         config.TRANSFERS_PATH = TRANSFERS_PATH
+    configure_transfer_store(TRANSFERS_PATH / "uploads")
     if transfer_session_ttl_seconds is not None:
         TRANSFER_SESSION_TTL_SECONDS = max(60, int(transfer_session_ttl_seconds))
         config.TRANSFER_SESSION_TTL_SECONDS = TRANSFER_SESSION_TTL_SECONDS
@@ -1338,25 +1350,19 @@ def get_or_create_blob_for_upload(
 
 
 def upload_part_paths(session: UploadSession) -> list[Path]:
-    paths: list[Path] = []
-    for part_number in range(1, session.part_count + 1):
-        part_path = upload_part_path(session.id, part_number)
-        if not part_path.exists():
-            raise HTTPException(status_code=400, detail="Upload session has missing parts")
-        paths.append(part_path)
-    return paths
+    try:
+        return get_transfer_store().part_paths(session.id, session.part_count)
+    except InvalidTransferPart as exc:
+        raise HTTPException(status_code=400, detail="Upload session has missing parts") from exc
 
 
 def upload_session_has_recoverable_parts(session: UploadSession) -> bool:
-    parts_by_number = uploaded_parts_by_number(session)
-    for part_number in range(1, session.part_count + 1):
-        part = parts_by_number.get(part_number)
-        if part is None:
-            return False
-        part_path = upload_part_path(session.id, part_number)
-        if not part_path.exists() or part_path.stat().st_size != part.size_bytes:
-            return False
-    return True
+    return get_transfer_store().has_recoverable_parts(
+        session_id=session.id,
+        total_size=session.total_size,
+        chunk_size=session.chunk_size,
+        part_count=session.part_count,
+    )
 
 
 def get_or_create_blob_for_upload_session(
@@ -1367,14 +1373,21 @@ def get_or_create_blob_for_upload_session(
     progress_callback: StorageProgressCallback | None = None,
 ) -> Blob:
     try:
-        stored = get_storage_backend().put_part_files(
-            upload_part_paths(session),
+        backend = get_storage_backend()
+        assembly = get_transfer_engine().wait_for_completed_assembly(
+            transfer_session_from_upload(session),
+        )
+        stored = put_assembled_upload_file(
+            backend,
+            assembly,
             content_type,
             expected_sha256,
             progress_callback,
         )
     except StorageChecksumMismatch as exc:
         raise HTTPException(status_code=400, detail="Upload checksum mismatch") from exc
+    except InvalidTransferPart as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except StorageConfigurationError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     except StorageError as exc:
@@ -1382,6 +1395,42 @@ def get_or_create_blob_for_upload_session(
     if stored.size_bytes != session.total_size:
         raise HTTPException(status_code=400, detail="Upload size does not match session")
     return get_or_create_blob_for_stored_blob(db, stored)
+
+
+def transfer_session_from_upload(session: UploadSession) -> TransferSession:
+    return TransferSession(
+        id=session.id,
+        owner_id=session.created_by,
+        mode=session.mode,
+        filename=session.filename,
+        total_size=session.total_size,
+        chunk_size=session.chunk_size,
+        part_count=session.part_count,
+        expires_at=normalize_timestamp(session.expires_at),
+        created_at=normalize_timestamp(session.created_at) or now_utc(),
+    )
+
+
+def put_assembled_upload_file(
+    backend: BlobStorageBackend,
+    assembly: CompletedAssembly,
+    content_type: str | None,
+    expected_sha256: str | None,
+    progress_callback: StorageProgressCallback | None,
+) -> StoredBlob:
+    if expected_sha256 and assembly.sha256 != expected_sha256.lower():
+        raise StorageChecksumMismatch("Upload checksum mismatch")
+    if progress_callback:
+        progress_callback(assembly.size_bytes)
+    stored = backend.put_file(
+        assembly.path,
+        assembly.sha256,
+        assembly.size_bytes,
+        content_type,
+    )
+    if progress_callback:
+        progress_callback(assembly.size_bytes)
+    return stored
 
 
 def create_document_version(
@@ -1823,7 +1872,7 @@ def transfer_expires_at(seconds: int) -> dt.datetime:
 
 
 def upload_session_dir(session_id: str) -> Path:
-    return TRANSFERS_PATH / "uploads" / session_id
+    return get_transfer_store().session_dir(session_id)
 
 
 def export_temp_dir() -> Path:
@@ -1869,11 +1918,11 @@ def clear_export_temp_files(job_ids: set[str] | None = None) -> list[str]:
 
 
 def upload_part_path(session_id: str, part_number: int) -> Path:
-    return upload_session_dir(session_id) / f"{part_number:08d}.part"
+    return get_transfer_store().part_path(session_id, part_number)
 
 
 def clear_upload_session_files(session_id: str) -> None:
-    shutil.rmtree(upload_session_dir(session_id), ignore_errors=True)
+    get_transfer_engine().clear_session(session_id)
 
 
 def clear_upload_session_parts(session: UploadSession) -> None:
@@ -1884,22 +1933,69 @@ def uploaded_parts_by_number(session: UploadSession) -> dict[int, UploadPart]:
     return {part.part_number: part for part in session.parts}
 
 
+def active_upload_parts(session: UploadSession) -> list[TransferPart]:
+    try:
+        return get_transfer_store().list_parts(session.id)
+    except TransferNotFound:
+        return []
+
+
+def upload_session_token(session: UploadSession) -> str | None:
+    if session.status not in {"active", "completing"}:
+        return None
+    expires_at = normalize_timestamp(session.expires_at)
+    return sign_upload_token(session.id, session.created_by, expires_at)
+
+
+def transfer_session_payload(state: TransferSession) -> dict[str, object]:
+    parts = get_transfer_store().list_parts(state.id)
+    uploaded_parts = [part.payload() for part in parts]
+    uploaded_bytes = sum(part.size_bytes for part in parts)
+    progress = get_transfer_store().get_verification_progress(state.id)
+    return {
+        "id": state.id,
+        "mode": state.mode,
+        "status": "active",
+        "filename": state.filename,
+        "size_bytes": state.total_size,
+        "chunk_size": state.chunk_size,
+        "part_count": state.part_count,
+        "uploaded_bytes": uploaded_bytes,
+        "uploaded_parts": uploaded_parts,
+        "verification": progress.payload() if progress else None,
+        "expires_at": state.expires_at.isoformat() if state.expires_at else None,
+        "result": None,
+        "upload_token": sign_upload_token(state.id, state.owner_id, state.expires_at),
+    }
+
+
 def upload_session_payload(session: UploadSession) -> dict[str, object]:
-    uploaded_parts = [
-        {
-            "part_number": part.part_number,
-            "offset": part.offset_bytes,
-            "size_bytes": part.size_bytes,
-            "sha256": part.sha256,
-        }
-        for part in sorted(session.parts, key=lambda item: item.part_number)
-    ]
-    uploaded_bytes = sum(part.size_bytes for part in session.parts)
+    transfer_parts = active_upload_parts(session)
+    uploaded_parts: list[dict[str, object]]
+    if transfer_parts:
+        uploaded_parts = [part.payload() for part in transfer_parts]
+        uploaded_bytes = sum(part.size_bytes for part in transfer_parts)
+    else:
+        uploaded_parts = [
+            {
+                "part_number": part.part_number,
+                "offset": part.offset_bytes,
+                "size_bytes": part.size_bytes,
+                "sha256": part.sha256,
+            }
+            for part in sorted(session.parts, key=lambda item: item.part_number)
+        ]
+        uploaded_bytes = sum(part.size_bytes for part in session.parts)
     verification_total = session.verification_total_bytes
     verification_processed = session.verification_processed_bytes
     if session.status == "complete":
         verification_total = session.total_size
         verification_processed = session.total_size
+    elif session.status == "completing":
+        progress = get_transfer_store().get_verification_progress(session.id)
+        if progress is not None:
+            verification_total = progress.total_bytes
+            verification_processed = progress.processed_bytes
     verification = (
         {
             "processed_bytes": min(verification_processed, verification_total),
@@ -1921,6 +2017,7 @@ def upload_session_payload(session: UploadSession) -> dict[str, object]:
         "verification": verification,
         "expires_at": session.expires_at.isoformat() if session.expires_at else None,
         "result": upload_session_result(session),
+        "upload_token": upload_session_token(session),
     }
 
 
@@ -2013,23 +2110,20 @@ def mark_upload_session_failed(session_id: str, message: str) -> None:
 
 def reserve_upload_completion(session: UploadSession, db: Session) -> None:
     ensure_active_upload_session(session, db)
-    parts_by_number = uploaded_parts_by_number(session)
-    missing = [
-        part_number
-        for part_number in range(1, session.part_count + 1)
-        if part_number not in parts_by_number
-    ]
-    if missing:
-        raise HTTPException(status_code=400, detail="Upload session has missing parts")
+    try:
+        get_transfer_store().part_paths(session.id, session.part_count)
+    except InvalidTransferPart as exc:
+        raise HTTPException(status_code=400, detail="Upload session has missing parts") from exc
+    except TransferNotFound as exc:
+        raise HTTPException(status_code=400, detail="Upload session has missing parts") from exc
     session.status = "completing"
-    session.verification_total_bytes = session.total_size
+    session.verification_total_bytes = 0
     session.verification_processed_bytes = 0
     session.updated_at = now_utc()
     db.commit()
 
 
 def upload_verification_progress_callback(
-    db: Session,
     session_id: str,
     total_size: int,
 ) -> StorageProgressCallback:
@@ -2047,13 +2141,11 @@ def upload_verification_progress_callback(
             and monotonic_now - last_reported_at < 0.25
         ):
             return
-        session = db.get(UploadSession, session_id)
-        if not session or session.status != "completing":
-            return
-        session.verification_total_bytes = total_size
-        session.verification_processed_bytes = processed
-        session.updated_at = now_utc()
-        db.commit()
+        get_transfer_store().set_verification_progress(
+            session_id,
+            processed_bytes=processed,
+            total_bytes=total_size,
+        )
         last_processed = processed
         last_reported_at = monotonic_now
 
@@ -2085,7 +2177,7 @@ def complete_upload_session_document(
             session,
             mime_type,
             expected_sha256,
-            upload_verification_progress_callback(db, session.id, verification_total),
+            upload_verification_progress_callback(session.id, verification_total),
         )
         doc = Document(
             folder_id=target_folder.id,
@@ -2136,7 +2228,7 @@ def complete_upload_session_document(
             session,
             mime_type,
             expected_sha256,
-            upload_verification_progress_callback(db, session.id, verification_total),
+            upload_verification_progress_callback(session.id, verification_total),
         )
         version = create_document_version(
             db,
@@ -2171,6 +2263,7 @@ def complete_upload_session_document(
     session.result_path = result_path
     record_state_change(db, "document.upload.complete", ("contents", "sidebar", "document_detail"))
     db.commit()
+    get_transfer_store().clear_verification_progress(session.id)
     clear_upload_session_files(session.id)
     return {"id": doc.id, "version": version.id, "path": result_path}
 
@@ -5411,8 +5504,11 @@ def create_upload_session(
                 ensure_unique_document_path(db, doc.folder_id, filename, doc.id)
             folder_path_value = None
             document_id = doc.id
+        session_id = uuid.uuid4().hex
+        created_at = now_utc()
+        expires_at = transfer_expires_at(TRANSFER_SESSION_TTL_SECONDS)
         session = UploadSession(
-            id=uuid.uuid4().hex,
+            id=session_id,
             mode=payload.mode,
             status="active",
             folder_path=folder_path_value,
@@ -5429,10 +5525,28 @@ def create_upload_session(
             user_context=transfer_user_payload(user),
             upload_ip=meta.get("ip"),
             upload_user_agent=meta.get("user_agent"),
-            expires_at=transfer_expires_at(TRANSFER_SESSION_TTL_SECONDS),
+            created_at=created_at,
+            updated_at=created_at,
+            expires_at=expires_at,
         )
-        db.add(session)
-        db.commit()
+        try:
+            get_transfer_store().create_session(
+                session_id=session_id,
+                owner_id=str(user["id"]),
+                mode=payload.mode,
+                filename=filename,
+                total_size=payload.size_bytes,
+                chunk_size=TRANSFER_CHUNK_BYTES,
+                part_count=part_count,
+                expires_at=expires_at,
+                created_at=created_at,
+            )
+            db.add(session)
+            db.commit()
+        except Exception:
+            db.rollback()
+            clear_upload_session_files(session_id)
+            raise
         return upload_session_payload(session)
 
 
@@ -5459,61 +5573,79 @@ async def upload_session_part(
     x_upload_offset: int = Header(..., alias="X-Upload-Offset"),
     x_upload_size: int = Header(..., alias="X-Upload-Size"),
     x_upload_sha256: str | None = Header(None, alias="X-Upload-Sha256"),
-    user: UserContext = Depends(current_user),
-    db: Session = Depends(get_db),
+    x_upload_token: str | None = Header(None, alias="X-Upload-Token"),
 ) -> dict[str, object]:
-    session = db.get(UploadSession, session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Upload session not found")
-    transfer_owner_required(session.created_by, user)
-    ensure_active_upload_session(session, db)
-    expected_offset, expected_size = expected_part_bounds(session, part_number)
+    try:
+        state = get_transfer_store().get_session(session_id)
+    except TransferNotFound as exc:
+        raise HTTPException(status_code=404, detail="Upload session not found") from exc
+
+    try:
+        token_owner_id = verify_upload_token(x_upload_token, session_id)
+    except TransferTokenError as exc:
+        if x_upload_token:
+            raise HTTPException(status_code=401, detail=str(exc)) from exc
+        user = current_user_snapshot(request)
+        transfer_owner_required(state.owner_id, user)
+    else:
+        if token_owner_id != state.owner_id:
+            raise HTTPException(status_code=404, detail="Upload session not found")
+
+    expires_at = normalize_timestamp(state.expires_at)
+    if expires_at is not None and expires_at <= now_utc():
+        with SessionLocal() as db:
+            session = db.get(UploadSession, session_id)
+            if session and session.status == "active":
+                session.status = "expired"
+                session.updated_at = now_utc()
+                clear_upload_session_parts(session)
+                db.commit()
+        clear_upload_session_files(session_id)
+        raise HTTPException(status_code=410, detail="Upload session expired")
+
+    try:
+        expected_offset, expected_size = state.expected_part_bounds(part_number)
+    except InvalidTransferPart as exc:
+        raise HTTPException(status_code=400, detail="Invalid part number") from exc
     if x_upload_offset != expected_offset or x_upload_size != expected_size:
         raise HTTPException(status_code=400, detail="Upload part range does not match session")
-    existing = uploaded_parts_by_number(session).get(part_number)
+
+    existing = get_transfer_store().get_part(session_id, part_number)
     if existing:
         if x_upload_sha256 and existing.sha256 != x_upload_sha256.lower():
             raise HTTPException(
                 status_code=409,
                 detail="Upload part already exists with different content",
             )
-        if existing.offset_bytes == expected_offset and existing.size_bytes == expected_size:
-            return upload_session_payload(session)
+        if existing.offset == expected_offset and existing.size_bytes == expected_size:
+            return transfer_session_payload(state)
         raise HTTPException(
             status_code=409, detail="Upload part already exists with different content"
         )
-    final_path = upload_part_path(session.id, part_number)
-    temp_path, actual_sha256, size_bytes = await spool_upload_part_body(
-        request,
-        expected_size,
-        x_upload_sha256,
-        final_path.parent,
-    )
+
     try:
-        with storage_write_lock():
-            session = db.get(UploadSession, session_id)
-            if not session:
-                raise HTTPException(status_code=404, detail="Upload session not found")
-            transfer_owner_required(session.created_by, user)
-            ensure_active_upload_session(session, db)
-            if uploaded_parts_by_number(session).get(part_number):
-                raise HTTPException(status_code=409, detail="Upload part already exists")
-            temp_path.replace(final_path)
-            db.add(
-                UploadPart(
-                    session_id=session.id,
-                    part_number=part_number,
-                    offset_bytes=expected_offset,
-                    size_bytes=size_bytes,
-                    sha256=actual_sha256,
-                    storage_path=str(final_path),
-                ),
-            )
-            session.updated_at = now_utc()
-            db.commit()
-            return upload_session_payload(session)
-    finally:
-        temp_path.unlink(missing_ok=True)
+        # This endpoint carries the service's largest request bodies. It bypasses
+        # Starlette's Request.stream() wrapper and hands raw ASGI receive messages
+        # to the transfer engine so network ingress is not serialized behind
+        # route-layer hashing, coalescing, or file writes.
+        await get_transfer_engine().ingest_part_receive(
+            session=state,
+            part_number=part_number,
+            offset=expected_offset,
+            expected_size=expected_size,
+            expected_sha256=x_upload_sha256,
+            receive=request.receive,
+        )
+    except InvalidTransferPart as exc:
+        detail = str(exc)
+        status_code = 413 if "too large" in detail else 400
+        raise HTTPException(status_code=status_code, detail=detail) from exc
+    except TransferConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="Upload part already exists with different content",
+        ) from exc
+    return transfer_session_payload(state)
 
 
 @router.post("/api/uploads/{session_id}/complete")

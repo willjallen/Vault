@@ -412,6 +412,7 @@ def upload_file_via_session(
         return session_response
     session = session_response.json()
     chunk_size = int(session["chunk_size"])
+    upload_token = str(session.get("upload_token") or "")
     for index, offset in enumerate(range(0, len(data), chunk_size), start=1):
         chunk = data[offset : offset + chunk_size]
         part_response = client.put(
@@ -423,10 +424,12 @@ def upload_file_via_session(
                 "X-Upload-Offset": str(offset),
                 "X-Upload-Sha256": sha256_hex(chunk),
                 "X-Upload-Size": str(len(chunk)),
+                "X-Upload-Token": upload_token,
             },
         )
         if part_response.status_code >= 400:
             return part_response
+        upload_token = str(part_response.json().get("upload_token") or upload_token)
     return client.post(
         f"/api/uploads/{session['id']}/complete",
         json={"sha256": sha256_hex(data)},

@@ -50,7 +50,7 @@ from .config import (
     new_token_urlsafe,
     oidc_url_uses_secure_transport,
 )
-from .db import get_db
+from .db import SessionLocal, get_db
 from .models import Folder, FolderPermission, VaultGroup, VaultGroupMembership, VaultUser
 
 LOCAL_DEV_DOMAINS = {"localhost", "127.0.0.1", "::1"}
@@ -458,7 +458,7 @@ def _auth_required(request: Request) -> None:
     raise HTTPException(status_code=401, detail="Authentication required")
 
 
-def current_user(request: Request, db: Session = Depends(get_db)) -> UserContext:
+def resolve_current_user(request: Request, db: Session) -> UserContext:
     """Resolve or JIT-create the canonical Vault user for this request."""
     if AUTH_MODE == "dev":
         user = _dev_identity(db)
@@ -473,6 +473,15 @@ def current_user(request: Request, db: Session = Depends(get_db)) -> UserContext
             return user
         _auth_required(request)
     raise HTTPException(status_code=500, detail=f"Unsupported auth mode: {AUTH_MODE}")
+
+
+def current_user(request: Request, db: Session = Depends(get_db)) -> UserContext:
+    return resolve_current_user(request, db)
+
+
+def current_user_snapshot(request: Request) -> UserContext:
+    with SessionLocal() as db:
+        return resolve_current_user(request, db)
 
 
 def require_admin(user: UserContext = Depends(current_user)) -> UserContext:

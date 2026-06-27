@@ -1,9 +1,12 @@
+import asyncio
 import datetime as dt
 import io
+import queue
 import tempfile
 import threading
 import unittest
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -41,6 +44,7 @@ from app.routers import (
     write_version_to_zip,
 )
 from app.storage import get_storage_backend
+from app.transfers.engine import _enqueue_part_buffer
 
 
 class StreamingTransferTests(unittest.TestCase):
@@ -61,7 +65,7 @@ class StreamingTransferTests(unittest.TestCase):
             with ctx.db() as db:
                 session = db.query(UploadSession).one()
                 self.assertEqual(session.status, "complete")
-                self.assertGreater(db.query(UploadPart).count(), 1)
+                self.assertEqual(db.query(UploadPart).count(), 0)
 
             ranged = ctx.client.get(
                 f"/documents/{doc_id}/download",
@@ -157,7 +161,7 @@ class StreamingTransferTests(unittest.TestCase):
             self.assertEqual(session_response.status_code, 200, session_response.text)
             session = session_response.json()
             with patch(
-                "app.routers.tempfile.NamedTemporaryFile",
+                "app.transfers.engine.tempfile.NamedTemporaryFile",
                 wraps=tempfile.NamedTemporaryFile,
             ) as named_temp_file:
                 part_response = ctx.client.put(
@@ -173,8 +177,125 @@ class StreamingTransferTests(unittest.TestCase):
                 )
             self.assertEqual(part_response.status_code, 200, part_response.text)
             self.assertEqual(
-                named_temp_file.call_args.kwargs["dir"], upload_session_dir(session["id"])
+                named_temp_file.call_args.kwargs["dir"], upload_session_dir(session["id"]) / "tmp"
             )
+
+    def test_upload_part_token_avoids_db_part_metadata(self) -> None:
+        headers = auth_headers("uploader", ["vault-admin"])
+        data = b"abcd"
+
+        with vault_test_client() as ctx:
+            session_response = ctx.client.post(
+                "/api/uploads",
+                json={
+                    "filename": "token-part.txt",
+                    "folder": "",
+                    "mime_type": "text/plain",
+                    "mode": "create",
+                    "size_bytes": len(data),
+                },
+                headers=headers,
+            )
+            self.assertEqual(session_response.status_code, 200, session_response.text)
+            session = session_response.json()
+            self.assertTrue(session["upload_token"])
+
+            part_response = ctx.client.put(
+                f"/api/uploads/{session['id']}/parts/1",
+                content=data,
+                headers={
+                    "Content-Type": "application/octet-stream",
+                    "X-Upload-Offset": "0",
+                    "X-Upload-Sha256": sha256_hex(data),
+                    "X-Upload-Size": str(len(data)),
+                    "X-Upload-Token": session["upload_token"],
+                },
+            )
+            self.assertEqual(part_response.status_code, 200, part_response.text)
+            self.assertEqual(part_response.json()["uploaded_bytes"], len(data))
+            with ctx.db() as db:
+                self.assertEqual(db.query(UploadPart).count(), 0)
+
+    def test_concurrent_upload_parts_use_transfer_store_not_db_rows(self) -> None:
+        headers = auth_headers("uploader", ["vault-admin"])
+        data = b"abcdefghijklmnop"
+
+        with vault_test_client() as ctx:
+            session_response = ctx.client.post(
+                "/api/uploads",
+                json={
+                    "filename": "parallel-parts.txt",
+                    "folder": "",
+                    "mime_type": "text/plain",
+                    "mode": "create",
+                    "size_bytes": len(data),
+                },
+                headers=headers,
+            )
+            self.assertEqual(session_response.status_code, 200, session_response.text)
+            session = session_response.json()
+            upload_token = session["upload_token"]
+
+            def put_part(index: int, offset: int) -> int:
+                chunk = data[offset : offset + session["chunk_size"]]
+                response = ctx.client.put(
+                    f"/api/uploads/{session['id']}/parts/{index}",
+                    content=chunk,
+                    headers={
+                        "Content-Type": "application/octet-stream",
+                        "X-Upload-Offset": str(offset),
+                        "X-Upload-Sha256": sha256_hex(chunk),
+                        "X-Upload-Size": str(len(chunk)),
+                        "X-Upload-Token": upload_token,
+                    },
+                )
+                return response.status_code
+
+            offsets = list(enumerate(range(0, len(data), session["chunk_size"]), start=1))
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                statuses = list(executor.map(lambda args: put_part(*args), offsets))
+
+            self.assertEqual(statuses, [200, 200, 200, 200])
+            with ctx.db() as db:
+                self.assertEqual(db.query(UploadPart).count(), 0)
+
+            completed = ctx.client.post(
+                f"/api/uploads/{session['id']}/complete",
+                json={"sha256": sha256_hex(data)},
+                headers=headers,
+            )
+            self.assertEqual(completed.status_code, 200, completed.text)
+            downloaded = ctx.client.get(
+                f"/documents/{completed.json()['id']}/download",
+                headers=headers,
+            )
+            self.assertEqual(downloaded.content, data)
+
+    def test_transfer_buffer_enqueue_yields_instead_of_blocking_executor(self) -> None:
+        class NonBlockingOnlyQueue:
+            def __init__(self) -> None:
+                self.attempts = 0
+                self.items: list[bytes | None] = []
+
+            def put_nowait(self, item: bytes | None) -> None:
+                self.attempts += 1
+                if self.attempts == 1:
+                    raise queue.Full
+                self.items.append(item)
+
+        async def run_enqueue() -> NonBlockingOnlyQueue:
+            loop = asyncio.get_running_loop()
+            worker = loop.create_future()
+            buffers = NonBlockingOnlyQueue()
+            await asyncio.wait_for(
+                _enqueue_part_buffer(buffers, worker, b"chunk"),  # ty: ignore[arg-type]
+                timeout=1.0,
+            )
+            return buffers
+
+        buffers = asyncio.run(run_enqueue())
+        self.assertEqual(buffers.items, [b"chunk"])
+        self.assertEqual(buffers.attempts, 2)
 
     def test_upload_part_does_not_require_client_checksum_header(self) -> None:
         headers = auth_headers("uploader", ["vault-admin"])
@@ -391,6 +512,53 @@ class StreamingTransferTests(unittest.TestCase):
                 self.assertEqual(db.query(Blob).count(), 1)
                 self.assertEqual(db.query(BlobLocation).count(), 1)
 
+    def test_upload_completion_uses_preassembled_transfer_file(self) -> None:
+        headers = auth_headers("uploader", ["vault-admin"])
+        data = b"abcdefgh"
+
+        with vault_test_client() as ctx:
+            session_response = ctx.client.post(
+                "/api/uploads",
+                json={
+                    "filename": "preassembled.txt",
+                    "folder": "",
+                    "mime_type": "text/plain",
+                    "mode": "create",
+                    "size_bytes": len(data),
+                },
+                headers=headers,
+            )
+            self.assertEqual(session_response.status_code, 200, session_response.text)
+            session = session_response.json()
+            for index, offset in enumerate(range(0, len(data), 4), start=1):
+                chunk = data[offset : offset + 4]
+                part_response = ctx.client.put(
+                    f"/api/uploads/{session['id']}/parts/{index}",
+                    content=chunk,
+                    headers={
+                        **headers,
+                        "Content-Type": "application/octet-stream",
+                        "X-Upload-Offset": str(offset),
+                        "X-Upload-Size": str(len(chunk)),
+                    },
+                )
+                self.assertEqual(part_response.status_code, 200, part_response.text)
+
+            backend = get_storage_backend("local")
+            with patch.object(backend, "put_part_files", wraps=backend.put_part_files) as put_parts:
+                completed = ctx.client.post(
+                    f"/api/uploads/{session['id']}/complete",
+                    json={"sha256": sha256_hex(data)},
+                    headers=headers,
+                )
+            self.assertEqual(completed.status_code, 200, completed.text)
+            put_parts.assert_not_called()
+            downloaded = ctx.client.get(
+                f"/documents/{completed.json()['id']}/download",
+                headers=headers,
+            )
+            self.assertEqual(downloaded.content, data)
+
     def test_upload_completion_records_verification_progress(self) -> None:
         headers = auth_headers("uploader", ["vault-admin"])
         data = b"abcdefgh"
@@ -538,7 +706,7 @@ class StreamingTransferTests(unittest.TestCase):
                 upload_session = db.get(UploadSession, session["id"])
                 self.assertIsNotNone(upload_session)
                 reserve_upload_completion(upload_session, db)
-            upload_part_path = upload_session_dir(session["id"]) / "00000001.part"
+            upload_part_path = upload_session_dir(session["id"]) / "parts" / "00000001.part"
             upload_part_path.unlink()
 
             recovered = recover_interrupted_transfers(

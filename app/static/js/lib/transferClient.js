@@ -241,6 +241,9 @@ function uploadPartRequest({ session, partNumber, chunk, offset, onProgress, sig
     xhr.setRequestHeader("Content-Type", "application/octet-stream");
     xhr.setRequestHeader("X-Upload-Offset", String(offset));
     xhr.setRequestHeader("X-Upload-Size", String(chunk.size));
+    if (session.upload_token) {
+      xhr.setRequestHeader("X-Upload-Token", session.upload_token);
+    }
     xhr.send(chunk);
   });
 }

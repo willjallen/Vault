@@ -202,7 +202,8 @@ class DockerDeployTests(unittest.TestCase):
         self.assertIn("USER vault", dockerfile)
         self.assertIn("HEALTHCHECK", dockerfile)
         self.assertIn(
-            'CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]',
+            'CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", '
+            '"--loop", "uvloop", "--http", "httptools", "--no-access-log"]',
             dockerfile,
         )
         self.assertNotIn("VAULT_VERSION", dockerfile)

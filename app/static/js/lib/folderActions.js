@@ -138,6 +138,10 @@ export function createFolderActionHandlers({
       setError("Document not found.");
       return;
     }
+    if (doc.archived) {
+      setError("Restore archived files before renaming.");
+      return;
+    }
     const parentPath = doc.folder || "";
     if ((folder || "") !== parentPath) {
       replaceFolder(parentPath);

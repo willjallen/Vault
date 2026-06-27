@@ -31,7 +31,11 @@ export function buildFileMenuItems(actions) {
     actions.openFileDetails
       ? { label: "History", action: () => actions.openFileDetails(doc) }
       : null,
-    { label: "Rename", action: () => actions.handleRenameFile(doc), disabled: busy },
+    {
+      label: "Rename",
+      action: () => actions.handleRenameFile(doc),
+      disabled: busy || doc.archived,
+    },
     doc.favorite && actions.handleRemoveFavoriteItem
       ? {
           label: "Remove from Favorites",

@@ -2814,6 +2814,8 @@ def move_doc_item(
     target_ref = parse_public_folder_path(destination_folder)
     if doc.folder.root_key != target_ref.root_key:
         raise HTTPException(status_code=400, detail="Use archive or restore for Archive moves")
+    if name is not None and document_is_archive(doc):
+        raise HTTPException(status_code=400, detail="Restore archived files before renaming")
     require_write_for_folder_path(db, destination_folder, user)
     target_folder = get_or_create_folder_path(db, destination_folder)
     target_name = normalize_item_name(name or doc.name, "File name")

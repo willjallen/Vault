@@ -1,6 +1,13 @@
 import unittest
 
-from tests.support import FAKE_REQUEST, create_versioned_document, user_context, vault_runtime
+from tests.support import (
+    FAKE_REQUEST,
+    auth_headers,
+    create_versioned_document,
+    user_context,
+    vault_runtime,
+    vault_test_client,
+)
 
 from app.models import Document
 from app.routers import (
@@ -107,6 +114,38 @@ class FlatArchiveTests(unittest.TestCase):
             self.assertEqual(
                 payload["documents"][0]["archived_original_path"], "Project/Sub/plan.txt"
             )
+
+    def test_rename_api_rejects_archived_document(self) -> None:
+        admin = user_context("admin", groups=["vault-admin"], is_admin=True)
+        admin_headers = auth_headers("admin", ["vault-admin"])
+
+        with vault_test_client() as ctx:
+            with ctx.db() as db:
+                source = get_or_create_folder_path(db, "Project")
+                doc = create_versioned_document(db, source, name="locked.txt", actor=admin)
+                archive_doc_item(doc, FAKE_REQUEST, admin, db)
+                db.commit()
+                doc_id = doc.id
+
+            renamed = ctx.client.post(
+                "/api/rename",
+                headers=admin_headers,
+                json={
+                    "items": [{"type": "document", "id": doc_id}],
+                    "name": "renamed.txt",
+                },
+            )
+
+            self.assertEqual(renamed.status_code, 200, renamed.text)
+            self.assertEqual(renamed.json()["ok"], [])
+            self.assertEqual(
+                renamed.json()["failed"][0]["detail"],
+                "Restore archived files before renaming",
+            )
+            with ctx.db() as db:
+                doc = db.get(Document, doc_id)
+                self.assertEqual(doc.name, "locked.txt")
+                self.assertEqual(document_path(doc), "Archive/locked.txt")
 
 
 if __name__ == "__main__":

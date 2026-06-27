@@ -1,0 +1,32 @@
+========================================================================
+
+v1.0.1
+
+fix: Harden SQLite event streaming under concurrent use by moving state-event database reads off the ASGI event loop.
+fix: Wake idle SSE clients from committed state-change notifications instead of per-client polling.
+fix: Align SQLite busy timeout and SQLAlchemy pool configuration for the single-container deployment profile.
+fix: Keep file extensions out of the default rename selection unless the user explicitly edits them.
+fix: Show Remove from Favorites when a selected item is opened from the Favorites context menu.
+fix: Prevent archived files from being renamed in the UI, inline rename flow, and rename API.
+
+
+========================================================================
+
+v1.0.0
+
+Initial release
+
+
+========================================================================
+
+feat:     A new feature.
+fix:      A bug fix.
+docs:     Documentation changes.
+style:    Code style changes (formatting, missing semicolons, etc.).
+refactor: Code refactoring (neither fixes a bug nor adds a feature).
+test:     Adding or updating tests.
+chore:    Routine tasks like updating dependencies or build tools.
+build:    Changes affecting the build system or external dependencies.
+ci:       Changes to CI configuration files or scripts.
+perf:     Performance improvements.
+revert:   Reverting a previous commit.

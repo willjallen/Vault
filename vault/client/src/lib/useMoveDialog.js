@@ -1,3 +1,4 @@
+import { createFolderRequestOptions } from "./folderRequests.js";
 import { folderNameFromPath, isArchivedPath, isArchiveRootPath } from "./utils.js";
 
 const { useState } = React;
@@ -116,10 +117,8 @@ export function useMoveDialog({
     const newPath = base ? `${base}/${trimmed}` : trimmed;
     setCreatingMoveFolder(true);
     setError("");
-    const form = new FormData();
-    form.append("folder", newPath);
     try {
-      const res = await apiFetch("/folders", { method: "POST", body: form });
+      const res = await apiFetch("/folders", createFolderRequestOptions(newPath));
       if (!res.ok) {
         const detail = await res.json().catch(() => ({}));
         throw new Error(detail.detail || "Could not create folder");

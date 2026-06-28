@@ -1,4 +1,5 @@
 import { folderToItem } from "./itemActions.js";
+import { createFolderRequestOptions } from "./folderRequests.js";
 import {
   folderBaseName,
   folderParent,
@@ -50,10 +51,8 @@ export function createFolderActionHandlers({
     const targetPath = folderPathForName(parentFolder || "", trimmed);
     setCreatingFolder(true);
     setError("");
-    const form = new FormData();
-    form.append("folder", targetPath);
     try {
-      const res = await apiFetch("/folders", { method: "POST", body: form });
+      const res = await apiFetch("/folders", createFolderRequestOptions(targetPath));
       if (!res.ok) {
         const detail = await res.json().catch(() => ({}));
         throw new Error(detail.detail || "Could not create folder");

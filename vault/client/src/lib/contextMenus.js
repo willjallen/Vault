@@ -227,7 +227,7 @@ export function buildPageMenuItems(actions) {
     {
       label: "Upload file",
       action: actions.handleUploadClick,
-      disabled: actions.busy || actions.uploading || inArchive,
+      disabled: actions.busy || inArchive,
     },
     {
       label: "New folder",

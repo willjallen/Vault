@@ -15,7 +15,7 @@ const bundled = await build({
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(bundled.outputFiles[0].text).toString(
   "base64"
 )}`;
-const { buildFileMenuItems } = await import(moduleUrl);
+const { buildFileMenuItems, buildPageMenuItems } = await import(moduleUrl);
 
 function fileMenuItemsFor(doc) {
   return buildFileMenuItems({
@@ -61,4 +61,30 @@ test("active file rename action remains enabled", () => {
   });
 
   assert.equal(items.find((item) => item.label === "Rename")?.disabled, false);
+});
+
+test("page upload stays available during another background upload", () => {
+  const items = buildPageMenuItems({
+    beginCreateFolder: () => {},
+    busy: false,
+    creatingFolder: false,
+    folder: "",
+    handleUploadClick: () => {},
+    uploading: true,
+  });
+
+  assert.equal(items.find((item) => item.label === "Upload file")?.disabled, false);
+});
+
+test("page actions remain disabled during foreground busy operations", () => {
+  const items = buildPageMenuItems({
+    beginCreateFolder: () => {},
+    busy: true,
+    creatingFolder: false,
+    folder: "",
+    handleUploadClick: () => {},
+  });
+
+  assert.equal(items.find((item) => item.label === "Upload file")?.disabled, true);
+  assert.equal(items.find((item) => item.label === "New folder")?.disabled, true);
 });

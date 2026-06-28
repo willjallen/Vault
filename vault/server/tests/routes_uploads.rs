@@ -1,12 +1,15 @@
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use axum::body::{Body, Bytes, to_bytes};
 use axum::http::{Method, Request, StatusCode};
 use futures_util::stream;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
+use tokio::sync::Notify;
 use tower::ServiceExt;
 use vault_server::auth::{AuthSettings, UserContext};
 use vault_server::config::Config;
@@ -18,7 +21,9 @@ use vault_server::folders::{
 };
 use vault_server::http::{self, AppState};
 use vault_server::reconciliation::storage_reconciliation_report;
-use vault_server::storage::{LocalBlobStorage, SharedBlobStorage};
+use vault_server::storage::{
+    BlobStorageBackend, LocalBlobStorage, SharedBlobStorage, StorageError, StoredBlob,
+};
 use vault_server::uploads::{
     self, CreateUploadRequest, UploadPartHeaders, UploadPartIngest, UploadRuntimeSettings,
 };
@@ -59,6 +64,76 @@ async fn test_state_with_upload_settings(
     let storage = LocalBlobStorage::new(config.objects_path(), &config.storage_prefix);
     let state = AppState::new(config, AuthSettings::default(), db, Arc::new(storage));
     (state, temp_dir)
+}
+
+#[derive(Debug)]
+struct BlockingPartStorage {
+    release: Arc<Notify>,
+    stored: StoredBlob,
+    waiting: Arc<Notify>,
+}
+
+#[async_trait]
+impl BlobStorageBackend for BlockingPartStorage {
+    fn name(&self) -> &'static str {
+        "local"
+    }
+
+    fn bucket(&self) -> &'static str {
+        ""
+    }
+
+    async fn ensure(&self) -> Result<(), StorageError> {
+        Ok(())
+    }
+
+    async fn put_bytes(&self, _data: &[u8]) -> Result<StoredBlob, StorageError> {
+        Err(StorageError::UnsupportedOperation(
+            "test storage only supports part promotion".to_string(),
+        ))
+    }
+
+    async fn put_file(
+        &self,
+        _source_path: &Path,
+        _digest: &str,
+        _size_bytes: u64,
+    ) -> Result<StoredBlob, StorageError> {
+        Err(StorageError::UnsupportedOperation(
+            "test storage only supports part promotion".to_string(),
+        ))
+    }
+
+    async fn put_part_files(
+        &self,
+        _part_paths: &[PathBuf],
+        _expected_digest: Option<&str>,
+    ) -> Result<StoredBlob, StorageError> {
+        self.waiting.notify_one();
+        self.release.notified().await;
+        Ok(self.stored.clone())
+    }
+
+    async fn read_bytes(&self, _object_key: &str) -> Result<Vec<u8>, StorageError> {
+        Err(StorageError::NotFound)
+    }
+
+    async fn read_range(
+        &self,
+        _object_key: &str,
+        _start: u64,
+        _end: u64,
+    ) -> Result<Vec<u8>, StorageError> {
+        Err(StorageError::NotFound)
+    }
+
+    async fn list_object_keys(&self) -> Result<Vec<String>, StorageError> {
+        Ok(Vec::new())
+    }
+
+    async fn delete_object(&self, _object_key: &str) -> Result<(), StorageError> {
+        Ok(())
+    }
 }
 
 async fn create_group(pool: &sqlx::SqlitePool, name: &str) -> i64 {
@@ -2116,4 +2191,152 @@ async fn completed_upload_session_reports_verification_progress() {
             i64::try_from(data.len()).expect("processed bytes")
         )
     );
+}
+
+async fn uploaded_session_with_fixed_parts(
+    app: axum::Router,
+    filename: &str,
+    data: &[u8],
+    part_size: usize,
+) -> String {
+    let create = app
+        .clone()
+        .oneshot(authed_json_request(
+            Method::POST,
+            "/api/uploads",
+            &json!({
+                "mode": "create",
+                "folder": "",
+                "filename": filename,
+                "mime_type": "text/plain",
+                "size_bytes": data.len()
+            }),
+        ))
+        .await
+        .expect("create upload");
+    assert_eq!(create.status(), StatusCode::OK);
+    let created = response_json(create).await;
+    let session_id = created["id"].as_str().expect("session id").to_string();
+
+    for (index, chunk) in data.chunks(part_size).enumerate() {
+        let part_number = i64::try_from(index + 1).expect("part number");
+        let offset = i64::try_from(index * part_size).expect("offset");
+        let uploaded = app
+            .clone()
+            .oneshot(upload_part_request_at_offset(
+                &session_id,
+                part_number,
+                offset,
+                chunk,
+            ))
+            .await
+            .expect("upload part");
+        assert_eq!(uploaded.status(), StatusCode::NO_CONTENT);
+    }
+    session_id
+}
+
+fn test_stored_blob(digest: &str, size_bytes: usize) -> StoredBlob {
+    StoredBlob {
+        backend: "local".to_string(),
+        bucket: String::new(),
+        digest: digest.to_string(),
+        hash_algo: "sha256".to_string(),
+        object_key: format!("sha256/{digest}"),
+        size_bytes: u64::try_from(size_bytes).expect("size"),
+    }
+}
+
+async fn wait_for_storage_block(
+    waiting: &Notify,
+    completion: &mut tokio::task::JoinHandle<
+        Result<uploads::UploadResultPayload, uploads::UploadError>,
+    >,
+) {
+    tokio::select! {
+        () = waiting.notified() => {}
+        result = completion => {
+            match result.expect("completion task") {
+                Ok(_) => panic!("completion finished before test storage blocked"),
+                Err(error) => panic!("completion failed before test storage blocked: {error}"),
+            }
+        }
+        () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+            panic!("completion did not reach test storage");
+        }
+    }
+}
+
+#[tokio::test]
+async fn upload_completion_reports_verification_bytes_before_storage_finishes() {
+    let (state, _temp_dir) =
+        test_state_with_upload_settings(5 * 1024 * 1024 * 1024, 4, 86_400).await;
+    grant_writer_root(&state.db).await;
+    let pool = state.db.clone();
+    let transfers_path = state.config.transfers_path();
+    let app = http::router(state);
+    let data = b"abcdefgh";
+    let digest = sha256_hex(data);
+    let session_id =
+        uploaded_session_with_fixed_parts(app, "verification-live-progress.txt", data, 4).await;
+
+    let waiting = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let storage = BlockingPartStorage {
+        release: release.clone(),
+        stored: test_stored_blob(&digest, data.len()),
+        waiting: waiting.clone(),
+    };
+    let complete_pool = pool.clone();
+    let complete_session_id = session_id.clone();
+    let complete_digest = digest.clone();
+    let completion_user_id: String =
+        sqlx::query_scalar("SELECT created_by FROM upload_sessions WHERE id = ?")
+            .bind(&session_id)
+            .fetch_one(&pool)
+            .await
+            .expect("session owner");
+    let completion_user = UserContext {
+        id: completion_user_id,
+        ..writer_context()
+    };
+    let mut completion = tokio::spawn(async move {
+        uploads::complete_upload_session(
+            &complete_pool,
+            &storage,
+            &transfers_path,
+            &complete_session_id,
+            Some(&complete_digest),
+            &completion_user,
+        )
+        .await
+    });
+
+    wait_for_storage_block(&waiting, &mut completion).await;
+    let progress = sqlx::query_as::<_, (String, i64, i64)>(
+        r"
+        SELECT status, verification_total_bytes, verification_processed_bytes
+        FROM upload_sessions
+        WHERE id = ?
+        ",
+    )
+    .bind(&session_id)
+    .fetch_one(&pool)
+    .await
+    .expect("verification progress");
+    assert_eq!(
+        progress,
+        (
+            "completing".to_string(),
+            i64::try_from(data.len()).expect("total bytes"),
+            i64::try_from(data.len()).expect("processed bytes")
+        )
+    );
+
+    release.notify_one();
+    let completed = completion
+        .await
+        .expect("completion task")
+        .expect("completion");
+    assert_eq!(completed.path, "verification-live-progress.txt");
 }

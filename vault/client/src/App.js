@@ -63,7 +63,6 @@ export function App({ initial }) {
   const [contentsAnchor, setContentsAnchor] = useState(null);
   const [folderSelection, setFolderSelection] = useState([]);
   const [folderAnchor, setFolderAnchor] = useState(null);
-  const [uploading, setUploading] = useState(false);
   const [busy, setBusy] = useState(false);
   const [draggingId, setDraggingId] = useState(null);
   const [dragBundle, setDragBundle] = useState(null);
@@ -528,7 +527,6 @@ export function App({ initial }) {
     if (!file) {
       return;
     }
-    setUploading(true);
     setError("");
     try {
       const result = await uploadWithProgress({
@@ -545,7 +543,6 @@ export function App({ initial }) {
     } catch (err) {
       setError(err.message || "Upload failed. Please try again.");
     } finally {
-      setUploading(false);
       setUploadHover(false);
       if (uploadInput.current) {
         uploadInput.current.value = "";
@@ -762,7 +759,6 @@ export function App({ initial }) {
       selectedDoc,
       siteSettings,
       navigateToFolder,
-      uploading,
       ...extra,
     };
   }

@@ -297,6 +297,19 @@ async fn preferences_patch_persists_canonical_ids_and_returns_enriched_favorites
         ]),
     );
     assert!(stored["favoriteItems"][0].get("path").is_none());
+    let state_event = sqlx::query_as::<_, (String, String)>(
+        "SELECT event_type, resources FROM state_events ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("state event");
+    assert_eq!(
+        state_event,
+        (
+            "preferences.update".to_string(),
+            "[\"preferences\"]".to_string()
+        )
+    );
 
     let response = app
         .oneshot(authed_get("/api/preferences", "artist", "artists"))
@@ -316,6 +329,7 @@ async fn preferences_patch_persists_canonical_ids_and_returns_enriched_favorites
 #[tokio::test]
 async fn preferences_patch_allows_missing_preferences_as_noop() {
     let (state, _temp_dir) = test_state().await;
+    let pool = state.db.clone();
     let app = http::router(state);
 
     let initial = app
@@ -329,6 +343,11 @@ async fn preferences_patch_allows_missing_preferences_as_noop() {
         .await
         .expect("initial response");
     assert_eq!(initial.status(), StatusCode::OK);
+    let event_count_after_initial =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM state_events")
+            .fetch_one(&pool)
+            .await
+            .expect("initial state event count");
 
     let response = app
         .clone()
@@ -345,6 +364,11 @@ async fn preferences_patch_allows_missing_preferences_as_noop() {
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["preferences"]["themePreference"], "light");
+    let event_count_after_noop = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM state_events")
+        .fetch_one(&pool)
+        .await
+        .expect("noop state event count");
+    assert_eq!(event_count_after_noop, event_count_after_initial);
 
     let response = app
         .oneshot(authed_get("/api/preferences", "artist", "artists"))

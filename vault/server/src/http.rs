@@ -1033,7 +1033,11 @@ async fn api_update_preferences(
     Json(payload): Json<PreferencesPatchRequest>,
 ) -> Result<Json<PreferencesResponse>, ApiError> {
     let user = current_user(&state, &headers).await?;
-    update_preferences_for_user(&state.db, &user, &payload.preferences).await?;
+    let (_, changed) = update_preferences_for_user(&state.db, &user, &payload.preferences).await?;
+    if changed {
+        record_state_event(&state.db, "preferences.update", &["preferences"]).await?;
+        notify_state_event_committed();
+    }
     Ok(Json(PreferencesResponse {
         preferences: views::build_preferences_payload(&state.db, &user).await?,
     }))

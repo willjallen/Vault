@@ -46,7 +46,7 @@ pub async fn update_preferences_for_user(
     pool: &SqlitePool,
     user: &UserContext,
     raw_patch: &Value,
-) -> Result<Value, PreferenceError> {
+) -> Result<(Value, bool), PreferenceError> {
     if user.vault_user_id <= 0 {
         return Err(PreferenceError::UserPreferencesRequireVaultUser);
     }
@@ -64,14 +64,16 @@ pub async fn update_preferences_for_user(
     } else {
         serde_json::from_str::<Value>(&raw)?
     };
+    let existing = normalize_user_preferences(&existing);
     let merged = merge_user_preferences(&existing, patch);
+    let changed = merged != existing;
     sqlx::query("UPDATE vault_users SET preferences = ? WHERE id = ?")
         .bind(merged.to_string())
         .bind(user.vault_user_id)
         .execute(&mut *transaction)
         .await?;
     transaction.commit().await?;
-    Ok(merged)
+    Ok((merged, changed))
 }
 
 #[must_use]

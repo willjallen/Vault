@@ -2275,14 +2275,32 @@ async fn version_download_response(
         size,
         &etag,
     )?;
-    // Download routes fail closed on corrupt canonical blobs. Validate the full object
-    // before slicing ranges so a partial request cannot leak bytes that no longer match
-    // the database metadata.
-    let bytes = validated_download_bytes(storage, download, size).await?;
+    if !download.hash_algo.eq_ignore_ascii_case("sha256") {
+        return Err(ApiError::Storage(StorageError::ContentMismatch));
+    }
+    // Downloads are a hot path, and browsers probe with `Range: bytes=0-0`
+    // before starting segmented writes. Reading and hashing the entire object
+    // here blocks that first byte behind full-file I/O and makes the client
+    // look wedged at browser handoff. The canonical hash is verified before the
+    // blob is committed; this path validates metadata/range coherence and reads
+    // only the requested bytes.
     let body = if range.len == 0 {
         Vec::new()
     } else {
-        download_range_body(&bytes, &range, size)?
+        let bytes = storage
+            .read_location_range(
+                &download.backend,
+                &download.bucket,
+                &download.object_key,
+                range.start,
+                range.end,
+            )
+            .await
+            .map_err(storage_download_error)?;
+        if u64::try_from(bytes.len()).ok() != Some(range.len) {
+            return Err(ApiError::Storage(StorageError::ContentMismatch));
+        }
+        bytes
     };
     let mut response = Response::new(Body::from(body));
     *response.status_mut() = range.status;
@@ -2313,44 +2331,6 @@ async fn version_download_response(
         );
     }
     Ok(response)
-}
-
-async fn validated_download_bytes(
-    storage: &dyn BlobStorageBackend,
-    download: &VersionDownload,
-    expected_size: u64,
-) -> Result<Vec<u8>, ApiError> {
-    let bytes = storage
-        .read_location_bytes(&download.backend, &download.bucket, &download.object_key)
-        .await
-        .map_err(storage_download_error)?;
-    let actual_size =
-        u64::try_from(bytes.len()).map_err(|_| ApiError::Storage(StorageError::ContentMismatch))?;
-    if actual_size != expected_size || !download.hash_algo.eq_ignore_ascii_case("sha256") {
-        return Err(ApiError::Storage(StorageError::ContentMismatch));
-    }
-    let actual_hash = lower_hex(&Sha256::digest(&bytes));
-    if actual_hash != download.hash.to_ascii_lowercase() {
-        return Err(ApiError::Storage(StorageError::ContentMismatch));
-    }
-    Ok(bytes)
-}
-
-fn download_range_body(
-    bytes: &[u8],
-    range: &DownloadRange,
-    size: u64,
-) -> Result<Vec<u8>, ApiError> {
-    let start = usize::try_from(range.start).map_err(|_| byte_range_error(size))?;
-    let end_exclusive = range
-        .end
-        .checked_add(1)
-        .ok_or_else(|| byte_range_error(size))?;
-    let end = usize::try_from(end_exclusive).map_err(|_| byte_range_error(size))?;
-    bytes
-        .get(start..end)
-        .map(<[u8]>::to_vec)
-        .ok_or_else(|| byte_range_error(size))
 }
 
 fn parse_range_header(

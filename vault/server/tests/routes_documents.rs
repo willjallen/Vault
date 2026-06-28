@@ -1508,7 +1508,7 @@ async fn download_routes_return_not_found_for_missing_versions_and_locations() {
 }
 
 #[tokio::test]
-async fn download_routes_reject_corrupt_stored_blob_bytes() {
+async fn download_routes_reject_truncated_stored_blob_bytes() {
     let (state, _temp_dir) = test_state().await;
     let readers = create_group(&state.db, "readers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -1541,9 +1541,9 @@ async fn download_routes_reject_corrupt_stored_blob_bytes() {
     .await
     .expect("object key");
     let object_path = state.config.objects_path().join(object_key);
-    tokio::fs::write(object_path, b"corrupt content")
+    tokio::fs::write(object_path, b"short")
         .await
-        .expect("corrupt object");
+        .expect("truncated object");
     let pool = state.db.clone();
     let app = http::router(state);
 
@@ -1555,7 +1555,7 @@ async fn download_routes_reject_corrupt_stored_blob_bytes() {
             "readers",
         ))
         .await
-        .expect("current corrupt download");
+        .expect("current truncated download");
     let current_status = current_response.status();
     let current_json = response_json(current_response).await;
     assert_eq!(current_status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -1573,7 +1573,7 @@ async fn download_routes_reject_corrupt_stored_blob_bytes() {
             "bytes=0-6",
         ))
         .await
-        .expect("version corrupt range download");
+        .expect("version truncated range download");
     let range_status = range_response.status();
     let range_json = response_json(range_response).await;
     assert_eq!(range_status, StatusCode::INTERNAL_SERVER_ERROR);

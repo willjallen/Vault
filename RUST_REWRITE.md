@@ -88,7 +88,7 @@ Implemented:
 - Rust OIDC login generates Python-compatible URL-safe state and nonce tokens using the configured `VAULT_OIDC_NONCE_BYTES` value with the same 16-byte lower bound; Rust OIDC discovery caches provider metadata by issuer for the configured `VAULT_OIDC_DISCOVERY_TTL_SECONDS`; production Compose passes both settings into the container.
 - Rust non-OIDC auth route parity covers `/login` and `/auth/callback` redirecting to `/` without setting cookies, while `/logout` remains available and clears session/state cookies with a safe redirect.
 - Rust dev-auth route parity keeps development auth separate from header auth: disabled dev mode rejects even when identity headers are present, and enabled dev mode resolves only the configured local development identity.
-- Rust benchmark harness parity includes direct-host and Docker-container Rust app runners, Python ASGI and Rust in-process receive/hash/write sink variants, opt-in throughput threshold enforcement for the documented local-direct upload/download target profile plus generic upload/download floors for ad hoc regression gates, and per-case server CPU/RSS capture when process metrics are available.
+- Rust benchmark harness includes direct-host and Docker-container Rust app runners, Rust in-process receive/hash/write sink variants, opt-in throughput threshold enforcement for the documented local-direct upload/download target profile plus generic upload/download floors for ad hoc regression gates, and per-case server CPU/RSS capture when process metrics are available.
 - Rust upload part PUTs now avoid per-part SQLite writes, avoid no-checksum JSON sidecars, verify signed upload-token bounds statelessly without per-part session-row reads or a process-global claims cache, atomically promote part files without overwriting already-promoted duplicates, return `204 No Content` acknowledgements, and keep full resumable state on `GET /api/uploads/{session_id}`.
 - Docker image replacement: the production Dockerfile builds content-hashed frontend assets, compiles the Rust `vault-server` release binary, runs it as the non-root `vault` user, preserves `/data` runtime state, serves bundled static assets, and healthchecks the Rust `/health` endpoint.
 
@@ -510,14 +510,6 @@ Rust equivalents started:
   - generated frontend/Rust build outputs are ignored
   - semver tag workflow builds and publishes the GHCR image without mutable `latest` tags
 
-- `test_bench_transfers.py`
-  - permanent transfer benchmark harness defaults app benchmarks to the Rust `vault-server`
-  - benchmark server env configures Rust bind address, data paths, auth mode, session secret, and chunk-size overrides
-  - benchmark harness preserves explicit Rust binary selection, cargo release fallback, and legacy Python/Uvicorn comparison mode
-  - benchmark harness can run the Rust app benchmark against the production Docker image contract with `/data` mounted and container-local runtime paths
-  - benchmark sink variants can isolate receive-only, receive+hash, receive+write, and receive+hash+write costs without Vault state
-  - benchmark harness enforces the documented local-direct throughput profile and reports upload/download threshold failures as hard run failures
-  - benchmark results include server CPU seconds, current RSS, and peak RSS when the host exposes process metrics
 
 - `test_event_stream_concurrency.py`
   - event stream replays only rows after `Last-Event-ID` as `event: state` SSE payloads with normalized resources
@@ -600,7 +592,7 @@ The Rust rewrite is complete only when:
 - `cargo fmt --all -- --check` passes.
 - `cargo clippy --workspace --all-targets -- -D warnings` passes.
 - `cargo test --workspace` passes.
-- `.venv/bin/pre-commit run --all-files --config .pre-commit-config.yaml` passes.
+- `pre-commit run --all-files --config .pre-commit-config.yaml` passes.
 - The Docker image runs the Rust service as the primary server.
 - The existing frontend works against the Rust service with no Python server.
 - Upload/download benchmarks meet or exceed the accepted target for local direct service runs.

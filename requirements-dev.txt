@@ -1,8 +1,0 @@
-# Python tooling for linting, formatting, typing, and security audits.
-ruff==0.15.20
-mypy==2.1.0
-sqlalchemy[mypy]==2.0.51
-bandit==1.9.4
-pip-audit==2.10.1
-pre-commit==4.6.0
-httpx==0.28.1

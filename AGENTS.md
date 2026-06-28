@@ -3,7 +3,7 @@
 Before finishing any code change, run the full repository gate:
 
 ```bash
-.venv/bin/pre-commit run --all-files --config .pre-commit-config.yaml
+pre-commit run --all-files --config .pre-commit-config.yaml
 ```
 
 That command is the source of truth for formatting, linting, type checking, audits, and tests. If it fails, fix the failure and rerun the same command until it passes.

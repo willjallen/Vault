@@ -223,20 +223,19 @@ The 4 MiB part case is still the failing benchmark target. Removing per-part SQL
 
 Each item can be measured. None should be assumed as the dominant limiter without numbers.
 
-## Permanent Benchmark Harness
+## Benchmark Harness
 
-The ad hoc benchmark has been turned into `scripts/bench_transfers.py`. It starts a temporary local server with a temporary data directory. App benchmarks default to the Rust `vault-server` binary, using `target/release/vault-server` when it exists and otherwise falling back to `cargo run --release -p vault-server`. The legacy Python/Uvicorn app remains available with `--server python`, and the minimal Python ASGI sink remains available for receive-ceiling benchmarks.
+The ad hoc benchmark is `scripts/bench_transfers.py`. It is an optional one-off utility, not part of the required repository gate, and intentionally uses only the Python standard library so the project does not require a virtualenv, requirements file, or Python lint/test tooling. It starts a temporary Rust `vault-server` with a temporary data directory.
 
 The script supports:
 
 1. Direct Rust app benchmark.
-2. Legacy Python/Uvicorn app benchmark for comparison.
-3. Minimal Python ASGI and Rust in-process sink benchmarks with checksum enabled or disabled, and optional write-to-file mode for receive+write or receive+hash+write measurements.
-4. Upload matrix by file size, chunk size, upload concurrency, body chunk size, and optional per-request rate cap.
-5. Download measurement after app uploads.
-6. JSON output for trend comparison.
-7. Human-readable summary output for quick local runs.
-8. Docker-container Rust app benchmark using the production image runtime contract.
+2. Rust in-process sink benchmarks with checksum enabled or disabled, and optional write-to-file mode for receive+write or receive+hash+write measurements.
+3. Upload matrix by file size, chunk size, upload concurrency, body chunk size, and optional per-request rate cap.
+4. Download measurement after app uploads.
+5. JSON output for trend comparison.
+6. Human-readable summary output for quick local runs.
+7. Docker-container Rust app benchmark using the production image runtime contract.
 
 Current baseline cases include:
 
@@ -258,7 +257,7 @@ The benchmark reports:
 5. Download wall time and aggregate MiB/s for completed uploads.
 6. Server CPU seconds, current RSS, and peak RSS when the host exposes process metrics.
 
-The missing harness work is nginx/TLS-topology benchmarking. Server CPU/RSS capture, container-mode Rust benchmarking, Python and Rust receive/hash/write sink variants, and explicit throughput thresholds are now built into the script, so release or CI runs can fail instead of relying on after-the-fact interpretation and benchmark runs have enough resource context to distinguish CPU pressure from request fanout or storage behavior. The current script is already enough to reject bad hot-path ideas and prove medium-file fanout behavior.
+The missing harness work is nginx/TLS-topology benchmarking. Server CPU/RSS capture, container-mode Rust benchmarking, Rust receive/hash/write sink variants, and explicit throughput thresholds are available without repo-managed Python dependencies, so release or CI runs can fail instead of relying on after-the-fact interpretation.
 
 ## Low-Overhead Telemetry
 
@@ -308,13 +307,13 @@ If `request_wall_ms` is high but worker write time is low, the issue is ingress 
 
 ### Step 1: Commit the benchmark harness
 
-Status: implemented.
+Status: implemented as a dependency-free optional Python script.
 
 Acceptance:
 
 1. The script reproduces the existing post-refactor baseline within reasonable variance.
-2. The script can run direct Uvicorn app mode.
-3. The script can run a minimal ASGI receive sink mode.
+2. The script can run direct Rust app mode.
+3. The script can run a minimal Rust receive sink mode.
 4. The script records enough data to compare chunk/concurrency changes.
 
 ### Step 2: Add adaptive upload chunk sizing
@@ -361,7 +360,7 @@ Acceptance:
 1. 38 MB and 114 MB medium-file cases improve compared to fixed 32 MiB chunks.
 2. 10-user local benchmark does not collapse under higher concurrency.
 3. Error/retry behavior remains correct.
-4. Browser behavior is verified with real browser tests if possible, because XHR/fetch connection behavior can differ from Python `httpx`.
+4. Browser behavior is verified with real browser tests if possible, because XHR/fetch connection behavior can differ from synthetic benchmark clients.
 
 ### Step 4: Make part hashing conditional
 
@@ -443,7 +442,7 @@ Acceptance:
 
 The benchmark work needs numeric targets, otherwise every run can be interpreted after the fact. The first target set should be conservative enough to be achievable by this application stack and strict enough to catch regressions.
 
-For local direct Uvicorn, after adaptive chunking, conditional part hashing, and writev batching, target:
+For local direct Rust service runs, after adaptive chunking and conditional part hashing, target:
 
 1. Single 128 MiB upload at or above 400 MiB/s.
 2. Ten concurrent 64 MiB uploads at or above 500 MiB/s aggregate.
@@ -451,7 +450,7 @@ For local direct Uvicorn, after adaptive chunking, conditional part hashing, and
 4. Single 114 MB Kevin-shaped upload materially above the fixed-32-MiB baseline.
 5. Single 38 MB Kevin-shaped upload materially above the fixed-32-MiB baseline.
 
-Those numbers are not the final ambition. They are the next ratchet. The ten-user target is now met in the best 8-worker local run. The single 128 MiB upload target is not consistently met yet. The receive-only sink proves Uvicorn can receive much faster than the current Vault route, so the remaining work is durable-path overhead, not raw ASGI receive.
+Those numbers are not the final ambition. They are the next ratchet. The ten-user target is now met in the best 8-worker local run. The single 128 MiB upload target is not consistently met yet. The receive-only sink work showed raw request ingress can be much faster than the current Vault route, so the remaining work is durable-path overhead, not raw receive.
 
 For local downloads, target:
 
@@ -495,8 +494,8 @@ This problem is not solved by one more refactor. It is solved when:
 The immediate next implementation should be:
 
 1. Add disabled-by-default per-session and per-part summary telemetry.
-2. Add sink variants for receive+write and receive+hash+write so the benchmark can isolate filesystem write cost without Vault state. Status: implemented with `--sink-write`, combined with checksum on/off.
+2. Keep sink variants for receive+write and receive+hash+write so the benchmark can isolate filesystem write cost without Vault state.
 3. Investigate a durable-path redesign that reduces part-file plus assembly write amplification without event-loop blocking or in-flight flush coordination.
-4. Add nginx/container benchmark mode so local direct-Uvicorn results can be compared to the deployed topology.
+4. Add nginx/container benchmark mode so local direct results can be compared to the deployed topology.
 
 Those steps directly address the remaining measured problem. They do not require speculation about the user's ISP, and they do not chase storage cleanup that only indirectly affects throughput.

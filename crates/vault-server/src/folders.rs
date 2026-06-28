@@ -1360,7 +1360,7 @@ async fn ensure_subtree_not_locked_by_other(
         FROM document_locks dl
         JOIN documents d ON d.id = dl.document_id
         WHERE dl.is_active = 1
-          AND dl.locked_by <> 
+          AND dl.locked_by <>
         ",
     );
     builder.push_bind(&user.id);

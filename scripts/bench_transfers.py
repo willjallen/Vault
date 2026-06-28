@@ -1,31 +1,33 @@
 #!/usr/bin/env python3
-"""Benchmark Vault upload/download transfer paths."""
+"""Benchmark Vault upload/download transfer paths.
+
+This is an optional one-off utility. It intentionally uses only the Python
+standard library so the repository does not require a virtualenv, requirements
+file, or Python lint/test tooling for normal development.
+"""
 
 from __future__ import annotations
 
 import argparse
-import asyncio
+import concurrent.futures
 import hashlib
+import http.client
 import json
 import os
 import socket
-import subprocess  # noqa: S404 - benchmark intentionally starts local Uvicorn.
+import subprocess
 import sys
 import tempfile
+import threading
 import time
-import uuid
-from collections.abc import AsyncIterator
 from contextlib import closing
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any
-
-import httpx
+from typing import Any, Iterable
 
 MIB = 1024 * 1024
 DEFAULT_BODY_BLOCK_BYTES = 256 * 1024
 LOCAL_DIRECT_PROFILE = "local-direct"
-PYTHON_SINK_MODE = "sink"
 RUST_SINK_MODE = "rust-sink"
 BENCHMARK_SERVER_ENV_KEYS = (
     "BASE_DOMAIN",
@@ -53,86 +55,6 @@ BENCHMARK_SERVER_ENV_KEYS = (
     "VAULT_TRANSFER_SESSION_TTL_SECONDS",
     "VAULT_TRANSFERS_PATH",
 )
-
-
-def env_flag(name: str, default: str = "0") -> bool:
-    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
-
-
-async def sink_app(scope: dict[str, Any], receive: Any, send: Any) -> None:
-    """Minimal ASGI app for measuring receive overhead without Vault work."""
-
-    if scope["type"] != "http":
-        return
-    method = scope.get("method", "")
-    path = scope.get("path", "")
-    if method == "GET" and path == "/health":
-        body = b"ok"
-        await send(
-            {
-                "type": "http.response.start",
-                "status": 200,
-                "headers": [
-                    (b"content-type", b"text/plain"),
-                    (b"content-length", str(len(body)).encode("ascii")),
-                ],
-            },
-        )
-        await send({"type": "http.response.body", "body": body})
-        return
-    if method == "PUT" and path == "/sink":
-        size_bytes = 0
-        hash_body = env_flag("VAULT_BENCH_SINK_HASH", "1")
-        write_body = env_flag("VAULT_BENCH_SINK_WRITE", "0")
-        digest = hashlib.sha256() if hash_body else None
-        sink_file = open_sink_file() if write_body else None
-        try:
-            while True:
-                message = await receive()
-                if message["type"] == "http.disconnect":
-                    return
-                chunk = message.get("body", b"")
-                if chunk:
-                    size_bytes += len(chunk)
-                    if digest is not None:
-                        digest.update(chunk)
-                    if sink_file is not None:
-                        sink_file.write(chunk)
-                if not message.get("more_body", False):
-                    break
-        finally:
-            if sink_file is not None:
-                sink_file.close()
-        body = json.dumps(
-            {"bytes": size_bytes, "sha256": digest.hexdigest() if digest is not None else None}
-        ).encode()
-        await send(
-            {
-                "type": "http.response.start",
-                "status": 200,
-                "headers": [
-                    (b"content-type", b"application/json"),
-                    (b"content-length", str(len(body)).encode("ascii")),
-                ],
-            },
-        )
-        await send({"type": "http.response.body", "body": body})
-        return
-    body = b"not found"
-    await send(
-        {
-            "type": "http.response.start",
-            "status": 404,
-            "headers": [(b"content-length", str(len(body)).encode("ascii"))],
-        },
-    )
-    await send({"type": "http.response.body", "body": body})
-
-
-def open_sink_file() -> Any:
-    sink_dir = Path(os.getenv("VAULT_BENCH_SINK_DIR", tempfile.gettempdir()))
-    sink_dir.mkdir(parents=True, exist_ok=True)
-    return (sink_dir / f"sink-{os.getpid()}-{uuid.uuid4().hex}.bin").open("wb")
 
 
 @dataclass(frozen=True)
@@ -186,21 +108,23 @@ class ProcessUsage:
     peak_rss_mib: float | None
 
 
+@dataclass(frozen=True)
+class HttpResponse:
+    status: int
+    headers: dict[str, str]
+    body: bytes
+
+    def json(self) -> Any:
+        return json.loads(self.body.decode("utf-8"))
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--mode",
-        choices=("app", PYTHON_SINK_MODE, RUST_SINK_MODE, "both"),
+        choices=("app", RUST_SINK_MODE, "both"),
         default="app",
-        help=(
-            "Benchmark the real app, the Python ASGI sink, the Rust sink route, or app+Python sink."
-        ),
-    )
-    parser.add_argument(
-        "--server",
-        choices=("rust", "python"),
-        default="rust",
-        help="App server implementation to benchmark. Sink mode always uses the Python ASGI sink.",
+        help="Benchmark the real Rust app, the Rust sink route, or both.",
     )
     parser.add_argument(
         "--case",
@@ -208,22 +132,14 @@ def parse_args() -> argparse.Namespace:
         choices=tuple(default_cases()),
         help="Case name to run. May be passed more than once. Defaults to all cases.",
     )
-    parser.add_argument(
-        "--json",
-        type=Path,
-        help="Write machine-readable benchmark results to this path.",
-    )
+    parser.add_argument("--json", type=Path, help="Write machine-readable results to this path.")
     parser.add_argument(
         "--body-block-kib",
         type=int,
         default=DEFAULT_BODY_BLOCK_BYTES // 1024,
         help="Client request-body generator chunk size.",
     )
-    parser.add_argument(
-        "--quiet",
-        action="store_true",
-        help="Only print the final JSON payload.",
-    )
+    parser.add_argument("--quiet", action="store_true", help="Only print the final JSON payload.")
     parser.add_argument(
         "--part-checksum",
         action="store_true",
@@ -244,12 +160,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--sink-no-checksum",
         action="store_true",
-        help="In sink mode, read request bodies without hashing them.",
+        help="In Rust sink mode, read request bodies without hashing them.",
     )
     parser.add_argument(
         "--sink-write",
         action="store_true",
-        help="In sink mode, write request bodies to temporary files to measure receive+write cost.",
+        help="In Rust sink mode, write request bodies to temporary files.",
     )
     parser.add_argument(
         "--rust-bin",
@@ -321,27 +237,9 @@ def default_cases() -> dict[str, BenchCase]:
 
 def local_direct_thresholds() -> list[ThroughputThreshold]:
     return [
-        ThroughputThreshold(
-            case_name="single-128m",
-            mode="app",
-            server="rust",
-            min_upload_mib_per_second=400.0,
-            min_download_mib_per_second=900.0,
-        ),
-        ThroughputThreshold(
-            case_name="ten-64m",
-            mode="app",
-            server="rust",
-            min_upload_mib_per_second=500.0,
-            min_download_mib_per_second=900.0,
-        ),
-        ThroughputThreshold(
-            case_name="ten-64m-4m-parts",
-            mode="app",
-            server="rust",
-            min_upload_mib_per_second=450.0,
-            min_download_mib_per_second=900.0,
-        ),
+        ThroughputThreshold("single-128m", "app", "rust", 400.0, 900.0),
+        ThroughputThreshold("ten-64m", "app", "rust", 500.0, 900.0),
+        ThroughputThreshold("ten-64m-4m-parts", "app", "rust", 450.0, 900.0),
     ]
 
 
@@ -501,11 +399,11 @@ def repeated_sha256(size: int, body_block: bytes) -> str:
     return digest.hexdigest()
 
 
-async def repeated_body(
+def repeated_body(
     size: int,
     body_block: bytes,
     rate_mib_per_second: float | None,
-) -> AsyncIterator[bytes]:
+) -> Iterable[bytes]:
     remaining = size
     sent = 0
     started = time.perf_counter()
@@ -518,23 +416,87 @@ async def repeated_body(
             expected_elapsed = sent / (rate_mib_per_second * MIB)
             actual_elapsed = time.perf_counter() - started
             if expected_elapsed > actual_elapsed:
-                await asyncio.sleep(expected_elapsed - actual_elapsed)
+                time.sleep(expected_elapsed - actual_elapsed)
 
 
-async def wait_health(base_url: str, proc: subprocess.Popen[bytes], timeout_seconds: float) -> None:
+def request_bytes(
+    host: str,
+    port: int,
+    method: str,
+    path: str,
+    *,
+    headers: dict[str, str] | None = None,
+    body: bytes | Iterable[bytes] | None = None,
+    timeout: float = 300.0,
+) -> HttpResponse:
+    conn = http.client.HTTPConnection(host, port, timeout=timeout)
+    try:
+        conn.putrequest(method, path, skip_host=False, skip_accept_encoding=True)
+        for key, value in (headers or {}).items():
+            conn.putheader(key, value)
+        conn.putheader("Connection", "close")
+        conn.endheaders()
+        if body is not None:
+            if isinstance(body, bytes):
+                conn.send(body)
+            else:
+                for chunk in body:
+                    if chunk:
+                        conn.send(chunk)
+        response = conn.getresponse()
+        response_headers = {key.lower(): value for key, value in response.getheaders()}
+        return HttpResponse(response.status, response_headers, response.read())
+    finally:
+        conn.close()
+
+
+def json_request(
+    host: str,
+    port: int,
+    method: str,
+    path: str,
+    *,
+    headers: dict[str, str] | None = None,
+    payload: Any | None = None,
+    timeout: float = 300.0,
+) -> HttpResponse:
+    body = b"" if payload is None else json.dumps(payload).encode("utf-8")
+    request_headers = {
+        "Content-Type": "application/json",
+        "Content-Length": str(len(body)),
+        **(headers or {}),
+    }
+    return request_bytes(
+        host,
+        port,
+        method,
+        path,
+        headers=request_headers,
+        body=body,
+        timeout=timeout,
+    )
+
+
+def raise_for_status(response: HttpResponse, context: str) -> None:
+    if 200 <= response.status < 300:
+        return
+    body = response.body.decode("utf-8", "replace")
+    raise RuntimeError(f"{context} failed with HTTP {response.status}: {body}")
+
+
+def wait_health(host: str, port: int, proc: subprocess.Popen[bytes], timeout_seconds: float) -> None:
     deadline = time.perf_counter() + timeout_seconds
-    async with httpx.AsyncClient(timeout=1.0) as client:
-        while time.perf_counter() < deadline:
-            if proc.poll() is not None:
-                stderr = proc.stderr.read().decode("utf-8", "replace") if proc.stderr else ""
-                raise RuntimeError(f"server exited early: {stderr}")
-            try:
-                response = await client.get(f"{base_url}/health")
-                if response.status_code == 200 and response.text == "ok":
-                    return
-            except httpx.HTTPError:
-                pass
-            await asyncio.sleep(0.1)
+    while time.perf_counter() < deadline:
+        if proc.poll() is not None:
+            stderr = proc.stderr.read().decode("utf-8", "replace") if proc.stderr else ""
+            raise RuntimeError(f"server exited early: {stderr}")
+        try:
+            response = request_bytes(host, port, "GET", "/health", timeout=1.0)
+            if response.status == 200 and response.body == b"ok":
+                return
+        except OSError:
+            pass
+        time.sleep(0.1)
     raise TimeoutError("server did not become healthy")
 
 
@@ -572,7 +534,7 @@ def container_server_env(chunk_mib: int | None) -> dict[str, str]:
     env = server_env(Path("/data"), chunk_mib, 8000)
     env.update(
         {
-            "VAULT_HOST": "0.0.0.0",  # noqa: S104 - required inside Docker for host port publishing.
+            "VAULT_HOST": "0.0.0.0",
             "VAULT_STATIC_DIR": "/app/app/static",
             "VAULT_DOCKER_RUNTIME": "1",
         },
@@ -624,35 +586,12 @@ def docker_build_command(image: str) -> list[str]:
 
 
 def build_docker_image(image: str) -> None:
-    subprocess.run(  # noqa: S603 - argv is fixed by this benchmark script.
-        docker_build_command(image),
-        cwd=Path.cwd(),
-        check=True,
-    )
-
-
-def uvicorn_command(app_ref: str, port: int) -> list[str]:
-    return [
-        sys.executable,
-        "-m",
-        "uvicorn",
-        app_ref,
-        "--host",
-        "127.0.0.1",
-        "--port",
-        str(port),
-        "--loop",
-        "uvloop",
-        "--http",
-        "httptools",
-        "--no-access-log",
-    ]
+    subprocess.run(docker_build_command(image), cwd=Path.cwd(), check=True)
 
 
 def start_server(
     *,
     mode: str,
-    server: str,
     runner: str,
     port: int,
     temp_dir: Path,
@@ -675,8 +614,8 @@ def start_server(
         env["VAULT_BENCH_SINK_HASH"] = "1" if sink_checksum else "0"
         env["VAULT_BENCH_SINK_WRITE"] = "1" if sink_write else "0"
         env["VAULT_BENCH_ROUTES"] = "1" if mode == RUST_SINK_MODE else "0"
-        command = direct_server_command(mode, server, port, rust_bin)
-    return subprocess.Popen(  # noqa: S603 - argv is fixed by this benchmark script.
+        command = rust_server_command(rust_bin)
+    return subprocess.Popen(
         command,
         cwd=Path.cwd(),
         env=env,
@@ -685,70 +624,53 @@ def start_server(
     )
 
 
-def direct_server_command(
-    mode: str,
-    server: str,
-    port: int,
-    rust_bin: Path | None,
-) -> list[str]:
-    if mode == PYTHON_SINK_MODE:
-        command = uvicorn_command("scripts.bench_transfers:sink_app", port)
-    elif mode == RUST_SINK_MODE:
-        command = rust_server_command(rust_bin)
-    elif server == "python":
-        command = uvicorn_command("app.main:app", port)
-    else:
-        command = rust_server_command(rust_bin)
-    return command
-
-
-async def benchmark_sink_case(
+def benchmark_sink_case(
     *,
-    base_url: str,
+    host: str,
+    port: int,
     case: BenchCase,
     body_block: bytes,
     client_rate_mib: float | None,
     sink_checksum: bool,
-    mode: str = PYTHON_SINK_MODE,
-    server: str = "asgi-sink",
-    path: str = "/sink",
 ) -> CaseResult:
     file_size = case.file_mib * MIB
     total_mib = case.users * case.file_mib
-    timeout = httpx.Timeout(300.0, connect=10.0)
-    limits = httpx.Limits(max_connections=max(100, case.users * case.workers * 2))
+    part_size = case.chunk_mib * MIB if case.chunk_mib else min(32 * MIB, file_size)
     part_durations: list[float] = []
+    lock = threading.Lock()
     started = time.perf_counter()
-    async with httpx.AsyncClient(base_url=base_url, timeout=timeout, limits=limits) as client:
 
-        async def upload_one(index: int) -> None:
-            del index
-            part_size = case.chunk_mib * MIB if case.chunk_mib else min(32 * MIB, file_size)
-            semaphore = asyncio.Semaphore(case.workers)
+    def put_part(size: int) -> None:
+        expected = repeated_sha256(size, body_block) if sink_checksum else None
+        t0 = time.perf_counter()
+        response = request_bytes(
+            host,
+            port,
+            "PUT",
+            "/api/bench/sink",
+            headers={"Content-Length": str(size)},
+            body=repeated_body(size, body_block, client_rate_mib),
+        )
+        elapsed = time.perf_counter() - t0
+        raise_for_status(response, "sink upload")
+        if sink_checksum and response.json()["sha256"] != expected:
+            raise AssertionError("sink checksum mismatch")
+        with lock:
+            part_durations.append(elapsed)
 
-            async def put_part(offset: int) -> None:
-                size = min(part_size, file_size - offset)
-                expected = repeated_sha256(size, body_block) if sink_checksum else None
-                async with semaphore:
-                    t0 = time.perf_counter()
-                    response = await client.put(
-                        path,
-                        headers={"Content-Length": str(size)},
-                        content=repeated_body(size, body_block, client_rate_mib),
-                    )
-                    part_durations.append(time.perf_counter() - t0)
-                    response.raise_for_status()
-                    if sink_checksum and response.json()["sha256"] != expected:
-                        raise AssertionError("sink checksum mismatch")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=case.users * case.workers) as executor:
+        futures = []
+        for _ in range(case.users):
+            for offset in range(0, file_size, part_size):
+                futures.append(executor.submit(put_part, min(part_size, file_size - offset)))
+        for future in concurrent.futures.as_completed(futures):
+            future.result()
 
-            await asyncio.gather(*(put_part(offset) for offset in range(0, file_size, part_size)))
-
-        await asyncio.gather(*(upload_one(index) for index in range(case.users)))
     upload_wall = time.perf_counter() - started
     return CaseResult(
         name=case.name,
-        mode=mode,
-        server=server,
+        mode=RUST_SINK_MODE,
+        server="rust",
         users=case.users,
         file_mib=case.file_mib,
         workers=case.workers,
@@ -771,121 +693,148 @@ async def benchmark_sink_case(
     )
 
 
-async def benchmark_app_case(
+def benchmark_app_case(
     *,
-    base_url: str,
+    host: str,
+    port: int,
     case: BenchCase,
     body_block: bytes,
     part_checksum: bool,
     client_rate_mib: float | None,
-    server: str,
 ) -> CaseResult:
     file_size = case.file_mib * MIB
     total_mib = case.users * case.file_mib
-    timeout = httpx.Timeout(300.0, connect=10.0)
-    limits = httpx.Limits(max_connections=max(100, case.users * case.workers * 2))
-    part_sha_cache: dict[int, str] = {}
     final_sha = repeated_sha256(file_size, body_block)
+    part_sha_cache: dict[int, str] = {}
     part_durations: list[float] = []
     part_started_at: list[float] = []
     part_finished_at: list[float] = []
     complete_started_at: list[float] = []
     complete_finished_at: list[float] = []
     doc_ids: list[tuple[int, dict[str, str]]] = []
+    lock = threading.Lock()
     started = time.perf_counter()
 
-    async with httpx.AsyncClient(base_url=base_url, timeout=timeout, limits=limits) as client:
+    def upload_user(index: int) -> None:
+        headers = auth_headers(f"bench{index}")
+        session_response = json_request(
+            host,
+            port,
+            "POST",
+            "/api/uploads",
+            headers=headers,
+            payload={
+                "filename": f"bench-{index}-{case.file_mib}m.bin",
+                "folder": "",
+                "mime_type": "application/octet-stream",
+                "mode": "create",
+                "size_bytes": file_size,
+                "client_upload_parallelism": case.workers,
+            },
+        )
+        raise_for_status(session_response, "create upload session")
+        session = session_response.json()
+        session_id = session["id"]
+        token = session["upload_token"]
+        chunk_size = int(session["chunk_size"])
 
-        async def upload_user(index: int) -> None:
-            headers = auth_headers(f"bench{index}")
-            session_response = await client.post(
-                "/api/uploads",
-                headers=headers,
-                json={
-                    "filename": f"bench-{index}-{case.file_mib}m.bin",
-                    "folder": "",
-                    "mime_type": "application/octet-stream",
-                    "mode": "create",
-                    "size_bytes": file_size,
-                    "client_upload_parallelism": case.workers,
-                },
+        def put_part(part_number: int, offset: int, size: int) -> None:
+            part_headers = {
+                "Content-Type": "application/octet-stream",
+                "Content-Length": str(size),
+                "X-Upload-Offset": str(offset),
+                "X-Upload-Size": str(size),
+                "X-Upload-Token": token,
+            }
+            if part_checksum:
+                part_headers["X-Upload-Sha256"] = part_sha_cache.setdefault(
+                    size,
+                    repeated_sha256(size, body_block),
+                )
+            t0 = time.perf_counter()
+            response = request_bytes(
+                host,
+                port,
+                "PUT",
+                f"/api/uploads/{session_id}/parts/{part_number}",
+                headers=part_headers,
+                body=repeated_body(size, body_block, client_rate_mib),
             )
-            session_response.raise_for_status()
-            session = session_response.json()
-            session_id = session["id"]
-            token = session["upload_token"]
-            chunk_size = int(session["chunk_size"])
-            semaphore = asyncio.Semaphore(case.workers)
+            elapsed = time.perf_counter() - t0
+            raise_for_status(response, f"upload part {part_number}")
+            with lock:
+                part_durations.append(elapsed)
 
-            async def put_part(part_number: int, offset: int, size: int) -> None:
-                async with semaphore:
-                    headers = {
-                        "Content-Type": "application/octet-stream",
-                        "Content-Length": str(size),
-                        "X-Upload-Offset": str(offset),
-                        "X-Upload-Size": str(size),
-                        "X-Upload-Token": token,
-                    }
-                    if part_checksum:
-                        headers["X-Upload-Sha256"] = part_sha_cache.setdefault(
-                            size,
-                            repeated_sha256(size, body_block),
-                        )
-                    t0 = time.perf_counter()
-                    response = await client.put(
-                        f"/api/uploads/{session_id}/parts/{part_number}",
-                        headers=headers,
-                        content=repeated_body(size, body_block, client_rate_mib),
-                    )
-                    part_durations.append(time.perf_counter() - t0)
-                    response.raise_for_status()
-
-            tasks = []
+        part_started = time.perf_counter()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=case.workers) as executor:
+            futures = []
             for part_number, offset in enumerate(range(0, file_size, chunk_size), start=1):
                 size = min(chunk_size, file_size - offset)
-                tasks.append(asyncio.create_task(put_part(part_number, offset, size)))
-            part_started_at.append(time.perf_counter())
-            await asyncio.gather(*tasks)
-            part_finished_at.append(time.perf_counter())
-            complete_started_at.append(time.perf_counter())
-            complete_response = await client.post(
-                f"/api/uploads/{session_id}/complete",
-                headers=headers,
-                json={"sha256": final_sha},
-            )
-            complete_finished_at.append(time.perf_counter())
-            complete_response.raise_for_status()
+                futures.append(executor.submit(put_part, part_number, offset, size))
+            for future in concurrent.futures.as_completed(futures):
+                future.result()
+        part_finished = time.perf_counter()
+
+        complete_started = time.perf_counter()
+        complete_response = json_request(
+            host,
+            port,
+            "POST",
+            f"/api/uploads/{session_id}/complete",
+            headers=headers,
+            payload={"sha256": final_sha},
+        )
+        complete_finished = time.perf_counter()
+        raise_for_status(complete_response, "complete upload session")
+        with lock:
+            part_started_at.append(part_started)
+            part_finished_at.append(part_finished)
+            complete_started_at.append(complete_started)
+            complete_finished_at.append(complete_finished)
             doc_ids.append((int(complete_response.json()["id"]), headers))
 
-        await asyncio.gather(*(upload_user(index) for index in range(case.users)))
-        upload_wall = time.perf_counter() - started
-        download_started = time.perf_counter()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=case.users) as executor:
+        futures = [executor.submit(upload_user, index) for index in range(case.users)]
+        for future in concurrent.futures.as_completed(futures):
+            future.result()
 
-        async def download_doc(doc_id: int, headers: dict[str, str]) -> int:
+    upload_wall = time.perf_counter() - started
+    download_started = time.perf_counter()
+
+    def download_doc(doc_id: int, headers: dict[str, str]) -> int:
+        conn = http.client.HTTPConnection(host, port, timeout=300.0)
+        try:
+            conn.putrequest("GET", f"/documents/{doc_id}/download", skip_accept_encoding=True)
+            for key, value in headers.items():
+                conn.putheader(key, value)
+            conn.putheader("Connection", "close")
+            conn.endheaders()
+            response = conn.getresponse()
+            if not 200 <= response.status < 300:
+                body = response.read().decode("utf-8", "replace")
+                raise RuntimeError(f"download {doc_id} failed with HTTP {response.status}: {body}")
             total = 0
-            async with client.stream(
-                "GET",
-                f"/documents/{doc_id}/download",
-                headers=headers,
-            ) as response:
-                response.raise_for_status()
-                async for chunk in response.aiter_bytes():
-                    total += len(chunk)
+            while chunk := response.read(DEFAULT_BODY_BLOCK_BYTES):
+                total += len(chunk)
             return total
+        finally:
+            conn.close()
 
-        downloaded_sizes = await asyncio.gather(
-            *(download_doc(doc_id, headers) for doc_id, headers in doc_ids),
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, case.users)) as executor:
+        downloaded_sizes = list(
+            executor.map(lambda item: download_doc(item[0], item[1]), doc_ids),
         )
-        download_wall = time.perf_counter() - download_started
+    download_wall = time.perf_counter() - download_started
     expected_download = case.users * file_size
     if sum(downloaded_sizes) != expected_download:
         raise AssertionError("download size mismatch")
+
     part_wall = max(part_finished_at) - min(part_started_at)
     complete_wall = max(complete_finished_at) - min(complete_started_at)
     return CaseResult(
         name=case.name,
         mode="app",
-        server=server,
+        server="rust",
         users=case.users,
         file_mib=case.file_mib,
         workers=case.workers,
@@ -908,9 +857,8 @@ async def benchmark_app_case(
     )
 
 
-async def run_case(
+def run_case(
     mode: str,
-    server: str,
     case: BenchCase,
     body_block: bytes,
     *,
@@ -924,15 +872,15 @@ async def run_case(
     startup_timeout: float,
 ) -> CaseResult:
     with tempfile.TemporaryDirectory(prefix="vault-transfer-bench-") as tmp:
+        temp_dir = Path(tmp)
         if runner == "docker":
-            Path(tmp).chmod(0o777)
+            temp_dir.chmod(0o777)
         port = free_port()
         proc = start_server(
             mode=mode,
-            server=server,
             runner=runner,
             port=port,
-            temp_dir=Path(tmp),
+            temp_dir=temp_dir,
             chunk_mib=case.chunk_mib,
             sink_checksum=sink_checksum,
             sink_write=sink_write,
@@ -940,28 +888,25 @@ async def run_case(
             docker_image=docker_image,
         )
         try:
-            base_url = f"http://127.0.0.1:{port}"
-            await wait_health(base_url, proc, startup_timeout)
+            wait_health("127.0.0.1", port, proc, startup_timeout)
             before_usage = process_usage(proc.pid)
-            if mode in {PYTHON_SINK_MODE, RUST_SINK_MODE}:
-                result = await benchmark_sink_case(
-                    base_url=base_url,
+            if mode == RUST_SINK_MODE:
+                result = benchmark_sink_case(
+                    host="127.0.0.1",
+                    port=port,
                     case=case,
                     body_block=body_block,
                     client_rate_mib=client_rate_mib,
                     sink_checksum=sink_checksum,
-                    mode=mode,
-                    server="rust" if mode == RUST_SINK_MODE else "asgi-sink",
-                    path="/api/bench/sink" if mode == RUST_SINK_MODE else "/sink",
                 )
             else:
-                result = await benchmark_app_case(
-                    base_url=base_url,
+                result = benchmark_app_case(
+                    host="127.0.0.1",
+                    port=port,
                     case=case,
                     body_block=body_block,
                     part_checksum=part_checksum,
                     client_rate_mib=client_rate_mib,
-                    server=server,
                 )
             return with_process_usage(result, before_usage, process_usage(proc.pid))
         finally:
@@ -999,26 +944,24 @@ def print_result(result: CaseResult) -> None:
     )
 
 
-async def run() -> dict[str, Any]:
+def run() -> dict[str, Any]:
     args = parse_args()
-    if args.runner == "docker" and (args.mode != "app" or args.server != "rust"):
-        raise SystemExit("--runner=docker currently supports only --mode=app --server=rust")
+    if args.runner == "docker" and args.mode != "app":
+        raise SystemExit("--runner=docker currently supports only --mode=app")
     if args.runner == "docker" and args.docker_build:
         build_docker_image(args.docker_image)
     cases_by_name = default_cases()
     selected = [cases_by_name[name] for name in (args.case or cases_by_name)]
     if args.workers is not None:
         selected = [replace(case, workers=max(1, args.workers)) for case in selected]
-    modes = ("app", PYTHON_SINK_MODE) if args.mode == "both" else (args.mode,)
+    modes = ("app", RUST_SINK_MODE) if args.mode == "both" else (args.mode,)
     body_block = b"x" * max(1, args.body_block_kib * 1024)
     results: list[CaseResult] = []
     thresholds = configured_thresholds(args)
     for mode in modes:
         for case in selected:
-            server = "asgi-sink" if mode == PYTHON_SINK_MODE else args.server
-            result = await run_case(
+            result = run_case(
                 mode,
-                server,
                 case,
                 body_block,
                 part_checksum=args.part_checksum,
@@ -1039,7 +982,7 @@ async def run() -> dict[str, Any]:
         "body_block_kib": args.body_block_kib,
         "client_rate_mib": args.client_rate_mib,
         "part_checksum": args.part_checksum,
-        "app_server": args.server,
+        "app_server": "rust",
         "runner": args.runner,
         "docker_image": args.docker_image if args.runner == "docker" else None,
         "sink_checksum": not args.sink_no_checksum,
@@ -1060,4 +1003,4 @@ async def run() -> dict[str, Any]:
 
 
 if __name__ == "__main__":
-    asyncio.run(run())
+    run()

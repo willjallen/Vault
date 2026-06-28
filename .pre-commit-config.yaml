@@ -12,73 +12,8 @@ repos:
       - id: check-json
       - id: check-added-large-files
 
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.15.20
-    hooks:
-      - id: ruff-format
-        args: ["--config", "pyproject.toml", "--check"]
-      - id: ruff
-        args: ["--config", "pyproject.toml", "--exit-non-zero-on-fix"]
-
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v2.1.0
-    hooks:
-      - id: mypy
-        files: ^app/
-        args: ["--config-file", "pyproject.toml"]
-        additional_dependencies:
-          - fastapi==0.138.1
-          - starlette==1.3.1
-          - uvicorn[standard]==0.49.0
-          - SQLAlchemy==2.0.51
-          - sqlalchemy[mypy]==2.0.51
-          - python-multipart==0.0.32
-          - jinja2==3.1.6
-          - boto3==1.43.36
-          - joserfc==1.7.1
-
-  - repo: https://github.com/PyCQA/bandit
-    rev: 1.9.4
-    hooks:
-      - id: bandit
-        args:
-          [
-            "-r",
-            "app",
-            "-x",
-            "app/static",
-            "--severity-level",
-            "low",
-            "--confidence-level",
-            "low",
-          ]
-        pass_filenames: false
-
-  - repo: https://github.com/pypa/pip-audit
-    rev: v2.10.1
-    hooks:
-      - id: pip-audit
-        args:
-          [
-            "-r",
-            "requirements.txt",
-            "-r",
-            "requirements-dev.txt",
-            "--strict",
-            "--progress-spinner=off",
-          ]
-
   - repo: local
     hooks:
-      - id: pip-check
-        name: pip check
-        entry: bash
-        language: system
-        pass_filenames: false
-        always_run: true
-        args:
-          - "-c"
-          - ".venv/bin/python -m pip check"
       - id: build-assets
         name: build frontend assets
         entry: bash
@@ -88,15 +23,6 @@ repos:
         args:
           - "-c"
           - "npm run build:assets"
-      - id: unit-tests
-        name: python unit tests
-        entry: bash
-        language: system
-        pass_filenames: false
-        always_run: true
-        args:
-          - "-c"
-          - ".venv/bin/python -m unittest discover -s tests"
       - id: cargo-fmt
         name: cargo fmt
         entry: bash
@@ -114,7 +40,7 @@ repos:
         always_run: true
         args:
           - "-c"
-          - ".venv/bin/python scripts/check_rust_test_layout.py"
+          - "scripts/check-rust-test-layout.sh"
       - id: cargo-clippy
         name: cargo clippy
         entry: bash

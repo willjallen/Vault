@@ -2,13 +2,7 @@
 .git/
 .github/
 .local/
-.mypy_cache/
 .npm/
-.pytest_cache/
-.ruff_cache/
-.venv/
-__pycache__/
-*.py[cod]
 node_modules/
 target/
 app/static/dist/

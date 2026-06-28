@@ -1,18 +1,16 @@
 """Authentication and canonical Vault identity helpers."""
 
 import base64
-import binascii
 import datetime as dt
 import hashlib
 import hmac
 import json
-import math
 import os
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, TypedDict, cast
+from typing import TypedDict
 
 from fastapi import Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse
@@ -20,7 +18,6 @@ from joserfc import jwk, jwt
 from joserfc.errors import JoseError
 from joserfc.jwt import JWTClaimsRegistry
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .config import (
@@ -44,13 +41,11 @@ from .config import (
     OIDC_USERNAME_CLAIM,
     PUBLIC_URL,
     SESSION_COOKIE_NAME,
-    SESSION_COOKIE_SECURE,
     SESSION_MAX_AGE_SECONDS,
     SESSION_SECRET,
     new_token_urlsafe,
-    oidc_url_uses_secure_transport,
 )
-from .db import SessionLocal, get_db
+from .db import get_db
 from .models import Folder, FolderPermission, VaultGroup, VaultGroupMembership, VaultUser
 
 LOCAL_DEV_DOMAINS = {"localhost", "127.0.0.1", "::1"}
@@ -79,12 +74,11 @@ def configure_auth(
     bootstrap_admin_emails: set[str] | None = None,
     session_secret: str | None = None,
     session_cookie_name: str | None = None,
-    session_cookie_secure: str | None = None,
     session_max_age_seconds: int | None = None,
 ) -> None:
     """Configure process-local auth globals."""
     global ADMIN_GROUPS, AUTH_MODE, BOOTSTRAP_ADMIN_EMAILS
-    global SESSION_COOKIE_NAME, SESSION_COOKIE_SECURE, SESSION_MAX_AGE_SECONDS, SESSION_SECRET
+    global SESSION_COOKIE_NAME, SESSION_MAX_AGE_SECONDS, SESSION_SECRET
 
     from . import config
 
@@ -99,8 +93,6 @@ def configure_auth(
         SESSION_SECRET = session_secret
     if session_cookie_name is not None:
         SESSION_COOKIE_NAME = session_cookie_name.strip() or "vault_session"
-    if session_cookie_secure is not None:
-        SESSION_COOKIE_SECURE = session_cookie_secure.strip().lower() or "auto"
     if session_max_age_seconds is not None:
         SESSION_MAX_AGE_SECONDS = session_max_age_seconds
 
@@ -112,7 +104,6 @@ def configure_auth(
     config.BOOTSTRAP_ADMIN_EMAILS = BOOTSTRAP_ADMIN_EMAILS
     config.SESSION_SECRET = SESSION_SECRET
     config.SESSION_COOKIE_NAME = SESSION_COOKIE_NAME
-    config.SESSION_COOKIE_SECURE = SESSION_COOKIE_SECURE
     config.SESSION_MAX_AGE_SECONDS = SESSION_MAX_AGE_SECONDS
 
 
@@ -157,38 +148,21 @@ def _verify_payload(value: str | None) -> dict[str, object] | None:
     if not value or "." not in value:
         return None
     body, signature = value.rsplit(".", 1)
-    try:
-        body_bytes = body.encode("ascii")
-        signature.encode("ascii")
-    except UnicodeEncodeError:
-        return None
-    expected = hmac.new(SESSION_SECRET.encode("utf-8"), body_bytes, hashlib.sha256)
+    expected = hmac.new(SESSION_SECRET.encode("utf-8"), body.encode("ascii"), hashlib.sha256)
     if not hmac.compare_digest(_b64encode(expected.digest()), signature):
         return None
     try:
         payload = json.loads(_b64decode(body))
-    except (binascii.Error, UnicodeDecodeError, ValueError, json.JSONDecodeError):
-        return None
-    if not isinstance(payload, dict):
+    except (ValueError, json.JSONDecodeError):
         return None
     expires_at = payload.get("exp")
-    if (
-        isinstance(expires_at, bool)
-        or not isinstance(expires_at, int | float)
-        or not math.isfinite(float(expires_at))
-        or float(expires_at) < time.time()
-    ):
+    if isinstance(expires_at, int | float) and expires_at < time.time():
         return None
-    return payload
+    return payload if isinstance(payload, dict) else None
 
 
 def _cookie_secure(request: Request) -> bool:
-    mode = SESSION_COOKIE_SECURE.strip().lower()
-    if mode in {"1", "true", "yes", "on"}:
-        return True
-    if mode in {"0", "false", "no", "off"}:
-        return False
-    return request.url.scheme == "https" or PUBLIC_URL.lower().startswith("https://")
+    return request.url.scheme == "https"
 
 
 def _safe_redirect(value: str | None) -> str:
@@ -220,23 +194,7 @@ def _vault_group_names(user_id: int, db: Session) -> list[str]:
     )
 
 
-def vault_user_is_effective_admin(
-    user: VaultUser,
-    db: Session,
-    group_names: set[str] | list[str] | tuple[str, ...] | None = None,
-) -> bool:
-    if user.is_admin:
-        return True
-    groups = (
-        {group.strip().lower() for group in group_names if group.strip()}
-        if group_names is not None
-        else {group.strip().lower() for group in _vault_group_names(user.id, db) if group.strip()}
-    )
-    return _admin_hint(user.email, groups)
-
-
 def _context_for_user(user: VaultUser, db: Session) -> UserContext:
-    groups = _vault_group_names(user.id, db)
     return {
         "id": str(user.id),
         "vault_user_id": user.id,
@@ -244,8 +202,8 @@ def _context_for_user(user: VaultUser, db: Session) -> UserContext:
         "subject": user.subject,
         "name": user.name,
         "email": user.email or "",
-        "groups": groups,
-        "is_admin": vault_user_is_effective_admin(user, db, groups),
+        "groups": _vault_group_names(user.id, db),
+        "is_admin": bool(user.is_admin),
     }
 
 
@@ -299,7 +257,7 @@ def _sync_vault_groups(db: Session, user: VaultUser, groups: set[str]) -> None:
             db.add(VaultGroupMembership(user_id=user.id, group_id=group_id))
 
 
-def _upsert_vault_user_once(
+def _upsert_vault_user(
     db: Session,
     issuer: str,
     subject: str,
@@ -330,56 +288,28 @@ def _upsert_vault_user_once(
             subject=subject,
             email=email,
             name=display_name,
-            is_admin=False,
+            is_admin=admin_hint,
             is_active=True,
             last_login_at=now if mark_login else None,
             last_seen_at=now,
         )
         db.add(user)
     else:
-        if not user.is_active:
-            raise HTTPException(status_code=403, detail="User is disabled")
         user.email = email
         user.name = display_name
         user.last_seen_at = now
         if mark_login:
             user.last_login_at = now
+        if admin_hint:
+            user.is_admin = True
     db.flush()
     if groups is not None:
         _sync_vault_groups(db, user, groups)
     db.commit()
     db.refresh(user)
+    if not user.is_active:
+        raise HTTPException(status_code=403, detail="User is disabled")
     return user
-
-
-def _upsert_vault_user(
-    db: Session,
-    issuer: str,
-    subject: str,
-    email: str | None,
-    name: str | None,
-    groups: set[str] | None = None,
-    admin_hint: bool = False,
-    mark_login: bool = False,
-) -> VaultUser:
-    for attempt in range(2):
-        try:
-            return _upsert_vault_user_once(
-                db,
-                issuer,
-                subject,
-                email,
-                name,
-                groups=groups,
-                admin_hint=admin_hint,
-                mark_login=mark_login,
-            )
-        except IntegrityError:
-            db.rollback()
-            if attempt == 0:
-                continue
-            raise
-    raise HTTPException(status_code=500, detail="Could not sync user identity")
 
 
 def _dev_identity(db: Session) -> UserContext | None:
@@ -437,7 +367,7 @@ def _header_identity(request: Request, db: Session) -> UserContext:
 def _session_identity(request: Request, db: Session) -> UserContext | None:
     payload = _verify_payload(request.cookies.get(SESSION_COOKIE_NAME))
     user_id = payload.get("uid") if payload else None
-    if isinstance(user_id, bool) or not isinstance(user_id, int):
+    if not isinstance(user_id, int):
         return None
     user = db.execute(select(VaultUser).where(VaultUser.id == user_id)).scalars().first()
     if not user or not user.is_active:
@@ -448,7 +378,7 @@ def _session_identity(request: Request, db: Session) -> UserContext | None:
 
 
 def _auth_required(request: Request) -> None:
-    if AUTH_MODE == "oidc" and request.method == "GET" and not request.url.path.startswith("/api/"):
+    if AUTH_MODE == "oidc" and request.method == "GET" and request.url.path == "/":
         rd = urllib.parse.quote(_request_path_with_query(request))
         raise HTTPException(
             status_code=303,
@@ -458,7 +388,7 @@ def _auth_required(request: Request) -> None:
     raise HTTPException(status_code=401, detail="Authentication required")
 
 
-def resolve_current_user(request: Request, db: Session) -> UserContext:
+def current_user(request: Request, db: Session = Depends(get_db)) -> UserContext:
     """Resolve or JIT-create the canonical Vault user for this request."""
     if AUTH_MODE == "dev":
         user = _dev_identity(db)
@@ -473,15 +403,6 @@ def resolve_current_user(request: Request, db: Session) -> UserContext:
             return user
         _auth_required(request)
     raise HTTPException(status_code=500, detail=f"Unsupported auth mode: {AUTH_MODE}")
-
-
-def current_user(request: Request, db: Session = Depends(get_db)) -> UserContext:
-    return resolve_current_user(request, db)
-
-
-def current_user_snapshot(request: Request) -> UserContext:
-    with SessionLocal() as db:
-        return resolve_current_user(request, db)
 
 
 def require_admin(user: UserContext = Depends(current_user)) -> UserContext:
@@ -501,13 +422,8 @@ def _oidc_discovery() -> dict[str, object]:
     if not OIDC_ISSUER or not OIDC_CLIENT_ID:
         raise HTTPException(status_code=500, detail="OIDC is not configured")
     cached_config = _DISCOVERY_CACHE.get("config")
-    expires_at = _DISCOVERY_CACHE.get("expires_at", 0)
-    if (
-        isinstance(cached_config, dict)
-        and isinstance(expires_at, int | float)
-        and float(expires_at) > time.time()
-    ):
-        return cached_config
+    if cached_config and float(_DISCOVERY_CACHE.get("expires_at", 0)) > time.time():
+        return cached_config  # type: ignore[return-value]
     config = _http_json(f"{OIDC_ISSUER}/.well-known/openid-configuration")
     _DISCOVERY_CACHE["config"] = config
     _DISCOVERY_CACHE["expires_at"] = time.time() + OIDC_DISCOVERY_TTL_SECONDS
@@ -522,16 +438,10 @@ def _http_json(
     parsed_url = urllib.parse.urlparse(url)
     if parsed_url.scheme not in {"http", "https"}:
         raise HTTPException(status_code=502, detail="OIDC provider URL is invalid")
-    if not oidc_url_uses_secure_transport(url):
-        raise HTTPException(status_code=502, detail="OIDC provider URL must use HTTPS")
     body = urllib.parse.urlencode(data).encode("utf-8") if data is not None else None
     request = urllib.request.Request(url, data=body, headers=headers or {})  # noqa: S310
     try:
-        # OIDC URLs are restricted to http/https before this request.
-        with urllib.request.urlopen(  # noqa: S310  # nosec B310
-            request,
-            timeout=OIDC_HTTP_TIMEOUT_SECONDS,
-        ) as response:
+        with urllib.request.urlopen(request, timeout=OIDC_HTTP_TIMEOUT_SECONDS) as response:  # noqa: S310
             parsed = json.loads(response.read().decode("utf-8"))
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=502, detail="OIDC provider request failed") from exc
@@ -547,8 +457,6 @@ def oidc_login_response(request: Request) -> RedirectResponse:
     authorization_endpoint = str(discovery.get("authorization_endpoint") or "")
     if not authorization_endpoint:
         raise HTTPException(status_code=500, detail="OIDC authorization endpoint is missing")
-    if not oidc_url_uses_secure_transport(authorization_endpoint):
-        raise HTTPException(status_code=502, detail="OIDC authorization endpoint must use HTTPS")
 
     state = new_token_urlsafe()
     nonce = new_token_urlsafe()
@@ -596,7 +504,7 @@ def _exchange_code_for_token(
     headers = {"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"}
     if OIDC_CLIENT_AUTH == "client_secret_post":
         form["client_secret"] = OIDC_CLIENT_SECRET
-    elif OIDC_CLIENT_AUTH == "client_secret_basic" and OIDC_CLIENT_SECRET:
+    elif OIDC_CLIENT_SECRET:
         credentials = f"{OIDC_CLIENT_ID}:{OIDC_CLIENT_SECRET}".encode()
         headers["Authorization"] = f"Basic {base64.b64encode(credentials).decode('ascii')}"
     return _http_json(token_endpoint, form, headers)
@@ -613,7 +521,7 @@ def _verified_id_claims(
     try:
         token = jwt.decode(
             id_token,
-            jwk.KeySet.import_key_set(cast(Any, _http_json(jwks_uri))),
+            jwk.KeySet.import_key_set(_http_json(jwks_uri)),
             algorithms=["RS256", "RS384", "RS512", "ES256", "ES384", "ES512"],
         )
         claims = dict(token.claims)

@@ -22,3 +22,6 @@ opt-level = 3
 
 [profile.dev.package.sha2-asm]
 opt-level = 3
+
+[profile.dev.package.crc]
+opt-level = 3

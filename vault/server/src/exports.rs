@@ -33,11 +33,15 @@ const ZIP_DOS_DATE_1980_01_01: u16 = 33;
 const ZIP_VERSION_DEFLATE: u16 = 20;
 const ZIP_VERSION_ZIP64: u16 = 45;
 const ZIP64_EXTRA_FIELD_ID: u16 = 0x0001;
+const ZIP_GENERAL_PURPOSE_DATA_DESCRIPTOR: u16 = 1 << 3;
 const ZIP_FIELD_U16_MAX: usize = u16::MAX as usize;
 const ZIP_FIELD_U32_MAX: u64 = u32::MAX as u64;
 const EXPORT_ZIP_COMPRESSION_THRESHOLD_BYTES: i64 = 3 * 1024 * 1024 * 1024;
 const EXPORT_ZIP_COMPRESSLEVEL: u32 = 1;
 const EXPORT_CANCEL_CHECK_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+const EXPORT_STREAM_CHUNK_BYTES: u64 = 64 * 1024 * 1024;
+const EXPORT_STREAM_STORED_ENTRY_BYTES: i64 = 64 * 1024 * 1024;
+const EXPORT_PROGRESS_UPDATE_BYTES: i64 = 32 * 1024 * 1024;
 const EXPORT_COMPRESSION_SAMPLE_BYTES: usize = 1024 * 1024;
 const EXPORT_COMPRESSION_MIN_RATIO_NUMERATOR: usize = 98;
 const EXPORT_COMPRESSION_MIN_RATIO_DENOMINATOR: usize = 100;
@@ -334,6 +338,30 @@ struct ZipEntryMeta {
     compressed_size: u64,
     uncompressed_size: u64,
     local_header_offset: u64,
+    uses_data_descriptor: bool,
+}
+
+#[derive(Debug)]
+struct ExportZipArtifact {
+    path: PathBuf,
+    digest: String,
+    size_bytes: u64,
+}
+
+struct ZipWriteContext<'a> {
+    pool: &'a SqlitePool,
+    storage: &'a dyn BlobStorageBackend,
+    job_id: &'a str,
+    file: &'a mut fs::File,
+    zip_hasher: &'a mut Sha256,
+    offset: &'a mut u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ZipCompressionPlan {
+    Stored,
+    Deflated,
+    Sample,
 }
 
 #[doc(hidden)]
@@ -364,6 +392,7 @@ pub fn zip_header_probe(input: ZipHeaderProbeInput<'_>) -> Result<ZipHeaderProbe
         0,
         input.compressed_size,
         input.uncompressed_size,
+        false,
     )?;
     let central_directory_header = central_directory_header(&ZipEntryMeta {
         name: input.name.to_string(),
@@ -372,6 +401,7 @@ pub fn zip_header_probe(input: ZipHeaderProbeInput<'_>) -> Result<ZipHeaderProbe
         compressed_size: input.compressed_size,
         uncompressed_size: input.uncompressed_size,
         local_header_offset: input.local_header_offset,
+        uses_data_descriptor: false,
     })?;
     let end_of_central_directory = end_of_central_directory(
         input.entry_count,
@@ -779,7 +809,7 @@ async fn complete_export_job(
     // Python's empty-folder behavior, and normal export jobs can lose readable
     // descendants before the worker rechecks state. Finish those as empty ZIPs.
     update_export_totals(pool, job_id, &downloads).await?;
-    let temp_path = match create_export_zip(
+    let artifact = match create_export_zip(
         pool,
         storage,
         transfers_path,
@@ -789,7 +819,7 @@ async fn complete_export_job(
     )
     .await
     {
-        Ok(temp_path) => temp_path,
+        Ok(artifact) => artifact,
         Err(error) => {
             let _ = fs::remove_file(export_temp_path(transfers_path, job_id)).await;
             return Err(error);
@@ -803,8 +833,8 @@ async fn complete_export_job(
     .execute(pool)
     .await?;
     ensure_export_not_cancelled(pool, job_id).await?;
-    let result = persist_export_artifact(pool, storage, job_id, &temp_path).await;
-    let _ = fs::remove_file(&temp_path).await;
+    let result = persist_export_artifact(pool, storage, job_id, &artifact).await;
+    let _ = fs::remove_file(&artifact.path).await;
     if result.is_ok() {
         record_export_events(pool, &downloads, &work.user).await?;
     }
@@ -1032,7 +1062,7 @@ async fn ensure_export_not_cancelled(pool: &SqlitePool, job_id: &str) -> Result<
     }
 }
 
-async fn record_export_progress(
+async fn record_export_entry_progress(
     pool: &SqlitePool,
     job_id: &str,
     processed_bytes: i64,
@@ -1055,6 +1085,52 @@ async fn record_export_progress(
     Ok(())
 }
 
+async fn record_export_byte_progress(
+    pool: &SqlitePool,
+    job_id: &str,
+    processed_bytes: i64,
+) -> Result<(), ExportError> {
+    if processed_bytes <= 0 {
+        return Ok(());
+    }
+    ensure_export_not_cancelled(pool, job_id).await?;
+    sqlx::query(
+        r"
+        UPDATE export_jobs
+        SET processed_bytes = CASE
+                WHEN processed_bytes + ? > total_bytes THEN total_bytes
+                ELSE processed_bytes + ?
+            END,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+          AND status = 'running'
+        ",
+    )
+    .bind(processed_bytes)
+    .bind(processed_bytes)
+    .bind(job_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn record_export_item_complete(pool: &SqlitePool, job_id: &str) -> Result<(), ExportError> {
+    ensure_export_not_cancelled(pool, job_id).await?;
+    sqlx::query(
+        r"
+        UPDATE export_jobs
+        SET processed_items = processed_items + 1,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+          AND status = 'running'
+        ",
+    )
+    .bind(job_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 async fn create_export_zip(
     pool: &SqlitePool,
     storage: &dyn BlobStorageBackend,
@@ -1062,7 +1138,7 @@ async fn create_export_zip(
     job_id: &str,
     downloads: &[VersionDownload],
     zip_options: ExportZipOptions,
-) -> Result<PathBuf, ExportError> {
+) -> Result<ExportZipArtifact, ExportError> {
     // Export ZIPs are derived transfer artifacts, not canonical document state. Build them in
     // transfer scratch space first, then promote only the completed archive into blob storage.
     fs::create_dir_all(transfers_path.join("exports")).await?;
@@ -1086,54 +1162,34 @@ async fn create_export_zip(
             archive_name = safe_zip_entry_name(&format!("{}-{archive_name}", download.document_id));
             written_names.insert(archive_name.clone());
         }
-        let data = storage
-            .read_location_bytes(&download.backend, &download.bucket, &download.object_key)
-            .await?;
-        verify_download_bytes(download, &data)?;
-        let crc32 = Crc::<u32>::new(&CRC_32_ISO_HDLC).checksum(&data);
-        let size_bytes = u64::try_from(data.len()).map_err(|_| ExportError::ZipLimitExceeded)?;
-        let compression = export_entry_compression(
-            &archive_name,
-            download,
-            &data,
-            total_export_bytes,
-            zip_options,
-        )?;
-        let entry_data = match compression {
-            ZipCompression::Stored => data,
-            ZipCompression::Deflated => deflate_bytes(&data, zip_options.compresslevel)?,
-        };
-        let compressed_size =
-            u64::try_from(entry_data.len()).map_err(|_| ExportError::ZipLimitExceeded)?;
-        let local_header_offset = offset;
-        let local_header = local_file_header(
-            &archive_name,
-            compression,
-            crc32,
-            compressed_size,
-            size_bytes,
-        )?;
-        write_counted(&mut file, &mut zip_hasher, &mut offset, &local_header).await?;
-        // A single large ZIP entry can dominate an export. Check cancellation between
-        // payload chunks so cancelling a job does not wait for the whole file to finish.
-        write_counted_checked(
+        let compression_plan =
+            export_entry_compression_plan(&archive_name, download, total_export_bytes, zip_options);
+        let mut write_context = ZipWriteContext {
             pool,
+            storage,
             job_id,
-            &mut file,
-            &mut zip_hasher,
-            &mut offset,
-            &entry_data,
-        )
-        .await?;
-        entries.push(ZipEntryMeta {
-            name: archive_name,
-            compression,
-            crc32,
-            compressed_size,
-            uncompressed_size: size_bytes,
-            local_header_offset,
-        });
-        record_export_progress(pool, job_id, download.size_bytes).await?;
+            file: &mut file,
+            zip_hasher: &mut zip_hasher,
+            offset: &mut offset,
+        };
+        let entry = match compression_plan {
+            ZipCompressionPlan::Stored if should_stream_stored_entry(download) => {
+                write_stored_zip_entry_streaming(&mut write_context, &archive_name, download)
+                    .await?
+            }
+            _ => {
+                write_buffered_zip_entry(
+                    &mut write_context,
+                    &archive_name,
+                    download,
+                    compression_plan,
+                    total_export_bytes,
+                    zip_options,
+                )
+                .await?
+            }
+        };
+        entries.push(entry);
     }
 
     ensure_export_not_cancelled(pool, job_id).await?;
@@ -1152,7 +1208,169 @@ async fn create_export_zip(
     )?;
     write_counted(&mut file, &mut zip_hasher, &mut offset, &end_record).await?;
     file.flush().await?;
-    Ok(temp_path)
+    Ok(ExportZipArtifact {
+        path: temp_path,
+        digest: lower_hex(&zip_hasher.finalize()),
+        size_bytes: offset,
+    })
+}
+
+async fn write_buffered_zip_entry(
+    context: &mut ZipWriteContext<'_>,
+    archive_name: &str,
+    download: &VersionDownload,
+    compression_plan: ZipCompressionPlan,
+    total_export_bytes: i64,
+    zip_options: ExportZipOptions,
+) -> Result<ZipEntryMeta, ExportError> {
+    let data = context
+        .storage
+        .read_location_bytes(&download.backend, &download.bucket, &download.object_key)
+        .await?;
+    verify_download_bytes(download, &data)?;
+    let crc32 = Crc::<u32>::new(&CRC_32_ISO_HDLC).checksum(&data);
+    let size_bytes = u64::try_from(data.len()).map_err(|_| ExportError::ZipLimitExceeded)?;
+    let compression = match compression_plan {
+        ZipCompressionPlan::Stored => ZipCompression::Stored,
+        ZipCompressionPlan::Deflated => ZipCompression::Deflated,
+        ZipCompressionPlan::Sample => {
+            sampled_zip_compression(&data, total_export_bytes, zip_options)?
+        }
+    };
+    let entry_data = match compression {
+        ZipCompression::Stored => data,
+        ZipCompression::Deflated => deflate_bytes(&data, zip_options.compresslevel)?,
+    };
+    let compressed_size =
+        u64::try_from(entry_data.len()).map_err(|_| ExportError::ZipLimitExceeded)?;
+    let local_header_offset = *context.offset;
+    let local_header = local_file_header(
+        archive_name,
+        compression,
+        crc32,
+        compressed_size,
+        size_bytes,
+        false,
+    )?;
+    write_counted(
+        context.file,
+        context.zip_hasher,
+        context.offset,
+        &local_header,
+    )
+    .await?;
+    // Buffered entries are intentionally limited to small or explicitly compressed
+    // files. Check cancellation between chunks so one entry cannot wedge a job.
+    write_counted_checked(
+        context.pool,
+        context.job_id,
+        context.file,
+        context.zip_hasher,
+        context.offset,
+        &entry_data,
+    )
+    .await?;
+    record_export_entry_progress(context.pool, context.job_id, download.size_bytes).await?;
+    Ok(ZipEntryMeta {
+        name: archive_name.to_string(),
+        compression,
+        crc32,
+        compressed_size,
+        uncompressed_size: size_bytes,
+        local_header_offset,
+        uses_data_descriptor: false,
+    })
+}
+
+async fn write_stored_zip_entry_streaming(
+    context: &mut ZipWriteContext<'_>,
+    archive_name: &str,
+    download: &VersionDownload,
+) -> Result<ZipEntryMeta, ExportError> {
+    let expected_size =
+        u64::try_from(download.size_bytes).map_err(|_| ExportError::ZipLimitExceeded)?;
+    let local_header_offset = *context.offset;
+    let local_header = local_file_header(
+        archive_name,
+        ZipCompression::Stored,
+        0,
+        expected_size,
+        expected_size,
+        true,
+    )?;
+    write_counted(
+        context.file,
+        context.zip_hasher,
+        context.offset,
+        &local_header,
+    )
+    .await?;
+
+    let crc = Crc::<u32>::new(&CRC_32_ISO_HDLC);
+    let mut crc_digest = crc.digest();
+    let mut source_hasher = Sha256::new();
+    let mut source_offset = 0_u64;
+    let mut pending_progress = 0_i64;
+    while source_offset < expected_size {
+        ensure_export_not_cancelled(context.pool, context.job_id).await?;
+        let remaining = expected_size - source_offset;
+        let read_len = remaining.min(EXPORT_STREAM_CHUNK_BYTES);
+        let end = source_offset
+            .checked_add(read_len)
+            .and_then(|value| value.checked_sub(1))
+            .ok_or(ExportError::ZipLimitExceeded)?;
+        let chunk = context
+            .storage
+            .read_location_range(
+                &download.backend,
+                &download.bucket,
+                &download.object_key,
+                source_offset,
+                end,
+            )
+            .await?;
+        if u64::try_from(chunk.len()).map_err(|_| ExportError::ZipLimitExceeded)? != read_len {
+            return Err(ExportError::BlobContentMismatch);
+        }
+        crc_digest.update(&chunk);
+        source_hasher.update(&chunk);
+        write_counted(context.file, context.zip_hasher, context.offset, &chunk).await?;
+        source_offset = source_offset
+            .checked_add(read_len)
+            .ok_or(ExportError::ZipLimitExceeded)?;
+        pending_progress = pending_progress
+            .checked_add(i64::try_from(read_len).map_err(|_| ExportError::ZipLimitExceeded)?)
+            .ok_or(ExportError::ZipLimitExceeded)?;
+        if pending_progress >= EXPORT_PROGRESS_UPDATE_BYTES || source_offset == expected_size {
+            record_export_byte_progress(context.pool, context.job_id, pending_progress).await?;
+            pending_progress = 0;
+        }
+        tokio::task::yield_now().await;
+    }
+
+    let digest = lower_hex(&source_hasher.finalize());
+    if download.hash_algo != "sha256" || digest != download.hash {
+        return Err(ExportError::BlobContentMismatch);
+    }
+    let crc32 = crc_digest.finalize();
+    let descriptor = data_descriptor(crc32, expected_size, expected_size)?;
+    write_counted(
+        context.file,
+        context.zip_hasher,
+        context.offset,
+        &descriptor,
+    )
+    .await?;
+    record_export_item_complete(context.pool, context.job_id).await?;
+    Ok(ZipEntryMeta {
+        name: archive_name.to_string(),
+        compression: ZipCompression::Stored,
+        crc32,
+        compressed_size: expected_size,
+        uncompressed_size: expected_size,
+        local_header_offset,
+        uses_data_descriptor: true,
+    })
 }
 
 fn export_temp_path(transfers_path: &Path, job_id: &str) -> PathBuf {
@@ -1165,12 +1383,12 @@ async fn persist_export_artifact(
     pool: &SqlitePool,
     storage: &dyn BlobStorageBackend,
     job_id: &str,
-    temp_path: &Path,
+    artifact: &ExportZipArtifact,
 ) -> Result<(), ExportError> {
     ensure_export_not_cancelled(pool, job_id).await?;
-    let (digest, size_bytes) = hash_file(temp_path).await?;
-    ensure_export_not_cancelled(pool, job_id).await?;
-    let stored = storage.put_file(temp_path, &digest, size_bytes).await?;
+    let stored = storage
+        .put_file(&artifact.path, &artifact.digest, artifact.size_bytes)
+        .await?;
     if let Err(error) = ensure_export_not_cancelled(pool, job_id).await {
         cleanup_unreferenced_export_object(pool, storage, &stored).await;
         return Err(error);
@@ -1383,24 +1601,6 @@ async fn get_or_create_blob(pool: &SqlitePool, stored: &StoredBlob) -> Result<i6
     Ok(blob_id)
 }
 
-async fn hash_file(path: &Path) -> Result<(String, u64), ExportError> {
-    let mut file = fs::File::open(path).await?;
-    let mut hasher = Sha256::new();
-    let mut size_bytes = 0_u64;
-    let mut buffer = vec![0_u8; crate::storage::STORAGE_CHUNK_SIZE];
-    loop {
-        let read = tokio::io::AsyncReadExt::read(&mut file, &mut buffer).await?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-        size_bytes = size_bytes
-            .checked_add(u64::try_from(read).map_err(|_| ExportError::ZipLimitExceeded)?)
-            .ok_or(ExportError::ZipLimitExceeded)?;
-    }
-    Ok((lower_hex(&hasher.finalize()), size_bytes))
-}
-
 async fn mark_export_failed(
     pool: &SqlitePool,
     job_id: &str,
@@ -1533,23 +1733,29 @@ fn verify_download_bytes(download: &VersionDownload, data: &[u8]) -> Result<(), 
     Ok(())
 }
 
-fn export_entry_compression(
+fn export_entry_compression_plan(
     archive_name: &str,
     download: &VersionDownload,
-    data: &[u8],
     total_export_bytes: i64,
     options: ExportZipOptions,
-) -> Result<ZipCompression, ExportError> {
+) -> ZipCompressionPlan {
     if !export_zip_compression_enabled(total_export_bytes, options) {
-        return Ok(ZipCompression::Stored);
+        return ZipCompressionPlan::Stored;
     }
     if export_entry_is_known_stored(archive_name, download.mime_type.as_deref()) {
-        return Ok(ZipCompression::Stored);
+        return ZipCompressionPlan::Stored;
     }
     if export_entry_is_known_compressible(archive_name, download.mime_type.as_deref()) {
-        return Ok(ZipCompression::Deflated);
+        return ZipCompressionPlan::Deflated;
     }
-    sampled_zip_compression(data, options.compresslevel)
+    if download.size_bytes >= EXPORT_STREAM_STORED_ENTRY_BYTES {
+        return ZipCompressionPlan::Stored;
+    }
+    ZipCompressionPlan::Sample
+}
+
+fn should_stream_stored_entry(download: &VersionDownload) -> bool {
+    download.size_bytes >= EXPORT_STREAM_STORED_ENTRY_BYTES
 }
 
 fn export_zip_compression_enabled(total_bytes: i64, options: ExportZipOptions) -> bool {
@@ -1574,13 +1780,20 @@ fn export_entry_is_known_stored(archive_name: &str, mime_type: Option<&str>) -> 
         || EXPORT_STORED_EXTENSIONS.contains(&extension.as_str())
 }
 
-fn sampled_zip_compression(data: &[u8], compresslevel: u32) -> Result<ZipCompression, ExportError> {
+fn sampled_zip_compression(
+    data: &[u8],
+    total_export_bytes: i64,
+    options: ExportZipOptions,
+) -> Result<ZipCompression, ExportError> {
+    if !export_zip_compression_enabled(total_export_bytes, options) {
+        return Ok(ZipCompression::Stored);
+    }
     if data.is_empty() {
         return Ok(ZipCompression::Stored);
     }
     let sample_len = data.len().min(EXPORT_COMPRESSION_SAMPLE_BYTES);
     let sample = &data[..sample_len];
-    let compressed = zlib_bytes(sample, compresslevel)?;
+    let compressed = zlib_bytes(sample, options.compresslevel)?;
     if compressed.len()
         <= sample.len() * EXPORT_COMPRESSION_MIN_RATIO_NUMERATOR
             / EXPORT_COMPRESSION_MIN_RATIO_DENOMINATOR
@@ -1645,10 +1858,11 @@ fn local_file_header(
     crc32: u32,
     compressed_size: u64,
     uncompressed_size: u64,
+    uses_data_descriptor: bool,
 ) -> Result<Vec<u8>, ExportError> {
     let name_bytes = name.as_bytes();
     let needs_zip64 = zip64_sizes_needed(compressed_size, uncompressed_size);
-    let extra = if needs_zip64 {
+    let extra = if needs_zip64 && !uses_data_descriptor {
         zip64_extra_field(&[uncompressed_size, compressed_size])?
     } else {
         Vec::new()
@@ -1663,13 +1877,25 @@ fn local_file_header(
             ZIP_VERSION_DEFLATE
         },
     );
-    push_u16(&mut header, 0);
+    push_u16(
+        &mut header,
+        if uses_data_descriptor {
+            ZIP_GENERAL_PURPOSE_DATA_DESCRIPTOR
+        } else {
+            0
+        },
+    );
     push_u16(&mut header, compression.method_code());
     push_u16(&mut header, 0);
     push_u16(&mut header, ZIP_DOS_DATE_1980_01_01);
-    push_u32(&mut header, crc32);
-    push_zip_u32_or_zip64(&mut header, compressed_size, needs_zip64)?;
-    push_zip_u32_or_zip64(&mut header, uncompressed_size, needs_zip64)?;
+    push_u32(&mut header, if uses_data_descriptor { 0 } else { crc32 });
+    if uses_data_descriptor {
+        push_zip_u32_or_zip64(&mut header, 0, needs_zip64)?;
+        push_zip_u32_or_zip64(&mut header, 0, needs_zip64)?;
+    } else {
+        push_zip_u32_or_zip64(&mut header, compressed_size, needs_zip64)?;
+        push_zip_u32_or_zip64(&mut header, uncompressed_size, needs_zip64)?;
+    }
     push_u16(&mut header, checked_zip_u16(name_bytes.len())?);
     push_u16(&mut header, checked_zip_u16(extra.len())?);
     header.extend_from_slice(name_bytes);
@@ -1707,7 +1933,14 @@ fn central_directory_header(entry: &ZipEntryMeta) -> Result<Vec<u8>, ExportError
             ZIP_VERSION_DEFLATE
         },
     );
-    push_u16(&mut header, 0);
+    push_u16(
+        &mut header,
+        if entry.uses_data_descriptor {
+            ZIP_GENERAL_PURPOSE_DATA_DESCRIPTOR
+        } else {
+            0
+        },
+    );
     push_u16(&mut header, entry.compression.method_code());
     push_u16(&mut header, 0);
     push_u16(&mut header, ZIP_DOS_DATE_1980_01_01);
@@ -1773,6 +2006,25 @@ fn end_of_central_directory(
     push_zip_u32_or_zip64(&mut record, central_directory_offset, needs_zip64)?;
     push_u16(&mut record, 0);
     Ok(record)
+}
+
+fn data_descriptor(
+    crc32: u32,
+    compressed_size: u64,
+    uncompressed_size: u64,
+) -> Result<Vec<u8>, ExportError> {
+    let uses_zip64 = zip64_sizes_needed(compressed_size, uncompressed_size);
+    let mut descriptor = Vec::with_capacity(if uses_zip64 { 24 } else { 16 });
+    push_u32(&mut descriptor, 0x0807_4b50);
+    push_u32(&mut descriptor, crc32);
+    if uses_zip64 {
+        push_u64(&mut descriptor, compressed_size);
+        push_u64(&mut descriptor, uncompressed_size);
+    } else {
+        push_u32(&mut descriptor, checked_zip_u32(compressed_size)?);
+        push_u32(&mut descriptor, checked_zip_u32(uncompressed_size)?);
+    }
+    Ok(descriptor)
 }
 
 async fn write_counted(

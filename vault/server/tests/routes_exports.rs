@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -304,6 +305,77 @@ impl BlobStorageBackend for CancelAfterReadStorage {
             }
         });
         Ok(bytes)
+    }
+}
+
+#[derive(Debug)]
+struct BlockAfterProgressRangeStorage {
+    inner: LocalBlobStorage,
+    range_reads: Arc<AtomicUsize>,
+    entered_after_progress: Arc<Notify>,
+    release_range: Arc<Notify>,
+}
+
+#[async_trait]
+impl BlobStorageBackend for BlockAfterProgressRangeStorage {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn bucket(&self) -> &str {
+        self.inner.bucket()
+    }
+
+    async fn ensure(&self) -> Result<(), StorageError> {
+        self.inner.ensure().await
+    }
+
+    async fn put_bytes(&self, data: &[u8]) -> Result<StoredBlob, StorageError> {
+        self.inner.put_bytes(data).await
+    }
+
+    async fn put_file(
+        &self,
+        source_path: &Path,
+        digest: &str,
+        size_bytes: u64,
+    ) -> Result<StoredBlob, StorageError> {
+        self.inner.put_file(source_path, digest, size_bytes).await
+    }
+
+    async fn put_part_files(
+        &self,
+        part_paths: &[PathBuf],
+        expected_digest: Option<&str>,
+    ) -> Result<StoredBlob, StorageError> {
+        self.inner.put_part_files(part_paths, expected_digest).await
+    }
+
+    async fn read_bytes(&self, object_key: &str) -> Result<Vec<u8>, StorageError> {
+        self.inner.read_bytes(object_key).await
+    }
+
+    async fn read_range(
+        &self,
+        object_key: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<u8>, StorageError> {
+        let bytes = self.inner.read_range(object_key, start, end).await?;
+        let reads = self.range_reads.fetch_add(1, Ordering::SeqCst) + 1;
+        if reads == 2 {
+            self.entered_after_progress.notify_one();
+            self.release_range.notified().await;
+        }
+        Ok(bytes)
+    }
+
+    async fn list_object_keys(&self) -> Result<Vec<String>, StorageError> {
+        self.inner.list_object_keys().await
+    }
+
+    async fn delete_object(&self, object_key: &str) -> Result<(), StorageError> {
+        self.inner.delete_object(object_key).await
     }
 }
 
@@ -1847,6 +1919,84 @@ async fn cancelled_export_during_large_entry_write_cleans_partial_zip() {
             .join(format!("{job_id}.zip.tmp")),
     )
     .await;
+}
+
+#[tokio::test]
+async fn large_stored_export_reports_byte_progress_before_entry_finishes() {
+    let (mut state, _temp_dir) = test_state().await;
+    let entered_after_progress = Arc::new(Notify::new());
+    let release_range = Arc::new(Notify::new());
+    state.storage = Arc::new(BlockAfterProgressRangeStorage {
+        inner: LocalBlobStorage::new(state.config.objects_path(), &state.config.storage_prefix),
+        range_reads: Arc::new(AtomicUsize::new(0)),
+        entered_after_progress: entered_after_progress.clone(),
+        release_range: release_range.clone(),
+    });
+    let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
+        .await
+        .expect("root");
+    let data = vec![b'x'; 65 * 1024 * 1024];
+    let document_id = insert_stored_document_with_mime(
+        &state.db,
+        &state.storage,
+        root.id,
+        "large.bin",
+        &data,
+        "application/octet-stream",
+    )
+    .await;
+    let pool = state.db.clone();
+    let app = http::router(state);
+
+    let response = app
+        .oneshot(authed_json_post(
+            "/api/exports",
+            "admin",
+            "vault-admin",
+            &json!({"items": [{"type": "document", "id": document_id}]}),
+        ))
+        .await
+        .expect("export response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let job_id = response_json(response).await["id"]
+        .as_str()
+        .expect("job id")
+        .to_string();
+
+    timeout(Duration::from_secs(5), entered_after_progress.notified())
+        .await
+        .expect("export should report progress before finishing the large entry");
+    let progress = sqlx::query_as::<_, (String, i64, i64, i64)>(
+        r"
+        SELECT status, processed_items, processed_bytes, total_bytes
+        FROM export_jobs
+        WHERE id = ?
+        ",
+    )
+    .bind(&job_id)
+    .fetch_one(&pool)
+    .await
+    .expect("export progress");
+    assert_eq!(progress.0, "running");
+    assert_eq!(progress.1, 0);
+    assert!(progress.2 >= 32 * 1024 * 1024, "{progress:?}");
+    assert!(progress.2 < progress.3, "{progress:?}");
+
+    release_range.notify_one();
+    wait_for_export_status_in_db(&pool, &job_id, "complete").await;
+    let completed = sqlx::query_as::<_, (i64, i64, i64)>(
+        r"
+        SELECT processed_items, processed_bytes, total_bytes
+        FROM export_jobs
+        WHERE id = ?
+        ",
+    )
+    .bind(&job_id)
+    .fetch_one(&pool)
+    .await
+    .expect("completed export progress");
+    assert_eq!(completed.0, 1);
+    assert_eq!(completed.1, completed.2);
 }
 
 #[tokio::test]

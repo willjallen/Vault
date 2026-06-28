@@ -11,6 +11,7 @@ const DOWNLOAD_WRITE_BACKPRESSURE_BYTES = 512 * 1024 * 1024;
 const EXPORT_POLL_MS = 900;
 const PROGRESS_TICK_MS = 80;
 const VERIFICATION_POLL_MS = 240;
+const SERVER_PROGRESS_RATE_MIN_BYTES = 1024 * 1024;
 
 export class TransferCancelledError extends Error {
   constructor(message = "Transfer cancelled") {
@@ -45,10 +46,12 @@ async function errorFromResponse(response, fallback) {
 
 function progressFromValues(loaded, total, startedAt, options = {}) {
   const elapsedSeconds = Math.max((performance.now() - startedAt) / 1000, 0.01);
-  const bytesPerSecond = loaded / elapsedSeconds;
+  const suppressRate =
+    options.stage === "preparing" && loaded > 0 && loaded < SERVER_PROGRESS_RATE_MIN_BYTES;
+  const bytesPerSecond = suppressRate ? 0 : loaded / elapsedSeconds;
   const finalizing = options.stage === "finalizing" || options.stage === "server-finalizing";
   const etaSeconds =
-    total && bytesPerSecond > 0 && loaded < total && !finalizing
+    total && bytesPerSecond > 0 && loaded < total && !finalizing && !suppressRate
       ? (total - loaded) / bytesPerSecond
       : null;
   return {
@@ -957,13 +960,19 @@ export async function exportAndDownload({
       },
       "Could not start export"
     );
+    const exportStartedAt = performance.now();
     let current = job;
     while (!["complete", "failed", "cancelled"].includes(current.status)) {
       throwIfAborted(signal);
       onProgress(
-        progressFromValues(current.processed_bytes || 0, current.total_bytes || null, startedAt, {
-          stage: current.status === "finalizing" ? "server-finalizing" : "preparing",
-        })
+        progressFromValues(
+          current.processed_bytes || 0,
+          current.total_bytes || null,
+          exportStartedAt,
+          {
+            stage: current.status === "finalizing" ? "server-finalizing" : "preparing",
+          }
+        )
       );
       await waitFor(EXPORT_POLL_MS, signal);
       current = await requestJson(`/api/exports/${job.id}`, { signal }, "Could not refresh export");

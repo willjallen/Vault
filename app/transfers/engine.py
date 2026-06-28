@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 import queue
 import tempfile
 import threading
@@ -11,6 +12,7 @@ from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from starlette.types import Receive
 
@@ -33,13 +35,12 @@ BufferItem = bytes | None
 @dataclass
 class _PartSpoolResult:
     path: Path
-    sha256: str
+    sha256: str | None
     size_bytes: int
 
 
 @dataclass
 class _AssemblyState:
-    path: Path
     condition: threading.Condition = field(
         default_factory=lambda: threading.Condition(threading.RLock()),
     )
@@ -147,6 +148,7 @@ class TransferEngine:
             _write_part_buffers,
             buffers,
             self.store.tmp_dir(session_id),
+            expected_sha256 is not None,
         )
 
         async def enqueue(item: BufferItem) -> None:
@@ -188,6 +190,7 @@ class TransferEngine:
             _write_part_buffers,
             buffers,
             self.store.tmp_dir(session_id),
+            expected_sha256 is not None,
         )
 
         async def enqueue(item: BufferItem) -> None:
@@ -245,7 +248,7 @@ class TransferEngine:
             if state.sha256 is None:
                 raise InvalidTransferPart("Upload assembly is incomplete")
             return CompletedAssembly(
-                path=state.path,
+                part_paths=tuple(self.store.part_paths(session.id, session.part_count)),
                 size_bytes=state.size_bytes,
                 sha256=state.sha256,
             )
@@ -254,9 +257,7 @@ class TransferEngine:
         with self._lock:
             state = self._assemblies.get(session.id)
             if state is None:
-                path = self.store.session_dir(session.id) / "assembled.tmp"
-                path.unlink(missing_ok=True)
-                state = _AssemblyState(path=path)
+                state = _AssemblyState()
                 self._assemblies[session.id] = state
             return state
 
@@ -274,7 +275,12 @@ class TransferEngine:
                 part = self.store.get_part(session.id, part_number)
                 if part is None:
                     break
-                written = _append_part_to_assembly(state.path, part.path, state.digest)
+                # Completed local uploads are committed as verified part
+                # manifests. This worker only walks contiguous parts in file
+                # order to compute the canonical whole-file digest; it avoids
+                # rewriting bytes that the part PUT path has already durably
+                # accepted.
+                written = _hash_part_for_assembly(part.path, state.digest)
                 with state.condition:
                     state.size_bytes += written
                     state.next_part_number += 1
@@ -349,6 +355,7 @@ async def _signal_part_writer_stop(
 def _write_part_buffers(
     buffers: queue.Queue[BufferItem],
     temp_dir: Path,
+    hash_part: bool,
 ) -> _PartSpoolResult:
     temp_dir.mkdir(parents=True, exist_ok=True)
     temp_file = tempfile.NamedTemporaryFile(
@@ -357,15 +364,17 @@ def _write_part_buffers(
         delete=False,
     )
     temp_path = Path(temp_file.name)
-    digest = hashlib.sha256()
+    digest = hashlib.sha256() if hash_part else None
     size_bytes = 0
-    pending = bytearray()
+    pending: list[bytes] = []
+    pending_size = 0
 
     def flush_pending() -> None:
-        nonlocal pending
+        nonlocal pending, pending_size
         if pending:
-            temp_file.write(pending)
-            pending = bytearray()
+            _write_pending_buffers(temp_file.fileno(), temp_file, pending)
+            pending = []
+            pending_size = 0
 
     try:
         with temp_file:
@@ -373,18 +382,20 @@ def _write_part_buffers(
                 item = buffers.get()
                 if item is None:
                     break
-                digest.update(item)
-                # Coalesce body chunks in the worker thread, not in the event
-                # loop. This keeps the route task focused on socket ingress and
-                # lets OpenSSL hashing and filesystem writes run off-loop.
-                pending.extend(item)
+                if digest is not None:
+                    digest.update(item)
+                # Batch existing ASGI body buffers in the worker thread. On
+                # POSIX, writev avoids an extra Python bytearray copy before
+                # the filesystem write; the route task stays focused on ingress.
+                pending.append(item)
                 size_bytes += len(item)
-                if len(pending) >= INGEST_BUFFER_BYTES:
+                pending_size += len(item)
+                if pending_size >= INGEST_BUFFER_BYTES:
                     flush_pending()
             flush_pending()
         return _PartSpoolResult(
             path=temp_path,
-            sha256=digest.hexdigest(),
+            sha256=digest.hexdigest() if digest is not None else None,
             size_bytes=size_bytes,
         )
     except Exception:
@@ -392,19 +403,37 @@ def _write_part_buffers(
         raise
 
 
-def _append_part_to_assembly(
-    target_path: Path,
+def _write_pending_buffers(fd: int, fallback_file: Any, buffers: list[bytes]) -> None:
+    if hasattr(os, "writev"):
+        _writev_all(fd, buffers)
+        return
+    for item in buffers:
+        fallback_file.write(item)
+
+
+def _writev_all(fd: int, buffers: list[bytes]) -> None:
+    pending: list[memoryview] = [memoryview(item) for item in buffers if item]
+    while pending:
+        written = os.writev(fd, pending)
+        if written <= 0:
+            raise OSError("writev wrote no bytes")
+        while pending and written >= len(pending[0]):
+            written -= len(pending[0])
+            pending.pop(0)
+        if pending and written:
+            pending[0] = pending[0][written:]
+
+
+def _hash_part_for_assembly(
     part_path: Path,
     digest: hashlib._Hash,
 ) -> int:
-    written = 0
-    target_path.parent.mkdir(parents=True, exist_ok=True)
-    with part_path.open("rb") as source, target_path.open("ab") as output:
+    processed = 0
+    with part_path.open("rb") as source:
         while True:
             chunk = source.read(ASSEMBLY_READ_BYTES)
             if not chunk:
                 break
             digest.update(chunk)
-            output.write(chunk)
-            written += len(chunk)
-    return written
+            processed += len(chunk)
+    return processed

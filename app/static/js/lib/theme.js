@@ -47,10 +47,10 @@ function readHostPaletteOverride() {
 }
 
 function normalizeBooleanPreference(value, fallback) {
-  if (value === true || value === "true") {
+  if (value === true) {
     return true;
   }
-  if (value === false || value === "false") {
+  if (value === false) {
     return false;
   }
   return fallback;

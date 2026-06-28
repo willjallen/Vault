@@ -3,6 +3,8 @@
 import datetime
 import errno
 import hashlib
+import json
+import os
 import shutil
 import threading
 import uuid
@@ -31,6 +33,7 @@ from .config import (
 storage_lock = threading.Lock()
 FILES_LOCK_PATH = OBJECTS_PATH / ".vault-storage.lock"
 STORAGE_CHUNK_SIZE = 1024 * 1024
+LOCAL_MULTIPART_FORMAT = "vault.local.multipart.v1"
 
 msvcrt: Any = None
 try:
@@ -68,6 +71,21 @@ class StoredBlob:
     backend: str
     bucket: str
     object_key: str
+
+
+@dataclass(frozen=True)
+class LocalMultipartPart:
+    object_key: str
+    path: Path
+    size_bytes: int
+
+
+@dataclass(frozen=True)
+class LocalMultipartManifest:
+    hash_algo: str
+    digest: str
+    size_bytes: int
+    parts: tuple[LocalMultipartPart, ...]
 
 
 class BlobReader(Protocol):
@@ -140,6 +158,79 @@ class PathSequenceReader:
             self.current = None
 
 
+class LocalMultipartRangeReader:
+    def __init__(
+        self,
+        manifest: LocalMultipartManifest,
+        start: int,
+        end: int,
+    ) -> None:
+        self.parts = manifest.parts
+        self.remaining = max(0, end - start + 1)
+        self.part_index = 0
+        self.current: BlobReader | None = None
+        self.current_remaining = 0
+        self._seek_to_start(start)
+
+    def _seek_to_start(self, start: int) -> None:
+        skipped = 0
+        for index, part in enumerate(self.parts):
+            part_end = skipped + part.size_bytes
+            if start < part_end:
+                self.part_index = index
+                self.current = part.path.open("rb")
+                offset = start - skipped
+                if offset:
+                    cast_file = self.current
+                    seek = getattr(cast_file, "seek", None)
+                    if seek:
+                        seek(offset)
+                self.current_remaining = part.size_bytes - offset
+                return
+            skipped = part_end
+        self.part_index = len(self.parts)
+
+    def read(self, size: int = -1) -> bytes:
+        if self.remaining <= 0:
+            return b""
+        if size < 0 or size > self.remaining:
+            size = min(STORAGE_CHUNK_SIZE, self.remaining)
+        remaining = size
+        chunks: list[bytes] = []
+        while remaining > 0 and self.remaining > 0:
+            if self.current is None:
+                if self.part_index >= len(self.parts):
+                    break
+                part = self.parts[self.part_index]
+                self.current = part.path.open("rb")
+                self.current_remaining = part.size_bytes
+            read_size = min(remaining, self.remaining, self.current_remaining)
+            chunk = self.current.read(read_size)
+            if not chunk:
+                self._close_current()
+                self.part_index += 1
+                continue
+            chunks.append(chunk)
+            chunk_len = len(chunk)
+            remaining -= chunk_len
+            self.remaining -= chunk_len
+            self.current_remaining -= chunk_len
+            if self.current_remaining <= 0:
+                self._close_current()
+                self.part_index += 1
+        return b"".join(chunks)
+
+    def _close_current(self) -> None:
+        if self.current is not None:
+            close = getattr(self.current, "close", None)
+            if close:
+                close()
+            self.current = None
+
+    def close(self) -> None:
+        self._close_current()
+
+
 class BlobStorageBackend:
     name: str
     bucket: str
@@ -202,6 +293,24 @@ def object_key_for_hash(hash_algo: str, digest: str) -> str:
     return _prefixed_key(f"{hash_algo}/{digest}")
 
 
+def multipart_manifest_key_for_hash(hash_algo: str, digest: str) -> str:
+    return _prefixed_key(f"multipart/{hash_algo}/{digest}/manifest.json")
+
+
+def multipart_part_key_for_hash(hash_algo: str, digest: str, part_number: int) -> str:
+    return _prefixed_key(f"multipart/{hash_algo}/{digest}/parts/{part_number:08d}.part")
+
+
+def _is_multipart_manifest_key(object_key: str) -> bool:
+    cleaned = object_key.strip().lstrip("/").replace("\\", "/")
+    return cleaned.endswith("/manifest.json") and "/multipart/" in f"/{cleaned}"
+
+
+def _is_multipart_part_key(object_key: str) -> bool:
+    cleaned = object_key.strip().lstrip("/").replace("\\", "/")
+    return "/multipart/" in f"/{cleaned}" and "/parts/" in cleaned
+
+
 class LocalBlobStorage(BlobStorageBackend):
     name = "local"
     bucket = ""
@@ -218,6 +327,95 @@ class LocalBlobStorage(BlobStorageBackend):
         if self.root not in target.parents and target != self.root:
             raise StorageConfigurationError("Invalid object key")
         return target
+
+    def _read_multipart_manifest(self, object_key: str) -> LocalMultipartManifest:
+        manifest_path = self._object_path(object_key)
+        if not manifest_path.exists() or not manifest_path.is_file():
+            raise StorageNotFoundError("Blob missing from storage")
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise StorageError("Multipart manifest is unreadable") from exc
+        if not isinstance(payload, dict):
+            raise StorageError("Multipart manifest is invalid")
+        if payload.get("format") != LOCAL_MULTIPART_FORMAT:
+            raise StorageError("Multipart manifest format is unsupported")
+        hash_algo = str(payload.get("hash_algo") or "")
+        digest = str(payload.get("digest") or "")
+        size_bytes = int(payload.get("size_bytes") or 0)
+        raw_parts = payload.get("parts")
+        if hash_algo != "sha256" or not digest or not isinstance(raw_parts, list):
+            raise StorageError("Multipart manifest is invalid")
+        parts: list[LocalMultipartPart] = []
+        total_size = 0
+        for raw_part in raw_parts:
+            if not isinstance(raw_part, dict):
+                raise StorageError("Multipart manifest is invalid")
+            part_key = str(raw_part.get("object_key") or "")
+            part_size = int(raw_part.get("size_bytes") or 0)
+            part_path = self._object_path(part_key)
+            if part_size < 0 or not part_path.exists() or not part_path.is_file():
+                raise StorageNotFoundError("Blob missing from storage")
+            if part_path.stat().st_size != part_size:
+                raise StorageError("Multipart part size does not match manifest")
+            parts.append(
+                LocalMultipartPart(
+                    object_key=part_key,
+                    path=part_path,
+                    size_bytes=part_size,
+                ),
+            )
+            total_size += part_size
+        if total_size != size_bytes:
+            raise StorageError("Multipart manifest size is invalid")
+        return LocalMultipartManifest(
+            hash_algo=hash_algo,
+            digest=digest,
+            size_bytes=size_bytes,
+            parts=tuple(parts),
+        )
+
+    def _write_multipart_manifest(
+        self,
+        manifest_key: str,
+        *,
+        digest: str,
+        size_bytes: int,
+        part_entries: list[dict[str, object]],
+    ) -> None:
+        manifest_path = self._object_path(manifest_key)
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = manifest_path.with_name(f"{manifest_path.name}.tmp-{uuid.uuid4().hex}")
+        payload = {
+            "format": LOCAL_MULTIPART_FORMAT,
+            "hash_algo": "sha256",
+            "digest": digest,
+            "size_bytes": size_bytes,
+            "parts": part_entries,
+        }
+        try:
+            temp_path.write_text(
+                json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            temp_path.replace(manifest_path)
+        finally:
+            temp_path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _link_or_copy_part(source_path: Path, target_path: Path) -> None:
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        if target_path.exists():
+            if target_path.stat().st_size == source_path.stat().st_size:
+                return
+            raise StorageError("Multipart object part already exists with a different size")
+        try:
+            os.link(source_path, target_path)
+        except OSError as exc:
+            if exc.errno not in {errno.EXDEV, errno.EPERM, errno.EACCES}:
+                raise
+            with source_path.open("rb") as source, target_path.open("xb") as output:
+                shutil.copyfileobj(source, output, STORAGE_CHUNK_SIZE)
 
     def put_bytes(self, data: bytes, content_type: str | None = None) -> StoredBlob:
         del content_type
@@ -282,6 +480,13 @@ class LocalBlobStorage(BlobStorageBackend):
         progress_callback: StorageProgressCallback | None = None,
     ) -> StoredBlob:
         del content_type
+        paths = list(part_paths)
+        if expected_digest is not None:
+            return self._put_verified_part_manifest(
+                paths,
+                expected_digest.lower(),
+                progress_callback,
+            )
         self.ensure()
         staging_dir = self.root / ".vault-staging"
         staging_dir.mkdir(parents=True, exist_ok=True)
@@ -290,7 +495,7 @@ class LocalBlobStorage(BlobStorageBackend):
         size_bytes = 0
         try:
             with temp_path.open("xb") as output:
-                for part_path in part_paths:
+                for part_path in paths:
                     with part_path.open("rb") as source:
                         while True:
                             chunk = source.read(STORAGE_CHUNK_SIZE)
@@ -302,8 +507,6 @@ class LocalBlobStorage(BlobStorageBackend):
                             if progress_callback:
                                 progress_callback(size_bytes)
             actual_digest = digest.hexdigest()
-            if expected_digest and actual_digest != expected_digest.lower():
-                raise StorageChecksumMismatch("Upload checksum mismatch")
             object_key = object_key_for_hash("sha256", actual_digest)
             target = self._object_path(object_key)
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -323,6 +526,67 @@ class LocalBlobStorage(BlobStorageBackend):
             object_key=object_key,
         )
 
+    def _put_verified_part_manifest(
+        self,
+        part_paths: list[Path],
+        digest: str,
+        progress_callback: StorageProgressCallback | None = None,
+    ) -> StoredBlob:
+        self.ensure()
+        manifest_key = multipart_manifest_key_for_hash("sha256", digest)
+        try:
+            existing = self._read_multipart_manifest(manifest_key)
+        except StorageNotFoundError:
+            existing = None
+        if existing is not None:
+            if progress_callback:
+                progress_callback(existing.size_bytes)
+            return StoredBlob(
+                hash_algo="sha256",
+                digest=digest,
+                size_bytes=existing.size_bytes,
+                backend=self.name,
+                bucket=self.bucket,
+                object_key=manifest_key,
+            )
+
+        # The transfer engine has already read the parts in order and computed
+        # the canonical whole-file SHA-256. Local storage therefore promotes the
+        # verified part files into a content-addressed manifest instead of
+        # rewriting a second complete object during upload completion.
+        part_entries: list[dict[str, object]] = []
+        size_bytes = 0
+        staged_keys: list[str] = []
+        try:
+            for index, part_path in enumerate(part_paths, start=1):
+                part_size = part_path.stat().st_size
+                part_key = multipart_part_key_for_hash("sha256", digest, index)
+                target_path = self._object_path(part_key)
+                self._link_or_copy_part(part_path, target_path)
+                staged_keys.append(part_key)
+                part_entries.append({"object_key": part_key, "size_bytes": part_size})
+                size_bytes += part_size
+            self._write_multipart_manifest(
+                manifest_key,
+                digest=digest,
+                size_bytes=size_bytes,
+                part_entries=part_entries,
+            )
+        except Exception:
+            for part_key in staged_keys:
+                self._object_path(part_key).unlink(missing_ok=True)
+            raise
+        if progress_callback:
+            progress_callback(size_bytes)
+        return StoredBlob(
+            hash_algo="sha256",
+            digest=digest,
+            size_bytes=size_bytes,
+            backend=self.name,
+            bucket=self.bucket,
+            object_key=manifest_key,
+        )
+
     def read_bytes(self, object_key: str, bucket: str | None = None) -> bytes:
         del bucket
         with self.open_reader(object_key) as reader:
@@ -335,6 +599,18 @@ class LocalBlobStorage(BlobStorageBackend):
         bucket: str | None = None,
     ) -> Iterator[BlobReader]:
         del bucket
+        if _is_multipart_manifest_key(object_key):
+            manifest = self._read_multipart_manifest(object_key)
+            reader = LocalMultipartRangeReader(
+                manifest,
+                0,
+                max(0, manifest.size_bytes - 1),
+            )
+            try:
+                yield reader
+            finally:
+                reader.close()
+            return
         target = self._object_path(object_key)
         if not target.exists() or not target.is_file():
             raise StorageNotFoundError("Blob missing from storage")
@@ -352,6 +628,16 @@ class LocalBlobStorage(BlobStorageBackend):
         del bucket
         if start < 0 or end < start:
             raise StorageConfigurationError("Invalid byte range")
+        if _is_multipart_manifest_key(object_key):
+            manifest = self._read_multipart_manifest(object_key)
+            if end >= manifest.size_bytes:
+                raise StorageConfigurationError("Invalid byte range")
+            reader = LocalMultipartRangeReader(manifest, start, end)
+            try:
+                yield reader
+            finally:
+                reader.close()
+            return
         target = self._object_path(object_key)
         if not target.exists() or not target.is_file():
             raise StorageNotFoundError("Blob missing from storage")
@@ -365,14 +651,26 @@ class LocalBlobStorage(BlobStorageBackend):
         for path in self.root.rglob("*"):
             if not path.is_file() or path.name.startswith(".vault-storage.lock"):
                 continue
-            keys.append(str(path.relative_to(self.root)).replace("\\", "/"))
+            key = str(path.relative_to(self.root)).replace("\\", "/")
+            if key.startswith(".vault-staging/") or _is_multipart_part_key(key):
+                continue
+            keys.append(key)
         return sorted(keys)
 
     def delete_object(self, object_key: str, bucket: str | None = None) -> None:
         del bucket
+        manifest: LocalMultipartManifest | None = None
+        if _is_multipart_manifest_key(object_key):
+            try:
+                manifest = self._read_multipart_manifest(object_key)
+            except StorageNotFoundError:
+                manifest = None
         target = self._object_path(object_key)
         if target.exists() and target.is_file():
             target.unlink()
+        if manifest is not None:
+            for part in manifest.parts:
+                part.path.unlink(missing_ok=True)
 
 
 class S3CompatibleBlobStorage(BlobStorageBackend):

@@ -27,6 +27,9 @@ node_modules/
 .npm/
 app/static/dist/
 
+# Rust
+target/
+
 # Runtime data, logs, and local debug artifacts
 .docker-data/
 .local/

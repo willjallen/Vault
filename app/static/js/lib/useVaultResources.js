@@ -218,7 +218,7 @@ export function useVaultResources({
       const params = new URLSearchParams({
         folder: targetFolder || "",
         q: q || "",
-        recursive: recursive ? "1" : "0",
+        recursive: recursive ? "true" : "false",
       });
       const res = await apiFetch(`/api/folders/contents?${params.toString()}`);
       if (!background && requestId !== contentRequestRef.current) {

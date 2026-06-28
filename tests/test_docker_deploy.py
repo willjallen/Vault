@@ -157,15 +157,44 @@ class DockerDeployTests(unittest.TestCase):
             compose,
         )
         self.assertIn("VAULT_EXPORT_WORKERS: ${VAULT_EXPORT_WORKERS:-1}", compose)
+        self.assertIn("VAULT_TRANSFERS_PATH: ${VAULT_TRANSFERS_PATH:-/data/transfers}", compose)
         self.assertNotIn("/vault-metadata", compose)
         self.assertNotIn("/vault-objects", compose)
         self.assertIn("VAULT_DOCKER_RUNTIME: ${VAULT_DOCKER_RUNTIME:-1}", compose)
+        self.assertIn("VAULT_REQUIRE_SESSION_SECRET: ${VAULT_REQUIRE_SESSION_SECRET:-}", compose)
         self.assertIn("VAULT_SESSION_SECRET: ${VAULT_SESSION_SECRET:-}", compose)
+        self.assertIn(
+            "VAULT_SESSION_COOKIE_NAME: ${VAULT_SESSION_COOKIE_NAME:-vault_session}",
+            compose,
+        )
         self.assertIn("VAULT_SESSION_COOKIE_SECURE: ${VAULT_SESSION_COOKIE_SECURE:-auto}", compose)
-        self.assertIn("FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-127.0.0.1}", compose)
+        self.assertNotIn("FORWARDED_ALLOW_IPS", compose)
         self.assertIn("VAULT_GZIP_MINIMUM_SIZE: ${VAULT_GZIP_MINIMUM_SIZE:-1024}", compose)
         self.assertIn("VAULT_GZIP_COMPRESSLEVEL: ${VAULT_GZIP_COMPRESSLEVEL:-6}", compose)
+        self.assertIn("VAULT_CONTENT_SECURITY_POLICY: ${VAULT_CONTENT_SECURITY_POLICY:-}", compose)
+        self.assertIn("VAULT_HSTS_PRELOAD: ${VAULT_HSTS_PRELOAD:-0}", compose)
         self.assertIn("VAULT_AUTH_MODE: ${VAULT_AUTH_MODE:-headers}", compose)
+        self.assertIn(
+            "VAULT_OIDC_STATE_COOKIE_NAME: ${VAULT_OIDC_STATE_COOKIE_NAME:-vault_oidc_state}",
+            compose,
+        )
+        self.assertIn(
+            "VAULT_OIDC_AUTHORIZATION_ENDPOINT: ${VAULT_OIDC_AUTHORIZATION_ENDPOINT:-}",
+            compose,
+        )
+        self.assertIn(
+            "VAULT_OIDC_ALLOW_INSECURE_HTTP: ${VAULT_OIDC_ALLOW_INSECURE_HTTP:-0}",
+            compose,
+        )
+        self.assertIn("VAULT_OIDC_NONCE_BYTES: ${VAULT_OIDC_NONCE_BYTES:-24}", compose)
+        self.assertIn(
+            "VAULT_OIDC_DISCOVERY_TTL_SECONDS: ${VAULT_OIDC_DISCOVERY_TTL_SECONDS:-3600}",
+            compose,
+        )
+        self.assertIn(
+            "VAULT_OIDC_HTTP_TIMEOUT_SECONDS: ${VAULT_OIDC_HTTP_TIMEOUT_SECONDS:-8}",
+            compose,
+        )
         self.assertNotIn("VAULT_DEV_AUTH", compose)
         self.assertNotIn("dev-insecure-session-secret", compose)
 
@@ -192,20 +221,28 @@ class DockerDeployTests(unittest.TestCase):
         self.assertIn("FROM node:22-slim AS assets", dockerfile)
         self.assertIn("RUN npm ci", dockerfile)
         self.assertIn("RUN npm run build:assets", dockerfile)
+        self.assertIn("FROM rust:1.95-slim-bookworm AS rust-builder", dockerfile)
+        self.assertIn("RUN cargo build --release -p vault-server", dockerfile)
+        self.assertIn("FROM debian:bookworm-slim", dockerfile)
+        self.assertIn(
+            "COPY --from=rust-builder --chown=vault:vault "
+            "/build/target/release/vault-server /app/vault-server",
+            dockerfile,
+        )
         self.assertIn("COPY --from=assets --chown=vault:vault /build/app/static/dist", dockerfile)
         self.assertIn("VAULT_DATA_DIR=/data", dockerfile)
         self.assertIn("VAULT_DB_PATH=/data/vault.db", dockerfile)
         self.assertIn("VAULT_OBJECTS_PATH=/data/objects", dockerfile)
+        self.assertIn("VAULT_STATIC_DIR=/app/app/static", dockerfile)
         self.assertIn("VAULT_DOCKER_RUNTIME=1", dockerfile)
         self.assertIn('VOLUME ["/data"]', dockerfile)
         self.assertIn("EXPOSE 8000", dockerfile)
         self.assertIn("USER vault", dockerfile)
         self.assertIn("HEALTHCHECK", dockerfile)
-        self.assertIn(
-            'CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", '
-            '"--loop", "uvloop", "--http", "httptools", "--no-access-log"]',
-            dockerfile,
-        )
+        self.assertIn("curl -fsS --max-time 2 http://127.0.0.1:8000/health", dockerfile)
+        self.assertIn('CMD ["/app/vault-server"]', dockerfile)
+        self.assertNotIn("uvicorn", dockerfile)
+        self.assertNotIn("python:3.11", dockerfile)
         self.assertNotIn("VAULT_VERSION", dockerfile)
         self.assertNotIn("/vault-metadata", dockerfile)
         self.assertNotIn("/vault-objects", dockerfile)
@@ -215,6 +252,7 @@ class DockerDeployTests(unittest.TestCase):
         gitignore = (ROOT / ".gitignore").read_text()
 
         self.assertIn("app/static/dist/", dockerignore)
+        self.assertIn("target/", dockerignore)
         self.assertIn("app/static/dist/", gitignore)
 
     def test_semver_tag_workflow_builds_and_publishes_ghcr_image(self) -> None:

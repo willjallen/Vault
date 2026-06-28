@@ -97,6 +97,42 @@ repos:
         args:
           - "-c"
           - ".venv/bin/python -m unittest discover -s tests"
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: bash
+        language: system
+        pass_filenames: false
+        always_run: true
+        args:
+          - "-c"
+          - "cargo fmt --all -- --check"
+      - id: rust-test-layout
+        name: rust test layout
+        entry: bash
+        language: system
+        pass_filenames: false
+        always_run: true
+        args:
+          - "-c"
+          - ".venv/bin/python scripts/check_rust_test_layout.py"
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: bash
+        language: system
+        pass_filenames: false
+        always_run: true
+        args:
+          - "-c"
+          - "cargo clippy --workspace --all-targets -- -D warnings"
+      - id: cargo-test
+        name: cargo test
+        entry: bash
+        language: system
+        pass_filenames: false
+        always_run: true
+        args:
+          - "-c"
+          - "cargo test --workspace"
       - id: npm-audit
         name: npm audit
         entry: npm

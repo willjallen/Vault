@@ -10,6 +10,7 @@
 __pycache__/
 *.py[cod]
 node_modules/
+target/
 app/static/dist/
 tests/
 FINDINGS.md

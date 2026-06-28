@@ -1,5 +1,7 @@
 const UPLOAD_SESSION_STORAGE_KEY = "vault.uploadSessions";
-const UPLOAD_CONCURRENCY = 8;
+const UPLOAD_LOW_LATENCY_CONCURRENCY = 8;
+const UPLOAD_MAX_CONCURRENCY = 16;
+const UPLOAD_LOW_LATENCY_RTT_MS = 25;
 const UPLOAD_RETRY_LIMIT = 3;
 const DOWNLOAD_CONCURRENCY = 4;
 const DOWNLOAD_SEGMENT_BYTES = 64 * 1024 * 1024;
@@ -89,6 +91,40 @@ function waitFor(delay, signal) {
   });
 }
 
+export function uploadParallelismForLatency(rttMs) {
+  if (Number.isFinite(rttMs) && rttMs >= 0 && rttMs <= UPLOAD_LOW_LATENCY_RTT_MS) {
+    return UPLOAD_LOW_LATENCY_CONCURRENCY;
+  }
+  return UPLOAD_MAX_CONCURRENCY;
+}
+
+async function measureUploadControlLatency(signal) {
+  throwIfAborted(signal);
+  const startedAt = performance.now();
+  try {
+    const response = await fetch(`/health?upload_probe=${Date.now()}`, {
+      cache: "no-store",
+      credentials: "include",
+      signal,
+    });
+    await response.text().catch(() => "");
+    if (!response.ok) {
+      return null;
+    }
+    return performance.now() - startedAt;
+  } catch (error) {
+    if (isAbortError(error)) {
+      throw new TransferCancelledError();
+    }
+    return null;
+  }
+}
+
+async function resolveUploadParallelism(signal) {
+  const controlRttMs = await measureUploadControlLatency(signal);
+  return uploadParallelismForLatency(controlRttMs);
+}
+
 function readStoredUploadSessions() {
   try {
     const parsed = JSON.parse(localStorage.getItem(UPLOAD_SESSION_STORAGE_KEY) || "[]");
@@ -160,6 +196,7 @@ async function createUploadSession({
   documentId,
   note,
   renameToUpload,
+  uploadParallelism,
   signal,
 }) {
   return requestJson(
@@ -175,6 +212,7 @@ async function createUploadSession({
         mode: mode || "create",
         note: note || "",
         rename_to_upload: Boolean(renameToUpload),
+        client_upload_parallelism: uploadParallelism,
         size_bytes: file.size,
       }),
       signal,
@@ -355,6 +393,10 @@ export async function uploadFileResumable({
   const storedSessionId = storedUploadSessionId(key);
   let session = null;
   try {
+    // Upload session sizing is path-sensitive. Low-latency clients should not
+    // pay for high request fanout, but stream-limited clients need enough active
+    // PUTs to fill their uplink. The server uses this hint to choose chunk size.
+    const uploadParallelism = await resolveUploadParallelism(signal);
     session = storedSessionId ? await existingUploadSession(storedSessionId, signal) : null;
     if (!session || session.status !== "active") {
       session = await createUploadSession({
@@ -364,6 +406,7 @@ export async function uploadFileResumable({
         mode,
         note,
         renameToUpload,
+        uploadParallelism,
         signal,
       });
       rememberUploadSession(key, session.id);
@@ -433,7 +476,7 @@ export async function uploadFileResumable({
         activeParts.set(partNumber, { loaded: 0, size: chunk.size });
         emitUploadProgress({ force: true });
         try {
-          session = await uploadPart({
+          await uploadPart({
             chunk,
             onAttemptStart: () => updateActivePartProgress(partNumber, 0, { reset: true }),
             onProgress: (loaded) => updateActivePartProgress(partNumber, loaded),
@@ -450,7 +493,7 @@ export async function uploadFileResumable({
       }
     }
     await Promise.all(
-      Array.from({ length: Math.min(UPLOAD_CONCURRENCY, session.part_count) }, () => uploadWorker())
+      Array.from({ length: Math.min(uploadParallelism, session.part_count) }, () => uploadWorker())
     );
 
     const verificationStartedAt = performance.now();

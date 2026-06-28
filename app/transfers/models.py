@@ -12,7 +12,7 @@ class TransferPart:
     part_number: int
     offset: int
     size_bytes: int
-    sha256: str
+    sha256: str | None
     path: Path
 
     def payload(self) -> dict[str, object]:
@@ -38,7 +38,7 @@ class TransferProgress:
 
 @dataclass(frozen=True)
 class CompletedAssembly:
-    path: Path
+    part_paths: tuple[Path, ...]
     size_bytes: int
     sha256: str
 

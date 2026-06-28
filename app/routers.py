@@ -138,6 +138,13 @@ SHARE_CODE_PATTERN = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 TTL_ACTIONS = {"archive", "delete"}
 APPEARANCE_PALETTES = {"cozy", "winui"}
 APPEARANCE_THEMES = {"system", "light", "dark"}
+UPLOAD_MIN_ADAPTIVE_PARTS = 4
+UPLOAD_DEFAULT_ADAPTIVE_PARTS = 16
+UPLOAD_MAX_ADAPTIVE_PARTS = 16
+UPLOAD_SMALL_ADAPTIVE_MAX_BYTES = 48 * 1024 * 1024
+UPLOAD_TARGET_ADAPTIVE_CHUNK_BYTES = 8 * 1024 * 1024
+UPLOAD_MIN_ADAPTIVE_CHUNK_BYTES = 4 * 1024 * 1024
+UPLOAD_CHUNK_ROUNDING_BYTES = 1024 * 1024
 SYSTEM_USER: UserContext = {
     "id": "system",
     "vault_user_id": 0,
@@ -409,6 +416,7 @@ class UploadSessionPayload(BaseModel):
     document_id: int | None = None
     note: str | None = None
     rename_to_upload: bool = False
+    client_upload_parallelism: int | None = None
 
 
 class CompleteUploadPayload(BaseModel):
@@ -1422,11 +1430,15 @@ def put_assembled_upload_file(
         raise StorageChecksumMismatch("Upload checksum mismatch")
     if progress_callback:
         progress_callback(assembly.size_bytes)
-    stored = backend.put_file(
-        assembly.path,
-        assembly.sha256,
-        assembly.size_bytes,
+    # Upload parts are already durable before completion. Storage backends get
+    # the verified ordered part list so local storage can promote parts into a
+    # manifest without rewriting the whole file, while remote backends can still
+    # perform their own multipart/object upload as needed.
+    stored = backend.put_part_files(
+        assembly.part_paths,
         content_type,
+        assembly.sha256,
+        progress_callback,
     )
     if progress_callback:
         progress_callback(assembly.size_bytes)
@@ -1869,6 +1881,58 @@ def transfer_owner_required(owner_id: str, user: UserContext) -> None:
 
 def transfer_expires_at(seconds: int) -> dt.datetime:
     return now_utc() + dt.timedelta(seconds=seconds)
+
+
+def upload_parallelism_target(client_upload_parallelism: int | None) -> int:
+    if client_upload_parallelism is None:
+        return UPLOAD_DEFAULT_ADAPTIVE_PARTS
+    return min(
+        UPLOAD_MAX_ADAPTIVE_PARTS,
+        max(UPLOAD_MIN_ADAPTIVE_PARTS, int(client_upload_parallelism)),
+    )
+
+
+def target_upload_chunk_bytes(parallelism: int) -> int:
+    if parallelism >= UPLOAD_MAX_ADAPTIVE_PARTS:
+        return UPLOAD_TARGET_ADAPTIVE_CHUNK_BYTES
+    return max(
+        UPLOAD_TARGET_ADAPTIVE_CHUNK_BYTES,
+        (UPLOAD_TARGET_ADAPTIVE_CHUNK_BYTES * UPLOAD_MAX_ADAPTIVE_PARTS + parallelism - 1)
+        // parallelism,
+    )
+
+
+def choose_upload_chunk_size(
+    size_bytes: int,
+    client_upload_parallelism: int | None = None,
+) -> int:
+    max_chunk = max(1, TRANSFER_CHUNK_BYTES)
+    target_parallelism = upload_parallelism_target(client_upload_parallelism)
+    if size_bytes <= 0:
+        return max_chunk
+    if size_bytes <= max_chunk:
+        return max(1, size_bytes)
+    full_size_parts = (size_bytes + max_chunk - 1) // max_chunk
+    if full_size_parts >= target_parallelism:
+        return max_chunk
+    min_chunk = min(max_chunk, UPLOAD_MIN_ADAPTIVE_CHUNK_BYTES)
+    round_to = min(max_chunk, UPLOAD_CHUNK_ROUNDING_BYTES)
+    if size_bytes <= UPLOAD_SMALL_ADAPTIVE_MAX_BYTES:
+        target_parts = target_parallelism
+    else:
+        target_chunk = target_upload_chunk_bytes(target_parallelism)
+        target_parts = (size_bytes + target_chunk - 1) // target_chunk
+        target_parts = min(
+            target_parallelism,
+            max(UPLOAD_MIN_ADAPTIVE_PARTS, target_parts),
+        )
+    target_chunk = (size_bytes + target_parts - 1) // target_parts
+    rounded = ((target_chunk + round_to - 1) // round_to) * round_to
+    # Medium files otherwise create too few HTTP streams to hide per-stream
+    # ingress limits. The browser supplies a path-aware parallelism hint so low
+    # latency clients can avoid excess part fanout while stream-limited clients
+    # can create enough active requests to fill the pipe.
+    return min(max_chunk, max(min_chunk, rounded))
 
 
 def upload_session_dir(session_id: str) -> Path:
@@ -5479,7 +5543,11 @@ def create_upload_session(
             status_code=413, detail=f"Upload exceeds limit of {MAX_UPLOAD_BYTES} bytes"
         )
     mime_type = sanitize_mime_type(payload.mime_type, filename)
-    part_count = (payload.size_bytes + TRANSFER_CHUNK_BYTES - 1) // TRANSFER_CHUNK_BYTES
+    chunk_size = choose_upload_chunk_size(
+        payload.size_bytes,
+        payload.client_upload_parallelism,
+    )
+    part_count = (payload.size_bytes + chunk_size - 1) // chunk_size
     meta = client_meta(request)
     with storage_write_lock():
         if payload.mode == "create":
@@ -5515,7 +5583,7 @@ def create_upload_session(
             document_id=document_id,
             filename=filename,
             total_size=payload.size_bytes,
-            chunk_size=TRANSFER_CHUNK_BYTES,
+            chunk_size=chunk_size,
             part_count=part_count,
             mime_type=mime_type,
             note=(payload.note or "").strip() or None,
@@ -5536,7 +5604,7 @@ def create_upload_session(
                 mode=payload.mode,
                 filename=filename,
                 total_size=payload.size_bytes,
-                chunk_size=TRANSFER_CHUNK_BYTES,
+                chunk_size=chunk_size,
                 part_count=part_count,
                 expires_at=expires_at,
                 created_at=created_at,

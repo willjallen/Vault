@@ -9,30 +9,38 @@ COPY scripts ./scripts
 COPY app/static ./app/static
 RUN npm run build:assets
 
-FROM python:3.11-slim
+FROM rust:1.95-slim-bookworm AS rust-builder
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    TZ=UTC \
+WORKDIR /build
+
+COPY Cargo.toml Cargo.lock VERSION ./
+COPY crates ./crates
+RUN cargo build --release -p vault-server
+
+FROM debian:bookworm-slim
+
+ENV TZ=UTC \
     VAULT_DATA_DIR=/data \
     VAULT_DB_PATH=/data/vault.db \
     VAULT_OBJECTS_PATH=/data/objects \
+    VAULT_STATIC_DIR=/app/app/static \
     VAULT_STORAGE_BACKEND=local \
     VAULT_STORAGE_PREFIX= \
     VAULT_DOCKER_RUNTIME=1
 
 WORKDIR /app
 
-COPY requirements.txt .
-RUN pip install --root-user-action=ignore --no-cache-dir -r requirements.txt \
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/* \
     && groupadd --system vault \
     && useradd --system --gid vault --home-dir /app --shell /usr/sbin/nologin vault \
-    && mkdir -p /data \
+    && mkdir -p /data /app/app/static \
     && chown -R vault:vault /app /data
 
+COPY --from=rust-builder --chown=vault:vault /build/target/release/vault-server /app/vault-server
 COPY --chown=vault:vault VERSION /app/VERSION
-COPY --chown=vault:vault app /app/app
+COPY --chown=vault:vault app/static /app/app/static
 COPY --from=assets --chown=vault:vault /build/app/static/dist /app/app/static/dist
 
 USER vault
@@ -41,8 +49,6 @@ VOLUME ["/data"]
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).read()" || exit 1
+    CMD curl -fsS --max-time 2 http://127.0.0.1:8000/health > /dev/null || exit 1
 
-# Uploads are body-stream heavy; pin uvloop/httptools so production cannot
-# silently fall back to slower pure-Python event-loop or HTTP parser paths.
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--loop", "uvloop", "--http", "httptools", "--no-access-log"]
+CMD ["/app/vault-server"]

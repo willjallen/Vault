@@ -130,7 +130,7 @@ class FileTransferStateStore:
         temp_path: Path,
         offset: int,
         size_bytes: int,
-        sha256: str,
+        sha256: str | None,
     ) -> TransferPart:
         with self.session_lock(session_id):
             existing = self.get_part(session_id, part_number)
@@ -138,7 +138,7 @@ class FileTransferStateStore:
                 if (
                     existing.offset == offset
                     and existing.size_bytes == size_bytes
-                    and existing.sha256 == sha256
+                    and (sha256 is None or existing.sha256 == sha256)
                     and existing.path.exists()
                 ):
                     return existing
@@ -313,10 +313,11 @@ def _part_json(part: TransferPart) -> dict[str, object]:
 
 
 def _part_from_json(data: dict[str, Any], path: Path) -> TransferPart:
+    sha256 = data.get("sha256")
     return TransferPart(
         part_number=int(data["part_number"]),
         offset=int(data["offset"]),
         size_bytes=int(data["size_bytes"]),
-        sha256=str(data["sha256"]),
+        sha256=str(sha256) if sha256 else None,
         path=path,
     )

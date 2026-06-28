@@ -106,6 +106,56 @@ class StreamingTransferTests(unittest.TestCase):
                 self.assertEqual(db.query(UploadSession).count(), 0)
                 self.assertEqual(get_storage_backend("local").list_object_keys(), [])
 
+    def test_upload_session_adapts_chunk_size_for_medium_files(self) -> None:
+        headers = auth_headers("uploader", ["vault-admin"])
+
+        with vault_test_client() as ctx:
+            routers.configure_router_runtime(transfer_chunk_bytes=32 * 1024 * 1024)
+
+            def create_session(
+                size_bytes: int,
+                client_upload_parallelism: int | None = None,
+            ) -> dict[str, object]:
+                payload = {
+                    "filename": f"asset-{size_bytes}.bin",
+                    "folder": "",
+                    "mime_type": "application/octet-stream",
+                    "mode": "create",
+                    "size_bytes": size_bytes,
+                }
+                if client_upload_parallelism is not None:
+                    payload["client_upload_parallelism"] = client_upload_parallelism
+                response = ctx.client.post(
+                    "/api/uploads",
+                    json=payload,
+                    headers=headers,
+                )
+                self.assertEqual(response.status_code, 200, response.text)
+                return response.json()
+
+            thirty_eight_mib = create_session(38 * 1024 * 1024)
+            self.assertEqual(thirty_eight_mib["chunk_size"], 4 * 1024 * 1024)
+            self.assertEqual(thirty_eight_mib["part_count"], 10)
+
+            sixty_four_mib = create_session(64 * 1024 * 1024)
+            self.assertEqual(sixty_four_mib["chunk_size"], 8 * 1024 * 1024)
+            self.assertEqual(sixty_four_mib["part_count"], 8)
+
+            kevin_sized = create_session(109 * 1024 * 1024)
+            self.assertEqual(kevin_sized["chunk_size"], 8 * 1024 * 1024)
+            self.assertEqual(kevin_sized["part_count"], 14)
+
+            low_latency_kevin_sized = create_session(
+                109 * 1024 * 1024,
+                client_upload_parallelism=8,
+            )
+            self.assertEqual(low_latency_kevin_sized["chunk_size"], 16 * 1024 * 1024)
+            self.assertEqual(low_latency_kevin_sized["part_count"], 7)
+
+            large = create_session(512 * 1024 * 1024)
+            self.assertEqual(large["chunk_size"], 32 * 1024 * 1024)
+            self.assertEqual(large["part_count"], 16)
+
     def test_part_checksum_failure_leaves_no_blob_or_document_metadata(self) -> None:
         headers = auth_headers("uploader", ["vault-admin"])
         data = b"abcdef"
@@ -327,7 +377,19 @@ class StreamingTransferTests(unittest.TestCase):
                 },
             )
             self.assertEqual(part_response.status_code, 200, part_response.text)
-            self.assertEqual(part_response.json()["uploaded_parts"][0]["sha256"], sha256_hex(data))
+            self.assertIsNone(part_response.json()["uploaded_parts"][0]["sha256"])
+            checksum_duplicate = ctx.client.put(
+                f"/api/uploads/{session['id']}/parts/1",
+                content=data,
+                headers={
+                    **headers,
+                    "Content-Type": "application/octet-stream",
+                    "X-Upload-Offset": "0",
+                    "X-Upload-Sha256": sha256_hex(data),
+                    "X-Upload-Size": str(len(data)),
+                },
+            )
+            self.assertEqual(checksum_duplicate.status_code, 409)
 
             completed = ctx.client.post(
                 f"/api/uploads/{session['id']}/complete",
@@ -512,7 +574,7 @@ class StreamingTransferTests(unittest.TestCase):
                 self.assertEqual(db.query(Blob).count(), 1)
                 self.assertEqual(db.query(BlobLocation).count(), 1)
 
-    def test_upload_completion_uses_preassembled_transfer_file(self) -> None:
+    def test_upload_completion_commits_verified_parts_as_local_manifest(self) -> None:
         headers = auth_headers("uploader", ["vault-admin"])
         data = b"abcdefgh"
 
@@ -552,12 +614,24 @@ class StreamingTransferTests(unittest.TestCase):
                     headers=headers,
                 )
             self.assertEqual(completed.status_code, 200, completed.text)
-            put_parts.assert_not_called()
+            put_parts.assert_called_once()
+            with ctx.db() as db:
+                location = db.query(BlobLocation).one()
+                self.assertIn("/multipart/sha256/", f"/{location.object_key}")
+                self.assertTrue(location.object_key.endswith("/manifest.json"))
+                self.assertEqual(db.query(UploadPart).count(), 0)
+            self.assertFalse(upload_session_dir(session["id"]).exists())
             downloaded = ctx.client.get(
                 f"/documents/{completed.json()['id']}/download",
                 headers=headers,
             )
             self.assertEqual(downloaded.content, data)
+            ranged = ctx.client.get(
+                f"/documents/{completed.json()['id']}/download",
+                headers={**headers, "Range": "bytes=2-5"},
+            )
+            self.assertEqual(ranged.status_code, 206)
+            self.assertEqual(ranged.content, data[2:6])
 
     def test_upload_completion_records_verification_progress(self) -> None:
         headers = auth_headers("uploader", ["vault-admin"])

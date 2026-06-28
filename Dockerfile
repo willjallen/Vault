@@ -1,12 +1,11 @@
 FROM node:22-slim AS assets
 
-WORKDIR /build
+WORKDIR /build/vault/client
 
-COPY package.json package-lock.json ./
+COPY vault/client/package.json vault/client/package-lock.json ./
 RUN npm ci
 
-COPY scripts ./scripts
-COPY app/static ./app/static
+COPY vault/client ./
 RUN npm run build:assets
 
 FROM rust:1.95-slim-bookworm AS rust-builder
@@ -14,7 +13,7 @@ FROM rust:1.95-slim-bookworm AS rust-builder
 WORKDIR /build
 
 COPY Cargo.toml Cargo.lock VERSION ./
-COPY crates ./crates
+COPY vault/server ./vault/server
 RUN cargo build --release -p vault-server
 
 FROM debian:bookworm-slim
@@ -23,7 +22,7 @@ ENV TZ=UTC \
     VAULT_DATA_DIR=/data \
     VAULT_DB_PATH=/data/vault.db \
     VAULT_OBJECTS_PATH=/data/objects \
-    VAULT_STATIC_DIR=/app/app/static \
+    VAULT_STATIC_DIR=/app/vault/client \
     VAULT_STORAGE_BACKEND=local \
     VAULT_STORAGE_PREFIX= \
     VAULT_DOCKER_RUNTIME=1
@@ -35,13 +34,13 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system vault \
     && useradd --system --gid vault --home-dir /app --shell /usr/sbin/nologin vault \
-    && mkdir -p /data /app/app/static \
+    && mkdir -p /data /app/vault/client \
     && chown -R vault:vault /app /data
 
 COPY --from=rust-builder --chown=vault:vault /build/target/release/vault-server /app/vault-server
 COPY --chown=vault:vault VERSION /app/VERSION
-COPY --chown=vault:vault app/static /app/app/static
-COPY --from=assets --chown=vault:vault /build/app/static/dist /app/app/static/dist
+COPY --chown=vault:vault vault/client/assets /app/vault/client/assets
+COPY --from=assets --chown=vault:vault /build/vault/client/dist /app/vault/client/dist
 
 USER vault
 VOLUME ["/data"]

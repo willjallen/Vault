@@ -11,8 +11,9 @@ Thumbs.db
 
 # Node and frontend tooling
 node_modules/
+vault/client/node_modules/
 .npm/
-app/static/dist/
+vault/client/dist/
 
 # Rust
 target/
@@ -30,5 +31,3 @@ FINDINGS.md
 PROGRESS.md
 
 # Local lint cache files
-vault-service/.lint-env.hash
-vault-service/.lint-npm.hash

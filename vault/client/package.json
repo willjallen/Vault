@@ -1,0 +1,38 @@
+{
+  "name": "vault-service",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Front-end tooling for the Vault service static assets.",
+  "scripts": {
+    "build:assets": "node scripts/build-assets.mjs",
+    "check:assets": "node scripts/build-assets.mjs --check",
+    "test:js": "node --test tests/*.test.mjs",
+    "lint:js": "eslint \"src/**/*.js\" --max-warnings 0",
+    "lint:css": "stylelint \"styles/**/*.css\" --max-warnings 0",
+    "check:css-tokens": "node scripts/check-css-tokens.mjs",
+    "format:js": "prettier --check \"src/**/*.js\" \"styles/**/*.css\" \"scripts/**/*.mjs\" \"tests/**/*.mjs\"",
+    "lint": "npm run test:js && npm run lint:js && npm run lint:css && npm run check:css-tokens && npm run check:assets && npm run format:js"
+  },
+  "devDependencies": {
+    "@eslint/js": "9.39.4",
+    "esbuild": "0.28.1",
+    "eslint": "9.39.4",
+    "eslint-config-prettier": "10.1.8",
+    "eslint-plugin-import": "2.32.0",
+    "eslint-plugin-jsx-a11y": "6.10.2",
+    "eslint-plugin-react": "7.37.5",
+    "eslint-plugin-react-hooks": "7.1.1",
+    "eslint-plugin-security": "4.0.1",
+    "globals": "17.7.0",
+    "prettier": "3.8.4",
+    "stylelint": "17.14.0",
+    "stylelint-config-standard": "40.0.0"
+  },
+  "dependencies": {
+    "@fortawesome/fontawesome-svg-core": "7.3.0",
+    "@fortawesome/free-brands-svg-icons": "7.3.0",
+    "@fortawesome/free-solid-svg-icons": "7.3.0",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  }
+}

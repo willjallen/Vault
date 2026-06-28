@@ -22,7 +22,7 @@ repos:
         always_run: true
         args:
           - "-c"
-          - "npm run build:assets"
+          - "npm --prefix vault/client run build:assets"
       - id: cargo-fmt
         name: cargo fmt
         entry: bash
@@ -40,7 +40,7 @@ repos:
         always_run: true
         args:
           - "-c"
-          - "scripts/check-rust-test-layout.sh"
+          - "extras/check-rust-test-layout.sh"
       - id: cargo-clippy
         name: cargo clippy
         entry: bash
@@ -61,11 +61,13 @@ repos:
           - "cargo test --workspace"
       - id: npm-audit
         name: npm audit
-        entry: npm
+        entry: bash
         language: system
         pass_filenames: false
         always_run: true
-        args: ["audit", "--audit-level=moderate"]
+        args:
+          - "-c"
+          - "npm --prefix vault/client audit --audit-level=moderate"
       - id: npm-lint
         name: npm run lint (JS/CSS format + ESLint + Stylelint)
         entry: bash
@@ -74,4 +76,4 @@ repos:
         always_run: true
         args:
           - "-c"
-          - "npm run lint"
+          - "npm --prefix vault/client run lint"

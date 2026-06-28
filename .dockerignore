@@ -4,9 +4,10 @@
 .local/
 .npm/
 node_modules/
+vault/client/node_modules/
 target/
-app/static/dist/
-tests/
+vault/client/dist/
+vault/client/tests/
 FINDINGS.md
 PROGRESS.md
 *.log

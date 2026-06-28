@@ -350,8 +350,13 @@ async function completeUploadSession(session, sha256, signal) {
 
 async function pollUploadVerification({ sessionId, signal, onProgress, isDone }) {
   const startedAt = performance.now();
+  let immediate = true;
   while (!isDone()) {
-    await waitFor(VERIFICATION_POLL_MS, signal);
+    if (immediate) {
+      immediate = false;
+    } else {
+      await waitFor(VERIFICATION_POLL_MS, signal);
+    }
     if (isDone()) {
       break;
     }

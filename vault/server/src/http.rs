@@ -90,6 +90,7 @@ pub struct AppState {
     pub db: DbPool,
     pub storage: SharedBlobStorage,
     pub export_execution: Arc<ExportExecutionContext>,
+    pub upload_hash_coordinator: uploads::UploadHashCoordinator,
     upload_part_locks: Arc<AsyncMutex<HashSet<String>>>,
 }
 
@@ -106,6 +107,7 @@ impl AppState {
             db,
             storage,
             export_execution,
+            upload_hash_coordinator: uploads::UploadHashCoordinator::new(),
             upload_part_locks: Arc::new(AsyncMutex::new(HashSet::new())),
         }
     }
@@ -1361,6 +1363,9 @@ async fn api_upload_session_part(
         let user = current_user(&state, &headers).await?;
         uploads::ingest_upload_part(&state.db, ingest, &user, stream).await?;
     }
+    state
+        .upload_hash_coordinator
+        .schedule(state.db.clone(), transfers_path, session_id.clone());
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1401,13 +1406,14 @@ async fn api_complete_upload_session(
     Json(payload): Json<CompleteUploadRequest>,
 ) -> Result<Json<UploadResultPayload>, ApiError> {
     let user = current_user(&state, &headers).await?;
-    let payload = uploads::complete_upload_session(
+    let payload = uploads::complete_upload_session_with_hash_coordinator(
         &state.db,
         state.storage.as_ref(),
         &state.config.transfers_path(),
         &session_id,
         payload.sha256.as_deref(),
         &user,
+        &state.upload_hash_coordinator,
     )
     .await?;
     notify_state_event_committed();
@@ -1420,16 +1426,16 @@ async fn api_abort_upload_session(
     Path(session_id): Path<String>,
 ) -> Result<Json<UploadSessionPayload>, ApiError> {
     let user = current_user(&state, &headers).await?;
-    Ok(Json(
-        uploads::abort_upload_session(
-            &state.db,
-            &state.config.transfers_path(),
-            &state.auth.session_secret,
-            &session_id,
-            &user,
-        )
-        .await?,
-    ))
+    let payload = uploads::abort_upload_session(
+        &state.db,
+        &state.config.transfers_path(),
+        &state.auth.session_secret,
+        &session_id,
+        &user,
+    )
+    .await?;
+    state.upload_hash_coordinator.forget(&session_id).await;
+    Ok(Json(payload))
 }
 
 async fn legacy_create_document(

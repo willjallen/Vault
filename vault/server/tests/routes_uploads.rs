@@ -2340,3 +2340,95 @@ async fn upload_completion_reports_verification_bytes_before_storage_finishes() 
         .expect("completion");
     assert_eq!(completed.path, "verification-live-progress.txt");
 }
+
+#[tokio::test]
+async fn upload_completion_reuses_server_preverified_hash_state() {
+    let (state, _temp_dir) =
+        test_state_with_upload_settings(5 * 1024 * 1024 * 1024, 4, 86_400).await;
+    grant_writer_root(&state.db).await;
+    let pool = state.db.clone();
+    let transfers_path = state.config.transfers_path();
+    let coordinator = state.upload_hash_coordinator.clone();
+    let app = http::router(state);
+    let data = b"abcdefghijklmnop";
+    let digest = sha256_hex(data);
+    let session_id =
+        uploaded_session_with_fixed_parts(app, "preverified-upload.txt", data, 4).await;
+
+    coordinator.schedule(pool.clone(), transfers_path.clone(), session_id.clone());
+    for _ in 0..100 {
+        if coordinator.preverified_bytes(&session_id).await
+            == Some(i64::try_from(data.len()).expect("data size"))
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        coordinator.preverified_bytes(&session_id).await,
+        Some(i64::try_from(data.len()).expect("data size")),
+    );
+
+    let waiting = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let storage = BlockingPartStorage {
+        release: release.clone(),
+        stored: test_stored_blob(&digest, data.len()),
+        waiting: waiting.clone(),
+    };
+    let completion_user_id: String =
+        sqlx::query_scalar("SELECT created_by FROM upload_sessions WHERE id = ?")
+            .bind(&session_id)
+            .fetch_one(&pool)
+            .await
+            .expect("session owner");
+    let completion_user = UserContext {
+        id: completion_user_id,
+        ..writer_context()
+    };
+    let complete_pool = pool.clone();
+    let complete_transfers_path = transfers_path.clone();
+    let complete_session_id = session_id.clone();
+    let complete_digest = digest.clone();
+    let complete_coordinator = coordinator.clone();
+    let mut completion = tokio::spawn(async move {
+        uploads::complete_upload_session_with_hash_coordinator(
+            &complete_pool,
+            &storage,
+            &complete_transfers_path,
+            &complete_session_id,
+            Some(&complete_digest),
+            &completion_user,
+            &complete_coordinator,
+        )
+        .await
+    });
+
+    wait_for_storage_block(&waiting, &mut completion).await;
+    let progress = sqlx::query_as::<_, (String, i64, i64)>(
+        r"
+        SELECT status, verification_total_bytes, verification_processed_bytes
+        FROM upload_sessions
+        WHERE id = ?
+        ",
+    )
+    .bind(&session_id)
+    .fetch_one(&pool)
+    .await
+    .expect("verification progress");
+    assert_eq!(
+        progress,
+        (
+            "completing".to_string(),
+            i64::try_from(data.len()).expect("total bytes"),
+            i64::try_from(data.len()).expect("processed bytes")
+        )
+    );
+
+    release.notify_one();
+    let completed = completion
+        .await
+        .expect("completion task")
+        .expect("completion");
+    assert_eq!(completed.path, "preverified-upload.txt");
+}

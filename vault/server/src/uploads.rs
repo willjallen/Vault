@@ -1,6 +1,9 @@
+use std::collections::HashMap;
 use std::fmt::Display;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
@@ -17,6 +20,7 @@ use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::auth::UserContext;
@@ -257,6 +261,130 @@ struct CompletedParts {
     digest: String,
     size_bytes: i64,
     paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct UploadHashCoordinator {
+    states: Arc<Mutex<HashMap<String, Arc<UploadHashState>>>>,
+}
+
+// Large uploads should not finish network transfer and then start integrity
+// verification from zero. This coordinator hashes server-received part files in
+// order while later parts are still uploading; completion reuses that
+// server-computed SHA-256 state, with the old full-pass verification as fallback.
+#[derive(Debug)]
+struct UploadHashState {
+    processed_bytes: AtomicI64,
+    inner: Mutex<UploadHashStateInner>,
+}
+
+#[derive(Debug)]
+struct UploadHashStateInner {
+    hasher: Sha256,
+    next_part: i64,
+    reported_bytes: i64,
+    digest: Option<String>,
+}
+
+impl UploadHashState {
+    fn new() -> Self {
+        Self {
+            processed_bytes: AtomicI64::new(0),
+            inner: Mutex::new(UploadHashStateInner {
+                hasher: Sha256::new(),
+                next_part: 1,
+                reported_bytes: 0,
+                digest: None,
+            }),
+        }
+    }
+}
+
+impl UploadHashCoordinator {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn schedule(&self, pool: SqlitePool, transfers_path: PathBuf, session_id: String) {
+        let coordinator = self.clone();
+        tokio::spawn(async move {
+            if let Err(error) = coordinator
+                .advance_session(&pool, &transfers_path, &session_id)
+                .await
+            {
+                tracing::debug!(?error, session_id, "upload hash preverification paused");
+            }
+        });
+    }
+
+    pub async fn forget(&self, session_id: &str) {
+        self.states.lock().await.remove(session_id);
+    }
+
+    pub async fn preverified_bytes(&self, session_id: &str) -> Option<i64> {
+        self.processed_bytes(session_id).await
+    }
+
+    async fn processed_bytes(&self, session_id: &str) -> Option<i64> {
+        let state = {
+            let states = self.states.lock().await;
+            states.get(session_id).cloned()
+        }?;
+        Some(state.processed_bytes.load(Ordering::Acquire))
+    }
+
+    async fn completed_parts(
+        &self,
+        pool: &SqlitePool,
+        transfers_path: &Path,
+        session: &UploadSessionRow,
+        expected_sha256: Option<&str>,
+    ) -> Result<CompletedParts, UploadError> {
+        let (size_bytes, paths) = completed_part_paths(transfers_path, session).await?;
+        self.advance_session(pool, transfers_path, &session.id)
+            .await?;
+        let state = self.state_for(&session.id).await;
+        let digest = state
+            .inner
+            .lock()
+            .await
+            .digest
+            .clone()
+            .ok_or(UploadError::UploadSessionMissingParts)?;
+        if expected_sha256.is_some_and(|expected| digest != expected.to_ascii_lowercase()) {
+            return Err(UploadError::UploadChecksumMismatch);
+        }
+        Ok(CompletedParts {
+            digest,
+            size_bytes,
+            paths,
+        })
+    }
+
+    async fn advance_session(
+        &self,
+        pool: &SqlitePool,
+        transfers_path: &Path,
+        session_id: &str,
+    ) -> Result<(), UploadError> {
+        let session = fetch_upload_session(pool, session_id)
+            .await?
+            .ok_or(UploadError::UploadSessionNotFound)?;
+        if !matches!(session.status.as_str(), "active" | "completing") {
+            return Ok(());
+        }
+        let state = self.state_for(session_id).await;
+        advance_hash_state(pool, transfers_path, &session, &state).await
+    }
+
+    async fn state_for(&self, session_id: &str) -> Arc<UploadHashState> {
+        let mut states = self.states.lock().await;
+        states
+            .entry(session_id.to_string())
+            .or_insert_with(|| Arc::new(UploadHashState::new()))
+            .clone()
+    }
 }
 
 pub async fn create_upload_session(
@@ -617,6 +745,48 @@ pub async fn complete_upload_session(
     expected_sha256: Option<&str>,
     user: &UserContext,
 ) -> Result<UploadResultPayload, UploadError> {
+    complete_upload_session_impl(
+        pool,
+        storage,
+        transfers_path,
+        session_id,
+        expected_sha256,
+        user,
+        None,
+    )
+    .await
+}
+
+pub async fn complete_upload_session_with_hash_coordinator(
+    pool: &SqlitePool,
+    storage: &dyn BlobStorageBackend,
+    transfers_path: &Path,
+    session_id: &str,
+    expected_sha256: Option<&str>,
+    user: &UserContext,
+    hash_coordinator: &UploadHashCoordinator,
+) -> Result<UploadResultPayload, UploadError> {
+    complete_upload_session_impl(
+        pool,
+        storage,
+        transfers_path,
+        session_id,
+        expected_sha256,
+        user,
+        Some(hash_coordinator),
+    )
+    .await
+}
+
+async fn complete_upload_session_impl(
+    pool: &SqlitePool,
+    storage: &dyn BlobStorageBackend,
+    transfers_path: &Path,
+    session_id: &str,
+    expected_sha256: Option<&str>,
+    user: &UserContext,
+    hash_coordinator: Option<&UploadHashCoordinator>,
+) -> Result<UploadResultPayload, UploadError> {
     let session = fetch_upload_session(pool, session_id)
         .await?
         .ok_or(UploadError::UploadSessionNotFound)?;
@@ -625,10 +795,27 @@ pub async fn complete_upload_session(
         return completed_result(&session);
     }
     ensure_active_session(pool, transfers_path, &session).await?;
-    mark_upload_completing(pool, session_id, session.total_size).await?;
-    let parts = completed_parts(pool, transfers_path, &session, expected_sha256).await?;
+    let verified_bytes = if let Some(coordinator) = hash_coordinator {
+        coordinator
+            .processed_bytes(session_id)
+            .await
+            .unwrap_or_default()
+    } else {
+        0
+    };
+    mark_upload_completing(pool, session_id, session.total_size, verified_bytes).await?;
+    let parts = if let Some(coordinator) = hash_coordinator {
+        coordinator
+            .completed_parts(pool, transfers_path, &session, expected_sha256)
+            .await?
+    } else {
+        completed_parts(pool, transfers_path, &session, expected_sha256).await?
+    };
 
     let result = complete_upload_session_inner(pool, storage, &session, &parts, user).await;
+    if let Some(coordinator) = hash_coordinator {
+        coordinator.forget(session_id).await;
+    }
     match result {
         Ok(payload) => {
             clear_upload_session_files(transfers_path, session_id).await;
@@ -1091,14 +1278,28 @@ async fn completed_parts(
     session: &UploadSessionRow,
     expected_sha256: Option<&str>,
 ) -> Result<CompletedParts, UploadError> {
+    let (size_bytes, paths) = completed_part_paths(transfers_path, session).await?;
+    let digest = hash_completed_part_paths(pool, session, &paths).await?;
+    if expected_sha256.is_some_and(|expected| digest != expected.to_ascii_lowercase()) {
+        return Err(UploadError::UploadChecksumMismatch);
+    }
+    Ok(CompletedParts {
+        digest,
+        size_bytes,
+        paths,
+    })
+}
+
+async fn completed_part_paths(
+    transfers_path: &Path,
+    session: &UploadSessionRow,
+) -> Result<(i64, Vec<PathBuf>), UploadError> {
     let parts = transfer_parts(transfers_path, session).await?;
     if i64::try_from(parts.len()).ok() != Some(session.part_count) {
         return Err(UploadError::UploadSessionMissingParts);
     }
-    let mut hasher = Sha256::new();
     let mut size_bytes = 0_i64;
     let mut paths = Vec::with_capacity(parts.len());
-    let mut progress = VerificationProgress::new(&session.id, session.total_size);
     for (index, part) in parts.iter().enumerate() {
         let part_number = i64::try_from(index + 1).map_err(|_| UploadError::InvalidPartNumber)?;
         if part.part_number != part_number {
@@ -1108,20 +1309,112 @@ async fn completed_parts(
         if part.offset_bytes != expected_offset || part.size_bytes != expected_size {
             return Err(UploadError::UploadSessionMissingParts);
         }
-        let path = PathBuf::from(&part.storage_path);
-        hash_file(pool, &path, &mut hasher, &mut progress).await?;
         size_bytes += part.size_bytes;
-        paths.push(path);
+        paths.push(PathBuf::from(&part.storage_path));
     }
-    let digest = lower_hex(&hasher.finalize());
-    if expected_sha256.is_some_and(|expected| digest != expected.to_ascii_lowercase()) {
-        return Err(UploadError::UploadChecksumMismatch);
+    Ok((size_bytes, paths))
+}
+
+async fn hash_completed_part_paths(
+    pool: &SqlitePool,
+    session: &UploadSessionRow,
+    paths: &[PathBuf],
+) -> Result<String, UploadError> {
+    let mut hasher = Sha256::new();
+    let mut progress = VerificationProgress::new(&session.id, session.total_size);
+    for path in paths {
+        hash_file(pool, path, &mut hasher, &mut progress).await?;
     }
-    Ok(CompletedParts {
-        digest,
-        size_bytes,
-        paths,
-    })
+    Ok(lower_hex(&hasher.finalize()))
+}
+
+async fn advance_hash_state(
+    pool: &SqlitePool,
+    transfers_path: &Path,
+    session: &UploadSessionRow,
+    state: &Arc<UploadHashState>,
+) -> Result<(), UploadError> {
+    let session_dir = upload_session_dir(transfers_path, &session.id)?;
+    let mut inner = state.inner.lock().await;
+    loop {
+        let processed_bytes = state.processed_bytes.load(Ordering::Acquire);
+        if inner.digest.is_some() {
+            return Ok(());
+        }
+        if inner.next_part > session.part_count {
+            if processed_bytes == session.total_size {
+                inner.digest = Some(lower_hex(&inner.hasher.clone().finalize()));
+                record_upload_verification_progress(pool, &session.id, processed_bytes).await?;
+                inner.reported_bytes = processed_bytes;
+                return Ok(());
+            }
+            return Err(UploadError::UploadSessionMissingParts);
+        }
+        let Some(part) = read_part_metadata(&session_dir, session, inner.next_part).await? else {
+            return Ok(());
+        };
+        let (expected_offset, expected_size) = expected_part_bounds(session, part.part_number)?;
+        if part.part_number != inner.next_part
+            || part.offset_bytes != expected_offset
+            || part.size_bytes != expected_size
+        {
+            return Err(UploadError::UploadSessionMissingParts);
+        }
+        hash_part_file_into_state(
+            pool,
+            session,
+            &PathBuf::from(&part.storage_path),
+            expected_size,
+            state,
+            &mut inner,
+        )
+        .await?;
+        inner.next_part += 1;
+    }
+}
+
+async fn hash_part_file_into_state(
+    pool: &SqlitePool,
+    session: &UploadSessionRow,
+    path: &Path,
+    expected_size: i64,
+    state: &UploadHashState,
+    inner: &mut UploadHashStateInner,
+) -> Result<(), UploadError> {
+    let mut file = fs::File::open(path).await?;
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    let mut part_bytes = 0_i64;
+    loop {
+        let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            if part_bytes != expected_size {
+                return Err(UploadError::UploadPartSizeMismatch);
+            }
+            return Ok(());
+        }
+        part_bytes = part_bytes
+            .checked_add(i64::try_from(read).map_err(|_| UploadError::UploadPartTooLarge)?)
+            .ok_or(UploadError::UploadPartTooLarge)?;
+        if part_bytes > expected_size {
+            return Err(UploadError::UploadPartSizeMismatch);
+        }
+        inner.hasher.update(&buffer[..read]);
+        let processed_bytes = state
+            .processed_bytes
+            .load(Ordering::Acquire)
+            .checked_add(i64::try_from(read).map_err(|_| UploadError::UploadPartTooLarge)?)
+            .ok_or(UploadError::UploadSizeMismatch)?
+            .min(session.total_size);
+        state
+            .processed_bytes
+            .store(processed_bytes, Ordering::Release);
+        if processed_bytes - inner.reported_bytes >= VERIFICATION_PROGRESS_UPDATE_BYTES
+            || processed_bytes >= session.total_size
+        {
+            record_upload_verification_progress(pool, &session.id, processed_bytes).await?;
+            inner.reported_bytes = processed_bytes;
+        }
+    }
 }
 
 async fn hash_file(
@@ -1713,18 +2006,20 @@ async fn mark_upload_completing(
     pool: &SqlitePool,
     session_id: &str,
     total_bytes: i64,
+    processed_bytes: i64,
 ) -> Result<(), UploadError> {
     let result = sqlx::query(
         r"
         UPDATE upload_sessions
         SET status = 'completing',
             verification_total_bytes = ?,
-            verification_processed_bytes = 0,
+            verification_processed_bytes = ?,
             updated_at = ?
         WHERE id = ? AND status = 'active'
         ",
     )
     .bind(total_bytes)
+    .bind(processed_bytes.clamp(0, total_bytes))
     .bind(now_rfc3339()?)
     .bind(session_id)
     .execute(pool)
@@ -1742,21 +2037,29 @@ async fn record_upload_verification_progress(
     pool: &SqlitePool,
     session_id: &str,
     processed_bytes: i64,
-) -> Result<(), UploadError> {
+) -> Result<bool, UploadError> {
+    // Background upload hashing can begin while the session is still active. The
+    // guarded update lets that same verifier start publishing progress as soon
+    // as completion flips the session to `completing`, without writing noisy
+    // upload-time progress rows or regressing a newer byte count.
     sqlx::query(
         r"
         UPDATE upload_sessions
         SET verification_processed_bytes = ?,
             updated_at = ?
-        WHERE id = ? AND status = 'completing'
+        WHERE id = ?
+            AND status = 'completing'
+            AND verification_processed_bytes < ?
         ",
     )
     .bind(processed_bytes)
     .bind(now_rfc3339()?)
     .bind(session_id)
+    .bind(processed_bytes)
     .execute(pool)
-    .await?;
-    Ok(())
+    .await
+    .map(|result| result.rows_affected() > 0)
+    .map_err(UploadError::Database)
 }
 
 async fn ensure_active_session(

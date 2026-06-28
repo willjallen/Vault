@@ -16,3 +16,9 @@ pedantic = { level = "warn", priority = -1 }
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 module_name_repetitions = "allow"
+
+[profile.dev.package.sha2]
+opt-level = 3
+
+[profile.dev.package.sha2-asm]
+opt-level = 3

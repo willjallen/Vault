@@ -873,10 +873,10 @@ async fn complete_upload_session_inner(
     match result {
         Ok(payload) => Ok(payload),
         Err(error) => {
-            // Upload completion promotes bytes before the canonical SQLite commit so
-            // stale-state checks can still reject the upload without leaving a
-            // content-addressed object that has no DB location row.
-            cleanup_unreferenced_stored_object(pool, storage, &stored).await;
+            tracing::warn!(
+                object_key = %stored.object_key,
+                "upload object promotion succeeded but the metadata commit failed; leaving object for delayed cleanup"
+            );
             Err(error)
         }
     }
@@ -956,28 +956,6 @@ async fn complete_upload_session_after_store(
     .await?;
     transaction.commit().await?;
     Ok(result)
-}
-
-async fn cleanup_unreferenced_stored_object(
-    pool: &SqlitePool,
-    storage: &dyn BlobStorageBackend,
-    stored: &StoredBlob,
-) {
-    let referenced = sqlx::query_scalar::<_, i64>(
-        r"
-        SELECT COUNT(*)
-        FROM blob_locations
-        WHERE backend = ? AND bucket = ? AND object_key = ?
-        ",
-    )
-    .bind(&stored.backend)
-    .bind(&stored.bucket)
-    .bind(&stored.object_key)
-    .fetch_one(pool)
-    .await;
-    if referenced.ok() == Some(0) {
-        let _ = storage.delete_object(&stored.object_key).await;
-    }
 }
 
 async fn complete_create_upload_in_tx(

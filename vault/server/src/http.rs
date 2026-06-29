@@ -3756,6 +3756,10 @@ fn export_error_response(error: ExportError) -> (StatusCode, String) {
             StatusCode::INTERNAL_SERVER_ERROR,
             "Blob content does not match metadata".to_string(),
         ),
+        ExportError::StorageLocationConflict => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Storage location points at another blob".to_string(),
+        ),
         ExportError::ZipLimitExceeded => (
             StatusCode::BAD_REQUEST,
             "Export is too large for the current ZIP writer".to_string(),

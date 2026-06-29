@@ -68,6 +68,41 @@ async fn s3_compatible_storage_puts_reads_ranges_and_deletes_objects() {
 }
 
 #[tokio::test]
+async fn s3_compatible_storage_overwrites_existing_digest_key_with_new_bytes() {
+    let (endpoint_url, objects) = start_s3_mock_with_objects().await;
+    let storage = S3CompatibleBlobStorage::from_settings(S3StorageSettings {
+        name: "s3".to_string(),
+        bucket: "vault-test".to_string(),
+        region: "us-east-1".to_string(),
+        endpoint_url: Some(endpoint_url),
+        access_key_id: Some("test-access".to_string()),
+        secret_access_key: Some("test-secret".to_string()),
+        session_token: None,
+        prefix: "objects".to_string(),
+    })
+    .await
+    .expect("s3 storage");
+    let content = b"correct remote bytes";
+    let digest = sha256_hex(content);
+    let object_key = format!("objects/sha256/{digest}");
+    objects
+        .lock()
+        .await
+        .insert(object_key.clone(), b"wrong remote bytes".to_vec());
+
+    let stored = storage.put_bytes(content).await.expect("put bytes");
+
+    assert_eq!(stored.object_key, object_key);
+    assert_eq!(
+        storage
+            .read_bytes(&stored.object_key)
+            .await
+            .expect("read repaired remote"),
+        content,
+    );
+}
+
+#[tokio::test]
 async fn s3_compatible_storage_rejects_missing_bucket_configuration() {
     let error = S3CompatibleBlobStorage::from_settings(S3StorageSettings {
         name: "r2".to_string(),
@@ -224,19 +259,23 @@ async fn s3_compatible_storage_rejects_part_file_checksum_mismatch_without_uploa
 }
 
 async fn start_s3_mock() -> String {
+    start_s3_mock_with_objects().await.0
+}
+
+async fn start_s3_mock_with_objects() -> (String, ObjectMap) {
     let objects = ObjectMap::default();
     let app = Router::new()
         .route("/{bucket}/{*key}", head(mock_head_object))
         .route("/{bucket}/{*key}", put(mock_put_object))
         .route("/{bucket}/{*key}", get(mock_get_object))
         .route("/{bucket}/{*key}", delete(mock_delete_object))
-        .with_state(objects);
+        .with_state(objects.clone());
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
     let addr = listener.local_addr().expect("listener address");
     tokio::spawn(async move {
         axum::serve(listener, app).await.expect("s3 mock");
     });
-    endpoint_url(addr)
+    (endpoint_url(addr), objects)
 }
 
 fn endpoint_url(addr: SocketAddr) -> String {

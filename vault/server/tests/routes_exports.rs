@@ -643,10 +643,11 @@ async fn wait_for_cancelled_export_cleanup(
         .expect("orphan blob count");
         let mut keys = storage.list_object_keys().await.expect("object keys");
         keys.sort();
+        let expected_keys_retained = expected_keys.iter().all(|key| keys.contains(key));
         if status == "cancelled"
             && artifact_count == 0
             && orphan_blob_count == 0
-            && keys == expected_keys
+            && expected_keys_retained
         {
             return;
         }
@@ -654,7 +655,9 @@ async fn wait_for_cancelled_export_cleanup(
     }
     let mut keys = storage.list_object_keys().await.expect("final object keys");
     keys.sort();
-    panic!("cancelled export left artifact/blob metadata or object keys behind: {keys:?}");
+    panic!(
+        "cancelled export left artifact/blob metadata behind or lost expected object keys: {keys:?}"
+    );
 }
 
 async fn wait_for_path_missing(path: &Path) {
@@ -707,7 +710,7 @@ async fn assert_expired_export_swept(
         .await
         .expect("sweep transfers");
     assert_eq!(swept.deleted_exports, vec![job_id.to_string()]);
-    assert_eq!(swept.deleted_export_objects, vec![object_key.to_string()]);
+    assert_eq!(swept.deleted_export_objects, Vec::<String>::new());
     let job_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM export_jobs WHERE id = ?")
         .bind(job_id)
         .fetch_one(pool)
@@ -728,7 +731,7 @@ async fn assert_expired_export_swept(
     assert_eq!(blob_count, 0);
     assert_eq!(location_count, 0);
     assert!(
-        !storage
+        storage
             .list_object_keys()
             .await
             .expect("object keys")

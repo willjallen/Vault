@@ -23,6 +23,7 @@ use vault_server::http::{self, AppState};
 use vault_server::reconciliation::storage_reconciliation_report;
 use vault_server::storage::{
     BlobStorageBackend, LocalBlobStorage, SharedBlobStorage, StorageError, StoredBlob,
+    multipart_manifest_key_for_hash,
 };
 use vault_server::uploads::{
     self, CreateUploadRequest, UploadPartHeaders, UploadPartIngest, UploadRuntimeSettings,
@@ -1272,15 +1273,18 @@ async fn upload_completion_promotes_parts_without_assembled_blob() {
         format!("multipart/sha256/{digest}/manifest.json")
     );
     assert!(objects_path.join(&object_key).exists());
+    let local_storage = LocalBlobStorage::new(&objects_path, "");
+    let manifest = local_storage
+        .read_multipart_manifest(&object_key)
+        .await
+        .expect("multipart manifest");
+    assert_eq!(manifest.parts.len(), 2);
+    assert!(manifest.parts.iter().all(|part| part.path.exists()));
     assert!(
-        objects_path
-            .join(format!("multipart/sha256/{digest}/parts/00000001.part"))
-            .exists()
-    );
-    assert!(
-        objects_path
-            .join(format!("multipart/sha256/{digest}/parts/00000002.part"))
-            .exists()
+        manifest
+            .parts
+            .iter()
+            .all(|part| part.object_key.contains("/parts/"))
     );
     assert!(
         !objects_path.join(format!("sha256/{digest}")).exists(),
@@ -1412,7 +1416,7 @@ async fn upload_session_creates_document_without_part_database_writes() {
 }
 
 #[tokio::test]
-async fn create_completion_rechecks_duplicate_path_without_orphaning_storage() {
+async fn create_completion_rechecks_duplicate_path_without_deleting_promoted_object() {
     let (state, temp_dir) = test_state().await;
     grant_writer_root(&state.db).await;
     let race_folder = get_or_create_folder_path(&state.db, Some("Race"))
@@ -1503,20 +1507,16 @@ async fn create_completion_rechecks_duplicate_path_without_orphaning_storage() {
         .await
         .expect("locations");
     assert_eq!(location_count, 1);
-    assert_eq!(
-        local_storage
-            .list_object_keys()
-            .await
-            .expect("objects")
-            .len(),
-        1
-    );
+    let loser_key = multipart_manifest_key_for_hash("", "sha256", &sha256_hex(data));
+    let object_keys = local_storage.list_object_keys().await.expect("objects");
+    assert_eq!(object_keys.len(), 2);
+    assert!(object_keys.contains(&loser_key));
 
     let report = storage_reconciliation_report(&pool, &local_storage, false)
         .await
         .expect("reconciliation report");
     assert!(report.orphan_blob_ids.is_empty());
-    assert!(report.unreferenced_local_keys.is_empty());
+    assert_eq!(report.unreferenced_local_keys, vec![loser_key]);
 }
 
 #[tokio::test]

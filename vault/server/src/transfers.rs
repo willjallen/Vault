@@ -90,7 +90,7 @@ pub async fn sweep_expired_transfers(
 
 pub async fn sweep_expired_transfers_with_limit(
     pool: &SqlitePool,
-    storage: &SharedBlobStorage,
+    _storage: &SharedBlobStorage,
     transfers_path: &Path,
     limit: i64,
 ) -> Result<TransferSweepResult, TransferMaintenanceError> {
@@ -102,7 +102,7 @@ pub async fn sweep_expired_transfers_with_limit(
 
     let mut transaction = pool.begin().await?;
     sweep_upload_rows(&mut transaction, &uploads, &mut result).await?;
-    let object_keys_to_delete = sweep_export_rows(&mut transaction, &exports, &mut result).await?;
+    sweep_export_rows(&mut transaction, &exports, &mut result).await?;
     transaction.commit().await?;
 
     for session_id in result
@@ -119,11 +119,6 @@ pub async fn sweep_expired_transfers_with_limit(
     {
         clear_export_temp_file(transfers_path, job_id).await?;
     }
-    for object_key in object_keys_to_delete {
-        storage.delete_object(&object_key).await?;
-        result.deleted_export_objects.push(object_key);
-    }
-
     Ok(result)
 }
 
@@ -232,8 +227,7 @@ async fn recover_interrupted_transfers_inner(
         .await?;
         result.requeued_exports.push(export.id.clone());
     }
-    let object_keys_to_delete =
-        delete_unreferenced_blobs(&mut transaction, &artifact_blob_ids).await?;
+    delete_unreferenced_blobs(&mut transaction, &artifact_blob_ids).await?;
     transaction.commit().await?;
 
     for session_id in failed_upload_dirs {
@@ -245,10 +239,6 @@ async fn recover_interrupted_transfers_inner(
                 .deleted_export_temps
                 .push(format!("{job_id}.zip.tmp"));
         }
-    }
-    for object_key in object_keys_to_delete {
-        storage.delete_object(&object_key).await?;
-        result.deleted_export_objects.push(object_key);
     }
     if enqueue_exports {
         result.queued_exports =
@@ -439,7 +429,7 @@ async fn sweep_export_rows(
     transaction: &mut Transaction<'_, Sqlite>,
     exports: &[ExpiredExportRow],
     result: &mut TransferSweepResult,
-) -> Result<Vec<String>, sqlx::Error> {
+) -> Result<(), sqlx::Error> {
     let mut deleted_blob_ids = Vec::new();
     for export in exports {
         if matches!(export.status.as_str(), "queued" | "running" | "finalizing") {
@@ -476,31 +466,17 @@ async fn sweep_export_rows(
 async fn delete_unreferenced_blobs(
     transaction: &mut Transaction<'_, Sqlite>,
     blob_ids: &[i64],
-) -> Result<Vec<String>, sqlx::Error> {
-    let mut object_keys = Vec::new();
+) -> Result<(), sqlx::Error> {
     for blob_id in blob_ids {
         if blob_is_referenced(transaction, *blob_id).await? {
             continue;
         }
-        let blob_object_keys = sqlx::query_scalar::<_, String>(
-            "SELECT object_key FROM blob_locations WHERE blob_id = ?",
-        )
-        .bind(blob_id)
-        .fetch_all(&mut **transaction)
-        .await?;
-        sqlx::query("DELETE FROM blob_locations WHERE blob_id = ?")
-            .bind(blob_id)
-            .execute(&mut **transaction)
-            .await?;
         sqlx::query("DELETE FROM blobs WHERE id = ?")
             .bind(blob_id)
             .execute(&mut **transaction)
             .await?;
-        object_keys.extend(blob_object_keys);
     }
-    object_keys.sort();
-    object_keys.dedup();
-    Ok(object_keys)
+    Ok(())
 }
 
 async fn blob_is_referenced(

@@ -252,6 +252,8 @@ pub enum ExportError {
     ArtifactMissingStorageLocation,
     #[error("blob content does not match metadata")]
     BlobContentMismatch,
+    #[error("storage location points at another blob")]
+    StorageLocationConflict,
     #[error("export is too large for the current ZIP writer")]
     ZipLimitExceeded,
     #[error(transparent)]
@@ -1390,12 +1392,15 @@ async fn persist_export_artifact(
         .put_file(&artifact.path, &artifact.digest, artifact.size_bytes)
         .await?;
     if let Err(error) = ensure_export_not_cancelled(pool, job_id).await {
-        cleanup_unreferenced_export_object(pool, storage, &stored).await;
+        tracing::warn!(
+            object_key = %stored.object_key,
+            "export artifact promotion succeeded after cancellation; leaving object for delayed cleanup"
+        );
         return Err(error);
     }
     let blob_id = get_or_create_blob(pool, &stored).await?;
     if let Err(error) = ensure_export_not_cancelled(pool, job_id).await {
-        cleanup_export_artifact_commit(pool, storage, job_id, &stored).await;
+        cleanup_export_artifact_commit(pool, job_id, &stored).await;
         return Err(error);
     }
     let job = export_job_row(pool, job_id)
@@ -1427,7 +1432,7 @@ async fn persist_export_artifact(
     .execute(pool)
     .await?;
     if let Err(error) = ensure_export_not_cancelled(pool, job_id).await {
-        cleanup_export_artifact_commit(pool, storage, job_id, &stored).await;
+        cleanup_export_artifact_commit(pool, job_id, &stored).await;
         return Err(error);
     }
     let completed = sqlx::query(
@@ -1446,54 +1451,21 @@ async fn persist_export_artifact(
     .execute(pool)
     .await?;
     if completed.rows_affected() == 0 {
-        cleanup_export_artifact_commit(pool, storage, job_id, &stored).await;
+        cleanup_export_artifact_commit(pool, job_id, &stored).await;
         return Err(ExportError::ExportCancelled);
     }
     Ok(())
 }
 
-async fn cleanup_export_artifact_commit(
-    pool: &SqlitePool,
-    storage: &dyn BlobStorageBackend,
-    job_id: &str,
-    stored: &StoredBlob,
-) {
+async fn cleanup_export_artifact_commit(pool: &SqlitePool, job_id: &str, stored: &StoredBlob) {
     let _ = sqlx::query("DELETE FROM export_artifacts WHERE job_id = ?")
         .bind(job_id)
         .execute(pool)
         .await;
-    cleanup_unreferenced_export_blob(pool, storage, stored).await;
+    cleanup_unreferenced_export_blob(pool, stored).await;
 }
 
-async fn cleanup_unreferenced_export_object(
-    pool: &SqlitePool,
-    storage: &dyn BlobStorageBackend,
-    stored: &StoredBlob,
-) {
-    let references = sqlx::query_scalar::<_, i64>(
-        r"
-        SELECT COUNT(*)
-        FROM blob_locations
-        WHERE backend = ? AND bucket = ? AND object_key = ?
-        ",
-    )
-    .bind(&stored.backend)
-    .bind(&stored.bucket)
-    .bind(&stored.object_key)
-    .fetch_one(pool)
-    .await;
-    if matches!(references, Ok(0)) {
-        let _ = storage
-            .delete_location(&stored.backend, &stored.bucket, &stored.object_key)
-            .await;
-    }
-}
-
-async fn cleanup_unreferenced_export_blob(
-    pool: &SqlitePool,
-    storage: &dyn BlobStorageBackend,
-    stored: &StoredBlob,
-) {
+async fn cleanup_unreferenced_export_blob(pool: &SqlitePool, stored: &StoredBlob) {
     let Ok(size_bytes) = i64::try_from(stored.size_bytes) else {
         return;
     };
@@ -1510,8 +1482,14 @@ async fn cleanup_unreferenced_export_blob(
     .fetch_optional(pool)
     .await;
     let Some(blob_id) = blob_id.ok().flatten() else {
-        cleanup_unreferenced_export_object(pool, storage, stored).await;
         return;
+    };
+    let mut transaction = match pool.begin().await {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            tracing::warn!(?error, "failed to begin export blob cleanup transaction");
+            return;
+        }
     };
     let references = sqlx::query_scalar::<_, i64>(
         r"
@@ -1522,20 +1500,26 @@ async fn cleanup_unreferenced_export_blob(
     )
     .bind(blob_id)
     .bind(blob_id)
-    .fetch_one(pool)
+    .fetch_one(&mut *transaction)
     .await;
     if !matches!(references, Ok(0)) {
         return;
     }
-    let _ = sqlx::query("DELETE FROM blob_locations WHERE blob_id = ?")
+    let deleted = sqlx::query("DELETE FROM blobs WHERE id = ?")
         .bind(blob_id)
-        .execute(pool)
+        .execute(&mut *transaction)
         .await;
-    let _ = sqlx::query("DELETE FROM blobs WHERE id = ?")
-        .bind(blob_id)
-        .execute(pool)
-        .await;
-    cleanup_unreferenced_export_object(pool, storage, stored).await;
+    if let Err(error) = deleted {
+        tracing::warn!(
+            ?error,
+            blob_id,
+            "failed to delete unreferenced export blob metadata"
+        );
+        return;
+    }
+    if let Err(error) = transaction.commit().await {
+        tracing::warn!(?error, blob_id, "failed to commit export blob cleanup");
+    }
 }
 
 async fn record_export_events(
@@ -1586,6 +1570,21 @@ async fn get_or_create_blob(pool: &SqlitePool, stored: &StoredBlob) -> Result<i6
     .bind(i64::try_from(stored.size_bytes).map_err(|_| ExportError::ZipLimitExceeded)?)
     .fetch_one(pool)
     .await?;
+    let existing_location = sqlx::query_scalar::<_, i64>(
+        r"
+        SELECT blob_id
+        FROM blob_locations
+        WHERE backend = ? AND bucket = ? AND object_key = ?
+        ",
+    )
+    .bind(&stored.backend)
+    .bind(&stored.bucket)
+    .bind(&stored.object_key)
+    .fetch_optional(pool)
+    .await?;
+    if existing_location.is_some_and(|existing_blob_id| existing_blob_id != blob_id) {
+        return Err(ExportError::StorageLocationConflict);
+    }
     sqlx::query(
         r"
         INSERT OR IGNORE INTO blob_locations (blob_id, backend, bucket, object_key)

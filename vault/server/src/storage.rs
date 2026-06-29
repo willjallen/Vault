@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::fs;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use uuid::Uuid;
 
 use crate::config::Config;
@@ -197,10 +197,16 @@ struct ManifestPayload {
     parts: Vec<ManifestPartPayload>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct ManifestPartPayload {
     object_key: String,
     size_bytes: u64,
+}
+
+enum MultipartManifestState {
+    Existing(u64),
+    Missing,
+    Replace,
 }
 
 impl LocalBlobStorage {
@@ -255,7 +261,7 @@ impl LocalBlobStorage {
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent).await?;
         }
-        if fs::metadata(&target).await.is_err() {
+        if !file_matches_digest(&target, &digest, data.len() as u64).await? {
             let temp_path = temp_sibling_path(&target)?;
             let write_result = async {
                 fs::write(&temp_path, data).await?;
@@ -282,12 +288,16 @@ impl LocalBlobStorage {
             return Err(StorageError::SourceSizeChanged);
         }
         let normalized_digest = digest.to_ascii_lowercase();
+        let (source_digest, hashed_size) = hash_file(source_path).await?;
+        if hashed_size != size_bytes || source_digest != normalized_digest {
+            return Err(StorageError::ChecksumMismatch);
+        }
         let object_key = self.object_key_for_hash("sha256", &normalized_digest);
         let target = self.object_path(&object_key)?;
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent).await?;
         }
-        if fs::metadata(&target).await.is_err() {
+        if !file_matches_digest(&target, &normalized_digest, size_bytes).await? {
             let temp_path = temp_sibling_path(&target)?;
             let write_result = async {
                 if fs::rename(source_path, &temp_path).await.is_err() {
@@ -352,7 +362,7 @@ impl LocalBlobStorage {
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent).await?;
         }
-        if fs::metadata(&target).await.is_ok() {
+        if file_matches_digest(&target, &digest, size_bytes).await? {
             fs::remove_file(&temp_path).await?;
         } else {
             rename_or_replace(&temp_path, &target).await?;
@@ -506,44 +516,107 @@ impl LocalBlobStorage {
     ) -> Result<StoredBlob, StorageError> {
         self.ensure().await?;
         let manifest_key = self.multipart_manifest_key_for_hash("sha256", digest);
-        match self.read_multipart_manifest(&manifest_key).await {
-            Ok(existing) => {
-                return Ok(stored_blob(
-                    digest.to_string(),
-                    existing.size_bytes,
-                    manifest_key,
-                ));
-            }
-            Err(StorageError::NotFound) => {}
-            Err(error) => return Err(error),
+        let manifest_state = self
+            .verified_multipart_manifest_state(&manifest_key, digest)
+            .await?;
+        if let MultipartManifestState::Existing(size_bytes) = manifest_state {
+            return Ok(stored_blob(digest.to_string(), size_bytes, manifest_key));
         }
 
-        let mut part_entries = Vec::with_capacity(part_paths.len());
-        let mut staged_keys = Vec::with_capacity(part_paths.len());
-        let mut size_bytes = 0_u64;
-        for (index, part_path) in part_paths.iter().enumerate() {
-            let part_size = fs::metadata(part_path).await?.len();
-            let part_key = self.multipart_part_key_for_hash("sha256", digest, index + 1);
-            let target_path = self.object_path(&part_key)?;
-            if let Err(error) = link_or_copy_part(part_path, &target_path).await {
-                cleanup_keys(self, &staged_keys).await;
-                return Err(error);
-            }
-            staged_keys.push(part_key.clone());
-            part_entries.push(ManifestPartPayload {
-                object_key: part_key,
-                size_bytes: part_size,
-            });
-            size_bytes += part_size;
+        let (size_bytes, part_entries) = self
+            .publish_multipart_part_entries(part_paths, digest)
+            .await?;
+
+        if matches!(manifest_state, MultipartManifestState::Replace) {
+            self.write_multipart_manifest(
+                &manifest_key,
+                digest,
+                size_bytes,
+                part_entries.clone(),
+                true,
+            )
+            .await?;
+        } else {
+            self.publish_multipart_manifest(
+                &manifest_key,
+                digest,
+                size_bytes,
+                part_entries.clone(),
+            )
+            .await?;
         }
-        if let Err(error) = self
-            .write_multipart_manifest(&manifest_key, digest, size_bytes, part_entries)
-            .await
-        {
-            cleanup_keys(self, &staged_keys).await;
-            return Err(error);
+        let manifest = self
+            .read_and_verify_multipart_manifest(&manifest_key, digest)
+            .await?;
+        if manifest.size_bytes != size_bytes {
+            return Err(StorageError::ContentMismatch);
         }
         Ok(stored_blob(digest.to_string(), size_bytes, manifest_key))
+    }
+
+    async fn publish_multipart_part_entries(
+        &self,
+        part_paths: &[PathBuf],
+        digest: &str,
+    ) -> Result<(u64, Vec<ManifestPartPayload>), StorageError> {
+        let mut part_sizes = Vec::with_capacity(part_paths.len());
+        let mut size_bytes = 0_u64;
+        for part_path in part_paths {
+            let part_size = fs::metadata(part_path).await?.len();
+            part_sizes.push(part_size);
+            size_bytes += part_size;
+        }
+        let layout_id = multipart_layout_id(&part_sizes);
+        let mut part_entries = Vec::with_capacity(part_paths.len());
+        for (index, (part_path, part_size)) in part_paths.iter().zip(part_sizes.iter()).enumerate()
+        {
+            let part_key = multipart_part_key_for_hash_layout(
+                &self.prefix,
+                "sha256",
+                digest,
+                &layout_id,
+                index + 1,
+            );
+            let target_path = self.object_path(&part_key)?;
+            publish_part_file(part_path, &target_path, *part_size).await?;
+            part_entries.push(ManifestPartPayload {
+                object_key: part_key,
+                size_bytes: *part_size,
+            });
+        }
+        Ok((size_bytes, part_entries))
+    }
+
+    async fn publish_multipart_manifest(
+        &self,
+        manifest_key: &str,
+        digest: &str,
+        size_bytes: u64,
+        part_entries: Vec<ManifestPartPayload>,
+    ) -> Result<(), StorageError> {
+        if self
+            .write_multipart_manifest(
+                manifest_key,
+                digest,
+                size_bytes,
+                part_entries.clone(),
+                false,
+            )
+            .await?
+        {
+            return Ok(());
+        }
+        match self
+            .verified_multipart_manifest_state(manifest_key, digest)
+            .await?
+        {
+            MultipartManifestState::Existing(_) => Ok(()),
+            MultipartManifestState::Missing | MultipartManifestState::Replace => {
+                self.write_multipart_manifest(manifest_key, digest, size_bytes, part_entries, true)
+                    .await?;
+                Ok(())
+            }
+        }
     }
 
     async fn write_multipart_manifest(
@@ -552,12 +625,15 @@ impl LocalBlobStorage {
         digest: &str,
         size_bytes: u64,
         parts: Vec<ManifestPartPayload>,
-    ) -> Result<(), StorageError> {
+        replace_existing: bool,
+    ) -> Result<bool, StorageError> {
         let manifest_path = self.object_path(manifest_key)?;
         if let Some(parent) = manifest_path.parent() {
             fs::create_dir_all(parent).await?;
         }
-        let temp_path = temp_sibling_path(&manifest_path)?;
+        let staging_dir = self.root().join(".vault-staging");
+        fs::create_dir_all(&staging_dir).await?;
+        let temp_path = staging_dir.join(format!("manifest-{}.tmp", Uuid::new_v4().simple()));
         let payload = ManifestPayload {
             format: LOCAL_MULTIPART_FORMAT.to_string(),
             hash_algo: "sha256".to_string(),
@@ -569,13 +645,61 @@ impl LocalBlobStorage {
             let mut manifest_bytes = serde_json::to_vec(&payload)?;
             manifest_bytes.push(b'\n');
             fs::write(&temp_path, manifest_bytes).await?;
-            rename_or_replace(&temp_path, &manifest_path).await
+            if replace_existing {
+                rename_or_replace(&temp_path, &manifest_path).await?;
+                Ok(true)
+            } else {
+                match fs::hard_link(&temp_path, &manifest_path).await {
+                    Ok(()) => {
+                        let _ = fs::remove_file(&temp_path).await;
+                        Ok(true)
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        let _ = fs::remove_file(&temp_path).await;
+                        Ok(false)
+                    }
+                    Err(error) => Err(StorageError::Io(error)),
+                }
+            }
         }
         .await;
         if write_result.is_err() {
             let _ = fs::remove_file(&temp_path).await;
         }
         write_result
+    }
+
+    async fn verified_multipart_manifest_state(
+        &self,
+        object_key: &str,
+        expected_digest: &str,
+    ) -> Result<MultipartManifestState, StorageError> {
+        match self
+            .read_and_verify_multipart_manifest(object_key, expected_digest)
+            .await
+        {
+            Ok(existing) => Ok(MultipartManifestState::Existing(existing.size_bytes)),
+            Err(StorageError::NotFound) => Ok(MultipartManifestState::Missing),
+            Err(
+                StorageError::ContentMismatch
+                | StorageError::InvalidMultipartManifest
+                | StorageError::UnreadableMultipartManifest,
+            ) => Ok(MultipartManifestState::Replace),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn read_and_verify_multipart_manifest(
+        &self,
+        object_key: &str,
+        expected_digest: &str,
+    ) -> Result<LocalMultipartManifest, StorageError> {
+        let manifest = self.read_multipart_manifest(object_key).await?;
+        if manifest.digest != expected_digest {
+            return Err(StorageError::ContentMismatch);
+        }
+        verify_multipart_manifest_digest(&manifest).await?;
+        Ok(manifest)
     }
 
     async fn read_multipart_range(
@@ -854,16 +978,14 @@ impl BlobStorageBackend for S3CompatibleBlobStorage {
     async fn put_bytes(&self, data: &[u8]) -> Result<StoredBlob, StorageError> {
         let digest = sha256_hex(data);
         let object_key = self.object_key_for_hash("sha256", &digest);
-        if !self.remote_object_exists(&object_key).await {
-            self.client
-                .put_object()
-                .bucket(self.bucket())
-                .key(&object_key)
-                .body(ByteStream::from(data.to_vec()))
-                .send()
-                .await
-                .map_err(remote_storage_error)?;
-        }
+        self.client
+            .put_object()
+            .bucket(self.bucket())
+            .key(&object_key)
+            .body(ByteStream::from(data.to_vec()))
+            .send()
+            .await
+            .map_err(remote_storage_error)?;
         Ok(self.stored_blob(digest, data.len() as u64, object_key))
     }
 
@@ -878,21 +1000,23 @@ impl BlobStorageBackend for S3CompatibleBlobStorage {
             return Err(StorageError::SourceSizeChanged);
         }
         let normalized_digest = digest.to_ascii_lowercase();
-        let object_key = self.object_key_for_hash("sha256", &normalized_digest);
-        if !self.remote_object_exists(&object_key).await {
-            self.client
-                .put_object()
-                .bucket(self.bucket())
-                .key(&object_key)
-                .body(
-                    ByteStream::from_path(source_path)
-                        .await
-                        .map_err(remote_storage_error)?,
-                )
-                .send()
-                .await
-                .map_err(remote_storage_error)?;
+        let (source_digest, hashed_size) = hash_file(source_path).await?;
+        if hashed_size != size_bytes || source_digest != normalized_digest {
+            return Err(StorageError::ChecksumMismatch);
         }
+        let object_key = self.object_key_for_hash("sha256", &normalized_digest);
+        self.client
+            .put_object()
+            .bucket(self.bucket())
+            .key(&object_key)
+            .body(
+                ByteStream::from_path(source_path)
+                    .await
+                    .map_err(remote_storage_error)?,
+            )
+            .send()
+            .await
+            .map_err(remote_storage_error)?;
         Ok(self.stored_blob(normalized_digest, size_bytes, object_key))
     }
 
@@ -979,16 +1103,6 @@ impl BlobStorageBackend for S3CompatibleBlobStorage {
 }
 
 impl S3CompatibleBlobStorage {
-    async fn remote_object_exists(&self, object_key: &str) -> bool {
-        self.client
-            .head_object()
-            .bucket(self.bucket())
-            .key(object_key)
-            .send()
-            .await
-            .is_ok()
-    }
-
     fn stored_blob(&self, digest: String, size_bytes: u64, object_key: String) -> StoredBlob {
         StoredBlob {
             hash_algo: "sha256".to_string(),
@@ -1066,6 +1180,24 @@ pub fn multipart_part_key_for_hash(
 }
 
 #[must_use]
+pub fn multipart_part_key_for_hash_layout(
+    prefix: &str,
+    hash_algo: &str,
+    digest: &str,
+    layout_id: &str,
+    part_number: usize,
+) -> String {
+    prefixed_key(
+        prefix,
+        &format!(
+            "multipart/{hash_algo}/{}/parts/{}/{part_number:08}.part",
+            digest.to_ascii_lowercase(),
+            layout_id.to_ascii_lowercase(),
+        ),
+    )
+}
+
+#[must_use]
 pub fn is_multipart_manifest_key(object_key: &str) -> bool {
     let cleaned = object_key.trim().trim_start_matches('/').replace('\\', "/");
     cleaned.ends_with("/manifest.json") && format!("/{cleaned}").contains("/multipart/")
@@ -1102,6 +1234,153 @@ fn lower_hex(bytes: &[u8]) -> String {
     output
 }
 
+fn multipart_layout_id(part_sizes: &[u64]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update((part_sizes.len() as u64).to_be_bytes());
+    for size in part_sizes {
+        hasher.update(size.to_be_bytes());
+    }
+    lower_hex(&hasher.finalize())
+}
+
+async fn hash_file(path: &Path) -> Result<(String, u64), StorageError> {
+    let mut source = match fs::File::open(path).await {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(StorageError::NotFound);
+        }
+        Err(error) => return Err(StorageError::Io(error)),
+    };
+    let mut hasher = Sha256::new();
+    let mut size_bytes = 0_u64;
+    let mut buffer = vec![0_u8; STORAGE_CHUNK_SIZE];
+    loop {
+        let read = source.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        size_bytes += read as u64;
+    }
+    Ok((lower_hex(&hasher.finalize()), size_bytes))
+}
+
+async fn file_matches_digest(
+    path: &Path,
+    digest: &str,
+    size_bytes: u64,
+) -> Result<bool, StorageError> {
+    let metadata = match fs::metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(StorageError::Io(error)),
+    };
+    if !metadata.is_file() {
+        return Err(StorageError::ContentMismatch);
+    }
+    if metadata.len() != size_bytes {
+        return Ok(false);
+    }
+    match hash_file(path).await {
+        Ok((actual_digest, actual_size)) => {
+            Ok(actual_size == size_bytes && actual_digest == digest.to_ascii_lowercase())
+        }
+        Err(StorageError::NotFound) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+async fn file_matches_source(
+    target_path: &Path,
+    source_path: &Path,
+    size_bytes: u64,
+) -> Result<bool, StorageError> {
+    let metadata = match fs::metadata(target_path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(StorageError::Io(error)),
+    };
+    if !metadata.is_file() {
+        return Err(StorageError::ContentMismatch);
+    }
+    if metadata.len() != size_bytes {
+        return Ok(false);
+    }
+    let (source_digest, source_size) = hash_file(source_path).await?;
+    if source_size != size_bytes {
+        return Err(StorageError::SourceSizeChanged);
+    }
+    let (target_digest, target_size) = match hash_file(target_path).await {
+        Ok(result) => result,
+        Err(StorageError::NotFound) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    Ok(target_size == size_bytes && target_digest == source_digest)
+}
+
+async fn publish_part_file(
+    source_path: &Path,
+    target_path: &Path,
+    size_bytes: u64,
+) -> Result<(), StorageError> {
+    let source_size = fs::metadata(source_path).await?.len();
+    if source_size != size_bytes {
+        return Err(StorageError::SourceSizeChanged);
+    }
+    if let Some(parent) = target_path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    if file_matches_source(target_path, source_path, size_bytes).await? {
+        return Ok(());
+    }
+    if fs::hard_link(source_path, target_path).await.is_ok() {
+        return Ok(());
+    }
+    if file_matches_source(target_path, source_path, size_bytes).await? {
+        return Ok(());
+    }
+
+    let temp_path = temp_sibling_path(target_path)?;
+    let copy_result = async {
+        let mut source = fs::File::open(source_path).await?;
+        let mut target = fs::File::create_new(&temp_path).await?;
+        let copied = tokio::io::copy(&mut source, &mut target).await?;
+        target.flush().await?;
+        if copied != size_bytes {
+            return Err(StorageError::SourceSizeChanged);
+        }
+        rename_or_replace(&temp_path, target_path).await
+    }
+    .await;
+    if copy_result.is_err() {
+        let _ = fs::remove_file(&temp_path).await;
+    }
+    copy_result
+}
+
+async fn verify_multipart_manifest_digest(
+    manifest: &LocalMultipartManifest,
+) -> Result<(), StorageError> {
+    let mut hasher = Sha256::new();
+    let mut size_bytes = 0_u64;
+    let mut buffer = vec![0_u8; STORAGE_CHUNK_SIZE];
+    for part in &manifest.parts {
+        let mut source = fs::File::open(&part.path).await?;
+        loop {
+            let read = source.read(&mut buffer).await?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+            size_bytes += read as u64;
+        }
+    }
+    if size_bytes != manifest.size_bytes || lower_hex(&hasher.finalize()) != manifest.digest {
+        return Err(StorageError::ContentMismatch);
+    }
+    Ok(())
+}
+
 fn stored_blob(digest: String, size_bytes: u64, object_key: String) -> StoredBlob {
     StoredBlob {
         hash_algo: "sha256".to_string(),
@@ -1127,31 +1406,6 @@ async fn rename_or_replace(source: &Path, target: &Path) -> Result<(), StorageEr
         fs::rename(source, target).await?;
     }
     Ok(())
-}
-
-async fn link_or_copy_part(source_path: &Path, target_path: &Path) -> Result<(), StorageError> {
-    if let Some(parent) = target_path.parent() {
-        fs::create_dir_all(parent).await?;
-    }
-    if let Ok(metadata) = fs::metadata(target_path).await {
-        let source_size = fs::metadata(source_path).await?.len();
-        if metadata.len() == source_size {
-            return Ok(());
-        }
-        return Err(StorageError::ConflictingMultipartPart);
-    }
-    if fs::hard_link(source_path, target_path).await.is_err() {
-        fs::copy(source_path, target_path).await?;
-    }
-    Ok(())
-}
-
-async fn cleanup_keys(storage: &LocalBlobStorage, keys: &[String]) {
-    for key in keys {
-        if let Ok(path) = storage.object_path(key) {
-            let _ = fs::remove_file(path).await;
-        }
-    }
 }
 
 async fn stage_part_files(part_paths: &[PathBuf]) -> Result<(PathBuf, String, u64), StorageError> {

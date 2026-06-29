@@ -412,10 +412,7 @@ async fn recovery_requeues_interrupted_exports_and_removes_partial_artifacts() {
 
     assert_eq!(result.requeued_exports, vec!["running-export"]);
     assert_eq!(result.deleted_export_temps, vec!["running-export.zip.tmp"]);
-    assert_eq!(
-        result.deleted_export_objects,
-        vec![stored.object_key.clone()]
-    );
+    assert_eq!(result.deleted_export_objects, Vec::<String>::new());
     assert_eq!(status, "queued");
     assert_eq!(artifact_count, 0);
     assert_eq!(blob_count, 0);
@@ -425,7 +422,7 @@ async fn recovery_requeues_interrupted_exports_and_removes_partial_artifacts() {
             .is_err()
     );
     assert!(
-        !state
+        state
             .storage
             .list_object_keys()
             .await
@@ -589,15 +586,12 @@ async fn sweep_expired_exports_cancels_active_and_deletes_terminal_artifacts() {
 
     assert_eq!(result.cancelled_exports, vec!["queued-export"]);
     assert_eq!(result.deleted_exports, vec!["complete-export"]);
-    assert_eq!(
-        result.deleted_export_objects,
-        vec![stored.object_key.clone()]
-    );
+    assert_eq!(result.deleted_export_objects, Vec::<String>::new());
     assert_eq!(queued_status, "cancelled");
     assert_eq!(complete_count, 0);
     assert_eq!(blob_count, 0);
     assert!(
-        !state
+        state
             .storage
             .list_object_keys()
             .await

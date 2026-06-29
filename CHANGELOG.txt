@@ -1,5 +1,16 @@
 ========================================================================
 
+v1.1.0
+
+feat: Rewrite the application backend in Rust with an Axum/SQLx service that preserves the existing API and single-container deployment contract.
+feat: Port authentication, OIDC, security headers, gzip, admin/debug tooling, bootstrap metadata, preferences, site settings, and live state events to the Rust runtime.
+feat: Port folder browsing, document metadata, version history, locks, checkouts, archive/restore, favorites, sharing, retention, uploads, downloads, and export workflows to Rust.
+feat: Add Rust-native resumable transfer sessions, transfer cleanup, folder export jobs, ZIP64 archive support, and local/S3/R2 object storage handling.
+docs: Document the Rust rewrite and update Docker release defaults for v1.1.0.
+
+
+========================================================================
+
 v1.0.1
 
 fix: Harden SQLite event streaming under concurrent use by moving state-event database reads off the ASGI event loop.

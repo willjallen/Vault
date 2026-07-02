@@ -1,5 +1,14 @@
 ========================================================================
 
+v1.2.0
+
+fix: Harden resumable upload parts with browser-wide concurrency limits, per-part timeouts, and retries for transport-shaped upload failures.
+fix: Prevent failed or stalled upload part requests from leaving concurrent uploads permanently blocked.
+docs: Update Docker release defaults for v1.2.0.
+
+
+========================================================================
+
 v1.1.0
 
 feat: Rewrite the application backend in Rust with an Axum/SQLx service that preserves the existing API and single-container deployment contract.

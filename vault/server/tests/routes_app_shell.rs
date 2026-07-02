@@ -109,6 +109,10 @@ async fn index_renders_bootstrap_state_and_manifest_assets() {
         response.headers()[header::CONTENT_TYPE],
         "text/html; charset=utf-8"
     );
+    assert_eq!(
+        response.headers()[header::CACHE_CONTROL],
+        "no-store, max-age=0"
+    );
     let body = response_text(response).await;
     assert!(body.contains(r#"<div id="app-root" class="app-root"></div>"#));
     assert!(body.contains("window.__INITIAL_STATE__ = "));
@@ -220,7 +224,22 @@ async fn static_assets_are_served_from_manifest_and_missing_paths_404() {
         response.headers()[header::CONTENT_TYPE],
         "text/javascript; charset=utf-8"
     );
+    assert_eq!(
+        response.headers()[header::CACHE_CONTROL],
+        "public, max-age=31536000, immutable"
+    );
     assert!(response_bytes(response).await.len() > 1024);
+
+    let manifest_response = app
+        .clone()
+        .oneshot(authed_get_without_appearance("/static/dist/manifest.json"))
+        .await
+        .expect("manifest asset");
+    assert_eq!(manifest_response.status(), StatusCode::OK);
+    assert_eq!(
+        manifest_response.headers()[header::CACHE_CONTROL],
+        "no-cache"
+    );
 
     let missing = app
         .clone()

@@ -80,6 +80,9 @@ use crate::views::{
 
 const HEADER_PERCENT_HEX: &[u8; 16] = b"0123456789ABCDEF";
 const DEBUG_TIMEOUT_SECONDS: i64 = 10;
+const APP_SHELL_CACHE_CONTROL: &str = "no-store, max-age=0";
+const STATIC_IMMUTABLE_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
+const STATIC_REVALIDATE_CACHE_CONTROL: &str = "no-cache";
 static DEBUG_EVENT_STREAM_GENERATION: AtomicI64 = AtomicI64::new(0);
 static DEBUG_EVENT_STREAM_RETRY_MS: AtomicI64 = AtomicI64::new(3000);
 
@@ -392,7 +395,7 @@ async fn index(
     Extension(csp_nonce): Extension<CspNonce>,
     headers: HeaderMap,
     uri: Uri,
-) -> Result<Html<String>, ApiError> {
+) -> Result<Response, ApiError> {
     app_shell_response(state, headers, &uri, None, &csp_nonce.0).await
 }
 
@@ -402,7 +405,7 @@ async fn share_entry(
     headers: HeaderMap,
     uri: Uri,
     Path(code): Path<String>,
-) -> Result<Html<String>, ApiError> {
+) -> Result<Response, ApiError> {
     if !shares::valid_share_code(&code) {
         return Err(ApiError::NotFound("Share link not found".to_string()));
     }
@@ -415,7 +418,7 @@ async fn app_shell_response(
     uri: &Uri,
     share_code: Option<String>,
     nonce: &str,
-) -> Result<Html<String>, ApiError> {
+) -> Result<Response, ApiError> {
     let user = current_browser_user(&state, &headers, uri).await?;
     let initial_state = views::build_initial_state_payload(
         &state.db,
@@ -427,12 +430,19 @@ async fn app_shell_response(
     )
     .await?;
     let manifest = assets::load_static_asset_manifest(&state.config.static_dir).await?;
-    Ok(Html(assets::app_shell_html(
+    let mut response = Html(assets::app_shell_html(
         &initial_state,
         &manifest,
         &headers,
         nonce,
-    )?))
+    )?)
+    .into_response();
+    insert_header(
+        response.headers_mut(),
+        header::CACHE_CONTROL,
+        APP_SHELL_CACHE_CONTROL,
+    );
+    Ok(response)
 }
 
 async fn login(
@@ -555,7 +565,20 @@ async fn static_asset(
         header::CONTENT_TYPE,
         &asset.content_type,
     );
+    insert_header(
+        response.headers_mut(),
+        header::CACHE_CONTROL,
+        static_asset_cache_control(&path),
+    );
     Ok(response)
+}
+
+fn static_asset_cache_control(path: &str) -> &'static str {
+    if path.starts_with("dist/") && path != "dist/manifest.json" {
+        STATIC_IMMUTABLE_CACHE_CONTROL
+    } else {
+        STATIC_REVALIDATE_CACHE_CONTROL
+    }
 }
 
 async fn api_health(State(state): State<AppState>) -> Json<HealthPayload> {

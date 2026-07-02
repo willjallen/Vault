@@ -1,7 +1,11 @@
+import {
+  acquireUploadPartSlot,
+  shouldRetryUploadPart,
+  uploadParallelismForLatency,
+  uploadPartTimeoutMs,
+} from "./uploadPartPolicy.js";
+
 const UPLOAD_SESSION_STORAGE_KEY = "vault.uploadSessions";
-const UPLOAD_LOW_LATENCY_CONCURRENCY = 8;
-const UPLOAD_MAX_CONCURRENCY = 16;
-const UPLOAD_LOW_LATENCY_RTT_MS = 25;
 const UPLOAD_RETRY_LIMIT = 3;
 const DOWNLOAD_CONCURRENCY = 4;
 const DOWNLOAD_SEGMENT_BYTES = 64 * 1024 * 1024;
@@ -34,7 +38,10 @@ function parseJson(value) {
 
 function errorFromText(text, responseStatus, fallback) {
   const parsed = parseJson(text);
-  const error = new Error(parsed.detail || fallback);
+  const detail = parsed.detail || fallback;
+  const error = new Error(detail);
+  error.detail = parsed.detail || "";
+  error.responseText = text || "";
   error.status = responseStatus;
   return error;
 }
@@ -92,13 +99,6 @@ function waitFor(delay, signal) {
     }
     signal?.addEventListener("abort", onAbort, { once: true });
   });
-}
-
-export function uploadParallelismForLatency(rttMs) {
-  if (Number.isFinite(rttMs) && rttMs >= 0 && rttMs <= UPLOAD_LOW_LATENCY_RTT_MS) {
-    return UPLOAD_LOW_LATENCY_CONCURRENCY;
-  }
-  return UPLOAD_MAX_CONCURRENCY;
 }
 
 async function measureUploadControlLatency(signal) {
@@ -278,6 +278,7 @@ function uploadPartRequest({ session, partNumber, chunk, offset, onProgress, sig
 
     signal?.addEventListener("abort", abortRequest, { once: true });
     xhr.open("PUT", `/api/uploads/${session.id}/parts/${partNumber}`);
+    xhr.timeout = uploadPartTimeoutMs(chunk.size);
     xhr.withCredentials = true;
     xhr.setRequestHeader("Content-Type", "application/octet-stream");
     xhr.setRequestHeader("X-Upload-Offset", String(offset));
@@ -287,16 +288,6 @@ function uploadPartRequest({ session, partNumber, chunk, offset, onProgress, sig
     }
     xhr.send(chunk);
   });
-}
-
-function shouldRetryUploadPart(error) {
-  if (isAbortError(error)) {
-    return false;
-  }
-  if (error?.networkError || !error?.status) {
-    return true;
-  }
-  return [408, 429, 500, 502, 503, 504].includes(error.status);
 }
 
 async function uploadPart({
@@ -312,14 +303,19 @@ async function uploadPart({
     throwIfAborted(signal);
     onAttemptStart?.();
     try {
-      return await uploadPartRequest({
-        chunk,
-        offset,
-        onProgress,
-        partNumber,
-        session,
-        signal,
-      });
+      const releaseSlot = await acquireUploadPartSlot(signal);
+      try {
+        return await uploadPartRequest({
+          chunk,
+          offset,
+          onProgress,
+          partNumber,
+          session,
+          signal,
+        });
+      } finally {
+        releaseSlot();
+      }
     } catch (error) {
       if (!shouldRetryUploadPart(error) || attempt >= UPLOAD_RETRY_LIMIT) {
         throw error;

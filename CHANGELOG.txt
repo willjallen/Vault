@@ -1,5 +1,14 @@
 ========================================================================
 
+v1.3.0
+
+fix: Set frontend cache headers so deployments fetch the current app shell while content-addressed assets remain safely cacheable.
+fix: Make upload resume explicit by discarding zero-byte stored sessions, resuming only committed parts for the same selected file, and showing resume state in the UI.
+build: Centralize release version metadata on the VERSION file and publish Docker images from semantic version tags plus latest.
+
+
+========================================================================
+
 v1.2.0
 
 fix: Harden resumable upload parts with browser-wide concurrency limits, per-part timeouts, and retries for transport-shaped upload failures.

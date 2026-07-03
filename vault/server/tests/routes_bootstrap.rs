@@ -12,6 +12,7 @@ use vault_server::folders::{
 };
 use vault_server::http::{self, AppState};
 use vault_server::storage::LocalBlobStorage;
+use vault_server::version::app_version;
 
 async fn test_state() -> (AppState, tempfile::TempDir) {
     test_state_with_auth(AuthSettings::default()).await
@@ -249,7 +250,7 @@ async fn bootstrap_returns_runtime_user_preferences_settings_and_current_folder(
     assert_eq!(json["base_domain"], "localhost");
     assert_eq!(json["dev_mode"], false);
     assert_eq!(json["site_name"], "Test Vault");
-    assert_eq!(json["version"], "1.2.0");
+    assert_eq!(json["version"], app_version());
     assert_eq!(json["current_folder"], "Project");
     assert_eq!(json["user"]["subject"], "artist");
     assert_eq!(json["preferences"]["themePreference"], "system");

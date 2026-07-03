@@ -4,8 +4,14 @@ import {
   uploadParallelismForLatency,
   uploadPartTimeoutMs,
 } from "./uploadPartPolicy.js";
+import {
+  committedUploadBytes,
+  forgetUploadSession,
+  rememberUploadSession,
+  storedUploadSessionId,
+  uploadSessionKey,
+} from "./uploadSessionStore.js";
 
-const UPLOAD_SESSION_STORAGE_KEY = "vault.uploadSessions";
 const UPLOAD_RETRY_LIMIT = 3;
 const DOWNLOAD_CONCURRENCY = 4;
 const DOWNLOAD_SEGMENT_BYTES = 64 * 1024 * 1024;
@@ -67,6 +73,7 @@ function progressFromValues(loaded, total, startedAt, options = {}) {
     lengthComputable: Boolean(total),
     loaded,
     percent: total ? Math.min(100, Math.max(0, (loaded / total) * 100)) : null,
+    resumedBytes: options.resumedBytes || null,
     stage: options.stage || "transfer",
     total,
   };
@@ -126,46 +133,6 @@ async function measureUploadControlLatency(signal) {
 async function resolveUploadParallelism(signal) {
   const controlRttMs = await measureUploadControlLatency(signal);
   return uploadParallelismForLatency(controlRttMs);
-}
-
-function readStoredUploadSessions() {
-  try {
-    const parsed = JSON.parse(localStorage.getItem(UPLOAD_SESSION_STORAGE_KEY) || "[]");
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-}
-
-function writeStoredUploadSessions(records) {
-  localStorage.setItem(UPLOAD_SESSION_STORAGE_KEY, JSON.stringify(records));
-}
-
-function uploadSessionKey({ file, folder, mode, documentId, note, renameToUpload }) {
-  return [
-    mode || "create",
-    documentId || "",
-    folder || "",
-    file.name,
-    file.size,
-    file.lastModified,
-    note || "",
-    renameToUpload ? "rename" : "",
-  ].join("|");
-}
-
-function rememberUploadSession(key, sessionId) {
-  const sessions = readStoredUploadSessions().filter((record) => record.key !== key);
-  sessions.push({ key, sessionId });
-  writeStoredUploadSessions(sessions);
-}
-
-function forgetUploadSession(key) {
-  writeStoredUploadSessions(readStoredUploadSessions().filter((record) => record.key !== key));
-}
-
-function storedUploadSessionId(key) {
-  return readStoredUploadSessions().find((record) => record.key === key)?.sessionId || null;
 }
 
 async function requestJson(url, options = {}, fallback = "Request failed") {
@@ -396,12 +363,26 @@ export async function uploadFileResumable({
   const key = uploadSessionKey({ file, folder, mode, documentId, note, renameToUpload });
   const storedSessionId = storedUploadSessionId(key);
   let session = null;
+  let resumedSession = false;
   try {
     // Upload session sizing is path-sensitive. Low-latency clients should not
     // pay for high request fanout, but stream-limited clients need enough active
     // PUTs to fill their uplink. The server uses this hint to choose chunk size.
     const uploadParallelism = await resolveUploadParallelism(signal);
-    session = storedSessionId ? await existingUploadSession(storedSessionId, signal) : null;
+    if (storedSessionId) {
+      session = await existingUploadSession(storedSessionId, signal);
+      if (!session || session.status !== "active") {
+        forgetUploadSession(key);
+        session = null;
+      } else if (committedUploadBytes(session) <= 0) {
+        await abortUploadSession(session.id);
+        forgetUploadSession(key);
+        session = null;
+      } else {
+        resumedSession = true;
+        rememberUploadSession(key, session);
+      }
+    }
     if (!session || session.status !== "active") {
       session = await createUploadSession({
         documentId,
@@ -413,7 +394,7 @@ export async function uploadFileResumable({
         uploadParallelism,
         signal,
       });
-      rememberUploadSession(key, session.id);
+      rememberUploadSession(key, session);
     }
 
     const startedAt = performance.now();
@@ -424,6 +405,7 @@ export async function uploadFileResumable({
       (total, part) => total + part.size_bytes,
       0
     );
+    const resumedBytes = resumedSession ? completedBytes : 0;
     const activeParts = new Map();
     let lastProgressEmittedAt = 0;
 
@@ -443,6 +425,7 @@ export async function uploadFileResumable({
           file.size,
           startedAt,
           {
+            resumedBytes,
             stage: "uploading",
           }
         )
@@ -463,6 +446,14 @@ export async function uploadFileResumable({
     }
 
     emitUploadProgress({ force: true });
+    if (resumedBytes > 0) {
+      onProgress(
+        progressFromValues(completedBytes, file.size, startedAt, {
+          resumedBytes,
+          stage: "resuming",
+        })
+      );
+    }
 
     let nextPartNumber = 1;
     async function uploadWorker() {

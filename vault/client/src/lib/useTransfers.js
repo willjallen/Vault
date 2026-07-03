@@ -102,6 +102,7 @@ export function useTransfers({ onUnauthorized } = {}) {
         etaSeconds: progress.etaSeconds,
         loaded: progress.loaded,
         percent: progress.percent,
+        resumedBytes: progress.resumedBytes || null,
         stage: progress.stage || "transfer",
         total: progress.total,
       });

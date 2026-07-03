@@ -18,7 +18,7 @@ function formatEta(seconds) {
   return `${minutes}m ${String(remainingSeconds).padStart(2, "0")}s left`;
 }
 
-function transferTitle(transfer) {
+export function transferTitle(transfer) {
   if (transfer.status === "complete") {
     return transfer.kind === "upload" ? "Uploaded" : "Downloaded";
   }
@@ -33,6 +33,9 @@ function transferTitle(transfer) {
   }
   if (transfer.kind === "upload" && transfer.stage === "verifying") {
     return "Verifying upload";
+  }
+  if (transfer.kind === "upload" && transfer.resumedBytes > 0) {
+    return "Resuming upload";
   }
   if (transfer.kind === "download" && transfer.stage === "preparing") {
     return "Preparing download";
@@ -49,9 +52,12 @@ function transferTitle(transfer) {
   return transfer.kind === "upload" ? "Uploading" : "Downloading";
 }
 
-function transferStageLabel(transfer) {
+export function transferStageLabel(transfer) {
   if (transfer.kind === "upload" && transfer.stage === "verifying") {
     return "Server verification";
+  }
+  if (transfer.kind === "upload" && transfer.stage === "resuming") {
+    return "Previous upload found";
   }
   if (transfer.kind === "download" && transfer.stage === "preparing") {
     return "Server export";
@@ -81,7 +87,30 @@ function formatPercent(percent) {
   return `${Math.floor(percent)}%`;
 }
 
-function transferMeta(transfer) {
+function resumePercent(transfer) {
+  if (!transfer.total || !transfer.resumedBytes) {
+    return null;
+  }
+  return Math.min(100, Math.max(0, (transfer.resumedBytes / transfer.total) * 100));
+}
+
+function uploadResumeMeta(transfer) {
+  const resumedPercent = resumePercent(transfer);
+  if (transfer.kind === "upload" && transfer.stage === "resuming" && resumedPercent !== null) {
+    return `Resuming previous upload from ${formatPercent(resumedPercent)}`;
+  }
+  return "";
+}
+
+function uploadResumeSuffix(transfer) {
+  const resumedPercent = resumePercent(transfer);
+  if (transfer.kind === "upload" && resumedPercent !== null && transfer.stage !== "verifying") {
+    return `resumed from ${formatPercent(resumedPercent)}`;
+  }
+  return "";
+}
+
+export function transferMeta(transfer) {
   if (transfer.status === "cancelled") {
     return "Cancelled";
   }
@@ -100,6 +129,10 @@ function transferMeta(transfer) {
   if (transfer.kind === "download" && transfer.stage === "server-finalizing") {
     return transfer.total ? `${formatBytes(transfer.total)} packaged` : "Finalizing";
   }
+  const resumeMeta = uploadResumeMeta(transfer);
+  if (resumeMeta) {
+    return resumeMeta;
+  }
 
   const pieces = [];
   if (transfer.percent !== null && transfer.percent !== undefined) {
@@ -112,6 +145,10 @@ function transferMeta(transfer) {
   }
   if (transfer.bytesPerSecond > 0) {
     pieces.push(`${formatBytes(transfer.bytesPerSecond, { emptyForZero: false })}/s`);
+  }
+  const resumeSuffix = uploadResumeSuffix(transfer);
+  if (resumeSuffix) {
+    pieces.push(resumeSuffix);
   }
   const eta = formatEta(transfer.etaSeconds);
   if (eta) {

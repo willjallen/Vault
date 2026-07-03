@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use clap::Parser;
 
 #[derive(Debug, Clone, Parser)]
-#[command(author, version, about)]
+#[command(author, version = crate::version::app_version(), about)]
 pub struct Config {
     #[arg(long, env = "VAULT_HOST", default_value_t = IpAddr::V4(Ipv4Addr::UNSPECIFIED))]
     pub host: IpAddr,

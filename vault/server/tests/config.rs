@@ -1,8 +1,7 @@
 use std::path::{Path, PathBuf};
 
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use vault_server::config::Config;
-use vault_server::version::app_version;
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -12,10 +11,6 @@ fn root_file(path: &str) -> String {
     std::fs::read_to_string(repo_root().join(path)).unwrap_or_else(|error| {
         panic!("read {path}: {error}");
     })
-}
-
-fn release_image() -> String {
-    format!("ghcr.io/willjallen/vault:v{}", app_version())
 }
 
 #[test]
@@ -217,7 +212,15 @@ fn explicit_object_path_overrides_legacy_object_path_env_fallbacks() {
 fn app_version_comes_from_version_file() {
     let expected = std::fs::read_to_string(repo_root().join("VERSION")).expect("VERSION");
 
-    assert_eq!(app_version(), expected.trim());
+    assert_eq!(vault_server::version::app_version(), expected.trim());
+}
+
+#[test]
+fn cli_version_comes_from_version_file() {
+    assert_eq!(
+        Config::command().get_version(),
+        Some(vault_server::version::app_version())
+    );
 }
 
 #[test]
@@ -251,10 +254,11 @@ fn dockerfile_runs_rust_server_with_single_data_volume_contract() {
 }
 
 #[test]
-fn production_compose_uses_release_image_single_data_volume_and_hardened_defaults() {
+fn production_compose_uses_latest_image_single_data_volume_and_hardened_defaults() {
     let compose = root_file("docker-compose.yml");
 
-    assert!(compose.contains(&release_image()));
+    assert!(compose.contains("ghcr.io/willjallen/vault:latest"));
+    assert!(!compose.contains("ghcr.io/willjallen/vault:v"));
     assert!(compose.contains("${VAULT_BIND_ADDRESS:-127.0.0.1}:${VAULT_PORT:-8000}:8000"));
     assert!(compose.contains("- vault-data:/data"));
     assert!(compose.contains("vault-data:"));
@@ -360,7 +364,7 @@ fn generated_static_assets_are_ignored_build_output() {
 }
 
 #[test]
-fn semver_tag_workflow_builds_and_publishes_versioned_ghcr_image() {
+fn semver_tag_workflow_builds_and_publishes_versioned_and_latest_ghcr_image() {
     let workflow = root_file(".github/workflows/docker-image.yml");
 
     assert!(workflow.contains("      - \"v*.*.*\""));
@@ -372,8 +376,8 @@ fn semver_tag_workflow_builds_and_publishes_versioned_ghcr_image() {
     assert!(workflow.contains("docker/build-push-action@v6"));
     assert!(workflow.contains("push: true"));
     assert!(workflow.contains("type=semver,pattern={{version}}"));
+    assert!(workflow.contains("type=raw,value=latest"));
     assert!(!workflow.contains("VAULT_VERSION"));
     assert!(!workflow.contains("type=semver,pattern={{major}}.{{minor}}"));
     assert!(!workflow.contains("type=semver,pattern={{major}}"));
-    assert!(!workflow.contains("type=raw,value=latest"));
 }

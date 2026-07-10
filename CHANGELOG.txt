@@ -1,5 +1,14 @@
 ========================================================================
 
+v1.3.1
+
+fix: Route the single Download action by effective browser capability and the site gate, preserving system file selection where File System Access is available and using the native download manager otherwise.
+perf: Replace range probes, parallel client segments, and large write queues with one authenticated, backpressured download stream.
+fix: Explain native download-location behavior until the user dismisses the guidance through their synced Vault preferences.
+
+
+========================================================================
+
 v1.3.0
 
 fix: Set frontend cache headers so deployments fetch the current app shell while content-addressed assets remain safely cacheable.

@@ -1,5 +1,12 @@
 ========================================================================
 
+v1.3.2
+
+fix: Enable capability-based File System Access downloads by default while preserving automatic native download fallback for unsupported browsers.
+
+
+========================================================================
+
 v1.3.1
 
 fix: Route the single Download action by effective browser capability and the site gate, preserving system file selection where File System Access is available and using the native download manager otherwise.

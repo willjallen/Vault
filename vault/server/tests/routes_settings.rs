@@ -113,7 +113,7 @@ async fn settings_route_requires_auth_and_returns_defaults() {
     assert_eq!(unauthenticated_json["detail"], "Authentication required");
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["settings"]["archivePermanentDeleteAdminOnly"], true);
-    assert_eq!(json["settings"]["customDownloadStreamingEnabled"], false);
+    assert_eq!(json["settings"]["customDownloadStreamingEnabled"], true);
 }
 
 #[tokio::test]
@@ -197,7 +197,7 @@ async fn admin_settings_patch_persists_setting_and_emits_state_event() {
             "vault-admin",
             &json!({"settings": {
                 "archivePermanentDeleteAdminOnly": false,
-                "customDownloadStreamingEnabled": true
+                "customDownloadStreamingEnabled": false
             }}),
         ))
         .await
@@ -207,7 +207,7 @@ async fn admin_settings_patch_persists_setting_and_emits_state_event() {
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["settings"]["archivePermanentDeleteAdminOnly"], false);
-    assert_eq!(json["settings"]["customDownloadStreamingEnabled"], true);
+    assert_eq!(json["settings"]["customDownloadStreamingEnabled"], false);
 
     let reader_response = app
         .clone()
@@ -221,7 +221,7 @@ async fn admin_settings_patch_persists_setting_and_emits_state_event() {
     );
     assert_eq!(
         reader_json["settings"]["customDownloadStreamingEnabled"],
-        true,
+        false,
     );
 
     let stored = sqlx::query_scalar::<_, String>(

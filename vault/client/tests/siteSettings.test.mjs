@@ -8,18 +8,18 @@ const source = await readFile(sourceUrl, "utf8");
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(source).toString("base64")}`;
 const { normalizeSiteSettings } = await import(moduleUrl);
 
-test("custom download streaming is disabled by default", () => {
-  assert.equal(normalizeSiteSettings({}).customDownloadStreamingEnabled, false);
+test("custom download streaming is enabled by default", () => {
+  assert.equal(normalizeSiteSettings({}).customDownloadStreamingEnabled, true);
 });
 
-test("custom download streaming requires an explicit boolean opt-in", () => {
+test("custom download streaming accepts only an explicit boolean override", () => {
   assert.equal(
-    normalizeSiteSettings({ customDownloadStreamingEnabled: true }).customDownloadStreamingEnabled,
-    true
+    normalizeSiteSettings({ customDownloadStreamingEnabled: false }).customDownloadStreamingEnabled,
+    false
   );
   assert.equal(
-    normalizeSiteSettings({ customDownloadStreamingEnabled: "true" })
+    normalizeSiteSettings({ customDownloadStreamingEnabled: "false" })
       .customDownloadStreamingEnabled,
-    false
+    true
   );
 });

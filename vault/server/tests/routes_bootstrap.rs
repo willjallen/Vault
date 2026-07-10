@@ -269,7 +269,7 @@ async fn bootstrap_returns_runtime_user_preferences_settings_and_current_folder(
         true,
     );
     assert_eq!(json["settings"]["archivePermanentDeleteAdminOnly"], true);
-    assert_eq!(json["settings"]["customDownloadStreamingEnabled"], false);
+    assert_eq!(json["settings"]["customDownloadStreamingEnabled"], true);
 }
 
 #[tokio::test]

@@ -74,7 +74,7 @@ pub async fn update_admin_site_settings(
 pub fn normalize_site_settings(raw: &Value) -> Value {
     let mut normalized = Map::from_iter([
         ("archivePermanentDeleteAdminOnly".to_string(), json!(true)),
-        ("customDownloadStreamingEnabled".to_string(), json!(false)),
+        ("customDownloadStreamingEnabled".to_string(), json!(true)),
     ]);
     for key in [
         "archivePermanentDeleteAdminOnly",

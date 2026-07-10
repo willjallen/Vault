@@ -1,4 +1,5 @@
 import { useTransfers } from "./useTransfers.js";
+import { normalizeSiteSettings } from "./siteSettings.js";
 
 const { useCallback, useMemo, useRef } = React;
 
@@ -15,7 +16,9 @@ export function useAuthFetch({ initialBootstrap, requestConfirm, showNotice }) {
       ? window.location.hostname.split(".").slice(1).join(".")
       : "");
   const authMode = initialBootstrap.auth_mode || "headers";
-  const customDownloadsEnabled = initialBootstrap.settings?.customDownloadStreamingEnabled === true;
+  const customDownloadsEnabled = normalizeSiteSettings(
+    initialBootstrap.settings
+  ).customDownloadStreamingEnabled;
   const downloadLocationGuidanceDismissed =
     initialBootstrap.preferences?.downloadLocationGuidanceDismissed === true;
   const logoutUrl = useMemo(() => {

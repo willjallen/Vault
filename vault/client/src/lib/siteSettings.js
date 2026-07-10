@@ -1,6 +1,6 @@
 export const SITE_SETTING_DEFAULTS = {
   archivePermanentDeleteAdminOnly: true,
-  customDownloadStreamingEnabled: false,
+  customDownloadStreamingEnabled: true,
 };
 
 export function normalizeSiteSettings(value) {

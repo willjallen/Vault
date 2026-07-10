@@ -72,14 +72,21 @@ pub async fn update_admin_site_settings(
 
 #[must_use]
 pub fn normalize_site_settings(raw: &Value) -> Value {
-    let mut normalized =
-        Map::from_iter([("archivePermanentDeleteAdminOnly".to_string(), json!(true))]);
-    if let Some(value) = raw
-        .as_object()
-        .and_then(|object| object.get("archivePermanentDeleteAdminOnly"))
-        .and_then(Value::as_bool)
-    {
-        normalized.insert("archivePermanentDeleteAdminOnly".to_string(), json!(value));
+    let mut normalized = Map::from_iter([
+        ("archivePermanentDeleteAdminOnly".to_string(), json!(true)),
+        ("customDownloadStreamingEnabled".to_string(), json!(false)),
+    ]);
+    for key in [
+        "archivePermanentDeleteAdminOnly",
+        "customDownloadStreamingEnabled",
+    ] {
+        if let Some(value) = raw
+            .as_object()
+            .and_then(|object| object.get(key))
+            .and_then(Value::as_bool)
+        {
+            normalized.insert(key.to_string(), json!(value));
+        }
     }
     Value::Object(normalized)
 }
@@ -91,7 +98,7 @@ pub fn clean_site_setting_patch(raw: &Value) -> Result<Map<String, Value>, SiteS
     let mut cleaned = Map::new();
     for (key, value) in raw_object {
         match key.as_str() {
-            "archivePermanentDeleteAdminOnly" => {
+            "archivePermanentDeleteAdminOnly" | "customDownloadStreamingEnabled" => {
                 let Some(value) = value.as_bool() else {
                     return Err(invalid_patch(format!("{key} must be a boolean")));
                 };

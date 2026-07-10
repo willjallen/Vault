@@ -8,6 +8,7 @@ const USER_PREFERENCE_DEFAULTS = {
   openFoldersOnClick: true,
   alternateRows: false,
   doubleClickDownload: false,
+  downloadLocationGuidanceDismissed: false,
   favoriteItems: [],
   sidebarSectionSizes: {
     folders: 180,
@@ -183,6 +184,10 @@ export function normalizeUserPreferences(value) {
     doubleClickDownload: normalizeBooleanPreference(
       source.doubleClickDownload,
       USER_PREFERENCE_DEFAULTS.doubleClickDownload
+    ),
+    downloadLocationGuidanceDismissed: normalizeBooleanPreference(
+      source.downloadLocationGuidanceDismissed,
+      USER_PREFERENCE_DEFAULTS.downloadLocationGuidanceDismissed
     ),
     favoriteItems: normalizeFavoriteItems(source.favoriteItems),
     sidebarSectionSizes: normalizeSidebarSectionSizes(source.sidebarSectionSizes),

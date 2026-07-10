@@ -243,3 +243,15 @@ test("transfer dock calls out resumed uploads", () => {
   assert.equal(transferStageLabel(transfer), "Previous upload found");
   assert.equal(transferMeta(transfer), "Resuming previous upload from 50%");
 });
+
+test("transfer dock delegates browser-managed download status", () => {
+  const transfer = {
+    kind: "download",
+    stage: "browser-handoff",
+    status: "browser-managed",
+  };
+
+  assert.equal(transferTitle(transfer), "Download started");
+  assert.equal(transferStageLabel(transfer), "Browser download");
+  assert.equal(transferMeta(transfer), "Your browser controls the download location and progress");
+});

@@ -160,6 +160,7 @@ fn preference_patch(folder_id: i64, document_id: i64) -> Value {
             "openFoldersOnClick": false,
             "alternateRows": true,
             "doubleClickDownload": true,
+            "downloadLocationGuidanceDismissed": true,
             "favoriteItems": [
                 {"type": "folder", "id": folder_id},
                 {"type": "document", "id": document_id},
@@ -189,6 +190,7 @@ fn assert_enriched_preferences(preferences: &Value, folder_id: i64, document_id:
     assert_eq!(preferences["openFoldersOnClick"], false);
     assert_eq!(preferences["alternateRows"], true);
     assert_eq!(preferences["doubleClickDownload"], true);
+    assert_eq!(preferences["downloadLocationGuidanceDismissed"], true);
     assert_eq!(favorites.len(), 2);
     assert_eq!(favorites[0]["type"], "folder");
     assert_eq!(favorites[0]["id"], folder_id);
@@ -237,6 +239,10 @@ async fn preferences_get_returns_defaults() {
     assert_eq!(json["preferences"]["openFoldersOnClick"], true);
     assert_eq!(json["preferences"]["alternateRows"], false);
     assert_eq!(json["preferences"]["doubleClickDownload"], false);
+    assert_eq!(
+        json["preferences"]["downloadLocationGuidanceDismissed"],
+        false,
+    );
     assert_eq!(json["preferences"]["favoriteItems"], json!([]));
     assert_eq!(json["preferences"]["sidebarSectionSizes"]["folders"], 180);
     assert_eq!(json["preferences"]["sidebarSectionSizes"]["favorites"], 95);

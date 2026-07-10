@@ -19,11 +19,13 @@ test("boolean preferences accept only real booleans", () => {
     openFoldersOnClick: false,
     alternateRows: true,
     doubleClickDownload: true,
+    downloadLocationGuidanceDismissed: true,
   });
 
   assert.equal(normalized.openFoldersOnClick, false);
   assert.equal(normalized.alternateRows, true);
   assert.equal(normalized.doubleClickDownload, true);
+  assert.equal(normalized.downloadLocationGuidanceDismissed, true);
 });
 
 test("boolean preference strings fall back to defaults", () => {
@@ -31,9 +33,11 @@ test("boolean preference strings fall back to defaults", () => {
     openFoldersOnClick: "false",
     alternateRows: "true",
     doubleClickDownload: "true",
+    downloadLocationGuidanceDismissed: "true",
   });
 
   assert.equal(normalized.openFoldersOnClick, true);
   assert.equal(normalized.alternateRows, false);
   assert.equal(normalized.doubleClickDownload, false);
+  assert.equal(normalized.downloadLocationGuidanceDismissed, false);
 });

@@ -3,9 +3,15 @@ import { classNames } from "../lib/utils.js";
 const h = React.createElement;
 const { useCallback, useEffect, useRef, useState } = React;
 
+export function confirmationResolution(request, confirmed, remember) {
+  return request?.rememberLabel ? { confirmed, remember: confirmed && remember } : confirmed;
+}
+
 export function ConfirmToast({ request, onResolve }) {
   const [phase, setPhase] = useState("entering");
+  const [remember, setRemember] = useState(false);
   const confirmButton = useRef(null);
+  const rememberRef = useRef(false);
   const resolving = useRef(false);
   const resolveTimer = useRef(null);
 
@@ -17,9 +23,10 @@ export function ConfirmToast({ request, onResolve }) {
       resolving.current = true;
       setPhase("leaving");
       window.clearTimeout(resolveTimer.current);
-      resolveTimer.current = window.setTimeout(() => onResolve(confirmed), 150);
+      const result = confirmationResolution(request, confirmed, rememberRef.current);
+      resolveTimer.current = window.setTimeout(() => onResolve(result), 150);
     },
-    [onResolve]
+    [onResolve, request]
   );
 
   useEffect(() => {
@@ -27,6 +34,8 @@ export function ConfirmToast({ request, onResolve }) {
       return undefined;
     }
     resolving.current = false;
+    rememberRef.current = false;
+    setRemember(false);
     setPhase("entering");
     let firstFrame = null;
     let secondFrame = null;
@@ -105,6 +114,20 @@ export function ConfirmToast({ request, onResolve }) {
                     },
                     request.message
                   )
+                : null,
+              request.rememberLabel
+                ? h("label", { className: "confirm-toast-remember" }, [
+                    h("input", {
+                      checked: remember,
+                      key: "input",
+                      onChange: (evt) => {
+                        rememberRef.current = evt.target.checked;
+                        setRemember(evt.target.checked);
+                      },
+                      type: "checkbox",
+                    }),
+                    h("span", { key: "label" }, request.rememberLabel),
+                  ])
                 : null,
             ]),
             h("div", { className: "confirm-toast-actions", key: "actions" }, [

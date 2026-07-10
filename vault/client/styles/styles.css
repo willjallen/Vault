@@ -2857,6 +2857,23 @@ input[type="file"]::file-selector-button:hover {
   overflow-wrap: anywhere;
 }
 
+.confirm-toast-remember {
+  width: fit-content;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+  cursor: pointer;
+}
+
+.confirm-toast-remember input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--accent-fill);
+}
+
 .confirm-toast-actions {
   display: flex;
   justify-content: flex-end;

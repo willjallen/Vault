@@ -154,6 +154,7 @@ export function App({ initial }) {
     uploadWithProgress,
   } = useAuthFetch({
     initialBootstrap,
+    requestConfirm,
     showNotice,
   });
   const {

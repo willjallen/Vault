@@ -1,5 +1,6 @@
 export const SITE_SETTING_DEFAULTS = {
   archivePermanentDeleteAdminOnly: true,
+  customDownloadStreamingEnabled: false,
 };
 
 export function normalizeSiteSettings(value) {
@@ -9,6 +10,10 @@ export function normalizeSiteSettings(value) {
       typeof source.archivePermanentDeleteAdminOnly === "boolean"
         ? source.archivePermanentDeleteAdminOnly
         : SITE_SETTING_DEFAULTS.archivePermanentDeleteAdminOnly,
+    customDownloadStreamingEnabled:
+      typeof source.customDownloadStreamingEnabled === "boolean"
+        ? source.customDownloadStreamingEnabled
+        : SITE_SETTING_DEFAULTS.customDownloadStreamingEnabled,
   };
 }
 

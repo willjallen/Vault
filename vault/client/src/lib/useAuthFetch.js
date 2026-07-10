@@ -8,13 +8,16 @@ function connectionError() {
   return error;
 }
 
-export function useAuthFetch({ initialBootstrap, showNotice }) {
+export function useAuthFetch({ initialBootstrap, requestConfirm, showNotice }) {
   const baseDomain =
     initialBootstrap.base_domain ||
     (window.location.hostname.includes(".")
       ? window.location.hostname.split(".").slice(1).join(".")
       : "");
   const authMode = initialBootstrap.auth_mode || "headers";
+  const customDownloadsEnabled = initialBootstrap.settings?.customDownloadStreamingEnabled === true;
+  const downloadLocationGuidanceDismissed =
+    initialBootstrap.preferences?.downloadLocationGuidanceDismissed === true;
   const logoutUrl = useMemo(() => {
     const rd = encodeURIComponent(window.location.href);
     if (authMode === "headers" && baseDomain) {
@@ -43,8 +46,6 @@ export function useAuthFetch({ initialBootstrap, showNotice }) {
     window.location.href = loginUrl;
   }, [authMode, baseDomain, showNotice]);
 
-  const transfersApi = useTransfers({ onUnauthorized: redirectToLogin });
-
   const apiFetch = useCallback(
     async (url, options = {}) => {
       try {
@@ -67,6 +68,28 @@ export function useAuthFetch({ initialBootstrap, showNotice }) {
     },
     [redirectToLogin]
   );
+
+  const saveDownloadLocationGuidanceDismissed = useCallback(async () => {
+    const response = await apiFetch("/api/preferences", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        preferences: { downloadLocationGuidanceDismissed: true },
+      }),
+    });
+    if (!response.ok) {
+      const detail = await response.json().catch(() => ({}));
+      throw new Error(detail.detail || "Could not save download preference");
+    }
+  }, [apiFetch]);
+
+  const transfersApi = useTransfers({
+    customDownloadsEnabled,
+    downloadLocationGuidanceDismissed,
+    onUnauthorized: redirectToLogin,
+    requestConfirm,
+    saveDownloadLocationGuidanceDismissed,
+  });
 
   return {
     apiFetch,

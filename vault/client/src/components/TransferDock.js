@@ -19,6 +19,9 @@ function formatEta(seconds) {
 }
 
 export function transferTitle(transfer) {
+  if (transfer.status === "browser-managed") {
+    return "Download started";
+  }
   if (transfer.status === "complete") {
     return transfer.kind === "upload" ? "Uploaded" : "Downloaded";
   }
@@ -53,6 +56,9 @@ export function transferTitle(transfer) {
 }
 
 export function transferStageLabel(transfer) {
+  if (transfer.status === "browser-managed") {
+    return "Browser download";
+  }
   if (transfer.kind === "upload" && transfer.stage === "verifying") {
     return "Server verification";
   }
@@ -111,6 +117,9 @@ function uploadResumeSuffix(transfer) {
 }
 
 export function transferMeta(transfer) {
+  if (transfer.status === "browser-managed") {
+    return "Your browser controls the download location and progress";
+  }
   if (transfer.status === "cancelled") {
     return "Cancelled";
   }

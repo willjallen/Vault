@@ -97,7 +97,12 @@ pub fn normalize_user_preferences(raw: &Value) -> Value {
     {
         normalized.insert("palettePreference".to_string(), json!(palette));
     }
-    for key in ["openFoldersOnClick", "alternateRows", "doubleClickDownload"] {
+    for key in [
+        "openFoldersOnClick",
+        "alternateRows",
+        "doubleClickDownload",
+        "downloadLocationGuidanceDismissed",
+    ] {
         if let Some(value) = raw_object.get(key).and_then(Value::as_bool) {
             normalized.insert(key.to_string(), json!(value));
         }
@@ -143,7 +148,10 @@ pub fn clean_user_preference_patch(raw: &Value) -> Result<Map<String, Value>, Pr
                 };
                 cleaned.insert(key.clone(), json!(palette));
             }
-            "openFoldersOnClick" | "alternateRows" | "doubleClickDownload" => {
+            "openFoldersOnClick"
+            | "alternateRows"
+            | "doubleClickDownload"
+            | "downloadLocationGuidanceDismissed" => {
                 let Some(value) = value.as_bool() else {
                     return Err(invalid_patch(format!("{key} must be a boolean")));
                 };
@@ -180,6 +188,10 @@ fn default_preferences() -> Map<String, Value> {
         ("openFoldersOnClick".to_string(), json!(true)),
         ("alternateRows".to_string(), json!(false)),
         ("doubleClickDownload".to_string(), json!(false)),
+        (
+            "downloadLocationGuidanceDismissed".to_string(),
+            json!(false),
+        ),
         ("favoriteItems".to_string(), json!([])),
         (
             "sidebarSectionSizes".to_string(),

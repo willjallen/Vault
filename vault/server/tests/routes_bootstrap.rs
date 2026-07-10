@@ -256,6 +256,10 @@ async fn bootstrap_returns_runtime_user_preferences_settings_and_current_folder(
     assert_eq!(json["preferences"]["themePreference"], "system");
     assert_eq!(json["preferences"]["palettePreference"], "cozy");
     assert_eq!(
+        json["preferences"]["downloadLocationGuidanceDismissed"],
+        false,
+    );
+    assert_eq!(
         json["preferences"]["favoriteItems"],
         Value::Array(Vec::new())
     );
@@ -265,6 +269,7 @@ async fn bootstrap_returns_runtime_user_preferences_settings_and_current_folder(
         true,
     );
     assert_eq!(json["settings"]["archivePermanentDeleteAdminOnly"], true);
+    assert_eq!(json["settings"]["customDownloadStreamingEnabled"], false);
 }
 
 #[tokio::test]

@@ -4,6 +4,8 @@ import {
   exportAndDownload,
   uploadFileResumable,
 } from "./transferClient.js";
+import * as browserDownload from "./browserDownload.js";
+import { confirmNativeDownload } from "./downloadGuidance.js";
 
 const { useCallback, useEffect, useRef, useState } = React;
 
@@ -11,11 +13,22 @@ const COMPLETE_HOLD_MS = 1400;
 const ERROR_HOLD_MS = 2600;
 const EXIT_MS = 260;
 
-export function useTransfers({ onUnauthorized } = {}) {
+export function useTransfers({
+  customDownloadsEnabled = false,
+  downloadLocationGuidanceDismissed = false,
+  onUnauthorized,
+  requestConfirm,
+  saveDownloadLocationGuidanceDismissed,
+} = {}) {
   const [transfers, setTransfers] = useState([]);
+  const [guidanceDismissed, setGuidanceDismissed] = useState(
+    downloadLocationGuidanceDismissed === true
+  );
   const nextId = useRef(1);
   const timers = useRef(new Set());
   const controllers = useRef(new Map());
+  const filePickerDownloadsAvailable =
+    browserDownload.canUseFileSystemDownloadWriter(customDownloadsEnabled);
 
   const schedule = useCallback((callback, delay) => {
     const timer = setTimeout(() => {
@@ -175,6 +188,30 @@ export function useTransfers({ onUnauthorized } = {}) {
     [removeTransfer, schedule, updateTransfer]
   );
 
+  const handoffDownload = useCallback(
+    (id) => {
+      controllers.current.delete(id);
+      updateTransfer(id, {
+        bytesPerSecond: 0,
+        etaSeconds: null,
+        loaded: 0,
+        percent: null,
+        phase: "visible",
+        stage: "browser-handoff",
+        status: "browser-managed",
+      });
+      removeTransfer(id, ERROR_HOLD_MS);
+    },
+    [removeTransfer, updateTransfer]
+  );
+
+  const dismissDownloadLocationGuidance = useCallback(async () => {
+    if (saveDownloadLocationGuidanceDismissed) {
+      await saveDownloadLocationGuidanceDismissed();
+    }
+    setGuidanceDismissed(true);
+  }, [saveDownloadLocationGuidanceDismissed]);
+
   const uploadWithProgress = useCallback(
     async ({ file, folder, mode, documentId, note, renameToUpload, name: displayName, size }) => {
       const transfer = createTransfer(
@@ -210,23 +247,39 @@ export function useTransfers({ onUnauthorized } = {}) {
 
   const downloadWithProgress = useCallback(
     async ({ url, name: displayName, size, exportPayload }) => {
+      if (!filePickerDownloadsAvailable) {
+        const confirmed = await confirmNativeDownload({
+          dismissed: guidanceDismissed,
+          onDismiss: dismissDownloadLocationGuidance,
+          requestConfirm,
+        });
+        if (!confirmed) {
+          return { cancelled: true, status: 0 };
+        }
+      }
       const { id, signal } = createTransfer("download", displayName || "Download", size || null);
       try {
         const result = exportPayload
           ? await exportAndDownload({
+              customDownloadsEnabled,
               payload: exportPayload,
               onProgress: (progress) => updateProgress(id, progress),
               signal,
               suggestedName: displayName || "vault-download.zip",
             })
           : await downloadUrl({
+              customDownloadsEnabled,
               fallbackName: displayName || "download",
               fallbackTotal: size || null,
               onProgress: (progress) => updateProgress(id, progress),
               signal,
               url,
             });
-        completeTransfer(id, { size: result.size || size || null });
+        if (result.browserManaged) {
+          handoffDownload(id);
+        } else {
+          completeTransfer(id, { size: result.size || size || null });
+        }
         return result;
       } catch (err) {
         if (err instanceof TransferCancelledError || err.cancelled) {
@@ -237,8 +290,25 @@ export function useTransfers({ onUnauthorized } = {}) {
         throw err;
       }
     },
-    [completeTransfer, createTransfer, failTransfer, markTransferCancelled, updateProgress]
+    [
+      completeTransfer,
+      createTransfer,
+      customDownloadsEnabled,
+      dismissDownloadLocationGuidance,
+      filePickerDownloadsAvailable,
+      failTransfer,
+      guidanceDismissed,
+      handoffDownload,
+      markTransferCancelled,
+      requestConfirm,
+      updateProgress,
+    ]
   );
 
-  return { cancelTransfer, downloadWithProgress, transfers, uploadWithProgress };
+  return {
+    cancelTransfer,
+    downloadWithProgress,
+    transfers,
+    uploadWithProgress,
+  };
 }

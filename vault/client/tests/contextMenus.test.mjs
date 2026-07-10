@@ -63,6 +63,25 @@ test("active file rename action remains enabled", () => {
   assert.equal(items.find((item) => item.label === "Rename")?.disabled, false);
 });
 
+test("picker capability keeps a single Download menu action", () => {
+  const items = buildFileMenuItems({
+    busy: false,
+    currentUser: { id: "user" },
+    doc: { archived: false, favorite: false, id: 1, lock: {}, name: "active.txt" },
+    filePickerDownloadsAvailable: true,
+    handleArchive: () => {},
+    handleRenameFile: () => {},
+    handleShareItem: () => {},
+    handleVersionUploadClick: () => {},
+    handleView: () => {},
+    openMoveDialogForDoc: () => {},
+    siteSettings: {},
+  });
+
+  assert.equal(items[0].label, "Download");
+  assert.equal(items.filter((item) => /download/i.test(item.label)).length, 1);
+});
+
 test("page upload stays available during another background upload", () => {
   const items = buildPageMenuItems({
     beginCreateFolder: () => {},

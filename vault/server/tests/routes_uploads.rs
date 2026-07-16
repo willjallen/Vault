@@ -1,3 +1,5 @@
+use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -6,7 +8,6 @@ use axum::http::{Method, Request, StatusCode};
 use futures_util::stream;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
 use tokio::sync::Notify;
@@ -503,6 +504,30 @@ fn sha256_hex(data: &[u8]) -> String {
     lower_hex(&digest)
 }
 
+fn part_manifest_sha256_hex(data: &[u8], chunk_size: usize) -> String {
+    let part_count = if data.is_empty() {
+        0
+    } else {
+        data.len().div_ceil(chunk_size)
+    };
+    let mut manifest = format!(
+        "vault-upload-part-manifest-v1\nsize={}\nchunk={chunk_size}\nparts={part_count}\n",
+        data.len()
+    );
+    for (index, chunk) in data.chunks(chunk_size).enumerate() {
+        let part_number = index + 1;
+        let offset = index * chunk_size;
+        writeln!(
+            &mut manifest,
+            "part={part_number}:{offset}:{}:{}",
+            chunk.len(),
+            sha256_hex(chunk)
+        )
+        .expect("write part manifest descriptor");
+    }
+    sha256_hex(manifest.as_bytes())
+}
+
 fn lower_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(bytes.len() * 2);
@@ -511,6 +536,59 @@ fn lower_hex(bytes: &[u8]) -> String {
         output.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     output
+}
+
+async fn assert_rejected_completion_preserves_part(
+    app: &axum::Router,
+    session_id: &str,
+    session_dir: &Path,
+    payload: Value,
+    expected_detail: &str,
+) {
+    let response = app
+        .clone()
+        .oneshot(authed_json_request(
+            Method::POST,
+            &format!("/api/uploads/{session_id}/complete"),
+            &payload,
+        ))
+        .await
+        .expect("rejected completion");
+    let status = response.status();
+    let body = response_json(response).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["detail"], expected_detail);
+    assert!(session_dir.join("00000001.part").is_file());
+}
+
+async fn complete_upload_with_manifest_and_assert_download(
+    app: axum::Router,
+    session_id: &str,
+    data: &[u8],
+) {
+    let completed = app
+        .clone()
+        .oneshot(authed_json_request(
+            Method::POST,
+            &format!("/api/uploads/{session_id}/complete"),
+            &json!({"part_manifest_sha256": part_manifest_sha256_hex(data, data.len())}),
+        ))
+        .await
+        .expect("complete upload");
+    assert_eq!(completed.status(), StatusCode::OK);
+    let document_id = response_json(completed).await["id"]
+        .as_i64()
+        .expect("document id");
+    let downloaded = app
+        .oneshot(authed_request(
+            Method::GET,
+            &format!("/documents/{document_id}/download"),
+            Body::empty(),
+        ))
+        .await
+        .expect("download");
+    assert_eq!(downloaded.status(), StatusCode::OK);
+    assert_eq!(response_bytes(downloaded).await, data);
 }
 
 #[tokio::test]
@@ -784,6 +862,18 @@ async fn upload_session_adapts_chunk_size_from_runtime_config_and_client_paralle
 }
 
 #[tokio::test]
+async fn upload_session_caps_chunks_for_bounded_client_integrity_hashing() {
+    let (state, _temp_dir) =
+        test_state_with_upload_settings(5 * 1024 * 1024 * 1024, 512 * 1024 * 1024, 86_400).await;
+    grant_writer_root(&state.db).await;
+    let app = http::router(state);
+
+    let created = create_upload_session_for_size(app, 512 * 1024 * 1024, None).await;
+    assert_eq!(created["chunk_size"], 32 * 1024 * 1024);
+    assert_eq!(created["part_count"], 16);
+}
+
+#[tokio::test]
 async fn upload_part_does_not_require_client_checksum_header() {
     let (state, temp_dir) = test_state().await;
     grant_writer_root(&state.db).await;
@@ -865,29 +955,23 @@ async fn upload_part_does_not_require_client_checksum_header() {
         .expect("checksum duplicate");
     assert_eq!(checksum_duplicate.status(), StatusCode::CONFLICT);
 
-    let completed = app
-        .clone()
-        .oneshot(authed_json_request(
-            Method::POST,
-            &format!("/api/uploads/{session_id}/complete"),
-            &json!({}),
-        ))
-        .await
-        .expect("complete upload");
-    assert_eq!(completed.status(), StatusCode::OK);
-    let document_id = response_json(completed).await["id"]
-        .as_i64()
-        .expect("document id");
-    let downloaded = app
-        .oneshot(authed_request(
-            Method::GET,
-            &format!("/documents/{document_id}/download"),
-            Body::empty(),
-        ))
-        .await
-        .expect("download");
-    assert_eq!(downloaded.status(), StatusCode::OK);
-    assert_eq!(response_bytes(downloaded).await, data);
+    assert_rejected_completion_preserves_part(
+        &app,
+        &session_id,
+        &session_dir,
+        json!({"part_manifest_sha256": "not-a-sha256"}),
+        "Upload integrity digest is invalid",
+    )
+    .await;
+    assert_rejected_completion_preserves_part(
+        &app,
+        &session_id,
+        &session_dir,
+        json!({}),
+        "Upload completion requires an integrity expectation",
+    )
+    .await;
+    complete_upload_with_manifest_and_assert_download(app, &session_id, data).await;
 }
 
 #[tokio::test]
@@ -947,7 +1031,7 @@ async fn restart_recovers_checksum_free_browser_upload_parts() {
         .oneshot(authed_json_request(
             Method::POST,
             &format!("/api/uploads/{session_id}/complete"),
-            &json!({}),
+            &json!({"part_manifest_sha256": part_manifest_sha256_hex(data, 4)}),
         ))
         .await
         .expect("complete recovered upload");
@@ -1134,6 +1218,7 @@ async fn concurrent_part_promotion_does_not_overwrite_existing_part() {
             note: None,
             rename_to_upload: false,
             client_upload_parallelism: Some(2),
+            resume_identity_sha256: None,
         },
         &user,
         &ClientMeta {
@@ -1264,7 +1349,7 @@ async fn upload_session_resume_reports_existing_parts_and_completes_without_fina
         .oneshot(authed_json_request(
             Method::POST,
             &format!("/api/uploads/{session_id}/complete"),
-            &json!({}),
+            &json!({"part_manifest_sha256": part_manifest_sha256_hex(data, 4)}),
         ))
         .await
         .expect("complete upload");
@@ -1672,6 +1757,164 @@ async fn upload_part_accepts_signed_token_without_user_headers() {
     let rejected_json = response_json(rejected).await;
     assert_eq!(rejected_status, StatusCode::CONFLICT);
     assert_eq!(rejected_json["detail"], "Upload session is aborted");
+}
+
+#[tokio::test]
+async fn v2_upload_identity_is_echoed_and_bound_to_part_token() {
+    let (state, _temp_dir) = test_state().await;
+    grant_writer_root(&state.db).await;
+    let pool = state.db.clone();
+    let app = http::router(state);
+    let data = b"identity-bound upload";
+    let identity = "ab".repeat(32);
+    let malformed = app
+        .clone()
+        .oneshot(authed_json_request(
+            Method::POST,
+            "/api/uploads",
+            &json!({
+                "mode": "create",
+                "folder": "",
+                "filename": "invalid-identity.txt",
+                "size_bytes": data.len(),
+                "resume_identity_sha256": "not-a-sha256"
+            }),
+        ))
+        .await
+        .expect("create upload with malformed identity");
+    let malformed_status = malformed.status();
+    let malformed_json = response_json(malformed).await;
+    assert_eq!(malformed_status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        malformed_json["detail"],
+        "Upload integrity digest is invalid"
+    );
+    let upload_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM upload_sessions")
+        .fetch_one(&pool)
+        .await
+        .expect("upload session count");
+    assert_eq!(upload_count, 0);
+
+    let created = app
+        .clone()
+        .oneshot(authed_json_request(
+            Method::POST,
+            "/api/uploads",
+            &json!({
+                "mode": "create",
+                "folder": "",
+                "filename": "identity.txt",
+                "mime_type": "text/plain",
+                "size_bytes": data.len(),
+                "resume_identity_sha256": identity
+            }),
+        ))
+        .await
+        .expect("create v2 upload");
+    assert_eq!(created.status(), StatusCode::OK);
+    let created = response_json(created).await;
+    let session_id = created["id"].as_str().expect("session id");
+    let token = created["upload_token"].as_str().expect("upload token");
+    assert!(session_id.starts_with("u2-"));
+    assert_eq!(created["resume_identity_sha256"], identity);
+
+    let checksum_required = app
+        .clone()
+        .oneshot(upload_part_request_without_checksum(session_id, 1, 0, data))
+        .await
+        .expect("checksum-free v2 part");
+    let checksum_status = checksum_required.status();
+    let checksum_json = response_json(checksum_required).await;
+    assert_eq!(checksum_status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        checksum_json["detail"],
+        "Upload integrity digest is invalid"
+    );
+
+    let uploaded = app
+        .clone()
+        .oneshot(upload_part_token_request(session_id, 1, data, token))
+        .await
+        .expect("identity-bound token upload");
+    assert_eq!(uploaded.status(), StatusCode::NO_CONTENT);
+    sqlx::query(
+        r"
+        UPDATE upload_sessions
+        SET user_context = json_set(
+            user_context,
+            '$._upload_resume_identity_sha256',
+            ?
+        )
+        WHERE id = ?
+        ",
+    )
+    .bind("cd".repeat(32))
+    .bind(session_id)
+    .execute(&pool)
+    .await
+    .expect("change bound identity");
+    let rejected = app
+        .oneshot(upload_part_token_request(session_id, 1, data, token))
+        .await
+        .expect("mismatched identity token");
+    let rejected_status = rejected.status();
+    let rejected_json = response_json(rejected).await;
+    assert_eq!(rejected_status, StatusCode::UNAUTHORIZED);
+    assert_eq!(rejected_json["detail"], "Upload token is invalid");
+}
+
+#[tokio::test]
+async fn empty_v2_upload_completes_with_canonical_part_manifest() {
+    let (state, _temp_dir) =
+        test_state_with_upload_settings(5 * 1024 * 1024 * 1024, 4, 86_400).await;
+    grant_writer_root(&state.db).await;
+    let app = http::router(state);
+    let created = app
+        .clone()
+        .oneshot(authed_json_request(
+            Method::POST,
+            "/api/uploads",
+            &json!({
+                "mode": "create",
+                "folder": "",
+                "filename": "empty.txt",
+                "mime_type": "text/plain",
+                "size_bytes": 0,
+                "resume_identity_sha256": "ab".repeat(32)
+            }),
+        ))
+        .await
+        .expect("create empty v2 upload");
+    assert_eq!(created.status(), StatusCode::OK);
+    let created = response_json(created).await;
+    let session_id = created["id"].as_str().expect("session id");
+    let chunk_size = usize::try_from(created["chunk_size"].as_i64().expect("chunk size"))
+        .expect("positive chunk size");
+    assert_eq!(created["part_count"], 0);
+
+    let completed = app
+        .clone()
+        .oneshot(authed_json_request(
+            Method::POST,
+            &format!("/api/uploads/{session_id}/complete"),
+            &json!({"part_manifest_sha256": part_manifest_sha256_hex(b"", chunk_size)}),
+        ))
+        .await
+        .expect("complete empty v2 upload");
+    assert_eq!(completed.status(), StatusCode::OK);
+    let document_id = response_json(completed).await["id"]
+        .as_i64()
+        .expect("document id");
+    let downloaded = app
+        .oneshot(authed_request(
+            Method::GET,
+            &format!("/documents/{document_id}/download"),
+            Body::empty(),
+        ))
+        .await
+        .expect("download empty upload");
+    assert_eq!(downloaded.status(), StatusCode::OK);
+    assert!(response_bytes(downloaded).await.is_empty());
 }
 
 #[tokio::test]
@@ -2475,6 +2718,7 @@ async fn directly_uploaded_session_with_fixed_parts(
             note: None,
             rename_to_upload: false,
             client_upload_parallelism: None,
+            resume_identity_sha256: None,
         },
         user,
         &ClientMeta {
@@ -2708,6 +2952,107 @@ async fn checksum_mismatch_preserves_parts_and_allows_completion_retry() {
         .await
         .expect("retried completion");
     assert_eq!(completed.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn part_manifest_mismatch_preserves_parts_and_allows_retry() {
+    let (state, _temp_dir) =
+        test_state_with_upload_settings(5 * 1024 * 1024 * 1024, 4, 86_400).await;
+    grant_writer_root(&state.db).await;
+    let pool = state.db.clone();
+    let transfers_path = state.config.transfers_path();
+    let app = http::router(state);
+    let data = b"abcdefgh";
+    let correct_manifest = part_manifest_sha256_hex(data, 4);
+    assert_eq!(
+        correct_manifest,
+        "7cc9fd2e08c97a13a7d7aa4129de08ae9067cc0b1e93b99680ad1f111d113839"
+    );
+    let session_id =
+        uploaded_session_with_fixed_parts(app.clone(), "retry-manifest.txt", data, 4).await;
+    let mismatched = app
+        .clone()
+        .oneshot(authed_json_request(
+            Method::POST,
+            &format!("/api/uploads/{session_id}/complete"),
+            &json!({"part_manifest_sha256": "00".repeat(32)}),
+        ))
+        .await
+        .expect("mismatched manifest completion");
+    let mismatch_status = mismatched.status();
+    let mismatch_json = response_json(mismatched).await;
+    assert_eq!(mismatch_status, StatusCode::BAD_REQUEST);
+    assert_eq!(mismatch_json["detail"], "Upload part manifest mismatch");
+    assert_eq!(
+        wait_for_upload_status(&pool, &session_id, "active").await,
+        ("active".to_string(), 0, 0, None)
+    );
+    for part_number in 1..=2 {
+        assert!(
+            transfers_path
+                .join("uploads")
+                .join(&session_id)
+                .join(format!("{part_number:08}.part"))
+                .is_file()
+        );
+    }
+    let document_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM documents")
+        .fetch_one(&pool)
+        .await
+        .expect("document count");
+    assert_eq!(document_count, 0);
+
+    let completed = app
+        .oneshot(authed_json_request(
+            Method::POST,
+            &format!("/api/uploads/{session_id}/complete"),
+            &json!({"part_manifest_sha256": correct_manifest}),
+        ))
+        .await
+        .expect("manifest completion retry");
+    assert_eq!(completed.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn part_manifest_is_derived_from_staged_bytes_not_sidecars() {
+    let (state, _temp_dir) =
+        test_state_with_upload_settings(5 * 1024 * 1024 * 1024, 4, 86_400).await;
+    grant_writer_root(&state.db).await;
+    let pool = state.db.clone();
+    let transfers_path = state.config.transfers_path();
+    let coordinator = state.upload_hash_coordinator.clone();
+    let app = http::router(state);
+    let data = b"abcdefgh";
+    let session_id =
+        uploaded_session_with_fixed_parts(app.clone(), "tampered-part.txt", data, 4).await;
+    coordinator.forget(&session_id).await;
+    let session_dir = transfers_path.join("uploads").join(&session_id);
+    tokio::fs::write(session_dir.join("00000001.part"), b"wxyz")
+        .await
+        .expect("tamper staged bytes");
+
+    let response = app
+        .oneshot(authed_json_request(
+            Method::POST,
+            &format!("/api/uploads/{session_id}/complete"),
+            &json!({"part_manifest_sha256": part_manifest_sha256_hex(data, 4)}),
+        ))
+        .await
+        .expect("tampered completion");
+    let status = response.status();
+    let body = response_json(response).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["detail"], "Upload part manifest mismatch");
+    assert_eq!(
+        wait_for_upload_status(&pool, &session_id, "active").await,
+        ("active".to_string(), 0, 0, None)
+    );
+    let document_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM documents")
+        .fetch_one(&pool)
+        .await
+        .expect("document count");
+    assert_eq!(document_count, 0);
+    assert!(session_dir.join("00000001.part").is_file());
 }
 
 #[tokio::test]

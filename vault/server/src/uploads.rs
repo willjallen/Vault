@@ -43,12 +43,14 @@ const TRANSFER_SESSION_TTL_SECONDS: i64 = 86_400;
 const UPLOAD_MIN_ADAPTIVE_PARTS: i64 = 4;
 const UPLOAD_DEFAULT_ADAPTIVE_PARTS: i64 = 16;
 const UPLOAD_MAX_ADAPTIVE_PARTS: i64 = 16;
+const UPLOAD_MAX_INTEGRITY_CHUNK_BYTES: i64 = 32 * 1024 * 1024;
 const UPLOAD_SMALL_ADAPTIVE_MAX_BYTES: i64 = 48 * 1024 * 1024;
 const UPLOAD_TARGET_ADAPTIVE_CHUNK_BYTES: i64 = 8 * 1024 * 1024;
 const UPLOAD_MIN_ADAPTIVE_CHUNK_BYTES: i64 = 4 * 1024 * 1024;
 const UPLOAD_CHUNK_ROUNDING_BYTES: i64 = 1024 * 1024;
 const SMALL_PART_MEMORY_BUFFER_BYTES: i64 = 8 * 1024 * 1024;
 const VERIFICATION_PROGRESS_UPDATE_BYTES: i64 = 32 * 1024 * 1024;
+const UPLOAD_RESUME_IDENTITY_CONTEXT_KEY: &str = "_upload_resume_identity_sha256";
 
 #[derive(Debug, Clone, Copy)]
 pub struct UploadRuntimeSettings {
@@ -92,11 +94,22 @@ pub struct CreateUploadRequest {
     #[serde(default)]
     pub rename_to_upload: bool,
     pub client_upload_parallelism: Option<i64>,
+    #[serde(default)]
+    pub resume_identity_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CompleteUploadRequest {
+    #[serde(default)]
     pub sha256: Option<String>,
+    #[serde(default)]
+    pub part_manifest_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UploadIntegrityExpectations<'a> {
+    pub sha256: Option<&'a str>,
+    pub part_manifest_sha256: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -113,6 +126,7 @@ pub struct UploadSessionPayload {
     pub verification: Option<UploadVerificationPayload>,
     pub expires_at: Option<String>,
     pub result: Option<UploadResultPayload>,
+    pub resume_identity_sha256: Option<String>,
     pub upload_token: Option<String>,
 }
 
@@ -177,6 +191,12 @@ pub enum UploadError {
     UploadReadFailed,
     #[error("upload checksum mismatch")]
     UploadChecksumMismatch,
+    #[error("upload completion requires an integrity expectation")]
+    UploadIntegrityExpectationRequired,
+    #[error("upload integrity digest is invalid")]
+    UploadIntegrityDigestInvalid,
+    #[error("upload part manifest mismatch")]
+    UploadPartManifestMismatch,
     #[error("upload size does not match session")]
     UploadSizeMismatch,
     #[error("upload completion state transition failed: {0}")]
@@ -233,6 +253,7 @@ struct UploadSessionRow {
     result_document_id: Option<i64>,
     result_version_id: Option<String>,
     result_path: Option<String>,
+    resume_identity_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -286,6 +307,7 @@ struct UploadHashStateInner {
     next_part: i64,
     reported_bytes: i64,
     digest: Option<String>,
+    part_digests: Vec<String>,
 }
 
 impl UploadHashState {
@@ -297,6 +319,7 @@ impl UploadHashState {
                 next_part: 1,
                 reported_bytes: 0,
                 digest: None,
+                part_digests: Vec::new(),
             }),
         }
     }
@@ -342,21 +365,25 @@ impl UploadHashCoordinator {
         transfers_path: &Path,
         session: &UploadSessionRow,
         expected_sha256: Option<&str>,
+        expected_part_manifest_sha256: Option<&str>,
     ) -> Result<CompletedParts, UploadError> {
         let (size_bytes, paths) = completed_part_paths(transfers_path, session).await?;
         self.advance_session(pool, transfers_path, &session.id)
             .await?;
         let state = self.state_for(&session.id).await;
-        let digest = state
-            .inner
-            .lock()
-            .await
+        let inner = state.inner.lock().await;
+        let digest = inner
             .digest
             .clone()
             .ok_or(UploadError::UploadSessionMissingParts)?;
-        if expected_sha256.is_some_and(|expected| digest != expected.to_ascii_lowercase()) {
-            return Err(UploadError::UploadChecksumMismatch);
-        }
+        validate_completed_integrity(
+            session,
+            &digest,
+            &inner.part_digests,
+            expected_sha256,
+            expected_part_manifest_sha256,
+        )?;
+        drop(inner);
         Ok(CompletedParts {
             digest,
             size_bytes,
@@ -525,6 +552,8 @@ pub async fn create_upload_session(
         return Err(UploadError::UploadTooLarge(max_upload_bytes));
     }
     let mime_type = sanitize_mime_type(payload.mime_type.as_deref(), &filename);
+    let resume_identity_sha256 =
+        normalize_optional_sha256(payload.resume_identity_sha256.as_deref())?;
     let chunk_size = choose_upload_chunk_size(
         payload.size_bytes,
         payload.client_upload_parallelism,
@@ -534,13 +563,27 @@ pub async fn create_upload_session(
     let (folder_path, document_id) =
         prepare_upload_target(pool, &mode, &filename, &payload, user).await?;
 
-    let session_id = Uuid::new_v4().simple().to_string();
+    let session_id = if resume_identity_sha256.is_some() {
+        format!("u2-{}", Uuid::new_v4().simple())
+    } else {
+        Uuid::new_v4().simple().to_string()
+    };
     let session_dir = upload_session_dir(transfers_path, &session_id)?;
     fs::create_dir_all(&session_dir).await?;
     let now = now_rfc3339()?;
     let expires_at = (OffsetDateTime::now_utc()
         + Duration::seconds(settings.transfer_session_ttl_seconds))
     .format(&Rfc3339)?;
+    let mut user_context = serde_json::to_value(user)?;
+    if let (Some(identity), Some(context)) = (
+        resume_identity_sha256.as_ref(),
+        user_context.as_object_mut(),
+    ) {
+        context.insert(
+            UPLOAD_RESUME_IDENTITY_CONTEXT_KEY.to_string(),
+            serde_json::Value::String(identity.clone()),
+        );
+    }
     sqlx::query(
         r"
         INSERT INTO upload_sessions
@@ -583,7 +626,7 @@ pub async fn create_upload_session(
     .bind(payload.rename_to_upload)
     .bind(&user.id)
     .bind(&user.name)
-    .bind(serde_json::to_string(user)?)
+    .bind(serde_json::to_string(&user_context)?)
     .bind(&meta.ip)
     .bind(&meta.user_agent)
     .bind(&now)
@@ -741,6 +784,14 @@ where
     S: Stream<Item = Result<Bytes, E>> + Unpin,
     E: Display,
 {
+    if (session.resume_identity_sha256.is_some() && ingest.headers.sha256.is_none())
+        || ingest
+            .headers
+            .sha256
+            .is_some_and(|value| !is_sha256_hex(value))
+    {
+        return Err(UploadError::UploadIntegrityDigestInvalid);
+    }
     let (expected_offset, expected_size) = expected_part_bounds(&session, ingest.part_number)?;
     if ingest.headers.offset != expected_offset || ingest.headers.size != expected_size {
         return Err(UploadError::UploadPartRangeMismatch);
@@ -827,6 +878,7 @@ pub struct UploadPartTokenClaims {
     chunk_size: i64,
     part_count: i64,
     expires_at: String,
+    resume_identity_sha256: Option<String>,
 }
 
 impl UploadPartTokenClaims {
@@ -845,6 +897,7 @@ impl UploadPartTokenClaims {
             && self.chunk_size == session.chunk_size
             && self.part_count == session.part_count
             && self.expires_at == session.expires_at
+            && self.resume_identity_sha256 == session.resume_identity_sha256
     }
 }
 
@@ -861,7 +914,10 @@ pub async fn complete_upload_session(
         storage,
         transfers_path,
         session_id,
-        expected_sha256,
+        UploadIntegrityExpectations {
+            sha256: expected_sha256,
+            part_manifest_sha256: None,
+        },
         user,
         None,
     )
@@ -877,12 +933,36 @@ pub async fn complete_upload_session_with_hash_coordinator(
     user: &UserContext,
     hash_coordinator: &UploadHashCoordinator,
 ) -> Result<UploadResultPayload, UploadError> {
+    complete_upload_session_with_hash_coordinator_and_manifest(
+        pool,
+        storage,
+        transfers_path,
+        session_id,
+        UploadIntegrityExpectations {
+            sha256: expected_sha256,
+            part_manifest_sha256: None,
+        },
+        user,
+        hash_coordinator,
+    )
+    .await
+}
+
+pub async fn complete_upload_session_with_hash_coordinator_and_manifest(
+    pool: &SqlitePool,
+    storage: &dyn BlobStorageBackend,
+    transfers_path: &Path,
+    session_id: &str,
+    expectations: UploadIntegrityExpectations<'_>,
+    user: &UserContext,
+    hash_coordinator: &UploadHashCoordinator,
+) -> Result<UploadResultPayload, UploadError> {
     complete_upload_session_impl(
         pool,
         storage,
         transfers_path,
         session_id,
-        expected_sha256,
+        expectations,
         user,
         Some(hash_coordinator),
     )
@@ -894,7 +974,7 @@ async fn complete_upload_session_impl(
     storage: &dyn BlobStorageBackend,
     transfers_path: &Path,
     session_id: &str,
-    expected_sha256: Option<&str>,
+    expectations: UploadIntegrityExpectations<'_>,
     user: &UserContext,
     hash_coordinator: Option<&UploadHashCoordinator>,
 ) -> Result<UploadResultPayload, UploadError> {
@@ -906,6 +986,12 @@ async fn complete_upload_session_impl(
         return completed_result(&session);
     }
     ensure_active_session(pool, transfers_path, &session).await?;
+    let expected_sha256 = normalize_optional_sha256(expectations.sha256)?;
+    let expected_part_manifest_sha256 =
+        normalize_optional_sha256(expectations.part_manifest_sha256)?;
+    if expected_sha256.is_none() && expected_part_manifest_sha256.is_none() {
+        return Err(UploadError::UploadIntegrityExpectationRequired);
+    }
     let verified_bytes = if let Some(coordinator) = hash_coordinator {
         coordinator
             .processed_bytes(session_id)
@@ -925,10 +1011,23 @@ async fn complete_upload_session_impl(
     .await?;
     let parts_result = if let Some(coordinator) = hash_coordinator {
         coordinator
-            .completed_parts(pool, transfers_path, &session, expected_sha256)
+            .completed_parts(
+                pool,
+                transfers_path,
+                &session,
+                expected_sha256.as_deref(),
+                expected_part_manifest_sha256.as_deref(),
+            )
             .await
     } else {
-        completed_parts(pool, transfers_path, &session, expected_sha256).await
+        completed_parts(
+            pool,
+            transfers_path,
+            &session,
+            expected_sha256.as_deref(),
+            expected_part_manifest_sha256.as_deref(),
+        )
+        .await
     };
     let parts = match parts_result {
         Ok(parts) => parts,
@@ -1425,12 +1524,17 @@ async fn completed_parts(
     transfers_path: &Path,
     session: &UploadSessionRow,
     expected_sha256: Option<&str>,
+    expected_part_manifest_sha256: Option<&str>,
 ) -> Result<CompletedParts, UploadError> {
     let (size_bytes, paths) = completed_part_paths(transfers_path, session).await?;
-    let digest = hash_completed_part_paths(pool, session, &paths).await?;
-    if expected_sha256.is_some_and(|expected| digest != expected.to_ascii_lowercase()) {
-        return Err(UploadError::UploadChecksumMismatch);
-    }
+    let (digest, part_digests) = hash_completed_part_paths(pool, session, &paths).await?;
+    validate_completed_integrity(
+        session,
+        &digest,
+        &part_digests,
+        expected_sha256,
+        expected_part_manifest_sha256,
+    )?;
     Ok(CompletedParts {
         digest,
         size_bytes,
@@ -1467,11 +1571,57 @@ async fn hash_completed_part_paths(
     pool: &SqlitePool,
     session: &UploadSessionRow,
     paths: &[PathBuf],
-) -> Result<String, UploadError> {
+) -> Result<(String, Vec<String>), UploadError> {
     let mut hasher = Sha256::new();
+    let mut part_digests = Vec::with_capacity(paths.len());
     let mut progress = VerificationProgress::new(&session.id, session.total_size);
     for path in paths {
-        hash_file(pool, path, &mut hasher, &mut progress).await?;
+        part_digests.push(hash_file(pool, path, &mut hasher, &mut progress).await?);
+    }
+    Ok((lower_hex(&hasher.finalize()), part_digests))
+}
+
+fn validate_completed_integrity(
+    session: &UploadSessionRow,
+    digest: &str,
+    part_digests: &[String],
+    expected_sha256: Option<&str>,
+    expected_part_manifest_sha256: Option<&str>,
+) -> Result<(), UploadError> {
+    if expected_sha256.is_some_and(|expected| digest != expected) {
+        return Err(UploadError::UploadChecksumMismatch);
+    }
+    if let Some(expected) = expected_part_manifest_sha256 {
+        let actual = part_manifest_sha256(session, part_digests)?;
+        if actual != expected {
+            return Err(UploadError::UploadPartManifestMismatch);
+        }
+    }
+    Ok(())
+}
+
+fn part_manifest_sha256(
+    session: &UploadSessionRow,
+    part_digests: &[String],
+) -> Result<String, UploadError> {
+    if i64::try_from(part_digests.len()).ok() != Some(session.part_count) {
+        return Err(UploadError::UploadSessionMissingParts);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(
+        format!(
+            "vault-upload-part-manifest-v1\nsize={}\nchunk={}\nparts={}\n",
+            session.total_size, session.chunk_size, session.part_count
+        )
+        .as_bytes(),
+    );
+    for (index, digest) in part_digests.iter().enumerate() {
+        if !is_sha256_hex(digest) {
+            return Err(UploadError::UploadIntegrityDigestInvalid);
+        }
+        let part_number = i64::try_from(index + 1).map_err(|_| UploadError::InvalidPartNumber)?;
+        let (offset, size) = expected_part_bounds(session, part_number)?;
+        hasher.update(format!("part={part_number}:{offset}:{size}:{digest}\n").as_bytes());
     }
     Ok(lower_hex(&hasher.finalize()))
 }
@@ -1532,12 +1682,14 @@ async fn hash_part_file_into_state(
     let mut file = fs::File::open(path).await?;
     let mut buffer = vec![0_u8; 1024 * 1024];
     let mut part_bytes = 0_i64;
+    let mut part_hasher = Sha256::new();
     loop {
         let read = file.read(&mut buffer).await?;
         if read == 0 {
             if part_bytes != expected_size {
                 return Err(UploadError::UploadPartSizeMismatch);
             }
+            inner.part_digests.push(lower_hex(&part_hasher.finalize()));
             return Ok(());
         }
         part_bytes = part_bytes
@@ -1547,6 +1699,7 @@ async fn hash_part_file_into_state(
             return Err(UploadError::UploadPartSizeMismatch);
         }
         inner.hasher.update(&buffer[..read]);
+        part_hasher.update(&buffer[..read]);
         let processed_bytes = state
             .processed_bytes
             .load(Ordering::Acquire)
@@ -1570,15 +1723,17 @@ async fn hash_file(
     path: &Path,
     hasher: &mut Sha256,
     progress: &mut VerificationProgress<'_>,
-) -> Result<(), UploadError> {
+) -> Result<String, UploadError> {
     let mut file = fs::File::open(path).await?;
     let mut buffer = vec![0_u8; 1024 * 1024];
+    let mut part_hasher = Sha256::new();
     loop {
         let read = file.read(&mut buffer).await?;
         if read == 0 {
-            return Ok(());
+            return Ok(lower_hex(&part_hasher.finalize()));
         }
         hasher.update(&buffer[..read]);
+        part_hasher.update(&buffer[..read]);
         progress
             .add_bytes(
                 pool,
@@ -1842,6 +1997,7 @@ async fn upload_session_payload(
         verification,
         expires_at: Some(session.expires_at.clone()),
         result,
+        resume_identity_sha256: session.resume_identity_sha256.clone(),
         upload_token,
     })
 }
@@ -1874,7 +2030,9 @@ async fn fetch_upload_session(
             expires_at,
             result_document_id,
             result_version_id,
-            result_path
+            result_path,
+            json_extract(user_context, '$._upload_resume_identity_sha256')
+                AS resume_identity_sha256
         FROM upload_sessions
         WHERE id = ?
         ",
@@ -2450,6 +2608,11 @@ pub fn verify_upload_token_claims(
     let expires_at = string_value(&payload, "expires_at")
         .filter(|expires_at| !expires_at.is_empty())
         .ok_or(UploadError::UploadTokenInvalid)?;
+    let resume_identity_sha256 = match payload.get("resume") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) if is_sha256_hex(value) => Some(value.to_ascii_lowercase()),
+        Some(_) => return Err(UploadError::UploadTokenInvalid),
+    };
     Ok(UploadPartTokenClaims {
         session_id: session_id.to_string(),
         owner_id: owner.to_string(),
@@ -2459,6 +2622,7 @@ pub fn verify_upload_token_claims(
         chunk_size,
         part_count,
         expires_at: expires_at.to_string(),
+        resume_identity_sha256,
     })
 }
 
@@ -2487,6 +2651,7 @@ fn sign_upload_token(
         "size": session.total_size,
         "chunk": session.chunk_size,
         "parts": session.part_count,
+        "resume": session.resume_identity_sha256,
         "typ": "upload-part",
     });
     let body = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload)?);
@@ -2503,6 +2668,22 @@ fn string_value<'a>(payload: &'a Map<String, Value>, key: &str) -> Option<&'a st
 
 fn integer_value(payload: &Map<String, Value>, key: &str) -> Option<i64> {
     payload.get(key).and_then(Value::as_i64)
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn normalize_optional_sha256(value: Option<&str>) -> Result<Option<String>, UploadError> {
+    value
+        .map(|value| {
+            if is_sha256_hex(value) {
+                Ok(value.to_ascii_lowercase())
+            } else {
+                Err(UploadError::UploadIntegrityDigestInvalid)
+            }
+        })
+        .transpose()
 }
 
 fn unix_timestamp_now() -> f64 {
@@ -2561,7 +2742,7 @@ fn choose_upload_chunk_size(
     client_upload_parallelism: Option<i64>,
     transfer_chunk_bytes: i64,
 ) -> i64 {
-    let max_chunk = transfer_chunk_bytes.max(1);
+    let max_chunk = transfer_chunk_bytes.clamp(1, UPLOAD_MAX_INTEGRITY_CHUNK_BYTES);
     let target_parallelism = upload_parallelism_target(client_upload_parallelism);
     if size_bytes <= 0 {
         return max_chunk;

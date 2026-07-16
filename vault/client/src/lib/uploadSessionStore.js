@@ -1,5 +1,19 @@
 const UPLOAD_SESSION_STORAGE_KEY = "vault.uploadSessions";
 const UPLOAD_SESSION_STORAGE_TTL_MS = 6 * 60 * 60 * 1000;
+const UPLOAD_SESSION_KEY_VERSION = 2;
+
+function isCanonicalUploadSessionKey(key) {
+  try {
+    const parsed = JSON.parse(key);
+    return (
+      parsed?.version === UPLOAD_SESSION_KEY_VERSION &&
+      parsed.file?.fingerprint?.scheme === "sha256-sampled-v1" &&
+      /^[a-f0-9]{64}$/.test(parsed.file?.fingerprint?.digest || "")
+    );
+  } catch {
+    return false;
+  }
+}
 
 function normalizeStoredUploadSessionRecord(record, nowMs) {
   if (!record || typeof record !== "object") {
@@ -9,7 +23,7 @@ function normalizeStoredUploadSessionRecord(record, nowMs) {
   const sessionId = typeof record.sessionId === "string" ? record.sessionId : "";
   const updatedAt = Number(record.updatedAt);
   const createdAt = Number(record.createdAt);
-  if (!key || !sessionId || !Number.isFinite(updatedAt)) {
+  if (!key || !isCanonicalUploadSessionKey(key) || !sessionId || !Number.isFinite(updatedAt)) {
     return null;
   }
   if (nowMs - updatedAt > UPLOAD_SESSION_STORAGE_TTL_MS) {
@@ -53,17 +67,37 @@ function writeStoredUploadSessions(records) {
   localStorage.setItem(UPLOAD_SESSION_STORAGE_KEY, JSON.stringify(records));
 }
 
-export function uploadSessionKey({ file, folder, mode, documentId, note, renameToUpload }) {
-  return [
-    mode || "create",
-    documentId || "",
-    folder || "",
-    file.name,
-    file.size,
-    file.lastModified,
-    note || "",
-    renameToUpload ? "rename" : "",
-  ].join("|");
+export function uploadSessionKey({
+  contentFingerprint,
+  file,
+  folder,
+  mode,
+  documentId,
+  note,
+  renameToUpload,
+}) {
+  if (
+    contentFingerprint?.scheme !== "sha256-sampled-v1" ||
+    !/^[a-f0-9]{64}$/.test(contentFingerprint?.digest || "")
+  ) {
+    throw new Error("Upload content fingerprint is invalid.");
+  }
+  return JSON.stringify({
+    version: UPLOAD_SESSION_KEY_VERSION,
+    file: {
+      fingerprint: contentFingerprint,
+      lastModified: Number(file.lastModified) || 0,
+      name: String(file.name || ""),
+      size: Number(file.size) || 0,
+    },
+    target: {
+      documentId: documentId || null,
+      folder: folder || "",
+      mode: mode || "create",
+      note: note || "",
+      renameToUpload: Boolean(renameToUpload),
+    },
+  });
 }
 
 export function rememberUploadSession(key, session) {

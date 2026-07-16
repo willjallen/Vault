@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -9,6 +10,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode
 use futures_util::future::join_all;
 use futures_util::stream;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use tempfile::TempDir;
 use tower::ServiceExt;
@@ -62,7 +64,9 @@ pub struct UploadSessionInput {
     pub chunk_size: usize,
     pub headers: HeaderMap,
     pub id: String,
+    pub part_sha256: Vec<String>,
     pub part_count: usize,
+    pub sha256: String,
     pub total_size: usize,
     pub upload_token: String,
 }
@@ -307,8 +311,21 @@ impl UploadScenario {
             .expect("upload scenario writer permission");
         let app = http::router(state);
         let mut sessions = Vec::with_capacity(user_count);
+        let sha256 = sha256_repeated_upload_byte(
+            usize::try_from(total_size).expect("positive upload benchmark size"),
+        );
+        let mut part_sha256_by_size = HashMap::new();
         for user_index in 0..user_count {
-            sessions.push(create_upload_session(app.clone(), user_index, total_size).await);
+            sessions.push(
+                create_upload_session(
+                    app.clone(),
+                    user_index,
+                    total_size,
+                    &sha256,
+                    &mut part_sha256_by_size,
+                )
+                .await,
+            );
         }
         Self {
             app,
@@ -343,7 +360,7 @@ impl UploadScenario {
                 Method::POST,
                 &format!("/api/uploads/{}/complete", session.id),
                 &session.headers,
-                &json!({}),
+                &json!({"sha256": session.sha256}),
             );
             async move {
                 app.oneshot(request)
@@ -365,8 +382,12 @@ async fn create_upload_session(
     app: Router,
     user_index: usize,
     total_size: i64,
+    sha256: &str,
+    part_sha256_by_size: &mut HashMap<usize, String>,
 ) -> UploadSessionInput {
     let headers = auth_headers_for_user(user_index);
+    let resume_identity_sha256 =
+        sha256_bytes(format!("vault-performance-upload:{user_index}:{total_size}").as_bytes());
     let response = app
         .oneshot(json_request(
             Method::POST,
@@ -378,31 +399,48 @@ async fn create_upload_session(
                 "filename": format!("benchmark-upload-{user_index:02}.bin"),
                 "mime_type": "application/octet-stream",
                 "size_bytes": total_size,
-                "client_upload_parallelism": 16
+                "client_upload_parallelism": 16,
+                "resume_identity_sha256": resume_identity_sha256
             }),
         ))
         .await
         .expect("create upload benchmark session response");
     assert_eq!(response.status(), StatusCode::OK);
     let payload = response_json(response).await;
+    let id = payload["id"]
+        .as_str()
+        .expect("upload benchmark session id")
+        .to_string();
+    let chunk_size = usize::try_from(
+        payload["chunk_size"]
+            .as_i64()
+            .expect("upload benchmark chunk size"),
+    )
+    .expect("positive upload benchmark chunk size");
+    let part_count = usize::try_from(
+        payload["part_count"]
+            .as_i64()
+            .expect("upload benchmark part count"),
+    )
+    .expect("positive upload benchmark part count");
+    let total_size = usize::try_from(total_size).expect("positive upload benchmark size");
+    let part_sha256 = (1..=part_count)
+        .map(|part_number| {
+            let offset = (part_number - 1) * chunk_size;
+            let size = chunk_size.min(total_size - offset);
+            part_sha256_by_size
+                .entry(size)
+                .or_insert_with(|| sha256_repeated_upload_byte(size))
+                .clone()
+        })
+        .collect();
     UploadSessionInput {
-        id: payload["id"]
-            .as_str()
-            .expect("upload benchmark session id")
-            .to_string(),
-        chunk_size: usize::try_from(
-            payload["chunk_size"]
-                .as_i64()
-                .expect("upload benchmark chunk size"),
-        )
-        .expect("positive upload benchmark chunk size"),
-        part_count: usize::try_from(
-            payload["part_count"]
-                .as_i64()
-                .expect("upload benchmark part count"),
-        )
-        .expect("positive upload benchmark part count"),
-        total_size: usize::try_from(total_size).expect("positive upload benchmark size"),
+        id,
+        chunk_size,
+        part_count,
+        part_sha256,
+        sha256: sha256.to_string(),
+        total_size,
         upload_token: payload["upload_token"]
             .as_str()
             .expect("upload benchmark token")
@@ -429,9 +467,35 @@ fn upload_part_request(session: &UploadSessionInput, part_number: usize) -> Requ
         .header("content-length", size.to_string())
         .header("x-upload-offset", offset.to_string())
         .header("x-upload-size", size.to_string())
+        .header("x-upload-sha256", &session.part_sha256[part_number - 1])
         .header("x-upload-token", &session.upload_token)
         .body(Body::from_stream(chunks))
         .expect("upload part benchmark request")
+}
+
+fn sha256_repeated_upload_byte(size: usize) -> String {
+    let mut hasher = Sha256::new();
+    let mut remaining = size;
+    while remaining > 0 {
+        let chunk_size = remaining.min(UPLOAD_BODY_CHUNK_BYTES);
+        hasher.update(&UPLOAD_BODY_CHUNK[..chunk_size]);
+        remaining -= chunk_size;
+    }
+    lower_hex(&hasher.finalize())
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    lower_hex(&Sha256::digest(bytes))
+}
+
+fn lower_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    output
 }
 
 fn json_request(method: Method, uri: &str, headers: &HeaderMap, payload: &Value) -> Request<Body> {

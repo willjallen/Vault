@@ -1,5 +1,11 @@
 import * as browserDownload from "./browserDownload.js";
 import {
+  sha256Blob,
+  uploadContentFingerprint,
+  uploadPartManifestSha256,
+  uploadResumeIdentitySha256,
+} from "./fileIntegrity.js";
+import {
   acquireUploadPartSlot,
   shouldRetryUploadPart,
   uploadParallelismForLatency,
@@ -161,6 +167,7 @@ async function createUploadSession({
   documentId,
   note,
   renameToUpload,
+  resumeIdentitySha256,
   uploadParallelism,
   signal,
 }) {
@@ -177,6 +184,7 @@ async function createUploadSession({
         mode: mode || "create",
         note: note || "",
         rename_to_upload: Boolean(renameToUpload),
+        resume_identity_sha256: resumeIdentitySha256,
         client_upload_parallelism: uploadParallelism,
         size_bytes: file.size,
       }),
@@ -186,7 +194,7 @@ async function createUploadSession({
   );
 }
 
-function uploadPartRequest({ session, partNumber, chunk, offset, onProgress, signal }) {
+function uploadPartRequest({ session, partNumber, chunk, offset, onProgress, sha256, signal }) {
   throwIfAborted(signal);
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
@@ -245,6 +253,7 @@ function uploadPartRequest({ session, partNumber, chunk, offset, onProgress, sig
     xhr.setRequestHeader("Content-Type", "application/octet-stream");
     xhr.setRequestHeader("X-Upload-Offset", String(offset));
     xhr.setRequestHeader("X-Upload-Size", String(chunk.size));
+    xhr.setRequestHeader("X-Upload-Sha256", sha256);
     if (session.upload_token) {
       xhr.setRequestHeader("X-Upload-Token", session.upload_token);
     }
@@ -259,6 +268,7 @@ async function uploadPart({
   offset,
   onAttemptStart,
   onProgress,
+  sha256,
   signal,
 }) {
   for (let attempt = 1; attempt <= UPLOAD_RETRY_LIMIT; attempt += 1) {
@@ -273,6 +283,7 @@ async function uploadPart({
           onProgress,
           partNumber,
           session,
+          sha256,
           signal,
         });
       } finally {
@@ -296,13 +307,13 @@ function currentUploadLoadedBytes({ activeParts, completedBytes, fileSize }) {
   return Math.min(fileSize, Math.max(completedBytes, completedBytes + activeBytes));
 }
 
-async function completeUploadSession(session, sha256, signal) {
+async function completeUploadSession(session, { partManifestSha256, sha256 = null }, signal) {
   return requestJson(
     `/api/uploads/${session.id}/complete`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ sha256 }),
+      body: JSON.stringify({ part_manifest_sha256: partManifestSha256, sha256 }),
       signal,
     },
     "Could not complete upload"
@@ -345,6 +356,162 @@ async function abortUploadSession(sessionId) {
   }
 }
 
+async function abortUploadSessionStrict(sessionId, signal) {
+  const session = await requestJson(
+    `/api/uploads/${sessionId}`,
+    { method: "DELETE", signal },
+    "Could not replace an incompatible upload session"
+  );
+  if (!["aborted", "expired", "failed"].includes(session?.status)) {
+    throw new Error("The incompatible upload session could not be terminated.");
+  }
+  return session;
+}
+
+function expectedUploadPart(fileSize, chunkSize, partNumber) {
+  const offset = (partNumber - 1) * chunkSize;
+  return {
+    offset,
+    size: Math.max(0, Math.min(chunkSize, fileSize - offset)),
+  };
+}
+
+function normalizedUploadFilename(filename) {
+  return String(filename || "")
+    .replaceAll("\\", "/")
+    .split("/")
+    .at(-1)
+    .trim();
+}
+
+function uploadSessionMatchesFile(session, file, resumeIdentitySha256) {
+  const chunkSize = Number(session?.chunk_size);
+  const partCount = Number(session?.part_count);
+  const sizeBytes = Number(session?.size_bytes);
+  if (
+    typeof session?.id !== "string" ||
+    !session.id ||
+    session.status !== "active" ||
+    typeof session.upload_token !== "string" ||
+    !session.upload_token ||
+    !Number.isSafeInteger(chunkSize) ||
+    chunkSize <= 0 ||
+    !Number.isSafeInteger(partCount) ||
+    !Number.isSafeInteger(sizeBytes)
+  ) {
+    return false;
+  }
+  const expectedPartCount = file.size > 0 ? Math.ceil(file.size / chunkSize) : 0;
+  return (
+    partCount === expectedPartCount &&
+    sizeBytes === file.size &&
+    session.filename === normalizedUploadFilename(file.name) &&
+    session.resume_identity_sha256 === resumeIdentitySha256
+  );
+}
+
+async function verifiedCommittedPartDigests(file, session, resumeIdentitySha256, signal) {
+  if (!uploadSessionMatchesFile(session, file, resumeIdentitySha256)) {
+    return null;
+  }
+  const verified = new Map();
+  for (const part of session.uploaded_parts || []) {
+    throwIfAborted(signal);
+    const partNumber = Number(part?.part_number);
+    if (
+      !Number.isSafeInteger(partNumber) ||
+      partNumber < 1 ||
+      partNumber > session.part_count ||
+      verified.has(partNumber) ||
+      (part?.sha256 != null && !/^[a-f0-9]{64}$/.test(part.sha256))
+    ) {
+      return null;
+    }
+    const expected = expectedUploadPart(file.size, session.chunk_size, partNumber);
+    if (Number(part.offset) !== expected.offset || Number(part.size_bytes) !== expected.size) {
+      return null;
+    }
+    const chunk = file.slice(expected.offset, expected.offset + expected.size);
+    const sha256 = await sha256Blob(chunk, signal);
+    if (part.sha256 != null && sha256 !== part.sha256) {
+      return null;
+    }
+    verified.set(partNumber, { sha256, size: expected.size });
+  }
+  return verified;
+}
+
+async function resolveUploadSession({
+  documentId,
+  file,
+  folder,
+  key,
+  mode,
+  note,
+  renameToUpload,
+  resumeIdentitySha256,
+  signal,
+  uploadParallelism,
+}) {
+  let session = null;
+  let resumedSession = false;
+  let partDigests = new Map();
+  const storedSessionId = storedUploadSessionId(key);
+  if (storedSessionId) {
+    session = await existingUploadSession(storedSessionId, signal);
+    if (!session || session.status !== "active") {
+      forgetUploadSession(key);
+      session = null;
+    } else if (committedUploadBytes(session) <= 0) {
+      await abortUploadSessionStrict(session.id, signal);
+      forgetUploadSession(key);
+      session = null;
+    } else {
+      const verifiedParts = await verifiedCommittedPartDigests(
+        file,
+        session,
+        resumeIdentitySha256,
+        signal
+      );
+      const verifiedBytes = verifiedParts
+        ? [...verifiedParts.values()].reduce((total, part) => total + part.size, 0)
+        : 0;
+      if (!verifiedParts || verifiedBytes !== committedUploadBytes(session)) {
+        await abortUploadSessionStrict(session.id, signal);
+        forgetUploadSession(key);
+        session = null;
+      } else {
+        partDigests = verifiedParts;
+        resumedSession = true;
+        rememberUploadSession(key, session);
+      }
+    }
+  }
+  if (!session || session.status !== "active") {
+    session = await createUploadSession({
+      documentId,
+      file,
+      folder,
+      mode,
+      note,
+      renameToUpload,
+      resumeIdentitySha256,
+      uploadParallelism,
+      signal,
+    });
+    if (!uploadSessionMatchesFile(session, file, resumeIdentitySha256)) {
+      const createdSessionId = typeof session?.id === "string" && session.id ? session.id : null;
+      if (createdSessionId) {
+        await abortUploadSessionStrict(createdSessionId, signal);
+      }
+      forgetUploadSession(key);
+      throw new Error("Upload session layout does not match the selected file.");
+    }
+    rememberUploadSession(key, session);
+  }
+  return { partDigests, resumedSession, session };
+}
+
 export async function uploadFileResumable({
   file,
   folder = "",
@@ -355,42 +522,38 @@ export async function uploadFileResumable({
   onProgress,
   signal,
 }) {
-  const key = uploadSessionKey({ file, folder, mode, documentId, note, renameToUpload });
-  const storedSessionId = storedUploadSessionId(key);
+  let key = null;
   let session = null;
-  let resumedSession = false;
   try {
+    const contentFingerprint = await uploadContentFingerprint(file, signal);
+    key = uploadSessionKey({
+      contentFingerprint,
+      documentId,
+      file,
+      folder,
+      mode,
+      note,
+      renameToUpload,
+    });
+    const resumeIdentitySha256 = await uploadResumeIdentitySha256(key, signal);
     // Upload session sizing is path-sensitive. Low-latency clients should not
     // pay for high request fanout, but stream-limited clients need enough active
     // PUTs to fill their uplink. The server uses this hint to choose chunk size.
     const uploadParallelism = await resolveUploadParallelism(signal);
-    if (storedSessionId) {
-      session = await existingUploadSession(storedSessionId, signal);
-      if (!session || session.status !== "active") {
-        forgetUploadSession(key);
-        session = null;
-      } else if (committedUploadBytes(session) <= 0) {
-        await abortUploadSession(session.id);
-        forgetUploadSession(key);
-        session = null;
-      } else {
-        resumedSession = true;
-        rememberUploadSession(key, session);
-      }
-    }
-    if (!session || session.status !== "active") {
-      session = await createUploadSession({
-        documentId,
-        file,
-        folder,
-        mode,
-        note,
-        renameToUpload,
-        uploadParallelism,
-        signal,
-      });
-      rememberUploadSession(key, session);
-    }
+    const resolved = await resolveUploadSession({
+      documentId,
+      file,
+      folder,
+      key,
+      mode,
+      note,
+      renameToUpload,
+      resumeIdentitySha256,
+      signal,
+      uploadParallelism,
+    });
+    session = resolved.session;
+    const { partDigests, resumedSession } = resolved;
 
     const startedAt = performance.now();
     const uploadedParts = new Map(
@@ -463,6 +626,7 @@ export async function uploadFileResumable({
         if (existing) {
           continue;
         }
+        const sha256 = await sha256Blob(chunk, signal);
         activeParts.set(partNumber, { loaded: 0, size: chunk.size });
         emitUploadProgress({ force: true });
         try {
@@ -473,17 +637,29 @@ export async function uploadFileResumable({
             offset,
             partNumber,
             session,
+            sha256,
             signal,
           });
         } finally {
           activeParts.delete(partNumber);
         }
+        partDigests.set(partNumber, { sha256, size: chunk.size });
         completedBytes += chunk.size;
         emitUploadProgress({ force: true });
       }
     }
     await Promise.all(
       Array.from({ length: Math.min(uploadParallelism, session.part_count) }, () => uploadWorker())
+    );
+
+    const partManifestSha256 = await uploadPartManifestSha256(
+      {
+        chunkSize: session.chunk_size,
+        fileSize: file.size,
+        partCount: session.part_count,
+        partDigests,
+      },
+      signal
     );
 
     const verificationStartedAt = performance.now();
@@ -501,7 +677,7 @@ export async function uploadFileResumable({
     });
     let result;
     try {
-      result = await completeUploadSession(session, null, signal);
+      result = await completeUploadSession(session, { partManifestSha256 }, signal);
     } finally {
       verificationDone = true;
       await verificationPoll;
@@ -518,6 +694,10 @@ export async function uploadFileResumable({
       }
       forgetUploadSession(key);
       throw new TransferCancelledError();
+    }
+    if (error?.detail === "Upload part manifest mismatch" && session?.id) {
+      await abortUploadSessionStrict(session.id, signal);
+      forgetUploadSession(key);
     }
     throw error;
   }

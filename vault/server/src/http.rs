@@ -70,8 +70,9 @@ use crate::storage::{
 };
 use crate::transfers::{self, TransferMaintenanceError};
 use crate::uploads::{
-    self, CompleteUploadRequest, CreateUploadRequest, UploadError, UploadPartHeaders,
-    UploadPartIngest, UploadResultPayload, UploadRuntimeSettings, UploadSessionPayload,
+    self, CompleteUploadRequest, CreateUploadRequest, UploadError, UploadIntegrityExpectations,
+    UploadPartHeaders, UploadPartIngest, UploadResultPayload, UploadRuntimeSettings,
+    UploadSessionPayload,
 };
 use crate::views::{
     self, BootstrapPayload, ContentsPayload, DocumentDetailPayload, MyEditsPayload, SidebarPayload,
@@ -1429,12 +1430,15 @@ async fn api_complete_upload_session(
     Json(payload): Json<CompleteUploadRequest>,
 ) -> Result<Json<UploadResultPayload>, ApiError> {
     let user = current_user(&state, &headers).await?;
-    let payload = uploads::complete_upload_session_with_hash_coordinator(
+    let payload = uploads::complete_upload_session_with_hash_coordinator_and_manifest(
         &state.db,
         state.storage.as_ref(),
         &state.config.transfers_path(),
         &session_id,
-        payload.sha256.as_deref(),
+        UploadIntegrityExpectations {
+            sha256: payload.sha256.as_deref(),
+            part_manifest_sha256: payload.part_manifest_sha256.as_deref(),
+        },
         &user,
         &state.upload_hash_coordinator,
     )
@@ -3394,10 +3398,10 @@ fn upload_error_response(error: UploadError) -> (StatusCode, String) {
             StatusCode::BAD_REQUEST,
             "Upload failed while reading request body".to_string(),
         ),
-        UploadError::UploadChecksumMismatch => (
-            StatusCode::BAD_REQUEST,
-            "Upload checksum mismatch".to_string(),
-        ),
+        error @ (UploadError::UploadChecksumMismatch
+        | UploadError::UploadIntegrityExpectationRequired
+        | UploadError::UploadIntegrityDigestInvalid
+        | UploadError::UploadPartManifestMismatch) => upload_integrity_error_response(&error),
         UploadError::UploadSizeMismatch => (
             StatusCode::BAD_REQUEST,
             "Upload size does not match session".to_string(),
@@ -3426,6 +3430,19 @@ fn upload_error_response(error: UploadError) -> (StatusCode, String) {
             )
         }
     }
+}
+
+fn upload_integrity_error_response(error: &UploadError) -> (StatusCode, String) {
+    let detail = match error {
+        UploadError::UploadChecksumMismatch => "Upload checksum mismatch",
+        UploadError::UploadIntegrityExpectationRequired => {
+            "Upload completion requires an integrity expectation"
+        }
+        UploadError::UploadIntegrityDigestInvalid => "Upload integrity digest is invalid",
+        UploadError::UploadPartManifestMismatch => "Upload part manifest mismatch",
+        _ => unreachable!("non-integrity error passed to integrity error mapper"),
+    };
+    (StatusCode::BAD_REQUEST, detail.to_string())
 }
 
 fn upload_token_error_response(error: &UploadError) -> (StatusCode, String) {

@@ -7,6 +7,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::fs;
 
+use crate::blob_lifecycle::collect_unreferenced_blobs_with_limit;
 use crate::exports::{self, ExportError, ExportExecutionContext};
 use crate::storage::{SharedBlobStorage, StorageError};
 
@@ -89,7 +90,7 @@ pub async fn sweep_expired_transfers(
 
 pub async fn sweep_expired_transfers_with_limit(
     pool: &SqlitePool,
-    _storage: &SharedBlobStorage,
+    storage: &SharedBlobStorage,
     transfers_path: &Path,
     limit: i64,
 ) -> Result<TransferSweepResult, TransferMaintenanceError> {
@@ -117,6 +118,12 @@ pub async fn sweep_expired_transfers_with_limit(
         .chain(result.deleted_exports.iter())
     {
         clear_export_temp_file(transfers_path, job_id).await?;
+    }
+    match collect_unreferenced_blobs_with_limit(pool, storage.as_ref(), limit).await {
+        Ok(garbage_collection) => result
+            .deleted_export_objects
+            .extend(garbage_collection.deleted_objects),
+        Err(error) => tracing::warn!(?error, "transfer object garbage collection failed"),
     }
     Ok(result)
 }
@@ -158,7 +165,6 @@ async fn recover_interrupted_transfers_inner(
     let uploads = interrupted_uploads(pool, &now).await?;
     let exports = interrupted_exports(pool, &now).await?;
     let mut result = TransferRecoveryResult::default();
-    let mut artifact_blob_ids = Vec::new();
 
     let mut transaction = pool.begin().await?;
     for upload in &uploads {
@@ -198,12 +204,6 @@ async fn recover_interrupted_transfers_inner(
     }
 
     for export in &exports {
-        let blob_ids =
-            sqlx::query_scalar::<_, i64>("SELECT blob_id FROM export_artifacts WHERE job_id = ?")
-                .bind(&export.id)
-                .fetch_all(&mut *transaction)
-                .await?;
-        artifact_blob_ids.extend(blob_ids);
         sqlx::query("DELETE FROM export_artifacts WHERE job_id = ?")
             .bind(&export.id)
             .execute(&mut *transaction)
@@ -224,7 +224,6 @@ async fn recover_interrupted_transfers_inner(
         .await?;
         result.requeued_exports.push(export.id.clone());
     }
-    delete_unreferenced_blobs(&mut transaction, &artifact_blob_ids).await?;
     transaction.commit().await?;
 
     for job_id in &result.requeued_exports {
@@ -233,6 +232,18 @@ async fn recover_interrupted_transfers_inner(
                 .deleted_export_temps
                 .push(format!("{job_id}.zip.tmp"));
         }
+    }
+    match collect_unreferenced_blobs_with_limit(
+        pool,
+        storage.as_ref(),
+        DEFAULT_STARTUP_EXPORT_LIMIT,
+    )
+    .await
+    {
+        Ok(garbage_collection) => result
+            .deleted_export_objects
+            .extend(garbage_collection.deleted_objects),
+        Err(error) => tracing::warn!(?error, "recovery object garbage collection failed"),
     }
     if enqueue_exports {
         result.queued_exports =
@@ -489,7 +500,6 @@ async fn sweep_export_rows(
     now: &str,
     result: &mut TransferSweepResult,
 ) -> Result<(), sqlx::Error> {
-    let mut deleted_blob_ids = Vec::new();
     for export in exports {
         if matches!(export.status.as_str(), "queued" | "running" | "finalizing") {
             let cancelled = sqlx::query(
@@ -511,12 +521,6 @@ async fn sweep_export_rows(
                 result.cancelled_exports.push(export.id.clone());
             }
         } else {
-            let artifact_blob_ids = sqlx::query_scalar::<_, i64>(
-                "SELECT blob_id FROM export_artifacts WHERE job_id = ?",
-            )
-            .bind(&export.id)
-            .fetch_all(&mut **transaction)
-            .await?;
             let deleted = sqlx::query(
                 r"
                 DELETE FROM export_jobs
@@ -531,50 +535,11 @@ async fn sweep_export_rows(
             .execute(&mut **transaction)
             .await?;
             if deleted.rows_affected() > 0 {
-                deleted_blob_ids.extend(artifact_blob_ids);
                 result.deleted_exports.push(export.id.clone());
             }
         }
     }
-    delete_unreferenced_blobs(transaction, &deleted_blob_ids).await
-}
-
-async fn delete_unreferenced_blobs(
-    transaction: &mut Transaction<'_, Sqlite>,
-    blob_ids: &[i64],
-) -> Result<(), sqlx::Error> {
-    for blob_id in blob_ids {
-        if blob_is_referenced(transaction, *blob_id).await? {
-            continue;
-        }
-        sqlx::query("DELETE FROM blobs WHERE id = ?")
-            .bind(blob_id)
-            .execute(&mut **transaction)
-            .await?;
-    }
     Ok(())
-}
-
-async fn blob_is_referenced(
-    transaction: &mut Transaction<'_, Sqlite>,
-    blob_id: i64,
-) -> Result<bool, sqlx::Error> {
-    let document_reference =
-        sqlx::query_scalar::<_, i64>("SELECT 1 FROM document_versions WHERE blob_id = ? LIMIT 1")
-            .bind(blob_id)
-            .fetch_optional(&mut **transaction)
-            .await?
-            .is_some();
-    if document_reference {
-        return Ok(true);
-    }
-    Ok(
-        sqlx::query_scalar::<_, i64>("SELECT 1 FROM export_artifacts WHERE blob_id = ? LIMIT 1")
-            .bind(blob_id)
-            .fetch_optional(&mut **transaction)
-            .await?
-            .is_some(),
-    )
 }
 
 async fn clear_upload_session_files(transfers_path: &Path, session_id: &str) {

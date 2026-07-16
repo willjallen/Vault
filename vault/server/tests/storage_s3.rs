@@ -11,8 +11,10 @@ use axum::routing::{delete, get, head, put};
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
+use vault_server::blob_lifecycle::{begin_blob_publication, collect_unreferenced_blobs};
+use vault_server::db;
 use vault_server::storage::{
-    BlobStorageBackend, S3CompatibleBlobStorage, S3StorageSettings, StorageError,
+    BlobStorageBackend, BlobWriteKind, S3CompatibleBlobStorage, S3StorageSettings, StorageError,
 };
 
 type ObjectMap = Arc<Mutex<HashMap<String, Vec<u8>>>>;
@@ -256,6 +258,74 @@ async fn s3_compatible_storage_rejects_part_file_checksum_mismatch_without_uploa
             .await,
         Err(StorageError::NotFound),
     ));
+}
+
+#[tokio::test]
+async fn blob_lifecycle_garbage_collection_deletes_s3_object_and_metadata() {
+    let (endpoint_url, objects) = start_s3_mock_with_objects().await;
+    let storage = S3CompatibleBlobStorage::from_settings(S3StorageSettings {
+        name: "s3".to_string(),
+        bucket: "vault-gc".to_string(),
+        region: "us-east-1".to_string(),
+        endpoint_url: Some(endpoint_url),
+        access_key_id: Some("test-access".to_string()),
+        secret_access_key: Some("test-secret".to_string()),
+        session_token: None,
+        prefix: "objects".to_string(),
+    })
+    .await
+    .expect("s3 storage");
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let pool = db::connect(&temp_dir.path().join("vault.db"))
+        .await
+        .expect("database");
+    let content = b"remote garbage collection";
+    let digest = sha256_hex(content);
+    let publication = begin_blob_publication(
+        &pool,
+        &storage,
+        "sha256",
+        &digest,
+        content.len() as u64,
+        BlobWriteKind::Bytes,
+    )
+    .await
+    .expect("publication lease");
+    let stored = publication
+        .run_storage(storage.put_bytes(content))
+        .await
+        .expect("put object");
+    let mut transaction = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .expect("metadata transaction");
+    let blob_id = publication
+        .prepare_metadata_in_tx(&mut transaction, &stored)
+        .await
+        .expect("prepare metadata");
+    publication
+        .finish_metadata_in_tx(&mut transaction)
+        .await
+        .expect("finish metadata");
+    transaction.commit().await.expect("commit metadata");
+    drop(publication);
+
+    let result = collect_unreferenced_blobs(&pool, &storage)
+        .await
+        .expect("garbage collection");
+
+    assert_eq!(result.deleted_blob_ids, vec![blob_id]);
+    assert_eq!(result.deleted_objects, vec![stored.object_key.clone()]);
+    assert!(result.failures.is_empty());
+    assert!(!objects.lock().await.contains_key(&stored.object_key));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM blobs WHERE id = ?")
+            .bind(blob_id)
+            .fetch_one(&pool)
+            .await
+            .expect("blob count"),
+        0,
+    );
 }
 
 async fn start_s3_mock() -> String {

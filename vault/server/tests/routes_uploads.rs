@@ -13,6 +13,7 @@ use time::{Duration, OffsetDateTime};
 use tokio::sync::Notify;
 use tower::ServiceExt;
 use vault_server::auth::{AuthSettings, UserContext};
+use vault_server::blob_lifecycle::BlobLifecycleError;
 use vault_server::config::Config;
 use vault_server::db;
 use vault_server::documents::{ClientMeta, sweep_expired_documents};
@@ -23,8 +24,8 @@ use vault_server::folders::{
 use vault_server::http::{self, AppState};
 use vault_server::reconciliation::storage_reconciliation_report;
 use vault_server::storage::{
-    BlobStorageBackend, LocalBlobStorage, SharedBlobStorage, StorageError, StoredBlob,
-    multipart_manifest_key_for_hash,
+    BlobStorageBackend, BlobWriteKind, LocalBlobStorage, SharedBlobStorage, StorageError,
+    StoredBlob, multipart_manifest_key_for_hash,
 };
 use vault_server::transfers::recover_interrupted_transfers;
 use vault_server::uploads::{
@@ -88,6 +89,21 @@ impl BlobStorageBackend for BlockingPartStorage {
 
     async fn ensure(&self) -> Result<(), StorageError> {
         Ok(())
+    }
+
+    fn planned_object_key(
+        &self,
+        _hash_algo: &str,
+        _digest: &str,
+        write_kind: BlobWriteKind,
+    ) -> Result<String, StorageError> {
+        if write_kind == BlobWriteKind::PartFiles {
+            Ok(self.stored.object_key.clone())
+        } else {
+            Err(StorageError::UnsupportedOperation(
+                "test storage only supports part promotion".to_string(),
+            ))
+        }
     }
 
     async fn put_bytes(&self, _data: &[u8]) -> Result<StoredBlob, StorageError> {
@@ -1579,7 +1595,7 @@ async fn upload_session_creates_document_without_part_database_writes() {
 }
 
 #[tokio::test]
-async fn create_completion_rechecks_duplicate_path_without_deleting_promoted_object() {
+async fn create_completion_rechecks_duplicate_path_and_cleans_promoted_object() {
     let (state, temp_dir) = test_state().await;
     grant_writer_root(&state.db).await;
     let race_folder = get_or_create_folder_path(&state.db, Some("Race"))
@@ -1672,14 +1688,14 @@ async fn create_completion_rechecks_duplicate_path_without_deleting_promoted_obj
     assert_eq!(location_count, 1);
     let loser_key = multipart_manifest_key_for_hash("", "sha256", &sha256_hex(data));
     let object_keys = local_storage.list_object_keys().await.expect("objects");
-    assert_eq!(object_keys.len(), 2);
-    assert!(object_keys.contains(&loser_key));
+    assert_eq!(object_keys.len(), 1);
+    assert!(!object_keys.contains(&loser_key));
 
     let report = storage_reconciliation_report(&pool, &local_storage, false)
         .await
         .expect("reconciliation report");
     assert!(report.orphan_blob_ids.is_empty());
-    assert_eq!(report.unreferenced_local_keys, vec![loser_key]);
+    assert!(report.unreferenced_local_keys.is_empty());
 }
 
 #[tokio::test]
@@ -3364,6 +3380,67 @@ async fn abort_wins_against_in_flight_completion_without_committing_metadata() {
     .expect("metadata counts");
     assert_eq!(status, "aborted");
     assert_eq!(counts, (0, 0, 0));
+}
+
+#[tokio::test]
+async fn deletion_tombstone_returns_upload_to_active_without_discarding_parts() {
+    let (state, _temp_dir) =
+        test_state_with_upload_settings(5 * 1024 * 1024 * 1024, 4, 86_400).await;
+    grant_writer_root(&state.db).await;
+    let user = writer_context();
+    let data = b"abcdefgh";
+    let digest = sha256_hex(data);
+    let session_id =
+        directly_uploaded_session_with_fixed_parts(&state, &user, "retry-gc.txt", data, 4).await;
+    let blob_id =
+        sqlx::query("INSERT INTO blobs (hash_algo, hash, size_bytes) VALUES ('sha256', ?, ?)")
+            .bind(&digest)
+            .bind(i64::try_from(data.len()).expect("data size"))
+            .execute(&state.db)
+            .await
+            .expect("deleting blob")
+            .last_insert_rowid();
+    sqlx::query(
+        r"
+        INSERT INTO blob_locations (blob_id, backend, bucket, object_key)
+        VALUES (?, '_vault_deleting:test:local', '', ?)
+        ",
+    )
+    .bind(blob_id)
+    .bind(multipart_manifest_key_for_hash("", "sha256", &digest))
+    .execute(&state.db)
+    .await
+    .expect("deletion tombstone");
+    let transfers_path = state.config.transfers_path();
+
+    let error = uploads::complete_upload_session(
+        &state.db,
+        state.storage.as_ref(),
+        &transfers_path,
+        &session_id,
+        Some(&digest),
+        &user,
+    )
+    .await
+    .expect_err("deletion contention must be retryable");
+
+    assert!(matches!(
+        error,
+        uploads::UploadError::BlobLifecycle(BlobLifecycleError::DeletionInProgress)
+    ));
+    assert_eq!(
+        wait_for_upload_status(&state.db, &session_id, "active").await,
+        ("active".to_string(), 0, 0, None),
+    );
+    for part_number in 1..=2 {
+        assert!(
+            transfers_path
+                .join("uploads")
+                .join(&session_id)
+                .join(format!("{part_number:08}.part"))
+                .is_file()
+        );
+    }
 }
 
 #[tokio::test]

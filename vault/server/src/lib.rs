@@ -1,6 +1,7 @@
 pub mod admin;
 pub mod assets;
 pub mod auth;
+pub mod blob_lifecycle;
 pub mod config;
 pub mod db;
 pub mod documents;

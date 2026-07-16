@@ -582,7 +582,10 @@ pub async fn version_download_by_id(
         FROM document_versions v
         JOIN documents d ON d.id = v.document_id
         JOIN blobs b ON b.id = v.blob_id
-        LEFT JOIN blob_locations bl ON bl.blob_id = b.id
+        LEFT JOIN blob_locations bl
+         ON bl.blob_id = b.id
+         AND bl.backend NOT GLOB '_vault_pending:*'
+         AND bl.backend NOT GLOB '_vault_deleting:*'
         WHERE d.id = ? AND v.id = ?
         ORDER BY CASE WHEN bl.backend = 'local' THEN 0 ELSE 1 END, bl.id
         LIMIT 1

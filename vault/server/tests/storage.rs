@@ -131,10 +131,19 @@ async fn verified_part_files_promote_to_manifest_without_listing_parts() {
         )
         .await
         .expect("put manifest");
+    let published_manifest = storage
+        .read_multipart_manifest(&blob.object_key)
+        .await
+        .expect("published manifest");
+    let published_part_paths = published_manifest
+        .parts
+        .iter()
+        .map(|part| part.path.clone())
+        .collect::<Vec<_>>();
+    assert!(published_part_paths.iter().all(|path| path.is_file()));
 
     let manifest_key = multipart_manifest_key_for_hash("objects", "sha256", &digest);
     let first_part_key = multipart_part_key_for_hash("objects", "sha256", &digest, 1);
-    let second_part_key = multipart_part_key_for_hash("objects", "sha256", &digest, 2);
     assert_eq!(blob.object_key, manifest_key);
     assert_eq!(
         storage
@@ -168,8 +177,69 @@ async fn verified_part_files_promote_to_manifest_without_listing_parts() {
         storage.list_object_keys().await.expect("keys after delete"),
         Vec::<String>::new(),
     );
-    assert!(!storage.root().join(first_part_key).exists());
-    assert!(!storage.root().join(second_part_key).exists());
+    assert!(published_part_paths.iter().all(|path| !path.exists()));
+}
+
+#[tokio::test]
+async fn multipart_delete_rejects_manifest_that_points_at_another_blobs_parts() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let source_dir = temp_dir.path().join("parts");
+    tokio::fs::create_dir_all(&source_dir)
+        .await
+        .expect("source directory");
+    let first_source = source_dir.join("first.part");
+    let second_source = source_dir.join("second.part");
+    tokio::fs::write(&first_source, b"first object")
+        .await
+        .expect("first source");
+    tokio::fs::write(&second_source, b"second object")
+        .await
+        .expect("second source");
+    let first_digest = sha256_hex(b"first object");
+    let second_digest = sha256_hex(b"second object");
+    let storage = test_storage(&temp_dir.path().join("store"));
+    let first = storage
+        .put_part_files(&[first_source], Some(&first_digest))
+        .await
+        .expect("first multipart object");
+    let second = storage
+        .put_part_files(&[second_source], Some(&second_digest))
+        .await
+        .expect("second multipart object");
+    let second_manifest = storage
+        .read_multipart_manifest(&second.object_key)
+        .await
+        .expect("second manifest");
+    let protected_part = second_manifest.parts[0].clone();
+    let first_manifest_path = storage.root().join(&first.object_key);
+    let mut tampered: serde_json::Value = serde_json::from_slice(
+        &tokio::fs::read(&first_manifest_path)
+            .await
+            .expect("first manifest bytes"),
+    )
+    .expect("first manifest json");
+    tampered["parts"][0]["object_key"] = protected_part.object_key.clone().into();
+    tokio::fs::write(
+        &first_manifest_path,
+        serde_json::to_vec(&tampered).expect("tampered manifest json"),
+    )
+    .await
+    .expect("tamper first manifest");
+
+    let error = storage
+        .delete_object(&first.object_key)
+        .await
+        .expect_err("cross-object part reference must be rejected");
+
+    assert!(matches!(error, StorageError::InvalidMultipartManifest));
+    assert!(protected_part.path.is_file());
+    assert_eq!(
+        storage
+            .read_bytes(&second.object_key)
+            .await
+            .expect("second object remains readable"),
+        b"second object",
+    );
 }
 
 #[tokio::test]

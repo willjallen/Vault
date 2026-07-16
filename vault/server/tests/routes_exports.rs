@@ -23,7 +23,8 @@ use vault_server::folders::{
 };
 use vault_server::http::{self, AppState};
 use vault_server::storage::{
-    BlobStorageBackend, LocalBlobStorage, SharedBlobStorage, StorageError, StoredBlob,
+    BlobStorageBackend, BlobWriteKind, LocalBlobStorage, SharedBlobStorage, StorageError,
+    StoredBlob,
 };
 use vault_server::transfers::sweep_expired_transfers;
 
@@ -96,6 +97,15 @@ impl BlobStorageBackend for BlockingPutFileStorage {
         self.inner.ensure().await
     }
 
+    fn planned_object_key(
+        &self,
+        hash_algo: &str,
+        digest: &str,
+        write_kind: BlobWriteKind,
+    ) -> Result<String, StorageError> {
+        self.inner.planned_object_key(hash_algo, digest, write_kind)
+    }
+
     async fn put_bytes(&self, data: &[u8]) -> Result<StoredBlob, StorageError> {
         self.inner.put_bytes(data).await
     }
@@ -160,6 +170,15 @@ impl BlobStorageBackend for BlockAfterPutFileStorage {
 
     async fn ensure(&self) -> Result<(), StorageError> {
         self.inner.ensure().await
+    }
+
+    fn planned_object_key(
+        &self,
+        hash_algo: &str,
+        digest: &str,
+        write_kind: BlobWriteKind,
+    ) -> Result<String, StorageError> {
+        self.inner.planned_object_key(hash_algo, digest, write_kind)
     }
 
     async fn put_bytes(&self, data: &[u8]) -> Result<StoredBlob, StorageError> {
@@ -229,6 +248,15 @@ impl BlobStorageBackend for CancelAfterReadStorage {
 
     async fn ensure(&self) -> Result<(), StorageError> {
         self.inner.ensure().await
+    }
+
+    fn planned_object_key(
+        &self,
+        hash_algo: &str,
+        digest: &str,
+        write_kind: BlobWriteKind,
+    ) -> Result<String, StorageError> {
+        self.inner.planned_object_key(hash_algo, digest, write_kind)
     }
 
     async fn put_bytes(&self, data: &[u8]) -> Result<StoredBlob, StorageError> {
@@ -328,6 +356,15 @@ impl BlobStorageBackend for BlockAfterProgressRangeStorage {
 
     async fn ensure(&self) -> Result<(), StorageError> {
         self.inner.ensure().await
+    }
+
+    fn planned_object_key(
+        &self,
+        hash_algo: &str,
+        digest: &str,
+        write_kind: BlobWriteKind,
+    ) -> Result<String, StorageError> {
+        self.inner.planned_object_key(hash_algo, digest, write_kind)
     }
 
     async fn put_bytes(&self, data: &[u8]) -> Result<StoredBlob, StorageError> {
@@ -710,7 +747,7 @@ async fn assert_expired_export_swept(
         .await
         .expect("sweep transfers");
     assert_eq!(swept.deleted_exports, vec![job_id.to_string()]);
-    assert_eq!(swept.deleted_export_objects, Vec::<String>::new());
+    assert_eq!(swept.deleted_export_objects, vec![object_key.to_string()]);
     let job_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM export_jobs WHERE id = ?")
         .bind(job_id)
         .fetch_one(pool)
@@ -731,7 +768,7 @@ async fn assert_expired_export_swept(
     assert_eq!(blob_count, 0);
     assert_eq!(location_count, 0);
     assert!(
-        storage
+        !storage
             .list_object_keys()
             .await
             .expect("object keys")
@@ -1882,10 +1919,11 @@ async fn export_artifact_failure_rolls_back_blob_and_location_metadata() {
     .fetch_one(&pool)
     .await
     .expect("orphan blob count");
-    let keys = storage.list_object_keys().await.expect("object keys");
+    let mut keys = storage.list_object_keys().await.expect("object keys");
+    keys.sort();
     assert_eq!(artifact_count, 0);
     assert_eq!(orphan_blob_count, 0);
-    assert!(expected_keys.iter().all(|key| keys.contains(key)));
+    assert_eq!(keys, expected_keys);
 }
 
 #[tokio::test]

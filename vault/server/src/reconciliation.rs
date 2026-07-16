@@ -44,6 +44,7 @@ struct StorageReconciliationState {
     referenced_blob_ids: HashSet<i64>,
     orphan_blobs: Vec<BlobRecord>,
     local_locations: Vec<LocalLocationRecord>,
+    pending_local_keys: BTreeSet<String>,
     local_keys: BTreeSet<String>,
     recoverable_referenced_local_locations: BTreeSet<(i64, String)>,
     corrupt_local_keys: BTreeSet<String>,
@@ -100,6 +101,18 @@ async fn load_reconciliation_state(
     )
     .fetch_all(pool)
     .await?;
+    let pending_local_keys = sqlx::query_scalar::<_, String>(
+        r"
+        SELECT object_key
+        FROM blob_locations
+        WHERE backend GLOB '_vault_pending:*:local'
+           OR backend GLOB '_vault_deleting:*:local'
+        ",
+    )
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .collect::<BTreeSet<_>>();
     let local_keys = storage
         .list_object_keys()
         .await?
@@ -111,6 +124,7 @@ async fn load_reconciliation_state(
         referenced_blob_ids,
         orphan_blobs,
         local_locations,
+        pending_local_keys,
         local_keys,
         recoverable_referenced_local_locations,
         corrupt_local_keys,
@@ -168,6 +182,9 @@ fn reconciliation_report_from_state(
         .local_locations
         .iter()
         .map(|location| location.object_key.clone())
+        .collect::<BTreeSet<_>>()
+        .union(&state.pending_local_keys)
+        .cloned()
         .collect::<BTreeSet<_>>();
     let referenced_local_keys = state
         .local_locations
@@ -190,6 +207,9 @@ fn reconciliation_report_from_state(
         .cloned()
         .collect::<BTreeSet<_>>()
         .union(&state.corrupt_local_keys)
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .union(&state.pending_local_keys)
         .cloned()
         .collect::<BTreeSet<_>>();
     let unreferenced_local_keys = state
@@ -247,6 +267,9 @@ async fn apply_storage_reconciliation(
         .local_locations
         .iter()
         .map(|location| location.object_key.clone())
+        .collect::<BTreeSet<_>>()
+        .union(&state.pending_local_keys)
+        .cloned()
         .collect::<BTreeSet<_>>();
     let referenced_local_keys = state
         .local_locations
@@ -264,6 +287,9 @@ async fn apply_storage_reconciliation(
         .cloned()
         .collect::<BTreeSet<_>>()
         .union(&state.corrupt_local_keys)
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .union(&state.pending_local_keys)
         .cloned()
         .collect::<BTreeSet<_>>();
     let orphan_local_keys_to_delete = orphan_local_keys_to_delete(

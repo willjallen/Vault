@@ -24,6 +24,10 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::auth::UserContext;
+use crate::blob_lifecycle::{
+    BlobLifecycleError, PendingBlobPublication, begin_blob_publication,
+    collect_unreferenced_blobs_with_limit,
+};
 use crate::documents::{
     ClientMeta, DocumentError, DocumentRecord, document_path, editable_document_for_write,
     normalize_file_name,
@@ -33,7 +37,7 @@ use crate::folders::{
     normalize_folder, parse_public_folder_path, require_write_for_folder_path,
 };
 use crate::state_events::state_event_resources_json;
-use crate::storage::{BlobStorageBackend, StorageError, StoredBlob};
+use crate::storage::{BlobStorageBackend, BlobWriteKind, StorageError, StoredBlob};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -203,6 +207,8 @@ pub enum UploadError {
     CompletionStateTransition(String),
     #[error("storage location points at another blob")]
     StorageLocationConflict,
+    #[error(transparent)]
+    BlobLifecycle(#[from] BlobLifecycleError),
     #[error("upload token is required")]
     UploadTokenRequired,
     #[error("upload token is invalid")]
@@ -969,6 +975,8 @@ pub async fn complete_upload_session_with_hash_coordinator_and_manifest(
     .await
 }
 
+// The completion guard must cover every validation, publication, retry, and terminal path.
+#[allow(clippy::too_many_lines)]
 async fn complete_upload_session_impl(
     pool: &SqlitePool,
     storage: &dyn BlobStorageBackend,
@@ -1053,6 +1061,24 @@ async fn complete_upload_session_impl(
             Ok(payload)
         }
         Err(error) => {
+            if matches!(
+                &error,
+                UploadError::BlobLifecycle(
+                    BlobLifecycleError::DeletionInProgress
+                        | BlobLifecycleError::PublicationLeaseLost
+                )
+            ) {
+                if let Err(recovery_error) = completion_attempt.reset_for_retry().await {
+                    tracing::error!(
+                        ?error,
+                        ?recovery_error,
+                        session_id,
+                        "transient blob lifecycle error and upload state recovery both failed"
+                    );
+                    return Err(recovery_error);
+                }
+                return Err(error);
+            }
             completion_attempt.fail_on_drop(error.to_string());
             match mark_upload_failed(pool, transfers_path, session_id, &error.to_string()).await {
                 Ok(()) => {
@@ -1122,10 +1148,35 @@ async fn complete_upload_session_inner(
     parts: &CompletedParts,
     user: &UserContext,
 ) -> Result<UploadResultPayload, UploadError> {
-    let stored = storage
-        .put_part_files(&parts.paths, Some(&parts.digest))
-        .await?;
-    let result = complete_upload_session_after_store(pool, session, parts, user, &stored).await;
+    let size_bytes =
+        u64::try_from(parts.size_bytes).map_err(|_| UploadError::UploadSizeMismatch)?;
+    let publication = begin_blob_publication(
+        pool,
+        storage,
+        "sha256",
+        &parts.digest,
+        size_bytes,
+        BlobWriteKind::PartFiles,
+    )
+    .await?;
+    let stored = match publication
+        .run_storage(storage.put_part_files(&parts.paths, Some(&parts.digest)))
+        .await
+    {
+        Ok(stored) => stored,
+        Err(error) => {
+            if let Err(cleanup_error) = publication.abandon(None).await {
+                tracing::error!(
+                    ?cleanup_error,
+                    "failed to queue an unsuccessful upload publication for cleanup"
+                );
+            }
+            return Err(error.into());
+        }
+    };
+    let result =
+        complete_upload_session_after_store(pool, session, parts, user, &stored, &publication)
+            .await;
     match result {
         Ok(payload) => Ok(payload),
         Err(error) => {
@@ -1133,6 +1184,17 @@ async fn complete_upload_session_inner(
                 object_key = %stored.object_key,
                 "upload object promotion succeeded but the metadata commit failed; leaving object for delayed cleanup"
             );
+            if let Err(cleanup_error) = publication.abandon(Some(&stored)).await {
+                tracing::error!(
+                    ?cleanup_error,
+                    object_key = %stored.object_key,
+                    "failed to preserve upload object metadata for delayed cleanup"
+                );
+            } else if let Err(cleanup_error) =
+                collect_unreferenced_blobs_with_limit(pool, storage, 1).await
+            {
+                tracing::warn!(?cleanup_error, "prompt upload-object cleanup failed");
+            }
             Err(error)
         }
     }
@@ -1144,6 +1206,7 @@ async fn complete_upload_session_after_store(
     parts: &CompletedParts,
     user: &UserContext,
     stored: &StoredBlob,
+    publication: &PendingBlobPublication,
 ) -> Result<UploadResultPayload, UploadError> {
     if i64::try_from(stored.size_bytes).ok() != Some(session.total_size)
         || parts.size_bytes != session.total_size
@@ -1167,8 +1230,10 @@ async fn complete_upload_session_after_store(
         )
         .await?;
     }
-    let mut transaction = pool.begin().await?;
-    let blob_id = get_or_create_blob_in_tx(&mut transaction, stored).await?;
+    let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let blob_id = publication
+        .prepare_metadata_in_tx(&mut transaction, stored)
+        .await?;
     let result = match session.mode.as_str() {
         "create" => complete_create_upload_in_tx(&mut transaction, session, blob_id).await?,
         "checkin" => {
@@ -1223,6 +1288,7 @@ async fn complete_upload_session_after_store(
             None => UploadError::UploadSessionNotFound,
         });
     }
+    publication.finish_metadata_in_tx(&mut transaction).await?;
     transaction.commit().await?;
     Ok(result)
 }
@@ -2157,65 +2223,6 @@ async fn active_upload_lock_in_tx(
     .bind(document_id)
     .fetch_optional(&mut **transaction)
     .await?)
-}
-
-async fn get_or_create_blob_in_tx(
-    transaction: &mut Transaction<'_, Sqlite>,
-    stored: &StoredBlob,
-) -> Result<i64, UploadError> {
-    let size_bytes =
-        i64::try_from(stored.size_bytes).map_err(|_| UploadError::UploadSizeMismatch)?;
-    sqlx::query(
-        r"
-        INSERT OR IGNORE INTO blobs (hash_algo, hash, size_bytes)
-        VALUES (?, ?, ?)
-        ",
-    )
-    .bind(&stored.hash_algo)
-    .bind(&stored.digest)
-    .bind(size_bytes)
-    .execute(&mut **transaction)
-    .await?;
-    let blob_id = sqlx::query_scalar::<_, i64>(
-        r"
-        SELECT id
-        FROM blobs
-        WHERE hash_algo = ? AND hash = ? AND size_bytes = ?
-        ",
-    )
-    .bind(&stored.hash_algo)
-    .bind(&stored.digest)
-    .bind(size_bytes)
-    .fetch_one(&mut **transaction)
-    .await?;
-    let existing_location = sqlx::query_scalar::<_, i64>(
-        r"
-        SELECT blob_id
-        FROM blob_locations
-        WHERE backend = ? AND bucket = ? AND object_key = ?
-        ",
-    )
-    .bind(&stored.backend)
-    .bind(&stored.bucket)
-    .bind(&stored.object_key)
-    .fetch_optional(&mut **transaction)
-    .await?;
-    if existing_location.is_some_and(|existing_blob_id| existing_blob_id != blob_id) {
-        return Err(UploadError::StorageLocationConflict);
-    }
-    sqlx::query(
-        r"
-        INSERT OR IGNORE INTO blob_locations (blob_id, backend, bucket, object_key)
-        VALUES (?, ?, ?, ?)
-        ",
-    )
-    .bind(blob_id)
-    .bind(&stored.backend)
-    .bind(&stored.bucket)
-    .bind(&stored.object_key)
-    .execute(&mut **transaction)
-    .await?;
-    Ok(blob_id)
 }
 
 async fn ensure_unique_document_name_in_tx(

@@ -33,6 +33,10 @@ use crate::auth::{
     AuthError, AuthMode, AuthSettings, UserContext, dev_identity, header_identity,
     oidc_token_urlsafe, session_identity, sign_session_payload,
 };
+use crate::blob_lifecycle::{
+    BlobLifecycleError, PendingBlobPublication, begin_blob_publication,
+    collect_unreferenced_blobs_with_limit,
+};
 use crate::config::Config;
 use crate::db::DbPool;
 use crate::documents::{
@@ -66,7 +70,8 @@ use crate::state_events::{
     record_state_event, state_events_after, subscribe_state_events,
 };
 use crate::storage::{
-    BlobStorageBackend, LocalBlobStorage, SharedBlobStorage, StorageError, StoredBlob,
+    BlobStorageBackend, BlobWriteKind, LocalBlobStorage, SharedBlobStorage, StorageError,
+    StoredBlob, sha256_hex,
 };
 use crate::transfers::{self, TransferMaintenanceError};
 use crate::uploads::{
@@ -915,8 +920,50 @@ async fn api_admin_debug_seed(
     let folder = get_or_create_folder_path(&state.db, Some("Debug Samples")).await?;
     let name = format!("debug-sample-{}.txt", Uuid::new_v4().simple());
     let content = format!("Debug sample created by Rust Vault as {}\n", user.name);
-    let stored = state.storage.put_bytes(content.as_bytes()).await?;
-    let document_id = create_debug_document(&state, folder.id, &name, &stored, &user).await?;
+    let content_digest = sha256_hex(content.as_bytes());
+    let publication = begin_blob_publication(
+        &state.db,
+        state.storage.as_ref(),
+        "sha256",
+        &content_digest,
+        u64::try_from(content.len())
+            .map_err(|_| ApiError::Internal("Debug sample is too large".to_string()))?,
+        BlobWriteKind::Bytes,
+    )
+    .await?;
+    let stored = match publication
+        .run_storage(state.storage.put_bytes(content.as_bytes()))
+        .await
+    {
+        Ok(stored) => stored,
+        Err(error) => {
+            if let Err(cleanup_error) = publication.abandon(None).await {
+                tracing::error!(
+                    ?cleanup_error,
+                    "failed to queue an unsuccessful debug publication for cleanup"
+                );
+            }
+            return Err(error.into());
+        }
+    };
+    let document_result =
+        create_debug_document(&state, folder.id, &name, &stored, &user, &publication).await;
+    let document_id = match document_result {
+        Ok(document_id) => document_id,
+        Err(error) => {
+            if let Err(cleanup_error) = publication.abandon(Some(&stored)).await {
+                tracing::error!(
+                    ?cleanup_error,
+                    "failed to queue an uncommitted debug object for cleanup"
+                );
+            } else if let Err(cleanup_error) =
+                collect_unreferenced_blobs_with_limit(&state.db, state.storage.as_ref(), 1).await
+            {
+                tracing::warn!(?cleanup_error, "prompt debug-object cleanup failed");
+            }
+            return Err(error);
+        }
+    };
     record_state_event(&state.db, "folder.debug.seeded", &["contents", "sidebar"]).await?;
     notify_state_event_committed();
     Ok(Json(debug_action_result(json!({
@@ -1673,6 +1720,11 @@ async fn api_delete_forever(
     if changed {
         record_document_deleted_state(&state.db).await?;
         notify_state_event_committed();
+        if let Err(error) =
+            collect_unreferenced_blobs_with_limit(&state.db, state.storage.as_ref(), 250).await
+        {
+            tracing::warn!(?error, "prompt permanent-delete object cleanup failed");
+        }
     }
     Ok(Json(response))
 }
@@ -2914,58 +2966,18 @@ async fn create_debug_document(
     name: &str,
     stored: &StoredBlob,
     user: &UserContext,
+    publication: &PendingBlobPublication,
 ) -> Result<i64, ApiError> {
-    let mut transaction = state.db.begin().await?;
-    let blob_id = get_or_create_debug_blob(&mut transaction, stored).await?;
+    let mut transaction = state.db.begin_with("BEGIN IMMEDIATE").await?;
+    let blob_id = publication
+        .prepare_metadata_in_tx(&mut transaction, stored)
+        .await?;
     let document_id = insert_debug_document_row(&mut transaction, folder_id, name, user).await?;
     insert_debug_document_version_and_event(&mut transaction, document_id, blob_id, name, user)
         .await?;
+    publication.finish_metadata_in_tx(&mut transaction).await?;
     transaction.commit().await?;
     Ok(document_id)
-}
-
-async fn get_or_create_debug_blob(
-    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    stored: &StoredBlob,
-) -> Result<i64, ApiError> {
-    let size_bytes = i64::try_from(stored.size_bytes)
-        .map_err(|_| ApiError::Internal("Debug sample is too large".to_string()))?;
-    sqlx::query(
-        r"
-        INSERT OR IGNORE INTO blobs (hash_algo, hash, size_bytes)
-        VALUES (?, ?, ?)
-        ",
-    )
-    .bind(&stored.hash_algo)
-    .bind(&stored.digest)
-    .bind(size_bytes)
-    .execute(&mut **transaction)
-    .await?;
-    let blob_id = sqlx::query_scalar::<_, i64>(
-        r"
-        SELECT id
-        FROM blobs
-        WHERE hash_algo = ? AND hash = ? AND size_bytes = ?
-        ",
-    )
-    .bind(&stored.hash_algo)
-    .bind(&stored.digest)
-    .bind(size_bytes)
-    .fetch_one(&mut **transaction)
-    .await?;
-    sqlx::query(
-        r"
-        INSERT OR IGNORE INTO blob_locations (blob_id, backend, bucket, object_key)
-        VALUES (?, ?, ?, ?)
-        ",
-    )
-    .bind(blob_id)
-    .bind(&stored.backend)
-    .bind(&stored.bucket)
-    .bind(&stored.object_key)
-    .execute(&mut **transaction)
-    .await?;
-    Ok(blob_id)
 }
 
 async fn insert_debug_document_row(
@@ -3063,6 +3075,7 @@ enum ApiError {
     Asset(AssetError),
     Auth(AuthError),
     BadRequest(String),
+    BlobLifecycle(BlobLifecycleError),
     Database(sqlx::Error),
     Document(DocumentError),
     Export(ExportError),
@@ -3100,6 +3113,12 @@ impl From<AuthError> for ApiError {
 impl From<AssetError> for ApiError {
     fn from(error: AssetError) -> Self {
         Self::Asset(error)
+    }
+}
+
+impl From<BlobLifecycleError> for ApiError {
+    fn from(error: BlobLifecycleError) -> Self {
+        Self::BlobLifecycle(error)
     }
 }
 
@@ -3227,6 +3246,13 @@ fn api_error_status_detail(error: ApiError) -> (StatusCode, String) {
         ApiError::Asset(error) => asset_error_response(error),
         ApiError::Auth(error) => auth_error_response(error),
         ApiError::BadRequest(detail) => (StatusCode::BAD_REQUEST, detail),
+        ApiError::BlobLifecycle(error) => {
+            tracing::error!(?error, "blob lifecycle request failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal server error".to_string(),
+            )
+        }
         ApiError::Forbidden(detail) => (StatusCode::FORBIDDEN, detail),
         ApiError::Internal(detail) => (StatusCode::INTERNAL_SERVER_ERROR, detail),
         ApiError::NotFound(detail) => (StatusCode::NOT_FOUND, detail),
@@ -3421,6 +3447,7 @@ fn upload_error_response(error: UploadError) -> (StatusCode, String) {
         UploadError::Folder(error) => folder_error_response(error),
         UploadError::Storage(error) => storage_error_response(error),
         error @ (UploadError::Database(_)
+        | UploadError::BlobLifecycle(_)
         | UploadError::CompletionStateTransition(_)
         | UploadError::Io(_)
         | UploadError::Json(_)

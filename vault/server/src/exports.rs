@@ -8,7 +8,7 @@ use flate2::write::{DeflateEncoder, ZlibEncoder};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use sqlx::{FromRow, QueryBuilder, Sqlite, SqlitePool, Transaction};
+use sqlx::{FromRow, QueryBuilder, Sqlite, SqlitePool};
 use thiserror::Error;
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
@@ -18,6 +18,9 @@ use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use crate::auth::UserContext;
+use crate::blob_lifecycle::{
+    BlobLifecycleError, begin_blob_publication, collect_unreferenced_blobs_with_limit,
+};
 use crate::documents::{
     DocumentError, VersionDownload, current_version_download, document_for_read,
 };
@@ -25,7 +28,7 @@ use crate::folders::{
     FolderError, all_folders, folder_path_by_id, require_folder_read_access,
     subtree_folder_ids_from_records,
 };
-use crate::storage::{BlobStorageBackend, SharedBlobStorage, StorageError, StoredBlob};
+use crate::storage::{BlobStorageBackend, BlobWriteKind, SharedBlobStorage, StorageError};
 
 const EXPORT_TTL_SECONDS: i64 = 86_400;
 const EXPORT_WORKERS: i64 = 1;
@@ -254,6 +257,8 @@ pub enum ExportError {
     BlobContentMismatch,
     #[error("storage location points at another blob")]
     StorageLocationConflict,
+    #[error(transparent)]
+    BlobLifecycle(#[from] BlobLifecycleError),
     #[error("export is too large for the current ZIP writer")]
     ZipLimitExceeded,
     #[error(transparent)]
@@ -756,7 +761,10 @@ pub async fn export_artifact_download(
             l.object_key
         FROM export_jobs j
         LEFT JOIN export_artifacts a ON a.job_id = j.id
-        LEFT JOIN blob_locations l ON l.blob_id = a.blob_id
+        LEFT JOIN blob_locations l
+         ON l.blob_id = a.blob_id
+         AND l.backend NOT GLOB '_vault_pending:*'
+         AND l.backend NOT GLOB '_vault_deleting:*'
         WHERE j.id = ?
         ORDER BY a.id, l.id
         LIMIT 1
@@ -1405,6 +1413,8 @@ fn export_temp_path(transfers_path: &Path, job_id: &str) -> PathBuf {
         .join(format!("{job_id}.zip.tmp"))
 }
 
+// Publication and artifact metadata must remain a single visibly ordered failure boundary.
+#[allow(clippy::too_many_lines)]
 async fn persist_export_artifact(
     pool: &SqlitePool,
     storage: &dyn BlobStorageBackend,
@@ -1412,64 +1422,104 @@ async fn persist_export_artifact(
     artifact: &ExportZipArtifact,
 ) -> Result<(), ExportError> {
     ensure_export_not_cancelled(pool, job_id).await?;
-    let stored = storage
-        .put_file(&artifact.path, &artifact.digest, artifact.size_bytes)
+    let publication = begin_blob_publication(
+        pool,
+        storage,
+        "sha256",
+        &artifact.digest,
+        artifact.size_bytes,
+        BlobWriteKind::File,
+    )
+    .await?;
+    let stored = match publication
+        .run_storage(storage.put_file(&artifact.path, &artifact.digest, artifact.size_bytes))
+        .await
+    {
+        Ok(stored) => stored,
+        Err(error) => {
+            if let Err(cleanup_error) = publication.abandon(None).await {
+                tracing::error!(
+                    ?cleanup_error,
+                    "failed to queue an unsuccessful export publication for cleanup"
+                );
+            }
+            return Err(error.into());
+        }
+    };
+    let metadata_result = async {
+        ensure_export_not_cancelled(pool, job_id).await?;
+        let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
+        let blob_id = publication
+            .prepare_metadata_in_tx(&mut transaction, &stored)
+            .await?;
+        let job = sqlx::query_as::<_, (String, String)>(
+            r"
+            UPDATE export_jobs
+            SET status = 'complete',
+                processed_items = total_items,
+                processed_bytes = total_bytes,
+                completed_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+              AND status = 'finalizing'
+            RETURNING filename, expires_at
+            ",
+        )
+        .bind(job_id)
+        .fetch_optional(&mut *transaction)
         .await?;
-    if let Err(error) = ensure_export_not_cancelled(pool, job_id).await {
+        let Some((filename, expires_at)) = job else {
+            transaction.rollback().await?;
+            return Err(ExportError::ExportCancelled);
+        };
+        sqlx::query(
+            r"
+            INSERT INTO export_artifacts
+                (
+                    job_id,
+                    blob_id,
+                    filename,
+                    mime_type,
+                    size_bytes,
+                    hash_algo,
+                    hash,
+                    expires_at
+                )
+            VALUES
+                (?, ?, ?, 'application/zip', ?, 'sha256', ?, ?)
+            ",
+        )
+        .bind(job_id)
+        .bind(blob_id)
+        .bind(&filename)
+        .bind(i64::try_from(stored.size_bytes).map_err(|_| ExportError::ZipLimitExceeded)?)
+        .bind(&stored.digest)
+        .bind(&expires_at)
+        .execute(&mut *transaction)
+        .await?;
+        publication.finish_metadata_in_tx(&mut transaction).await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+    .await;
+    if let Err(error) = metadata_result {
         tracing::warn!(
             object_key = %stored.object_key,
-            "export artifact promotion succeeded after cancellation; leaving object for delayed cleanup"
+            "export artifact promotion was not committed; queueing the object for delayed cleanup"
         );
+        if let Err(cleanup_error) = publication.abandon(Some(&stored)).await {
+            tracing::error!(
+                ?cleanup_error,
+                object_key = %stored.object_key,
+                "failed to preserve export object metadata for delayed cleanup"
+            );
+        } else if let Err(cleanup_error) =
+            collect_unreferenced_blobs_with_limit(pool, storage, 1).await
+        {
+            tracing::warn!(?cleanup_error, "prompt export-object cleanup failed");
+        }
         return Err(error);
     }
-    let mut transaction = pool.begin().await?;
-    let job = sqlx::query_as::<_, (String, String)>(
-        r"
-        UPDATE export_jobs
-        SET status = 'complete',
-            processed_items = total_items,
-            processed_bytes = total_bytes,
-            completed_at = CURRENT_TIMESTAMP,
-            updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-          AND status = 'finalizing'
-        RETURNING filename, expires_at
-        ",
-    )
-    .bind(job_id)
-    .fetch_optional(&mut *transaction)
-    .await?;
-    let Some((filename, expires_at)) = job else {
-        transaction.rollback().await?;
-        return Err(ExportError::ExportCancelled);
-    };
-    let blob_id = get_or_create_blob_in_tx(&mut transaction, &stored).await?;
-    sqlx::query(
-        r"
-        INSERT INTO export_artifacts
-            (
-                job_id,
-                blob_id,
-                filename,
-                mime_type,
-                size_bytes,
-                hash_algo,
-                hash,
-                expires_at
-            )
-        VALUES
-            (?, ?, ?, 'application/zip', ?, 'sha256', ?, ?)
-        ",
-    )
-    .bind(job_id)
-    .bind(blob_id)
-    .bind(&filename)
-    .bind(i64::try_from(stored.size_bytes).map_err(|_| ExportError::ZipLimitExceeded)?)
-    .bind(&stored.digest)
-    .bind(&expires_at)
-    .execute(&mut *transaction)
-    .await?;
-    transaction.commit().await?;
     Ok(())
 }
 
@@ -1495,63 +1545,6 @@ async fn record_export_events(
         .await?;
     }
     Ok(())
-}
-
-async fn get_or_create_blob_in_tx(
-    transaction: &mut Transaction<'_, Sqlite>,
-    stored: &StoredBlob,
-) -> Result<i64, ExportError> {
-    sqlx::query(
-        r"
-        INSERT OR IGNORE INTO blobs (hash_algo, hash, size_bytes)
-        VALUES (?, ?, ?)
-        ",
-    )
-    .bind(&stored.hash_algo)
-    .bind(&stored.digest)
-    .bind(i64::try_from(stored.size_bytes).map_err(|_| ExportError::ZipLimitExceeded)?)
-    .execute(&mut **transaction)
-    .await?;
-    let blob_id = sqlx::query_scalar::<_, i64>(
-        r"
-        SELECT id
-        FROM blobs
-        WHERE hash_algo = ? AND hash = ? AND size_bytes = ?
-        ",
-    )
-    .bind(&stored.hash_algo)
-    .bind(&stored.digest)
-    .bind(i64::try_from(stored.size_bytes).map_err(|_| ExportError::ZipLimitExceeded)?)
-    .fetch_one(&mut **transaction)
-    .await?;
-    let existing_location = sqlx::query_scalar::<_, i64>(
-        r"
-        SELECT blob_id
-        FROM blob_locations
-        WHERE backend = ? AND bucket = ? AND object_key = ?
-        ",
-    )
-    .bind(&stored.backend)
-    .bind(&stored.bucket)
-    .bind(&stored.object_key)
-    .fetch_optional(&mut **transaction)
-    .await?;
-    if existing_location.is_some_and(|existing_blob_id| existing_blob_id != blob_id) {
-        return Err(ExportError::StorageLocationConflict);
-    }
-    sqlx::query(
-        r"
-        INSERT OR IGNORE INTO blob_locations (blob_id, backend, bucket, object_key)
-        VALUES (?, ?, ?, ?)
-        ",
-    )
-    .bind(blob_id)
-    .bind(&stored.backend)
-    .bind(&stored.bucket)
-    .bind(&stored.object_key)
-    .execute(&mut **transaction)
-    .await?;
-    Ok(blob_id)
 }
 
 async fn mark_export_failed(

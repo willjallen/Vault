@@ -15,6 +15,7 @@ use vault_server::folders::{
 };
 use vault_server::http::{self, AppState};
 use vault_server::storage::{LocalBlobStorage, SharedBlobStorage};
+use vault_server::transfers::sweep_expired_transfers;
 
 async fn test_state() -> (AppState, tempfile::TempDir) {
     let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -2364,6 +2365,127 @@ async fn delete_forever_defaults_to_admin_only_and_deletes_archived_documents() 
             "sidebar"
         ]),
     );
+}
+
+#[tokio::test]
+async fn delete_forever_removes_the_last_local_blob_copy() {
+    let (state, _temp_dir) = test_state().await;
+    let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
+        .await
+        .expect("vault root");
+    let archive_root = get_root_folder(&state.db, ARCHIVE_ROOT_KEY)
+        .await
+        .expect("archive root");
+    let document_id = insert_stored_versioned_document(
+        &state.db,
+        &state.storage,
+        root.id,
+        b"physically disposable bytes",
+        "plan.txt",
+    )
+    .await;
+    mark_document_archived(&state.db, document_id, archive_root.id, &json!({})).await;
+    let (blob_id, object_key) = sqlx::query_as::<_, (i64, String)>(
+        r"
+        SELECT v.blob_id, l.object_key
+        FROM document_versions v
+        JOIN blob_locations l ON l.blob_id = v.blob_id
+        WHERE v.document_id = ?
+        ",
+    )
+    .bind(document_id)
+    .fetch_one(&state.db)
+    .await
+    .expect("stored document location");
+    let pool = state.db.clone();
+    let storage = state.storage.clone();
+    let app = http::router(state);
+
+    let response = app
+        .oneshot(authed_json_post(
+            "/api/delete-forever",
+            "admin",
+            "vault-admin",
+            &json!({"items": [{"type": "document", "id": document_id}]}),
+        ))
+        .await
+        .expect("delete forever response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM blobs WHERE id = ?")
+            .bind(blob_id)
+            .fetch_one(&pool)
+            .await
+            .expect("blob count"),
+        0,
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM blob_locations WHERE blob_id = ?")
+            .bind(blob_id)
+            .fetch_one(&pool)
+            .await
+            .expect("location count"),
+        0,
+    );
+    assert!(storage.read_bytes(&object_key).await.is_err());
+}
+
+#[tokio::test]
+async fn retention_delete_followed_by_runtime_maintenance_removes_local_blob_copy() {
+    let (state, _temp_dir) = test_state().await;
+    let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
+        .await
+        .expect("vault root");
+    let document_id = insert_stored_versioned_document(
+        &state.db,
+        &state.storage,
+        root.id,
+        b"expired physical bytes",
+        "expired.txt",
+    )
+    .await;
+    let (blob_id, object_key) = sqlx::query_as::<_, (i64, String)>(
+        r"
+        SELECT v.blob_id, l.object_key
+        FROM document_versions v
+        JOIN blob_locations l ON l.blob_id = v.blob_id
+        WHERE v.document_id = ?
+        ",
+    )
+    .bind(document_id)
+    .fetch_one(&state.db)
+    .await
+    .expect("stored document location");
+    sqlx::query(
+        r"
+        UPDATE documents
+        SET expires_at = '2000-01-01T00:00:00Z', expiry_action = 'delete'
+        WHERE id = ?
+        ",
+    )
+    .bind(document_id)
+    .execute(&state.db)
+    .await
+    .expect("expire document");
+
+    let retention = sweep_expired_documents(&state.db, 250)
+        .await
+        .expect("retention sweep");
+    assert_eq!(retention.deleted, vec!["plan.txt"]);
+    sweep_expired_transfers(&state.db, &state.storage, &state.config.transfers_path())
+        .await
+        .expect("runtime transfer and object maintenance");
+
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM blobs WHERE id = ?")
+            .bind(blob_id)
+            .fetch_one(&state.db)
+            .await
+            .expect("blob count"),
+        0,
+    );
+    assert!(state.storage.read_bytes(&object_key).await.is_err());
 }
 
 #[tokio::test]

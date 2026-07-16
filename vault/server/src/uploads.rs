@@ -179,6 +179,8 @@ pub enum UploadError {
     UploadChecksumMismatch,
     #[error("upload size does not match session")]
     UploadSizeMismatch,
+    #[error("upload completion state transition failed: {0}")]
+    CompletionStateTransition(String),
     #[error("storage location points at another blob")]
     StorageLocationConflict,
     #[error("upload token is required")]
@@ -384,6 +386,122 @@ impl UploadHashCoordinator {
             .entry(session_id.to_string())
             .or_insert_with(|| Arc::new(UploadHashState::new()))
             .clone()
+    }
+}
+
+#[derive(Debug)]
+struct UploadCompletionAttempt {
+    pool: SqlitePool,
+    transfers_path: PathBuf,
+    session_id: String,
+    hash_coordinator: Option<UploadHashCoordinator>,
+    drop_action: UploadCompletionDropAction,
+    armed: bool,
+}
+
+#[derive(Debug, Clone)]
+enum UploadCompletionDropAction {
+    Retry,
+    Fail(String),
+}
+
+impl UploadCompletionAttempt {
+    fn new(
+        pool: &SqlitePool,
+        transfers_path: &Path,
+        session_id: &str,
+        hash_coordinator: Option<&UploadHashCoordinator>,
+    ) -> Self {
+        Self {
+            pool: pool.clone(),
+            transfers_path: transfers_path.to_path_buf(),
+            session_id: session_id.to_string(),
+            hash_coordinator: hash_coordinator.cloned(),
+            drop_action: UploadCompletionDropAction::Retry,
+            armed: true,
+        }
+    }
+
+    async fn reset_for_retry(&mut self) -> Result<(), UploadError> {
+        let pool = self.pool.clone();
+        let session_id = self.session_id.clone();
+        let hash_coordinator = self.hash_coordinator.clone();
+        // Transfer recovery ownership to one task before awaiting it. If the
+        // request is cancelled, that task continues and Drop must not start a
+        // second reset that could race a fast retry's new completion claim.
+        let recovery = tokio::spawn(async move {
+            if let Some(coordinator) = hash_coordinator {
+                coordinator.forget(&session_id).await;
+            }
+            // Publish `active` only after coordinator cleanup. Callers can
+            // treat the status transition as retry readiness.
+            reset_upload_completion_for_retry(&pool, &session_id).await
+        });
+        self.armed = false;
+        recovery
+            .await
+            .map_err(|error| UploadError::CompletionStateTransition(error.to_string()))?
+    }
+
+    fn fail_on_drop(&mut self, message: String) {
+        self.drop_action = UploadCompletionDropAction::Fail(message);
+    }
+
+    async fn forget_and_disarm(&mut self) {
+        let session_id = self.session_id.clone();
+        let hash_coordinator = self.hash_coordinator.clone();
+        // As with retry recovery, give cleanup to one owned task before
+        // disarming. Cancellation cannot leave coordinator state resident or
+        // trigger a second state transition.
+        let cleanup = tokio::spawn(async move {
+            if let Some(coordinator) = hash_coordinator {
+                coordinator.forget(&session_id).await;
+            }
+        });
+        self.armed = false;
+        if let Err(error) = cleanup.await {
+            tracing::error!(?error, "upload completion coordinator cleanup task failed");
+        }
+    }
+}
+
+impl Drop for UploadCompletionAttempt {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let pool = self.pool.clone();
+        let transfers_path = self.transfers_path.clone();
+        let session_id = self.session_id.clone();
+        let hash_coordinator = self.hash_coordinator.clone();
+        let drop_action = self.drop_action.clone();
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::error!(
+                session_id,
+                "upload completion attempt dropped outside a Tokio runtime; startup recovery must reset it"
+            );
+            return;
+        };
+        runtime.spawn(async move {
+            if let Some(coordinator) = hash_coordinator {
+                coordinator.forget(&session_id).await;
+            }
+            let recovery = match drop_action {
+                UploadCompletionDropAction::Retry => {
+                    reset_upload_completion_for_retry(&pool, &session_id).await
+                }
+                UploadCompletionDropAction::Fail(message) => {
+                    mark_upload_failed(&pool, &transfers_path, &session_id, &message).await
+                }
+            };
+            if let Err(error) = recovery {
+                tracing::error!(
+                    ?error,
+                    session_id,
+                    "could not settle interrupted upload completion"
+                );
+            }
+        });
     }
 }
 
@@ -803,27 +921,63 @@ async fn complete_upload_session_impl(
     } else {
         0
     };
-    mark_upload_completing(pool, session_id, session.total_size, verified_bytes).await?;
-    let parts = if let Some(coordinator) = hash_coordinator {
+    let mut completion_attempt = claim_upload_completion(
+        pool,
+        transfers_path,
+        session_id,
+        session.total_size,
+        verified_bytes,
+        hash_coordinator,
+    )
+    .await?;
+    let parts_result = if let Some(coordinator) = hash_coordinator {
         coordinator
             .completed_parts(pool, transfers_path, &session, expected_sha256)
-            .await?
+            .await
     } else {
-        completed_parts(pool, transfers_path, &session, expected_sha256).await?
+        completed_parts(pool, transfers_path, &session, expected_sha256).await
+    };
+    let parts = match parts_result {
+        Ok(parts) => parts,
+        Err(error) => {
+            if let Err(recovery_error) = completion_attempt.reset_for_retry().await {
+                tracing::error!(
+                    ?error,
+                    ?recovery_error,
+                    session_id,
+                    "upload completion validation and state recovery both failed"
+                );
+                return Err(recovery_error);
+            }
+            return Err(error);
+        }
     };
 
     let result = complete_upload_session_inner(pool, storage, &session, &parts, user).await;
-    if let Some(coordinator) = hash_coordinator {
-        coordinator.forget(session_id).await;
-    }
     match result {
         Ok(payload) => {
+            completion_attempt.forget_and_disarm().await;
             clear_upload_session_files(transfers_path, session_id).await;
             Ok(payload)
         }
         Err(error) => {
-            let _ = mark_upload_failed(pool, transfers_path, session_id, &error.to_string()).await;
-            Err(error)
+            completion_attempt.fail_on_drop(error.to_string());
+            match mark_upload_failed(pool, transfers_path, session_id, &error.to_string()).await {
+                Ok(()) => {
+                    completion_attempt.forget_and_disarm().await;
+                    Err(error)
+                }
+                Err(failure_error) => {
+                    completion_attempt.forget_and_disarm().await;
+                    tracing::error!(
+                        ?error,
+                        ?failure_error,
+                        session_id,
+                        "upload completion and terminal state recovery both failed"
+                    );
+                    Err(failure_error)
+                }
+            }
         }
     }
 }
@@ -2011,6 +2165,35 @@ async fn mark_upload_completing(
     Err(UploadError::UploadSessionStatus(current.status))
 }
 
+async fn claim_upload_completion(
+    pool: &SqlitePool,
+    transfers_path: &Path,
+    session_id: &str,
+    total_bytes: i64,
+    processed_bytes: i64,
+    hash_coordinator: Option<&UploadHashCoordinator>,
+) -> Result<UploadCompletionAttempt, UploadError> {
+    let pool = pool.clone();
+    let transfers_path = transfers_path.to_path_buf();
+    let session_id = session_id.to_string();
+    let hash_coordinator = hash_coordinator.cloned();
+    // SQLx work can finish after the request future is cancelled. Keep the
+    // claim in an owned task so a successful state transition always produces
+    // a guard. If the waiting request disappears, Tokio drops the task output
+    // and the guard schedules its status-predicated recovery.
+    tokio::spawn(async move {
+        mark_upload_completing(&pool, &session_id, total_bytes, processed_bytes).await?;
+        Ok::<_, UploadError>(UploadCompletionAttempt::new(
+            &pool,
+            &transfers_path,
+            &session_id,
+            hash_coordinator.as_ref(),
+        ))
+    })
+    .await
+    .map_err(|error| UploadError::CompletionStateTransition(error.to_string()))?
+}
+
 async fn record_upload_verification_progress(
     pool: &SqlitePool,
     session_id: &str,
@@ -2038,6 +2221,42 @@ async fn record_upload_verification_progress(
     .await
     .map(|result| result.rows_affected() > 0)
     .map_err(UploadError::Database)
+}
+
+async fn reset_upload_completion_for_retry(
+    pool: &SqlitePool,
+    session_id: &str,
+) -> Result<(), UploadError> {
+    let result = sqlx::query(
+        r"
+        UPDATE upload_sessions
+        SET status = 'active',
+            verification_total_bytes = 0,
+            verification_processed_bytes = 0,
+            error = NULL,
+            updated_at = ?
+        WHERE id = ? AND status = 'completing'
+        ",
+    )
+    .bind(now_rfc3339()?)
+    .bind(session_id)
+    .execute(pool)
+    .await?;
+    if result.rows_affected() > 0 {
+        return Ok(());
+    }
+    let status: Option<String> =
+        sqlx::query_scalar("SELECT status FROM upload_sessions WHERE id = ?")
+            .bind(session_id)
+            .fetch_optional(pool)
+            .await?;
+    match status.as_deref() {
+        Some("active" | "complete" | "failed" | "aborted" | "expired") => Ok(()),
+        Some(status) => Err(UploadError::CompletionStateTransition(format!(
+            "session {session_id} remained {status} after retry recovery"
+        ))),
+        None => Err(UploadError::UploadSessionNotFound),
+    }
 }
 
 async fn ensure_active_session(

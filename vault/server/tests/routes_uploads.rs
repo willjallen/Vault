@@ -2236,6 +2236,67 @@ async fn uploaded_session_with_fixed_parts(
     session_id
 }
 
+async fn directly_uploaded_session_with_fixed_parts(
+    state: &AppState,
+    user: &UserContext,
+    filename: &str,
+    data: &[u8],
+    part_size: usize,
+) -> String {
+    let transfers_path = state.config.transfers_path();
+    let session = uploads::create_upload_session(
+        &state.db,
+        &transfers_path,
+        &state.auth.session_secret,
+        UploadRuntimeSettings {
+            max_upload_bytes: state.config.max_upload_bytes,
+            transfer_chunk_bytes: state.config.transfer_chunk_bytes,
+            transfer_session_ttl_seconds: state.config.transfer_session_ttl_seconds,
+        },
+        CreateUploadRequest {
+            mode: "create".to_string(),
+            filename: filename.to_string(),
+            size_bytes: i64::try_from(data.len()).expect("data size"),
+            mime_type: Some("text/plain".to_string()),
+            folder: String::new(),
+            document_id: None,
+            note: None,
+            rename_to_upload: false,
+            client_upload_parallelism: None,
+        },
+        user,
+        &ClientMeta {
+            ip: None,
+            user_agent: None,
+        },
+    )
+    .await
+    .expect("upload session");
+    for (index, chunk) in data.chunks(part_size).enumerate() {
+        let part_number = i64::try_from(index + 1).expect("part number");
+        let offset = i64::try_from(index * part_size).expect("part offset");
+        let part_digest = sha256_hex(chunk);
+        uploads::ingest_upload_part_for_owner(
+            &state.db,
+            UploadPartIngest {
+                transfers_path: &transfers_path,
+                session_id: &session.id,
+                part_number,
+                headers: UploadPartHeaders {
+                    offset,
+                    size: i64::try_from(chunk.len()).expect("part size"),
+                    sha256: Some(&part_digest),
+                },
+            },
+            &user.id,
+            stream::iter([Ok::<Bytes, std::io::Error>(Bytes::copy_from_slice(chunk))]),
+        )
+        .await
+        .expect("upload part");
+    }
+    session.id
+}
+
 fn test_stored_blob(digest: &str, size_bytes: usize) -> StoredBlob {
     StoredBlob {
         backend: "local".to_string(),
@@ -2265,6 +2326,498 @@ async fn wait_for_storage_block(
             panic!("completion did not reach test storage");
         }
     }
+}
+
+async fn wait_for_upload_status(
+    pool: &sqlx::SqlitePool,
+    session_id: &str,
+    expected_status: &str,
+) -> (String, i64, i64, Option<String>) {
+    for _ in 0..100 {
+        let row = sqlx::query_as::<_, (String, i64, i64, Option<String>)>(
+            r"
+            SELECT
+                status,
+                verification_total_bytes,
+                verification_processed_bytes,
+                error
+            FROM upload_sessions
+            WHERE id = ?
+            ",
+        )
+        .bind(session_id)
+        .fetch_one(pool)
+        .await
+        .expect("upload status");
+        if row.0 == expected_status {
+            return row;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("upload session {session_id} did not become {expected_status}");
+}
+
+async fn wait_for_completion_claim_marker(pool: &sqlx::SqlitePool, session_id: &str) {
+    for _ in 0..100 {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM completion_claim_markers WHERE session_id = ?",
+        )
+        .bind(session_id)
+        .fetch_one(pool)
+        .await
+        .expect("completion claim marker");
+        if count == 1 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("completion claim for {session_id} was not recorded");
+}
+
+#[tokio::test]
+async fn incomplete_upload_completion_returns_to_active_and_can_retry() {
+    let (state, _temp_dir) =
+        test_state_with_upload_settings(5 * 1024 * 1024 * 1024, 4, 86_400).await;
+    grant_writer_root(&state.db).await;
+    let pool = state.db.clone();
+    let app = http::router(state);
+    let data = b"abcdefgh";
+
+    let created = app
+        .clone()
+        .oneshot(authed_json_request(
+            Method::POST,
+            "/api/uploads",
+            &json!({
+                "mode": "create",
+                "folder": "",
+                "filename": "retry-missing-part.txt",
+                "mime_type": "text/plain",
+                "size_bytes": data.len()
+            }),
+        ))
+        .await
+        .expect("create upload");
+    assert_eq!(created.status(), StatusCode::OK);
+    let session_id = response_json(created).await["id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    let first_part = app
+        .clone()
+        .oneshot(upload_part_request_at_offset(&session_id, 1, 0, &data[..4]))
+        .await
+        .expect("first part");
+    assert_eq!(first_part.status(), StatusCode::NO_CONTENT);
+
+    let incomplete = app
+        .clone()
+        .oneshot(authed_json_request(
+            Method::POST,
+            &format!("/api/uploads/{session_id}/complete"),
+            &json!({"sha256": sha256_hex(data)}),
+        ))
+        .await
+        .expect("incomplete completion");
+    let incomplete_status = incomplete.status();
+    let incomplete_json = response_json(incomplete).await;
+    assert_eq!(incomplete_status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        incomplete_json["detail"],
+        "Upload session has missing parts"
+    );
+    assert_eq!(
+        wait_for_upload_status(&pool, &session_id, "active").await,
+        ("active".to_string(), 0, 0, None)
+    );
+
+    let second_part = app
+        .clone()
+        .oneshot(upload_part_request_at_offset(&session_id, 2, 4, &data[4..]))
+        .await
+        .expect("second part");
+    assert_eq!(second_part.status(), StatusCode::NO_CONTENT);
+    let completed = app
+        .oneshot(authed_json_request(
+            Method::POST,
+            &format!("/api/uploads/{session_id}/complete"),
+            &json!({"sha256": sha256_hex(data)}),
+        ))
+        .await
+        .expect("retried completion");
+    assert_eq!(completed.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn checksum_mismatch_preserves_parts_and_allows_completion_retry() {
+    let (state, _temp_dir) =
+        test_state_with_upload_settings(5 * 1024 * 1024 * 1024, 4, 86_400).await;
+    grant_writer_root(&state.db).await;
+    let pool = state.db.clone();
+    let transfers_path = state.config.transfers_path();
+    let app = http::router(state);
+    let data = b"abcdefgh";
+    let session_id =
+        uploaded_session_with_fixed_parts(app.clone(), "retry-checksum.txt", data, 4).await;
+
+    let mismatched = app
+        .clone()
+        .oneshot(authed_json_request(
+            Method::POST,
+            &format!("/api/uploads/{session_id}/complete"),
+            &json!({"sha256": sha256_hex(b"wrong file")}),
+        ))
+        .await
+        .expect("mismatched completion");
+    let mismatch_status = mismatched.status();
+    let mismatch_json = response_json(mismatched).await;
+    assert_eq!(mismatch_status, StatusCode::BAD_REQUEST);
+    assert_eq!(mismatch_json["detail"], "Upload checksum mismatch");
+    assert_eq!(
+        wait_for_upload_status(&pool, &session_id, "active").await,
+        ("active".to_string(), 0, 0, None)
+    );
+    for part_number in 1..=2 {
+        assert!(
+            transfers_path
+                .join("uploads")
+                .join(&session_id)
+                .join(format!("{part_number:08}.part"))
+                .is_file()
+        );
+    }
+
+    let completed = app
+        .oneshot(authed_json_request(
+            Method::POST,
+            &format!("/api/uploads/{session_id}/complete"),
+            &json!({"sha256": sha256_hex(data)}),
+        ))
+        .await
+        .expect("retried completion");
+    assert_eq!(completed.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn part_read_failure_returns_to_active_and_preserves_retry_data() {
+    let (state, temp_dir) =
+        test_state_with_upload_settings(5 * 1024 * 1024 * 1024, 4, 86_400).await;
+    grant_writer_root(&state.db).await;
+    let pool = state.db.clone();
+    let transfers_path = state.config.transfers_path();
+    let app = http::router(state);
+    let data = b"abcdefgh";
+    let digest = sha256_hex(data);
+    let session_id = uploaded_session_with_fixed_parts(app, "retry-part-read.txt", data, 4).await;
+    let completion_user_id: String =
+        sqlx::query_scalar("SELECT created_by FROM upload_sessions WHERE id = ?")
+            .bind(&session_id)
+            .fetch_one(&pool)
+            .await
+            .expect("session owner");
+    let completion_user = UserContext {
+        id: completion_user_id,
+        ..writer_context()
+    };
+    let session_dir = transfers_path.join("uploads").join(&session_id);
+    let part_path = session_dir.join("00000001.part");
+    let part_backup = session_dir.join("00000001.part.retry-backup");
+    assert!(session_dir.join("00000001.json").is_file());
+    tokio::fs::rename(&part_path, &part_backup)
+        .await
+        .expect("temporarily move part");
+
+    let storage = LocalBlobStorage::new(temp_dir.path().join("objects"), "");
+    let error = uploads::complete_upload_session(
+        &pool,
+        &storage,
+        &transfers_path,
+        &session_id,
+        Some(&digest),
+        &completion_user,
+    )
+    .await
+    .expect_err("missing part file should fail completion");
+    assert!(
+        matches!(error, uploads::UploadError::Io(_)),
+        "unexpected completion error: {error:?}"
+    );
+    assert_eq!(
+        wait_for_upload_status(&pool, &session_id, "active").await,
+        ("active".to_string(), 0, 0, None)
+    );
+    assert!(part_backup.is_file());
+    assert!(!part_path.exists());
+
+    tokio::fs::rename(&part_backup, &part_path)
+        .await
+        .expect("restore part");
+    let completed = uploads::complete_upload_session(
+        &pool,
+        &storage,
+        &transfers_path,
+        &session_id,
+        Some(&digest),
+        &completion_user,
+    )
+    .await
+    .expect("completion after part restore");
+    assert_eq!(completed.path, "retry-part-read.txt");
+}
+
+#[tokio::test]
+async fn completion_reset_database_failure_is_not_silently_discarded() {
+    let (state, _temp_dir) =
+        test_state_with_upload_settings(5 * 1024 * 1024 * 1024, 4, 86_400).await;
+    grant_writer_root(&state.db).await;
+    let pool = state.db.clone();
+    let app = http::router(state);
+    let data = b"abcdefgh";
+    let created = app
+        .clone()
+        .oneshot(authed_json_request(
+            Method::POST,
+            "/api/uploads",
+            &json!({
+                "mode": "create",
+                "folder": "",
+                "filename": "forced-reset-failure.txt",
+                "mime_type": "text/plain",
+                "size_bytes": data.len()
+            }),
+        ))
+        .await
+        .expect("create upload");
+    let session_id = response_json(created).await["id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    let first_part = app
+        .clone()
+        .oneshot(upload_part_request_at_offset(&session_id, 1, 0, &data[..4]))
+        .await
+        .expect("first part");
+    assert_eq!(first_part.status(), StatusCode::NO_CONTENT);
+    sqlx::query(
+        r"
+        CREATE TRIGGER reject_upload_completion_reset
+        BEFORE UPDATE OF status ON upload_sessions
+        WHEN OLD.status = 'completing' AND NEW.status = 'active'
+        BEGIN
+            SELECT RAISE(ABORT, 'forced completion reset failure');
+        END
+        ",
+    )
+    .execute(&pool)
+    .await
+    .expect("reset failure trigger");
+
+    let response = app
+        .oneshot(authed_json_request(
+            Method::POST,
+            &format!("/api/uploads/{session_id}/complete"),
+            &json!({"sha256": sha256_hex(data)}),
+        ))
+        .await
+        .expect("completion with reset failure");
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let status: String = sqlx::query_scalar("SELECT status FROM upload_sessions WHERE id = ?")
+        .bind(&session_id)
+        .fetch_one(&pool)
+        .await
+        .expect("status after reset failure");
+    assert_eq!(status, "completing");
+
+    sqlx::query("DROP TRIGGER reject_upload_completion_reset")
+        .execute(&pool)
+        .await
+        .expect("remove reset failure trigger");
+}
+
+#[tokio::test]
+async fn cancelled_upload_completion_returns_to_active_and_can_retry() {
+    let (state, temp_dir) =
+        test_state_with_upload_settings(5 * 1024 * 1024 * 1024, 4, 86_400).await;
+    grant_writer_root(&state.db).await;
+    let pool = state.db.clone();
+    let transfers_path = state.config.transfers_path();
+    let coordinator = state.upload_hash_coordinator.clone();
+    let data = b"abcdefgh";
+    let digest = sha256_hex(data);
+    let completion_user = writer_context();
+    let session_id = directly_uploaded_session_with_fixed_parts(
+        &state,
+        &completion_user,
+        "retry-cancelled.txt",
+        data,
+        4,
+    )
+    .await;
+    coordinator.schedule(pool.clone(), transfers_path.clone(), session_id.clone());
+    for _ in 0..100 {
+        if coordinator.preverified_bytes(&session_id).await
+            == Some(i64::try_from(data.len()).expect("data size"))
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        coordinator.preverified_bytes(&session_id).await,
+        Some(i64::try_from(data.len()).expect("data size"))
+    );
+    let waiting = Arc::new(Notify::new());
+    let storage = BlockingPartStorage {
+        release: Arc::new(Notify::new()),
+        stored: test_stored_blob(&digest, data.len()),
+        waiting: waiting.clone(),
+    };
+    let complete_pool = pool.clone();
+    let complete_transfers_path = transfers_path.clone();
+    let complete_session_id = session_id.clone();
+    let complete_digest = digest.clone();
+    let complete_coordinator = coordinator.clone();
+    let retry_user = completion_user.clone();
+    let mut completion = tokio::spawn(async move {
+        uploads::complete_upload_session_with_hash_coordinator(
+            &complete_pool,
+            &storage,
+            &complete_transfers_path,
+            &complete_session_id,
+            Some(&complete_digest),
+            &completion_user,
+            &complete_coordinator,
+        )
+        .await
+    });
+
+    wait_for_storage_block(&waiting, &mut completion).await;
+    completion.abort();
+    assert!(
+        completion
+            .await
+            .expect_err("completion task should be cancelled")
+            .is_cancelled()
+    );
+    assert_eq!(
+        wait_for_upload_status(&pool, &session_id, "active").await,
+        ("active".to_string(), 0, 0, None)
+    );
+    assert_eq!(coordinator.preverified_bytes(&session_id).await, None);
+    for part_number in 1..=2 {
+        assert!(
+            transfers_path
+                .join("uploads")
+                .join(&session_id)
+                .join(format!("{part_number:08}.part"))
+                .is_file()
+        );
+    }
+
+    let retry_storage = LocalBlobStorage::new(temp_dir.path().join("objects"), "");
+    let completed = uploads::complete_upload_session_with_hash_coordinator(
+        &pool,
+        &retry_storage,
+        &transfers_path,
+        &session_id,
+        Some(&digest),
+        &retry_user,
+        &coordinator,
+    )
+    .await
+    .expect("completion after cancellation");
+    assert_eq!(completed.path, "retry-cancelled.txt");
+}
+
+#[tokio::test]
+async fn cancellation_while_completion_claim_is_blocked_cannot_strand_session() {
+    let (state, temp_dir) =
+        test_state_with_upload_settings(5 * 1024 * 1024 * 1024, 4, 86_400).await;
+    grant_writer_root(&state.db).await;
+    let pool = state.db.clone();
+    let transfers_path = state.config.transfers_path();
+    let user = writer_context();
+    let data = b"abcdefgh";
+    let digest = sha256_hex(data);
+    let session_id = directly_uploaded_session_with_fixed_parts(
+        &state,
+        &user,
+        "retry-cancelled-claim.txt",
+        data,
+        4,
+    )
+    .await;
+    sqlx::query("CREATE TABLE completion_claim_markers (session_id TEXT NOT NULL)")
+        .execute(&pool)
+        .await
+        .expect("claim marker table");
+    sqlx::query(
+        r"
+        CREATE TRIGGER record_upload_completion_claim
+        AFTER UPDATE OF status ON upload_sessions
+        WHEN OLD.status = 'active' AND NEW.status = 'completing'
+        BEGIN
+            INSERT INTO completion_claim_markers (session_id) VALUES (NEW.id);
+        END
+        ",
+    )
+    .execute(&pool)
+    .await
+    .expect("claim marker trigger");
+    let mut write_lock = pool.acquire().await.expect("write lock connection");
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *write_lock)
+        .await
+        .expect("block completion claim");
+
+    let complete_pool = pool.clone();
+    let complete_transfers_path = transfers_path.clone();
+    let complete_session_id = session_id.clone();
+    let complete_digest = digest.clone();
+    let completion_user = user.clone();
+    let storage = LocalBlobStorage::new(temp_dir.path().join("objects"), "");
+    let completion = tokio::spawn(async move {
+        uploads::complete_upload_session(
+            &complete_pool,
+            &storage,
+            &complete_transfers_path,
+            &complete_session_id,
+            Some(&complete_digest),
+            &completion_user,
+        )
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    completion.abort();
+    assert!(
+        completion
+            .await
+            .expect_err("completion should be cancelled while claiming")
+            .is_cancelled()
+    );
+    sqlx::query("COMMIT")
+        .execute(&mut *write_lock)
+        .await
+        .expect("release completion claim");
+    drop(write_lock);
+
+    wait_for_completion_claim_marker(&pool, &session_id).await;
+    assert_eq!(
+        wait_for_upload_status(&pool, &session_id, "active").await,
+        ("active".to_string(), 0, 0, None)
+    );
+    let retry_storage = LocalBlobStorage::new(temp_dir.path().join("objects"), "");
+    let completed = uploads::complete_upload_session(
+        &pool,
+        &retry_storage,
+        &transfers_path,
+        &session_id,
+        Some(&digest),
+        &user,
+    )
+    .await
+    .expect("completion after cancelled claim");
+    assert_eq!(completed.path, "retry-cancelled-claim.txt");
 }
 
 #[tokio::test]

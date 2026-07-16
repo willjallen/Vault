@@ -3414,6 +3414,7 @@ fn upload_error_response(error: UploadError) -> (StatusCode, String) {
         UploadError::Folder(error) => folder_error_response(error),
         UploadError::Storage(error) => storage_error_response(error),
         error @ (UploadError::Database(_)
+        | UploadError::CompletionStateTransition(_)
         | UploadError::Io(_)
         | UploadError::Json(_)
         | UploadError::TimeFormat(_)

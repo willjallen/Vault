@@ -79,8 +79,8 @@ use crate::uploads::{
     UploadSessionPayload,
 };
 use crate::views::{
-    self, BootstrapPayload, ContentsPayload, DocumentDetailPayload, MyEditsPayload, SidebarPayload,
-    ViewError,
+    self, BootstrapPayload, ContentsPageOptions, ContentsPayload, DocumentDetailPayload,
+    MyEditsPayload, SidebarPayload, ViewError,
 };
 
 const HEADER_PERCENT_HEX: &[u8; 16] = b"0123456789ABCDEF";
@@ -631,6 +631,13 @@ struct ContentsQuery {
     q: String,
     #[serde(default)]
     recursive: bool,
+    limit: Option<usize>,
+    cursor: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SidebarQuery {
+    cursor: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1138,9 +1145,12 @@ async fn api_update_preferences(
 async fn api_sidebar(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<SidebarQuery>,
 ) -> Result<Json<SidebarPayload>, ApiError> {
     let user = current_user(&state, &headers).await?;
-    Ok(Json(views::build_sidebar_payload(&state.db, &user).await?))
+    Ok(Json(
+        views::build_sidebar_page_payload(&state.db, &user, query.cursor.as_deref()).await?,
+    ))
 }
 
 async fn api_folder_contents(
@@ -1150,8 +1160,18 @@ async fn api_folder_contents(
 ) -> Result<Json<ContentsPayload>, ApiError> {
     let user = current_user(&state, &headers).await?;
     Ok(Json(
-        views::build_contents_payload(&state.db, &query.folder, &user, &query.q, query.recursive)
-            .await?,
+        views::build_contents_page_payload(
+            &state.db,
+            &query.folder,
+            &user,
+            &query.q,
+            query.recursive,
+            ContentsPageOptions {
+                limit: query.limit,
+                cursor: query.cursor,
+            },
+        )
+        .await?,
     ))
 }
 
@@ -3665,6 +3685,14 @@ fn view_error_response(error: ViewError) -> (StatusCode, String) {
         ViewError::InconsistentDocumentVersion => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "Current document version metadata is inconsistent".to_string(),
+        ),
+        ViewError::InvalidContentsCursor => (
+            StatusCode::BAD_REQUEST,
+            "Invalid contents cursor".to_string(),
+        ),
+        ViewError::InvalidSidebarCursor => (
+            StatusCode::BAD_REQUEST,
+            "Invalid sidebar cursor".to_string(),
         ),
         error => {
             tracing::error!(?error, "request failed");

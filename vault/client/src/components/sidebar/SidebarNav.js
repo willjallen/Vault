@@ -233,6 +233,28 @@ function SidebarSectionHeader({ title, collapsed = false, onToggleCollapsed }) {
   );
 }
 
+function SidebarLoadMore({ pagination }) {
+  if (!pagination?.hasMore && !pagination?.loadingMore) {
+    return null;
+  }
+  return h(
+    "div",
+    { "aria-live": "polite", className: "sidebar-load-more" },
+    h(
+      "button",
+      {
+        "aria-busy": pagination.loadingMore ? "true" : undefined,
+        "aria-label": pagination.loadingMore ? "Loading more folders" : "Load more folders",
+        className: "btn secondary sidebar-load-more-button",
+        disabled: pagination.loadingMore,
+        onClick: pagination.loadMore,
+        type: "button",
+      },
+      pagination.loadingMore ? "Loading more folders…" : "Load more folders"
+    )
+  );
+}
+
 function SidebarFolderShortcut({
   item,
   currentFolder,
@@ -326,6 +348,7 @@ function SidebarFolderList({
   collapsed = false,
   onToggleCollapsed,
   emptyContent,
+  footer,
   sectionDragProps = {},
   dropActive = false,
   dropAvailable = false,
@@ -364,40 +387,45 @@ function SidebarFolderList({
               dropActive ? "drop-active" : ""
             ),
           },
-          h(
-            "div",
-            { className: "tree" },
-            items.length
-              ? items.map((item) =>
-                  h(SidebarFolderShortcut, {
-                    key: item.path || item.name,
-                    item,
-                    currentFolder,
-                    dropHint,
-                    activeDropTarget,
-                    selected: selectedSet.has(keyForItem(item)),
-                    disableFolderDrops,
-                    onSelect,
-                    onSelectItem: (selectedItem, e) =>
-                      onSelectItem && onSelectItem(selectedItem, e, paneItems),
-                    onContextMenu,
-                    onFolderDragStart: (e, path) => {
-                      const key = keyForItem(item);
-                      const dragItems = selectedSet.has(key)
-                        ? paneItems.filter((folderItem) => selectedSet.has(keyForItem(folderItem)))
-                        : [item];
-                      if (onFolderDragStart) {
-                        onFolderDragStart(e, path, dragItems);
-                      }
-                    },
-                    onFolderDragEnd,
-                    draggingFolderPath,
-                    onDropOnFolder,
-                    onClearDropHint,
-                  })
-                )
-              : h("div", { className: "sidebar-empty" }, emptyContent || "Empty")
-          )
+          [
+            h(
+              "div",
+              { className: "tree", key: "tree" },
+              items.length
+                ? items.map((item) =>
+                    h(SidebarFolderShortcut, {
+                      key: item.path || item.name,
+                      item,
+                      currentFolder,
+                      dropHint,
+                      activeDropTarget,
+                      selected: selectedSet.has(keyForItem(item)),
+                      disableFolderDrops,
+                      onSelect,
+                      onSelectItem: (selectedItem, e) =>
+                        onSelectItem && onSelectItem(selectedItem, e, paneItems),
+                      onContextMenu,
+                      onFolderDragStart: (e, path) => {
+                        const key = keyForItem(item);
+                        const dragItems = selectedSet.has(key)
+                          ? paneItems.filter((folderItem) =>
+                              selectedSet.has(keyForItem(folderItem))
+                            )
+                          : [item];
+                        if (onFolderDragStart) {
+                          onFolderDragStart(e, path, dragItems);
+                        }
+                      },
+                      onFolderDragEnd,
+                      draggingFolderPath,
+                      onDropOnFolder,
+                      onClearDropHint,
+                    })
+                  )
+                : h("div", { className: "sidebar-empty" }, emptyContent || "Empty")
+            ),
+            footer,
+          ]
         )
   );
 }
@@ -605,6 +633,7 @@ export function SidebarNav({
   favoriteDropAvailable = false,
   sidebarSectionCollapsed,
   sidebarSectionSizes,
+  sidebarPagination,
   myEdits = [],
   selectedId,
   onSelect,
@@ -820,6 +849,7 @@ export function SidebarNav({
       draggingFolderPath,
       onDropOnFolder,
       onClearDropHint,
+      footer: h(SidebarLoadMore, { key: "load-more", pagination: sidebarPagination }),
     }),
     h(SidebarResizeHandle, {
       key: "folders-favorites",

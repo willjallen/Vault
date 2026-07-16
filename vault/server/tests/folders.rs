@@ -3,10 +3,10 @@ use vault_server::db;
 use vault_server::documents::{DocumentRecord, document_path};
 use vault_server::folders::{
     ARCHIVE_ROOT_KEY, FolderError, VAULT_ROOT_KEY, access_level, add_folder_permission,
-    all_folders, build_folder_path_cache, folder_access_level, folder_path_by_id,
-    folder_path_from_cache, get_folder_by_path, get_or_create_folder_path,
-    get_or_create_folder_path_with_created, get_root_folder, normalize_folder,
-    parse_public_folder_path, public_folder_path, require_folder_read_access,
+    all_folders, build_folder_path_cache, folder_access_level, folder_access_levels,
+    folder_path_by_id, folder_path_from_cache, get_folder_by_path, get_folder_by_path_read,
+    get_or_create_folder_path, get_or_create_folder_path_with_created, get_root_folder,
+    normalize_folder, parse_public_folder_path, public_folder_path, require_folder_read_access,
     require_folder_write_access, subtree_folder_ids_from_records, validate_permission_flags,
 };
 
@@ -94,6 +94,55 @@ async fn get_or_create_folder_path_creates_vault_folders_and_rebuilds_paths() {
     assert!(matches!(
         get_or_create_folder_path(&pool, Some("Archive/Child")).await,
         Err(FolderError::ArchiveDoesNotContainFolders),
+    ));
+}
+
+#[tokio::test]
+async fn read_only_folder_path_resolver_handles_roots_deep_paths_and_missing_segments() {
+    let pool = test_pool().await;
+    let project = get_or_create_folder_path(&pool, Some("Project/Private"))
+        .await
+        .expect("create path");
+    let vault_root = get_root_folder(&pool, VAULT_ROOT_KEY)
+        .await
+        .expect("vault root");
+    let archive_root = get_root_folder(&pool, ARCHIVE_ROOT_KEY)
+        .await
+        .expect("archive root");
+
+    assert_eq!(
+        get_folder_by_path_read(&pool, " Project\\Private/ ")
+            .await
+            .expect("deep read"),
+        Some(project),
+    );
+    assert_eq!(
+        get_folder_by_path_read(&pool, "")
+            .await
+            .expect("vault root read"),
+        Some(vault_root),
+    );
+    assert_eq!(
+        get_folder_by_path_read(&pool, "Archive")
+            .await
+            .expect("archive root read"),
+        Some(archive_root),
+    );
+    assert!(
+        get_folder_by_path_read(&pool, "Project/Missing/Child")
+            .await
+            .expect("missing read")
+            .is_none()
+    );
+    assert!(
+        get_folder_by_path_read(&pool, "Archive/Child")
+            .await
+            .expect("archive child read")
+            .is_none()
+    );
+    assert!(matches!(
+        get_folder_by_path_read(&pool, "Project/../Private").await,
+        Err(FolderError::InvalidPath),
     ));
 }
 
@@ -238,6 +287,158 @@ async fn folder_access_uses_nearest_direct_acl_and_admin_override() {
         folder_access_level(&pool, plans.id, &user(&["outsiders"], true))
             .await
             .expect("admin override"),
+        3,
+    );
+}
+
+#[tokio::test]
+async fn folder_access_batch_preserves_boundary_group_and_flag_semantics() {
+    let pool = test_pool().await;
+    let root = get_root_folder(&pool, VAULT_ROOT_KEY).await.expect("root");
+    let root_users = create_group(&pool, "root-users").await;
+    let readers = create_group(&pool, "\tReAdErS\u{2003}").await;
+    let writers = create_group(&pool, "writers").await;
+    let unrelated = create_group(&pool, "unrelated").await;
+    add_folder_permission(&pool, root.id, root_users, true, true, true)
+        .await
+        .expect("root access");
+
+    let open = get_or_create_folder_path(&pool, Some("Open"))
+        .await
+        .expect("open");
+    let boundary = get_or_create_folder_path(&pool, Some("Boundary"))
+        .await
+        .expect("boundary");
+    let descendant = get_or_create_folder_path(&pool, Some("Boundary/Descendant"))
+        .await
+        .expect("descendant");
+    let reopened = get_or_create_folder_path(&pool, Some("Boundary/Descendant/Reopened"))
+        .await
+        .expect("reopened");
+    add_folder_permission(&pool, boundary.id, readers, true, true, false)
+        .await
+        .expect("reader boundary");
+    add_folder_permission(&pool, boundary.id, writers, true, true, true)
+        .await
+        .expect("writer boundary");
+    add_folder_permission(&pool, boundary.id, unrelated, true, false, false)
+        .await
+        .expect("unrelated boundary");
+    add_folder_permission(&pool, reopened.id, root_users, true, true, true)
+        .await
+        .expect("reopened boundary");
+
+    let levels = folder_access_levels(
+        &pool,
+        &[open.id, boundary.id, descendant.id, descendant.id],
+        &user(&[" ROOT-USERS ", " readers ", "WRITERS"], false),
+    )
+    .await
+    .expect("batch access");
+    assert_eq!(levels.len(), 3);
+    assert_eq!(levels[&open.id], 3);
+    assert_eq!(levels[&boundary.id], 3);
+    assert_eq!(levels[&descendant.id], 3);
+
+    let reader_levels = folder_access_levels(
+        &pool,
+        &[boundary.id, descendant.id],
+        &user(&["readers"], false),
+    )
+    .await
+    .expect("reader access");
+    assert_eq!(reader_levels[&boundary.id], 2);
+    assert_eq!(reader_levels[&descendant.id], 2);
+
+    let denied = folder_access_levels(
+        &pool,
+        &[boundary.id, descendant.id, reopened.id],
+        &user(&["root-users"], false),
+    )
+    .await
+    .expect("unmatched boundary");
+    assert_eq!(denied[&boundary.id], 0);
+    assert_eq!(denied[&descendant.id], 0);
+    assert_eq!(denied[&reopened.id], 3);
+}
+
+#[tokio::test]
+async fn folder_access_batch_handles_cycles_and_more_than_sqlite_bind_limit() {
+    let pool = test_pool().await;
+    let root = get_root_folder(&pool, VAULT_ROOT_KEY).await.expect("root");
+    let readers = create_group(&pool, "readers").await;
+    add_folder_permission(&pool, root.id, readers, true, true, false)
+        .await
+        .expect("root reader");
+
+    let first_id = sqlx::query(
+        "INSERT INTO folders (root_key, parent_id, name, is_root) VALUES ('vault', NULL, 'Cycle A', 0)",
+    )
+    .execute(&pool)
+    .await
+    .expect("first cycle folder")
+    .last_insert_rowid();
+    let second_id = sqlx::query(
+        "INSERT INTO folders (root_key, parent_id, name, is_root) VALUES ('vault', ?, 'Cycle B', 0)",
+    )
+    .bind(first_id)
+    .execute(&pool)
+    .await
+    .expect("second cycle folder")
+    .last_insert_rowid();
+    sqlx::query("UPDATE folders SET parent_id = ? WHERE id = ?")
+        .bind(second_id)
+        .bind(first_id)
+        .execute(&pool)
+        .await
+        .expect("close parent cycle");
+    add_folder_permission(&pool, second_id, readers, true, true, false)
+        .await
+        .expect("cycle boundary");
+
+    sqlx::query(
+        r"
+        WITH RECURSIVE numbers(value) AS (
+            VALUES (1)
+            UNION ALL
+            SELECT value + 1 FROM numbers WHERE value < 1100
+        )
+        INSERT INTO folders (root_key, parent_id, name, is_root)
+        SELECT 'vault', ?, printf('Wide-%04d', value), 0
+        FROM numbers
+        ",
+    )
+    .bind(root.id)
+    .execute(&pool)
+    .await
+    .expect("wide folders");
+    let mut folder_ids = sqlx::query_scalar::<_, i64>(
+        "SELECT id FROM folders WHERE parent_id = ? AND name LIKE 'Wide-%' ORDER BY id",
+    )
+    .bind(root.id)
+    .fetch_all(&pool)
+    .await
+    .expect("wide folder ids");
+    assert_eq!(folder_ids.len(), 1_100);
+    folder_ids.push(first_id);
+    folder_ids.push(i64::MAX);
+
+    let levels = folder_access_levels(&pool, &folder_ids, &user(&[" readers "], false))
+        .await
+        .expect("large batch access");
+    assert_eq!(levels.len(), 1_101);
+    assert_eq!(levels[&first_id], 2);
+    assert!(!levels.contains_key(&i64::MAX));
+    assert!(levels.values().all(|level| *level == 2));
+
+    assert!(matches!(
+        folder_access_level(&pool, i64::MAX, &user(&["readers"], false)).await,
+        Err(FolderError::Database(sqlx::Error::RowNotFound)),
+    ));
+    assert_eq!(
+        folder_access_level(&pool, i64::MAX, &user(&[], true))
+            .await
+            .expect("admin short circuit"),
         3,
     );
 }

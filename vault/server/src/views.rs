@@ -1,6 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use serde::Serialize;
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{FromRow, SqlitePool};
 use thiserror::Error;
@@ -10,11 +12,13 @@ use time::{OffsetDateTime, PrimitiveDateTime, UtcOffset};
 use crate::auth::UserContext;
 use crate::documents::{
     AccessPayload, DocumentError, DocumentRecord, access_payload, document_access_level,
+    parse_archived_access,
 };
 use crate::folders::{
     ARCHIVE_ROOT, ARCHIVE_ROOT_KEY, FolderError, FolderRecord, VAULT_ROOT_KEY, all_folders,
-    build_folder_path_cache, ensure_root_folders, folder_access_level, folder_path_from_cache,
-    get_folder_by_path, get_root_folder, join_path, normalize_folder,
+    build_folder_path_cache, ensure_root_folders, folder_access_level, folder_access_levels,
+    folder_path_from_cache, get_folder_by_path, get_folder_by_path_read, join_path,
+    normalize_folder,
 };
 use crate::preferences::{PreferenceError, preferences_for_user};
 use crate::site_settings::{SiteSettingsError, site_settings_for_db};
@@ -29,6 +33,187 @@ const SIZE_UNITS: [(&str, i128); 4] = [
 const MONTH_NAMES: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
+const CONTENTS_DEFAULT_LIMIT: usize = 100;
+const CONTENTS_MAX_LIMIT: usize = 200;
+const CONTENTS_SCAN_MULTIPLIER: usize = 4;
+const SIDEBAR_ROOT_CHILD_LIMIT: usize = 200;
+const SIDEBAR_SCAN_LIMIT: usize = 800;
+const CONTENTS_CURSOR_VERSION: u8 = 1;
+const SIDEBAR_CURSOR_VERSION: u8 = 1;
+const FOLDER_PAGE_STATS_SQL: &str = r"
+WITH RECURSIVE
+params(is_admin) AS (VALUES (?)),
+user_groups(group_id) AS (
+    SELECT CAST(value AS INTEGER) FROM json_each(?)
+),
+requested(request_id, request_path) AS (
+    SELECT
+        CAST(json_extract(value, '$.id') AS INTEGER),
+        CAST(json_extract(value, '$.path') AS TEXT)
+    FROM json_each(?)
+),
+walk(request_id, folder_id, visited) AS (
+    SELECT request_id, request_id, printf(',%d,', request_id)
+    FROM requested
+    UNION ALL
+    SELECT
+        walk.request_id,
+        child.id,
+        walk.visited || child.id || ','
+    FROM walk
+    JOIN folders child ON child.parent_id = walk.folder_id
+    WHERE instr(walk.visited, printf(',%d,', child.id)) = 0
+),
+scoped_folders(folder_id) AS (
+    SELECT folder_id
+    FROM walk
+    GROUP BY folder_id
+),
+ancestry(folder_id, ancestor_id, parent_id, depth, visited) AS (
+    SELECT
+        scoped_folders.folder_id,
+        folders.id,
+        folders.parent_id,
+        0,
+        printf(',%d,', folders.id)
+    FROM scoped_folders
+    JOIN folders ON folders.id = scoped_folders.folder_id
+
+    UNION ALL
+
+    SELECT
+        ancestry.folder_id,
+        parent.id,
+        parent.parent_id,
+        ancestry.depth + 1,
+        ancestry.visited || parent.id || ','
+    FROM ancestry
+    JOIN folders parent ON parent.id = ancestry.parent_id
+    WHERE instr(ancestry.visited, printf(',%d,', parent.id)) = 0
+),
+boundary_depth(folder_id, depth) AS (
+    SELECT ancestry.folder_id, MIN(ancestry.depth)
+    FROM ancestry
+    WHERE EXISTS (
+        SELECT 1
+        FROM folder_permissions
+        WHERE folder_permissions.folder_id = ancestry.ancestor_id
+    )
+    GROUP BY ancestry.folder_id
+),
+boundaries(folder_id, boundary_id) AS (
+    SELECT ancestry.folder_id, ancestry.ancestor_id
+    FROM ancestry
+    JOIN boundary_depth
+      ON boundary_depth.folder_id = ancestry.folder_id
+     AND boundary_depth.depth = ancestry.depth
+),
+broken_parents(folder_id) AS (
+    SELECT ancestry.folder_id
+    FROM ancestry
+    LEFT JOIN folders parent ON parent.id = ancestry.parent_id
+    WHERE ancestry.parent_id IS NOT NULL AND parent.id IS NULL
+    GROUP BY ancestry.folder_id
+),
+folder_levels(folder_id, level) AS (
+    SELECT
+        scoped_folders.folder_id,
+        CASE
+            WHEN params.is_admin != 0 THEN 3
+            WHEN broken_parents.folder_id IS NOT NULL THEN 0
+            ELSE COALESCE(MAX(CASE
+                WHEN user_groups.group_id IS NULL THEN 0
+                WHEN fp.can_view != 0 AND fp.can_read != 0 AND fp.can_write != 0 THEN 3
+                WHEN fp.can_view != 0 AND fp.can_read != 0 THEN 2
+                WHEN fp.can_view != 0 THEN 1
+                ELSE 0
+            END), 0)
+        END
+    FROM scoped_folders
+    CROSS JOIN params
+    LEFT JOIN boundaries ON boundaries.folder_id = scoped_folders.folder_id
+    LEFT JOIN broken_parents ON broken_parents.folder_id = scoped_folders.folder_id
+    LEFT JOIN folder_permissions fp ON fp.folder_id = boundaries.boundary_id
+    LEFT JOIN user_groups ON user_groups.group_id = fp.group_id
+    GROUP BY scoped_folders.folder_id
+),
+visible_documents AS (
+    SELECT
+        walk.request_id,
+        d.id AS document_id,
+        d.folder_id,
+        COALESCE(b.size_bytes, 0) AS size_bytes,
+        v.committed_at AS mtime,
+        COALESCE(
+            NULLIF(v.committed_by_name, ''),
+            NULLIF(v.committed_by, '')
+        ) AS latest_by,
+        CASE
+            WHEN (NULLIF(d.current_version_id, '') IS NOT NULL OR EXISTS (
+                SELECT 1 FROM document_versions existing
+                WHERE existing.document_id = d.id
+            )) AND v.id IS NULL
+            THEN 1 ELSE 0
+        END AS inconsistent,
+        folders.root_key
+    FROM walk
+    JOIN folder_levels
+      ON folder_levels.folder_id = walk.folder_id
+     AND folder_levels.level >= 1
+    JOIN folders ON folders.id = walk.folder_id
+    JOIN documents d ON d.folder_id = walk.folder_id
+    LEFT JOIN document_versions v
+      ON v.document_id = d.id
+     AND v.id = d.current_version_id
+    LEFT JOIN blobs b ON b.id = v.blob_id
+    CROSS JOIN params
+    WHERE params.is_admin != 0
+       OR folders.root_key != 'archive'
+       OR (
+            json_type(CASE
+                WHEN d.archived_access IS NULL OR trim(d.archived_access) = '' THEN '{}'
+                ELSE d.archived_access
+            END) = 'object'
+            AND EXISTS (
+                SELECT 1
+                FROM json_each(CASE
+                    WHEN d.archived_access IS NULL OR trim(d.archived_access) = '' THEN '{}'
+                    ELSE d.archived_access
+                END) snapshot
+                JOIN user_groups
+                  ON snapshot.key = printf('%d', user_groups.group_id)
+                WHERE snapshot.type = 'integer'
+                  AND CAST(snapshot.value AS INTEGER) >= 1
+            )
+       )
+),
+ranked_documents AS (
+    SELECT
+        visible_documents.*,
+        ROW_NUMBER() OVER (
+            PARTITION BY request_id
+            ORDER BY
+                julianday(mtime) IS NOT NULL DESC,
+                julianday(mtime) DESC,
+                CASE WHEN julianday(mtime) IS NULL THEN mtime END DESC,
+                document_id
+        ) AS recency_rank
+    FROM visible_documents
+)
+SELECT
+    requested.request_path AS folder_path,
+    COALESCE(SUM(ranked_documents.size_bytes), 0) AS size_bytes,
+    MAX(CASE
+        WHEN ranked_documents.recency_rank = 1 THEN ranked_documents.mtime
+    END) AS mtime,
+    MAX(CASE
+        WHEN ranked_documents.recency_rank = 1 THEN ranked_documents.latest_by
+    END) AS latest_by,
+    MAX(ranked_documents.inconsistent) AS inconsistent
+FROM requested
+JOIN ranked_documents ON ranked_documents.request_id = requested.request_id
+GROUP BY requested.request_id, requested.request_path
+";
 
 #[derive(Debug, Error)]
 pub enum ViewError {
@@ -40,6 +225,10 @@ pub enum ViewError {
     InsufficientDocumentAccess,
     #[error("current document version metadata is inconsistent")]
     InconsistentDocumentVersion,
+    #[error("invalid contents cursor")]
+    InvalidContentsCursor,
+    #[error("invalid sidebar cursor")]
+    InvalidSidebarCursor,
     #[error(transparent)]
     Preferences(#[from] PreferenceError),
     #[error(transparent)]
@@ -58,6 +247,8 @@ pub enum ViewError {
 pub struct SidebarPayload {
     pub folder_children: HashMap<String, Vec<String>>,
     pub folder_metadata: HashMap<String, FolderMetadataPayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -94,6 +285,14 @@ pub struct ContentsPayload {
     pub recursive: bool,
     pub folders: Vec<FolderSummaryPayload>,
     pub documents: Vec<DocumentRowPayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ContentsPageOptions {
+    pub limit: Option<usize>,
+    pub cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -223,6 +422,87 @@ struct DocumentLockRow {
 }
 
 #[derive(Debug, Clone, FromRow)]
+struct FolderPageRow {
+    id: i64,
+    root_key: String,
+    parent_id: Option<i64>,
+    name: String,
+    is_root: bool,
+    created_at: Option<String>,
+    created_by: Option<String>,
+    created_by_name: Option<String>,
+    color: Option<String>,
+    icon: Option<String>,
+    default_ttl_days: Option<i64>,
+    default_ttl_action: Option<String>,
+    path: String,
+}
+
+impl FolderPageRow {
+    fn from_record(record: &FolderRecord, path: String) -> Self {
+        Self {
+            id: record.id,
+            root_key: record.root_key.clone(),
+            parent_id: record.parent_id,
+            name: record.name.clone(),
+            is_root: record.is_root,
+            created_at: record.created_at.clone(),
+            created_by: record.created_by.clone(),
+            created_by_name: record.created_by_name.clone(),
+            color: record.color.clone(),
+            icon: record.icon.clone(),
+            default_ttl_days: record.default_ttl_days,
+            default_ttl_action: record.default_ttl_action.clone(),
+            path,
+        }
+    }
+
+    fn record(&self) -> FolderRecord {
+        FolderRecord {
+            id: self.id,
+            root_key: self.root_key.clone(),
+            parent_id: self.parent_id,
+            name: self.name.clone(),
+            is_root: self.is_root,
+            created_at: self.created_at.clone(),
+            created_by: self.created_by.clone(),
+            created_by_name: self.created_by_name.clone(),
+            color: self.color.clone(),
+            icon: self.icon.clone(),
+            default_ttl_days: self.default_ttl_days,
+            default_ttl_action: self.default_ttl_action.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, FromRow)]
+struct FolderStatRow {
+    folder_path: String,
+    size_bytes: i64,
+    mtime: Option<String>,
+    latest_by: Option<String>,
+    inconsistent: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ContentsCursor {
+    version: u8,
+    folder: String,
+    q: String,
+    recursive: bool,
+    folder_after: i64,
+    document_after: i64,
+    folders_done: bool,
+    documents_done: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SidebarCursor {
+    version: u8,
+    after: i64,
+}
+
+#[derive(Debug, Clone, FromRow)]
 struct VersionHistoryRow {
     id: String,
     committed_at: Option<String>,
@@ -275,38 +555,66 @@ struct AvailableGroupRow {
     name: String,
 }
 
-struct ContentsContext<'a> {
+struct DocumentPageResult {
+    rows: Vec<(DocumentViewRow, i64)>,
+    folders: Vec<FolderRecord>,
+    path_cache: HashMap<i64, String>,
+    after: i64,
+    done: bool,
+}
+
+struct ContentsPageContext<'a> {
     pool: &'a SqlitePool,
+    current_folder: &'a FolderRecord,
+    current_path: &'a str,
     user: &'a UserContext,
-    path_cache: &'a HashMap<i64, String>,
-    folder_by_id: &'a HashMap<i64, &'a FolderRecord>,
-    normalized_folder: &'a str,
-    search_query: &'a str,
+    query: &'a str,
     recursive: bool,
+    limit: usize,
+}
+
+struct FavoriteDocumentContext<'a> {
+    user: &'a UserContext,
+    documents: &'a HashMap<i64, &'a DocumentViewRow>,
+    folders: &'a HashMap<i64, &'a FolderRecord>,
+    paths: &'a HashMap<i64, String>,
+    locks: &'a HashMap<i64, DocumentLockRow>,
+    folder_levels: &'a HashMap<i64, i64>,
+    user_group_ids: &'a HashSet<String>,
 }
 
 pub async fn build_sidebar_payload(
     pool: &SqlitePool,
     user: &UserContext,
 ) -> Result<SidebarPayload, ViewError> {
-    let vault_root = get_root_folder(pool, VAULT_ROOT_KEY).await?;
-    let _archive_root = get_root_folder(pool, ARCHIVE_ROOT_KEY).await?;
-    let folders = all_folders(pool).await?;
+    build_sidebar_page_payload(pool, user, None).await
+}
+
+pub async fn build_sidebar_page_payload(
+    pool: &SqlitePool,
+    user: &UserContext,
+    raw_cursor: Option<&str>,
+) -> Result<SidebarPayload, ViewError> {
+    let cursor = decode_sidebar_cursor(raw_cursor)?;
+    let (folders, next_after, has_more) = sidebar_folder_records(pool, user, cursor.after).await?;
+    let vault_root = folders
+        .iter()
+        .find(|folder| folder.is_root && folder.root_key == VAULT_ROOT_KEY)
+        .ok_or(ViewError::FolderNotFound)?;
     let path_cache = build_folder_path_cache(&folders)?;
+    let folder_ids = folders.iter().map(|folder| folder.id).collect::<Vec<_>>();
+    let access_levels = folder_access_levels(pool, &folder_ids, user).await?;
     let mut children = HashMap::from([
         (String::new(), Vec::new()),
         (ARCHIVE_ROOT.to_string(), Vec::new()),
     ]);
 
-    let mut visible_children = Vec::new();
-    for folder in folders
+    let mut visible_children = folders
         .iter()
         .filter(|folder| folder.parent_id == Some(vault_root.id))
-    {
-        if folder_access_level(pool, folder.id, user).await? >= 1 {
-            visible_children.push(folder_path_from_cache(folder, &path_cache)?);
-        }
-    }
+        .filter(|folder| access_levels.get(&folder.id).copied().unwrap_or(0) >= 1)
+        .map(|folder| folder_path_from_cache(folder, &path_cache))
+        .collect::<Result<Vec<_>, _>>()?;
     visible_children.sort();
     children.insert(String::new(), visible_children);
 
@@ -316,7 +624,7 @@ pub async fn build_sidebar_payload(
         .collect::<HashMap<_, _>>();
     let mut metadata = HashMap::new();
     for folder in &folders {
-        let level = folder_access_level(pool, folder.id, user).await?;
+        let level = access_levels.get(&folder.id).copied().unwrap_or(0);
         if level < 1 {
             continue;
         }
@@ -327,7 +635,35 @@ pub async fn build_sidebar_payload(
     Ok(SidebarPayload {
         folder_children: children,
         folder_metadata: metadata,
+        next_cursor: has_more
+            .then(|| encode_sidebar_cursor(next_after))
+            .transpose()?,
     })
+}
+
+fn decode_sidebar_cursor(raw: Option<&str>) -> Result<SidebarCursor, ViewError> {
+    let Some(raw) = raw.filter(|value| !value.is_empty()) else {
+        return Ok(SidebarCursor {
+            version: SIDEBAR_CURSOR_VERSION,
+            after: 0,
+        });
+    };
+    let bytes = URL_SAFE_NO_PAD
+        .decode(raw)
+        .map_err(|_| ViewError::InvalidSidebarCursor)?;
+    let cursor = serde_json::from_slice::<SidebarCursor>(&bytes)
+        .map_err(|_| ViewError::InvalidSidebarCursor)?;
+    if cursor.version != SIDEBAR_CURSOR_VERSION || cursor.after < 0 {
+        return Err(ViewError::InvalidSidebarCursor);
+    }
+    Ok(cursor)
+}
+
+fn encode_sidebar_cursor(after: i64) -> Result<String, ViewError> {
+    Ok(URL_SAFE_NO_PAD.encode(serde_json::to_vec(&SidebarCursor {
+        version: SIDEBAR_CURSOR_VERSION,
+        after,
+    })?))
 }
 
 pub async fn build_bootstrap_payload(
@@ -339,14 +675,12 @@ pub async fn build_bootstrap_payload(
 ) -> Result<BootstrapPayload, ViewError> {
     ensure_root_folders(pool).await?;
     let normalized_request = normalize_folder(Some(folder))?;
-    let Some(current_folder) = get_folder_by_path(pool, Some(&normalized_request)).await? else {
+    let Some(current_folder) = get_folder_by_path_read(pool, &normalized_request).await? else {
         return Err(ViewError::FolderNotFound);
     };
     if folder_access_level(pool, current_folder.id, user).await? < 1 {
         return Err(ViewError::FolderNotFound);
     }
-    let folders = all_folders(pool).await?;
-    let path_cache = build_folder_path_cache(&folders)?;
     Ok(BootstrapPayload {
         auth_mode: auth.mode.as_str().to_string(),
         base_domain: auth.base_domain.clone(),
@@ -360,7 +694,7 @@ pub async fn build_bootstrap_payload(
         preferences: build_preferences_payload(pool, user).await?,
         settings: site_settings_for_db(pool).await?,
         version: app_version().to_string(),
-        current_folder: folder_path_from_cache(&current_folder, &path_cache)?,
+        current_folder: normalized_request,
     })
 }
 
@@ -390,77 +724,754 @@ pub async fn build_contents_payload(
     q: &str,
     recursive: bool,
 ) -> Result<ContentsPayload, ViewError> {
+    build_contents_page_payload(
+        pool,
+        folder,
+        user,
+        q,
+        recursive,
+        ContentsPageOptions::default(),
+    )
+    .await
+}
+
+pub async fn build_contents_page_payload(
+    pool: &SqlitePool,
+    folder: &str,
+    user: &UserContext,
+    q: &str,
+    recursive: bool,
+    options: ContentsPageOptions,
+) -> Result<ContentsPayload, ViewError> {
     let normalized_request = normalize_folder(Some(folder))?;
-    let Some(current_folder) = get_folder_by_path(pool, Some(&normalized_request)).await? else {
+    let Some(current_folder) = get_folder_by_path_read(pool, &normalized_request).await? else {
         return Err(ViewError::FolderNotFound);
     };
     if folder_access_level(pool, current_folder.id, user).await? < 1 {
         return Err(ViewError::FolderNotFound);
     }
+    let search_query = q.trim().to_string();
+    let limit = options
+        .limit
+        .unwrap_or(CONTENTS_DEFAULT_LIMIT)
+        .clamp(1, CONTENTS_MAX_LIMIT);
+    let mut cursor = decode_contents_cursor(
+        options.cursor.as_deref(),
+        &normalized_request,
+        &search_query,
+        recursive,
+    )?;
 
-    let folders = all_folders(pool).await?;
+    let context = ContentsPageContext {
+        pool,
+        current_folder: &current_folder,
+        current_path: &normalized_request,
+        user,
+        query: &search_query,
+        recursive,
+        limit,
+    };
+    let (mut folder_rows, folder_after, folders_done) =
+        contents_folder_page(&context, &cursor).await?;
+    cursor.folder_after = folder_after;
+    cursor.folders_done = folders_done;
+    let (mut doc_rows, document_after, documents_done) =
+        contents_document_page(&context, &cursor).await?;
+    cursor.document_after = document_after;
+    cursor.documents_done = documents_done;
+
+    folder_rows.sort_by_key(|row| row.name.to_lowercase());
+    doc_rows.sort_by_key(|row| row.name.to_lowercase());
+
+    let next_cursor = (!cursor.folders_done || !cursor.documents_done)
+        .then(|| encode_contents_cursor(&cursor))
+        .transpose()?;
+
+    Ok(ContentsPayload {
+        folder: normalized_request,
+        q: search_query,
+        recursive,
+        folders: folder_rows,
+        documents: doc_rows,
+        next_cursor,
+    })
+}
+
+async fn contents_folder_page(
+    context: &ContentsPageContext<'_>,
+    cursor: &ContentsCursor,
+) -> Result<(Vec<FolderSummaryPayload>, i64, bool), ViewError> {
+    let (folder_page, after, done) = if cursor.folders_done {
+        (Vec::new(), cursor.folder_after, true)
+    } else {
+        scan_visible_folder_page(
+            context.pool,
+            context.current_folder,
+            context.current_path,
+            context.user,
+            context.query,
+            context.recursive,
+            cursor.folder_after,
+            context.limit,
+        )
+        .await?
+    };
+    let candidate_ids = folder_page
+        .iter()
+        .map(|folder| folder.id)
+        .collect::<Vec<_>>();
+    let ancestor_records = folder_records_with_ancestors(context.pool, &candidate_ids).await?;
+    let folder_by_id = ancestor_records
+        .iter()
+        .map(|folder| (folder.id, folder))
+        .collect::<HashMap<_, _>>();
+    let stats = folder_page_stats(context.pool, &folder_page, context.user).await?;
+    let levels = folder_access_levels(context.pool, &candidate_ids, context.user).await?;
+    let rows = folder_page
+        .iter()
+        .map(|row| {
+            let record = row.record();
+            folder_summary_payload_from_aggregate(
+                &record,
+                &row.path,
+                &stats,
+                levels.get(&record.id).copied().unwrap_or(0),
+                &folder_by_id,
+            )
+        })
+        .collect();
+    Ok((rows, after, done))
+}
+
+async fn contents_document_page(
+    context: &ContentsPageContext<'_>,
+    cursor: &ContentsCursor,
+) -> Result<(Vec<DocumentRowPayload>, i64, bool), ViewError> {
+    let page = if cursor.documents_done {
+        DocumentPageResult {
+            rows: Vec::new(),
+            folders: Vec::new(),
+            path_cache: HashMap::new(),
+            after: cursor.document_after,
+            done: true,
+        }
+    } else {
+        scan_visible_document_page(
+            context.pool,
+            context.current_folder,
+            context.current_path,
+            context.user,
+            context.query,
+            context.recursive,
+            cursor.document_after,
+            context.limit,
+        )
+        .await?
+    };
+    let folder_by_id = page
+        .folders
+        .iter()
+        .map(|folder| (folder.id, folder))
+        .collect::<HashMap<_, _>>();
+    let document_ids = page
+        .rows
+        .iter()
+        .map(|(document, _)| document.id)
+        .collect::<Vec<_>>();
+    let locks = active_locks_by_document_ids(context.pool, &document_ids).await?;
+    let rows = page
+        .rows
+        .iter()
+        .filter_map(|(document, level)| {
+            let folder = folder_by_id.get(&document.folder_id)?;
+            let path = page.path_cache.get(&document.folder_id)?;
+            Some(document_row_payload(
+                document,
+                folder,
+                path,
+                *level,
+                locks.get(&document.id),
+            ))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((rows, page.after, page.done))
+}
+
+fn decode_contents_cursor(
+    raw: Option<&str>,
+    folder: &str,
+    q: &str,
+    recursive: bool,
+) -> Result<ContentsCursor, ViewError> {
+    let Some(raw) = raw.filter(|value| !value.is_empty()) else {
+        return Ok(ContentsCursor {
+            version: CONTENTS_CURSOR_VERSION,
+            folder: folder.to_string(),
+            q: q.to_string(),
+            recursive,
+            folder_after: 0,
+            document_after: 0,
+            folders_done: false,
+            documents_done: false,
+        });
+    };
+    let bytes = URL_SAFE_NO_PAD
+        .decode(raw)
+        .map_err(|_| ViewError::InvalidContentsCursor)?;
+    let cursor = serde_json::from_slice::<ContentsCursor>(&bytes)
+        .map_err(|_| ViewError::InvalidContentsCursor)?;
+    if cursor.version != CONTENTS_CURSOR_VERSION
+        || cursor.folder != folder
+        || cursor.q != q
+        || cursor.recursive != recursive
+        || cursor.folder_after < 0
+        || cursor.document_after < 0
+    {
+        return Err(ViewError::InvalidContentsCursor);
+    }
+    Ok(cursor)
+}
+
+fn encode_contents_cursor(cursor: &ContentsCursor) -> Result<String, ViewError> {
+    Ok(URL_SAFE_NO_PAD.encode(serde_json::to_vec(cursor)?))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn scan_visible_folder_page(
+    pool: &SqlitePool,
+    current_folder: &FolderRecord,
+    current_path: &str,
+    user: &UserContext,
+    q: &str,
+    recursive: bool,
+    after: i64,
+    limit: usize,
+) -> Result<(Vec<FolderPageRow>, i64, bool), ViewError> {
+    if folder_is_archive(current_folder) {
+        return Ok((Vec::new(), after, true));
+    }
+    let scan_limit = limit
+        .checked_mul(CONTENTS_SCAN_MULTIPLIER)
+        .ok_or(ViewError::InvalidContentsCursor)?;
+    let recursive_scope = !q.is_empty() && recursive;
+    let mut candidates = folder_page_rows(
+        pool,
+        current_folder.id,
+        current_path,
+        recursive_scope,
+        after,
+        scan_limit + 1,
+    )
+    .await?;
+    let raw_has_more = candidates.len() > scan_limit;
+    candidates.truncate(scan_limit);
+    let ids = candidates.iter().map(|row| row.id).collect::<Vec<_>>();
+    let levels = folder_access_levels(pool, &ids, user).await?;
+    let mut rows = Vec::new();
+    let mut next_after = after;
+    let mut stopped_early = false;
+    for candidate in candidates {
+        next_after = candidate.id;
+        let level = levels.get(&candidate.id).copied().unwrap_or(0);
+        if level >= 1
+            && (q.is_empty() || matches_query(q, &[Some(&candidate.name), Some(&candidate.path)]))
+        {
+            rows.push(candidate);
+            if rows.len() == limit {
+                stopped_early = true;
+                break;
+            }
+        }
+    }
+    Ok((rows, next_after, !stopped_early && !raw_has_more))
+}
+
+async fn folder_page_rows(
+    pool: &SqlitePool,
+    current_folder_id: i64,
+    current_path: &str,
+    recursive: bool,
+    after: i64,
+    limit: usize,
+) -> Result<Vec<FolderPageRow>, ViewError> {
+    let limit = i64::try_from(limit).map_err(|_| ViewError::InvalidContentsCursor)?;
+    if recursive {
+        return Ok(sqlx::query_as::<_, FolderPageRow>(
+            r"
+            WITH RECURSIVE subtree(
+                id, root_key, parent_id, name, is_root, created_at, created_by,
+                created_by_name, color, icon, default_ttl_days, default_ttl_action,
+                path, visited
+            ) AS (
+                SELECT
+                    id, root_key, parent_id, name, is_root, created_at, created_by,
+                    created_by_name, color, icon, default_ttl_days, default_ttl_action,
+                    ?, printf(',%d,', id)
+                FROM folders
+                WHERE id = ?
+                UNION ALL
+                SELECT
+                    child.id, child.root_key, child.parent_id, child.name, child.is_root,
+                    child.created_at, child.created_by, child.created_by_name, child.color,
+                    child.icon, child.default_ttl_days, child.default_ttl_action,
+                    CASE WHEN subtree.path = '' THEN child.name
+                         ELSE subtree.path || '/' || child.name END,
+                    subtree.visited || child.id || ','
+                FROM folders child
+                JOIN subtree ON child.parent_id = subtree.id
+                WHERE instr(subtree.visited, printf(',%d,', child.id)) = 0
+            )
+            SELECT
+                id, root_key, parent_id, name, is_root, created_at, created_by,
+                created_by_name, color, icon, default_ttl_days, default_ttl_action, path
+            FROM subtree
+            WHERE id != ? AND id > ?
+            ORDER BY id
+            LIMIT ?
+            ",
+        )
+        .bind(current_path)
+        .bind(current_folder_id)
+        .bind(current_folder_id)
+        .bind(after)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?);
+    }
+    Ok(sqlx::query_as::<_, FolderPageRow>(
+        r"
+        SELECT
+            id, root_key, parent_id, name, is_root, created_at, created_by,
+            created_by_name, color, icon, default_ttl_days, default_ttl_action,
+            CASE WHEN ? = '' THEN name ELSE ? || '/' || name END AS path
+        FROM folders
+        WHERE parent_id = ? AND id > ?
+        ORDER BY id
+        LIMIT ?
+        ",
+    )
+    .bind(current_path)
+    .bind(current_path)
+    .bind(current_folder_id)
+    .bind(after)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?)
+}
+
+async fn folder_records_with_ancestors(
+    pool: &SqlitePool,
+    folder_ids: &[i64],
+) -> Result<Vec<FolderRecord>, ViewError> {
+    if folder_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids = serde_json::to_string(folder_ids)?;
+    Ok(sqlx::query_as::<_, FolderRecord>(
+        r"
+        WITH RECURSIVE
+        requested(id) AS (
+            SELECT CAST(value AS INTEGER) FROM json_each(?)
+        ),
+        ancestors(id, parent_id, visited) AS (
+            SELECT f.id, f.parent_id, printf(',%d,', f.id)
+            FROM folders f
+            JOIN requested r ON r.id = f.id
+            UNION ALL
+            SELECT parent.id, parent.parent_id, ancestors.visited || parent.id || ','
+            FROM ancestors
+            JOIN folders parent ON parent.id = ancestors.parent_id
+            WHERE instr(ancestors.visited, printf(',%d,', parent.id)) = 0
+        )
+        SELECT
+            id, root_key, parent_id, name, is_root, created_at, created_by,
+            created_by_name, color, icon, default_ttl_days, default_ttl_action
+        FROM folders
+        WHERE id IN (SELECT id FROM ancestors)
+        ",
+    )
+    .bind(ids)
+    .fetch_all(pool)
+    .await?)
+}
+
+async fn folder_page_stats(
+    pool: &SqlitePool,
+    folders: &[FolderPageRow],
+    user: &UserContext,
+) -> Result<Vec<DocStat>, ViewError> {
+    if folders.is_empty() {
+        return Ok(Vec::new());
+    }
+    let requested = folders
+        .iter()
+        .map(|folder| json!({"id": folder.id, "path": folder.path}))
+        .collect::<Vec<_>>();
+    let group_ids = user_group_ids(pool, user).await?;
+    let rows = sqlx::query_as::<_, FolderStatRow>(FOLDER_PAGE_STATS_SQL)
+        .bind(user.is_admin)
+        .bind(serde_json::to_string(&group_ids)?)
+        .bind(serde_json::to_string(&requested)?)
+        .fetch_all(pool)
+        .await?;
+    let mut stats = Vec::new();
+    for row in rows {
+        if row.inconsistent {
+            return Err(ViewError::InconsistentDocumentVersion);
+        }
+        stats.push(DocStat {
+            folder: row.folder_path,
+            size_bytes: row.size_bytes,
+            mtime: row.mtime,
+            latest_by: row.latest_by,
+        });
+    }
+    Ok(stats)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn scan_visible_document_page(
+    pool: &SqlitePool,
+    current_folder: &FolderRecord,
+    current_path: &str,
+    user: &UserContext,
+    q: &str,
+    recursive: bool,
+    after: i64,
+    limit: usize,
+) -> Result<DocumentPageResult, ViewError> {
+    let scan_limit = limit
+        .checked_mul(CONTENTS_SCAN_MULTIPLIER)
+        .ok_or(ViewError::InvalidContentsCursor)?;
+    let recursive_scope = !q.is_empty() && recursive;
+    let mut documents = scoped_document_page_rows(
+        pool,
+        current_folder.id,
+        recursive_scope,
+        after,
+        scan_limit + 1,
+    )
+    .await?;
+    let raw_has_more = documents.len() > scan_limit;
+    documents.truncate(scan_limit);
+    let folder_ids = documents
+        .iter()
+        .map(|document| document.folder_id)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let folders = folder_records_with_ancestors(pool, &folder_ids).await?;
     let path_cache = build_folder_path_cache(&folders)?;
     let folder_by_id = folders
         .iter()
         .map(|folder| (folder.id, folder))
         .collect::<HashMap<_, _>>();
-    let normalized_folder = folder_path_from_cache(&current_folder, &path_cache)?;
-    let search_query = q.trim().to_string();
-    let locks = active_locks_by_document(pool).await?;
-    let visible_docs = visible_document_rows(pool, user).await?;
-    let stats = docs_stats_for_folder_payloads(&visible_docs, &folder_by_id, &path_cache)?;
-    let context = ContentsContext {
-        pool,
-        user,
-        path_cache: &path_cache,
-        folder_by_id: &folder_by_id,
-        normalized_folder: &normalized_folder,
-        search_query: &search_query,
-        recursive,
-    };
-    let mut folder_rows = build_folder_rows(&context, &current_folder, &folders, &stats).await?;
-    let mut doc_rows =
-        build_document_rows(&context, &visible_docs, &locks, &current_folder).await?;
-
-    folder_rows.sort_by_key(|row| row.name.to_lowercase());
-    doc_rows.sort_by_key(|row| row.name.to_lowercase());
-
-    Ok(ContentsPayload {
-        folder: normalized_folder,
-        q: search_query,
-        recursive,
-        folders: folder_rows,
-        documents: doc_rows,
+    let levels = folder_access_levels(pool, &folder_ids, user).await?;
+    let user_group_ids = user_group_ids(pool, user).await?;
+    let mut rows = Vec::new();
+    let mut next_after = after;
+    let mut stopped_early = false;
+    for document in documents {
+        next_after = document.id;
+        let Some(folder) = folder_by_id.get(&document.folder_id) else {
+            continue;
+        };
+        let level = document_access_level_for_view(
+            &document,
+            folder,
+            levels.get(&document.folder_id).copied().unwrap_or(0),
+            user,
+            &user_group_ids,
+        )?;
+        if level < 1 {
+            continue;
+        }
+        if current_version_metadata_is_inconsistent(&document) {
+            return Err(ViewError::InconsistentDocumentVersion);
+        }
+        let path = path_cache
+            .get(&document.folder_id)
+            .map_or(current_path, String::as_str);
+        if !document_matches_query(&document, folder, path, q)? {
+            continue;
+        }
+        rows.push((document, level));
+        if rows.len() == limit {
+            stopped_early = true;
+            break;
+        }
+    }
+    Ok(DocumentPageResult {
+        rows,
+        folders,
+        path_cache,
+        after: next_after,
+        done: !stopped_early && !raw_has_more,
     })
+}
+
+async fn scoped_document_page_rows(
+    pool: &SqlitePool,
+    current_folder_id: i64,
+    recursive: bool,
+    after: i64,
+    limit: usize,
+) -> Result<Vec<DocumentViewRow>, ViewError> {
+    let limit = i64::try_from(limit).map_err(|_| ViewError::InvalidContentsCursor)?;
+    let scope = if recursive {
+        r"
+        WITH RECURSIVE scope(id, visited) AS (
+            SELECT id, printf(',%d,', id) FROM folders WHERE id = ?
+            UNION ALL
+            SELECT child.id, scope.visited || child.id || ','
+            FROM scope
+            JOIN folders child ON child.parent_id = scope.id
+            WHERE instr(scope.visited, printf(',%d,', child.id)) = 0
+        )
+        "
+    } else {
+        ""
+    };
+    let folder_predicate = if recursive {
+        "d.folder_id IN (SELECT id FROM scope)"
+    } else {
+        "d.folder_id = ?"
+    };
+    let sql = format!(
+        r"
+        {scope}
+        SELECT
+            d.id,
+            d.folder_id,
+            d.name,
+            d.created_at,
+            d.created_by,
+            d.created_by_name,
+            d.latest_version_number,
+            d.version_count,
+            d.expires_at,
+            d.expiry_action,
+            d.archived_from_folder,
+            d.archived_original_name,
+            d.archived_access,
+            d.current_version_id,
+            EXISTS (
+                SELECT 1 FROM document_versions existing_version
+                WHERE existing_version.document_id = d.id
+            ) AS has_versions,
+            v.id AS latest_version_id,
+            v.committed_at,
+            v.committed_by,
+            v.committed_by_name,
+            v.message AS latest_message,
+            v.version_number,
+            b.size_bytes
+        FROM documents d
+        LEFT JOIN document_versions v ON v.document_id = d.id AND v.id = d.current_version_id
+        LEFT JOIN blobs b ON b.id = v.blob_id
+        WHERE {folder_predicate} AND d.id > ?
+        ORDER BY d.id
+        LIMIT ?
+        "
+    );
+    Ok(sqlx::query_as::<_, DocumentViewRow>(&sql)
+        .bind(current_folder_id)
+        .bind(after)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?)
+}
+
+async fn user_group_ids(
+    pool: &SqlitePool,
+    user: &UserContext,
+) -> Result<HashSet<String>, ViewError> {
+    if user.is_admin || user.groups.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let names = user
+        .groups
+        .iter()
+        .filter_map(|group| {
+            let normalized = group.trim().to_ascii_lowercase();
+            (!normalized.is_empty()).then_some(normalized)
+        })
+        .collect::<HashSet<_>>();
+    let rows = sqlx::query_as::<_, (i64, String)>("SELECT id, name FROM vault_groups")
+        .fetch_all(pool)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .filter(|(_, name)| names.contains(&name.trim().to_ascii_lowercase()))
+        .map(|(id, _)| id.to_string())
+        .collect())
+}
+
+fn document_access_level_for_view(
+    document: &DocumentViewRow,
+    folder: &FolderRecord,
+    folder_level: i64,
+    user: &UserContext,
+    user_group_ids: &HashSet<String>,
+) -> Result<i64, ViewError> {
+    if user.is_admin {
+        return Ok(3);
+    }
+    if !folder_is_archive(folder) || folder_level <= 0 {
+        return Ok(folder_level);
+    }
+    let snapshot = parse_archived_access(document.archived_access.as_deref())?;
+    let source_level = user_group_ids
+        .iter()
+        .filter_map(|group_id| snapshot.get(group_id).copied())
+        .max()
+        .unwrap_or(0);
+    Ok(folder_level.min(source_level))
+}
+
+async fn active_locks_by_document_ids(
+    pool: &SqlitePool,
+    document_ids: &[i64],
+) -> Result<HashMap<i64, DocumentLockRow>, ViewError> {
+    if document_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows = sqlx::query_as::<_, DocumentLockRow>(
+        r"
+        SELECT
+            document_id, locked_by, locked_by_name, locked_at, locked_ip,
+            locked_user_agent, force_acquired
+        FROM document_locks
+        WHERE is_active = 1
+          AND document_id IN (SELECT CAST(value AS INTEGER) FROM json_each(?))
+        ",
+    )
+    .bind(serde_json::to_string(document_ids)?)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|row| (row.document_id, row)).collect())
+}
+
+async fn active_locks_for_user(
+    pool: &SqlitePool,
+    user_id: &str,
+) -> Result<HashMap<i64, DocumentLockRow>, ViewError> {
+    let rows = sqlx::query_as::<_, DocumentLockRow>(
+        r"
+        SELECT
+            document_id, locked_by, locked_by_name, locked_at, locked_ip,
+            locked_user_agent, force_acquired
+        FROM document_locks
+        WHERE is_active = 1 AND locked_by = ?
+        ",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|row| (row.document_id, row)).collect())
+}
+
+async fn sidebar_folder_records(
+    pool: &SqlitePool,
+    user: &UserContext,
+    after: i64,
+) -> Result<(Vec<FolderRecord>, i64, bool), ViewError> {
+    let mut folders = sqlx::query_as::<_, FolderRecord>(
+        r"
+        SELECT
+            id, root_key, parent_id, name, is_root, created_at, created_by,
+            created_by_name, color, icon, default_ttl_days, default_ttl_action
+        FROM folders
+        WHERE is_root = 1
+        ",
+    )
+    .fetch_all(pool)
+    .await?;
+    let vault_root_id = folders
+        .iter()
+        .find(|folder| folder.is_root && folder.root_key == VAULT_ROOT_KEY)
+        .map(|folder| folder.id)
+        .ok_or(ViewError::FolderNotFound)?;
+    let fetch_limit =
+        i64::try_from(SIDEBAR_SCAN_LIMIT + 1).map_err(|_| ViewError::InvalidSidebarCursor)?;
+    let mut batch = sqlx::query_as::<_, FolderRecord>(
+        r"
+        SELECT
+            id, root_key, parent_id, name, is_root, created_at, created_by,
+            created_by_name, color, icon, default_ttl_days, default_ttl_action
+        FROM folders
+        WHERE parent_id = ? AND id > ?
+        ORDER BY id
+        LIMIT ?
+        ",
+    )
+    .bind(vault_root_id)
+    .bind(after)
+    .bind(fetch_limit)
+    .fetch_all(pool)
+    .await?;
+    let raw_has_more = batch.len() > SIDEBAR_SCAN_LIMIT;
+    batch.truncate(SIDEBAR_SCAN_LIMIT);
+    let batch_ids = batch.iter().map(|folder| folder.id).collect::<Vec<_>>();
+    let levels = folder_access_levels(pool, &batch_ids, user).await?;
+    let mut next_after = after;
+    let mut visible_children = 0_usize;
+    let mut page_full = false;
+    for folder in batch {
+        next_after = folder.id;
+        if levels.get(&folder.id).copied().unwrap_or(0) < 1 {
+            continue;
+        }
+        folders.push(folder);
+        visible_children += 1;
+        if visible_children == SIDEBAR_ROOT_CHILD_LIMIT {
+            page_full = true;
+            break;
+        }
+    }
+    Ok((folders, next_after, page_full || raw_has_more))
 }
 
 pub async fn build_my_edits_payload(
     pool: &SqlitePool,
     user: &UserContext,
 ) -> Result<MyEditsPayload, ViewError> {
-    ensure_root_folders(pool).await?;
-    let folders = all_folders(pool).await?;
+    let locks = active_locks_for_user(pool, &user.id).await?;
+    let document_ids = locks.keys().copied().collect::<Vec<_>>();
+    let docs = document_view_rows_by_ids(pool, &document_ids).await?;
+    let folder_ids = docs
+        .iter()
+        .map(|document| document.folder_id)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let folders = folder_records_with_ancestors(pool, &folder_ids).await?;
     let path_cache = build_folder_path_cache(&folders)?;
     let folder_by_id = folders
         .iter()
         .map(|folder| (folder.id, folder))
         .collect::<HashMap<_, _>>();
-    let locks = active_locks_by_document(pool).await?;
-    let docs = document_view_rows(pool).await?;
+    let levels = folder_access_levels(pool, &folder_ids, user).await?;
+    let user_group_ids = user_group_ids(pool, user).await?;
     let mut rows = Vec::new();
 
     for doc in docs {
-        let Some(lock) = locks.get(&doc.id).filter(|lock| lock.locked_by == user.id) else {
+        let Some(lock) = locks.get(&doc.id) else {
             continue;
         };
-        let record = doc.document_record();
-        let level = document_access_level(pool, &record, user).await?;
-        if level < 3 {
-            continue;
-        }
         let Some(folder) = folder_by_id.get(&doc.folder_id) else {
             continue;
         };
+        let level = document_access_level_for_view(
+            &doc,
+            folder,
+            levels.get(&doc.folder_id).copied().unwrap_or(0),
+            user,
+            &user_group_ids,
+        )?;
+        if level < 3 {
+            continue;
+        }
         let doc_folder_path = folder_path_from_cache(folder, &path_cache)?;
         let row = document_row_payload(&doc, folder, &doc_folder_path, level, Some(lock))?;
         rows.push((row.path.to_lowercase(), row));
@@ -805,15 +1816,66 @@ async fn resolved_favorite_items(
         return Ok(Vec::new());
     }
 
-    let folders = all_folders(pool).await?;
+    let favorite_folder_ids = raw_items
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("folder"))
+        .filter_map(|item| item.get("id").and_then(Value::as_i64))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let favorite_document_ids = raw_items
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("document"))
+        .filter_map(|item| item.get("id").and_then(Value::as_i64))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let documents = document_view_rows_by_ids(pool, &favorite_document_ids).await?;
+    let document_folder_ids = documents
+        .iter()
+        .map(|document| document.folder_id)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut requested_folder_ids = favorite_folder_ids.clone();
+    requested_folder_ids.extend(document_folder_ids.iter().copied());
+    requested_folder_ids.sort_unstable();
+    requested_folder_ids.dedup();
+    let folders = folder_records_with_ancestors(pool, &requested_folder_ids).await?;
     let path_cache = build_folder_path_cache(&folders)?;
     let folder_by_id = folders
         .iter()
         .map(|folder| (folder.id, folder))
         .collect::<HashMap<_, _>>();
-    let visible_docs = visible_document_rows(pool, user).await?;
-    let stats = docs_stats_for_folder_payloads(&visible_docs, &folder_by_id, &path_cache)?;
-    let locks = active_locks_by_document(pool).await?;
+    let favorite_folder_levels = folder_access_levels(pool, &favorite_folder_ids, user).await?;
+    let visible_favorite_folders = favorite_folder_ids
+        .iter()
+        .filter(|folder_id| favorite_folder_levels.get(folder_id).copied().unwrap_or(0) >= 1)
+        .filter_map(|folder_id| folder_by_id.get(folder_id))
+        .map(|folder| {
+            Ok(FolderPageRow::from_record(
+                folder,
+                folder_path_from_cache(folder, &path_cache)?,
+            ))
+        })
+        .collect::<Result<Vec<_>, ViewError>>()?;
+    let stats = folder_page_stats(pool, &visible_favorite_folders, user).await?;
+    let document_levels = folder_access_levels(pool, &document_folder_ids, user).await?;
+    let user_group_ids = user_group_ids(pool, user).await?;
+    let document_by_id = documents
+        .iter()
+        .map(|document| (document.id, document))
+        .collect::<HashMap<_, _>>();
+    let locks = active_locks_by_document_ids(pool, &favorite_document_ids).await?;
+    let document_context = FavoriteDocumentContext {
+        user,
+        documents: &document_by_id,
+        folders: &folder_by_id,
+        paths: &path_cache,
+        locks: &locks,
+        folder_levels: &document_levels,
+        user_group_ids: &user_group_ids,
+    };
     let mut resolved = Vec::new();
 
     for item in raw_items {
@@ -825,25 +1887,18 @@ async fn resolved_favorite_items(
         };
         match item_type {
             "folder" => {
-                if let Some(row) =
-                    favorite_folder_payload(pool, user, item_id, &folder_by_id, &path_cache, &stats)
-                        .await?
-                {
+                if let Some(row) = favorite_folder_payload(
+                    item_id,
+                    &folder_by_id,
+                    &path_cache,
+                    &stats,
+                    &favorite_folder_levels,
+                )? {
                     resolved.push(row);
                 }
             }
             "document" => {
-                if let Some(row) = favorite_document_payload(
-                    pool,
-                    user,
-                    item_id,
-                    &visible_docs,
-                    &folder_by_id,
-                    &path_cache,
-                    &locks,
-                )
-                .await?
-                {
+                if let Some(row) = favorite_document_payload(&document_context, item_id)? {
                     resolved.push(row);
                 }
             }
@@ -853,23 +1908,22 @@ async fn resolved_favorite_items(
     Ok(resolved)
 }
 
-async fn favorite_folder_payload(
-    pool: &SqlitePool,
-    user: &UserContext,
+fn favorite_folder_payload(
     folder_id: i64,
     folder_by_id: &HashMap<i64, &FolderRecord>,
     path_cache: &HashMap<i64, String>,
     stats: &[DocStat],
+    access_levels: &HashMap<i64, i64>,
 ) -> Result<Option<Value>, ViewError> {
     let Some(folder) = folder_by_id.get(&folder_id) else {
         return Ok(None);
     };
-    let level = folder_access_level(pool, folder.id, user).await?;
+    let level = access_levels.get(&folder.id).copied().unwrap_or(0);
     if level < 1 {
         return Ok(None);
     }
     let path = folder_path_from_cache(folder, path_cache)?;
-    let mut value = serde_json::to_value(folder_summary_payload(
+    let mut value = serde_json::to_value(folder_summary_payload_from_aggregate(
         folder,
         &path,
         stats,
@@ -883,113 +1937,45 @@ async fn favorite_folder_payload(
     Ok(Some(value))
 }
 
-async fn favorite_document_payload(
-    pool: &SqlitePool,
-    user: &UserContext,
+fn favorite_document_payload(
+    context: &FavoriteDocumentContext<'_>,
     document_id: i64,
-    visible_docs: &[DocumentViewRow],
-    folder_by_id: &HashMap<i64, &FolderRecord>,
-    path_cache: &HashMap<i64, String>,
-    locks: &HashMap<i64, DocumentLockRow>,
 ) -> Result<Option<Value>, ViewError> {
-    let Some(doc) = visible_docs.iter().find(|doc| doc.id == document_id) else {
+    let Some(doc) = context.documents.get(&document_id) else {
         return Ok(None);
     };
-    let Some(folder) = folder_by_id.get(&doc.folder_id) else {
+    let Some(folder) = context.folders.get(&doc.folder_id) else {
         return Ok(None);
     };
-    let record = doc.document_record();
-    let level = document_access_level(pool, &record, user).await?;
+    let level = document_access_level_for_view(
+        doc,
+        folder,
+        context
+            .folder_levels
+            .get(&doc.folder_id)
+            .copied()
+            .unwrap_or(0),
+        context.user,
+        context.user_group_ids,
+    )?;
     if level < 1 {
         return Ok(None);
     }
-    let doc_folder_path = folder_path_from_cache(folder, path_cache)?;
+    if current_version_metadata_is_inconsistent(doc) {
+        return Err(ViewError::InconsistentDocumentVersion);
+    }
+    let doc_folder_path = folder_path_from_cache(folder, context.paths)?;
     let mut value = serde_json::to_value(document_row_payload(
         doc,
         folder,
         &doc_folder_path,
         level,
-        locks.get(&doc.id),
+        context.locks.get(&doc.id),
     )?)?;
     if let Some(object) = value.as_object_mut() {
         object.insert("type".to_string(), json!("document"));
     }
     Ok(Some(value))
-}
-
-async fn build_folder_rows(
-    context: &ContentsContext<'_>,
-    current_folder: &FolderRecord,
-    folders: &[FolderRecord],
-    stats: &[DocStat],
-) -> Result<Vec<FolderSummaryPayload>, ViewError> {
-    let mut rows = Vec::new();
-    for folder in folder_candidates(
-        current_folder,
-        folders,
-        context.path_cache,
-        context.normalized_folder,
-        context.search_query,
-        context.recursive,
-    ) {
-        let level = folder_access_level(context.pool, folder.id, context.user).await?;
-        if level < 1 {
-            continue;
-        }
-        let path = folder_path_from_cache(folder, context.path_cache)?;
-        if !context.search_query.is_empty()
-            && !matches_query(context.search_query, &[Some(&folder.name), Some(&path)])
-        {
-            continue;
-        }
-        rows.push(folder_summary_payload(
-            folder,
-            &path,
-            stats,
-            level,
-            context.folder_by_id,
-        ));
-    }
-    Ok(rows)
-}
-
-async fn build_document_rows(
-    context: &ContentsContext<'_>,
-    visible_docs: &[DocumentViewRow],
-    locks: &HashMap<i64, DocumentLockRow>,
-    current_folder: &FolderRecord,
-) -> Result<Vec<DocumentRowPayload>, ViewError> {
-    let current_is_archive = folder_is_archive(current_folder);
-    let mut rows = Vec::new();
-    for doc in visible_docs {
-        let Some(doc_folder) = context.folder_by_id.get(&doc.folder_id) else {
-            continue;
-        };
-        if folder_is_archive(doc_folder) != current_is_archive {
-            continue;
-        }
-        let doc_folder_path = folder_path_from_cache(doc_folder, context.path_cache)?;
-        if !folder_is_in_scope(
-            context.normalized_folder,
-            &doc_folder_path,
-            !context.search_query.is_empty() && context.recursive,
-        ) {
-            continue;
-        }
-        if !document_matches_query(doc, doc_folder, &doc_folder_path, context.search_query)? {
-            continue;
-        }
-        let record = doc.document_record();
-        let level = document_access_level(context.pool, &record, context.user).await?;
-        rows.push(document_row_payload(
-            doc,
-            doc_folder,
-            &doc_folder_path,
-            level,
-            locks.get(&doc.id),
-        )?);
-    }
-    Ok(rows)
 }
 
 fn document_matches_query(
@@ -1041,38 +2027,6 @@ impl DocumentViewRow {
     }
 }
 
-fn folder_candidates<'a>(
-    current_folder: &FolderRecord,
-    folders: &'a [FolderRecord],
-    path_cache: &HashMap<i64, String>,
-    normalized_folder: &str,
-    search_query: &str,
-    recursive: bool,
-) -> Vec<&'a FolderRecord> {
-    if folder_is_archive(current_folder) {
-        return Vec::new();
-    }
-    if !search_query.is_empty() && recursive {
-        let current_is_archive = folder_is_archive(current_folder);
-        return folders
-            .iter()
-            .filter(|folder| {
-                !folder.is_root
-                    && folder.id != current_folder.id
-                    && folder_is_archive(folder) == current_is_archive
-            })
-            .filter_map(|folder| {
-                let path = folder_path_from_cache(folder, path_cache).ok()?;
-                folder_contains_doc_folder(normalized_folder, &path).then_some(folder)
-            })
-            .collect::<Vec<_>>();
-    }
-    folders
-        .iter()
-        .filter(|folder| folder.parent_id == Some(current_folder.id))
-        .collect()
-}
-
 fn folder_summary_payload(
     folder: &FolderRecord,
     path: &str,
@@ -1118,6 +2072,23 @@ fn folder_summary_payload(
         size_display: format_size(Some(size)),
         access: access_payload(level),
     }
+}
+
+fn folder_summary_payload_from_aggregate(
+    folder: &FolderRecord,
+    path: &str,
+    stats: &[DocStat],
+    level: i64,
+    folder_by_id: &HashMap<i64, &FolderRecord>,
+) -> FolderSummaryPayload {
+    let aggregate = stats.iter().find(|stat| stat.folder == path);
+    folder_summary_payload(
+        folder,
+        path,
+        aggregate.map_or(&[], std::slice::from_ref),
+        level,
+        folder_by_id,
+    )
 }
 
 fn folder_summary_without_access(summary: FolderSummaryPayload) -> Result<Value, ViewError> {
@@ -1272,6 +2243,55 @@ async fn document_view_rows(pool: &SqlitePool) -> Result<Vec<DocumentViewRow>, V
             ON b.id = v.blob_id
         ",
     )
+    .fetch_all(pool)
+    .await?)
+}
+
+async fn document_view_rows_by_ids(
+    pool: &SqlitePool,
+    document_ids: &[i64],
+) -> Result<Vec<DocumentViewRow>, ViewError> {
+    if document_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(sqlx::query_as::<_, DocumentViewRow>(
+        r"
+        SELECT
+            d.id,
+            d.folder_id,
+            d.name,
+            d.created_at,
+            d.created_by,
+            d.created_by_name,
+            d.latest_version_number,
+            d.version_count,
+            d.expires_at,
+            d.expiry_action,
+            d.archived_from_folder,
+            d.archived_original_name,
+            d.archived_access,
+            d.current_version_id,
+            EXISTS (
+                SELECT 1
+                FROM document_versions existing_version
+                WHERE existing_version.document_id = d.id
+            ) AS has_versions,
+            v.id AS latest_version_id,
+            v.committed_at,
+            v.committed_by,
+            v.committed_by_name,
+            v.message AS latest_message,
+            v.version_number,
+            b.size_bytes
+        FROM documents d
+        LEFT JOIN document_versions v
+            ON v.document_id = d.id AND v.id = d.current_version_id
+        LEFT JOIN blobs b
+            ON b.id = v.blob_id
+        WHERE d.id IN (SELECT CAST(value AS INTEGER) FROM json_each(?))
+        ",
+    )
+    .bind(serde_json::to_string(document_ids)?)
     .fetch_all(pool)
     .await?)
 }
@@ -1527,14 +2547,6 @@ fn folder_contains_doc_folder(folder: &str, doc_folder: &str) -> bool {
         return doc_folder == ARCHIVE_ROOT || doc_folder.starts_with(&format!("{ARCHIVE_ROOT}/"));
     }
     doc_folder == folder || doc_folder.starts_with(&format!("{folder}/"))
-}
-
-fn folder_is_in_scope(target: &str, candidate: &str, recursive: bool) -> bool {
-    if recursive {
-        folder_contains_doc_folder(target, candidate)
-    } else {
-        candidate == target
-    }
 }
 
 fn matches_query(query: &str, values: &[Option<&str>]) -> bool {

@@ -1,7 +1,85 @@
 const { useCallback, useEffect, useMemo, useRef, useState } = React;
 
 function contentsKey(folder, q, recursive) {
-  return JSON.stringify([folder || "", q || "", Boolean(recursive)]);
+  return JSON.stringify([folder || "", (q || "").trim(), Boolean(recursive)]);
+}
+
+function normalizeContentsPage(contents) {
+  return {
+    ...contents,
+    next_cursor: contents.next_cursor ?? null,
+  };
+}
+
+function mergeByStableId(currentItems = [], nextItems = []) {
+  const merged = [];
+  const positions = new Map();
+
+  function add(item) {
+    const id = item?.id;
+    if (id === null || id === undefined) {
+      merged.push(item);
+      return;
+    }
+    if (positions.has(id)) {
+      merged[positions.get(id)] = item;
+      return;
+    }
+    positions.set(id, merged.length);
+    merged.push(item);
+  }
+
+  currentItems.forEach(add);
+  nextItems.forEach(add);
+  return merged;
+}
+
+export function mergeContentsPage(current, next) {
+  return {
+    ...current,
+    ...next,
+    documents: mergeByStableId(current.documents, next.documents),
+    folders: mergeByStableId(current.folders, next.folders),
+    next_cursor: next.next_cursor ?? null,
+  };
+}
+
+function mergeUniquePaths(currentPaths = [], nextPaths = []) {
+  return [...new Set([...currentPaths, ...nextPaths])];
+}
+
+function mergeFolderChildrenMaps(currentChildren = {}, nextChildren = {}) {
+  const merged = new Map(Object.entries(currentChildren));
+  Object.entries(nextChildren).forEach(([parentPath, paths]) => {
+    merged.set(parentPath, mergeUniquePaths(merged.get(parentPath) || [], paths || []));
+  });
+  return Object.fromEntries(merged);
+}
+
+function normalizeSidebarPage(sidebar) {
+  return {
+    ...sidebar,
+    next_cursor: sidebar.next_cursor ?? null,
+  };
+}
+
+export function mergeSidebarPage(current, next) {
+  const currentChildren = current.folder_children || {};
+  const nextChildren = next.folder_children || {};
+  return {
+    ...current,
+    ...next,
+    folder_children: {
+      ...currentChildren,
+      ...nextChildren,
+      "": mergeUniquePaths(currentChildren[""] || [], nextChildren[""] || []),
+    },
+    folder_metadata: {
+      ...(current.folder_metadata || {}),
+      ...(next.folder_metadata || {}),
+    },
+    next_cursor: next.next_cursor ?? null,
+  };
 }
 
 function childrenFromContents(contents) {
@@ -35,6 +113,7 @@ function emptyContents(folder, q, recursive) {
     recursive: Boolean(recursive),
     folders: [],
     documents: [],
+    next_cursor: null,
   };
 }
 
@@ -88,8 +167,8 @@ export function useVaultResources({
   setError,
   showNotice,
 }) {
-  const initialContents = initial.contents || { folders: [], documents: [] };
-  const initialSidebar = initial.sidebar || { folder_children: {} };
+  const initialContents = normalizeContentsPage(initial.contents || { folders: [], documents: [] });
+  const initialSidebar = normalizeSidebarPage(initial.sidebar || { folder_children: {} });
   const initialMyEdits = initial.my_edits || { documents: [] };
   const initialContentsKey = contentsKey(
     initialContents.folder || "",
@@ -108,9 +187,17 @@ export function useVaultResources({
   const [selectedDocDetail, setSelectedDocDetail] = useState(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [recursiveSearch, setRecursiveSearch] = useState(false);
+  const [loadingMoreRequest, setLoadingMoreRequest] = useState(null);
+  const [sidebarLoadingMoreRequest, setSidebarLoadingMoreRequest] = useState(null);
   const contentsCacheRef = useRef(new Map([[initialContentsKey, initialContents]]));
   const prefetchingKeysRef = useRef(new Set());
   const contentRequestRef = useRef(0);
+  const contentsCacheGenerationRef = useRef(0);
+  const loadingMoreRequestRef = useRef(null);
+  const sidebarRef = useRef(initialSidebar);
+  const sidebarRequestRef = useRef(0);
+  const sidebarGenerationRef = useRef(0);
+  const sidebarLoadingMoreRequestRef = useRef(null);
   const detailRequestRef = useRef(0);
   const onMissingFolderRef = useRef(onMissingFolder);
   const onPreferencesRefreshRef = useRef(onPreferencesRefresh);
@@ -125,8 +212,17 @@ export function useVaultResources({
   searchQueryRef.current = searchQuery;
   recursiveSearchRef.current = recursiveSearch;
   selectedIdRef.current = selectedId;
+  sidebarRef.current = sidebar;
 
   const activeContentsKey = contentsKey(folder, searchQuery, recursiveSearch);
+  const contentsContextRef = useRef({ generation: 0, key: activeContentsKey });
+  if (contentsContextRef.current.key !== activeContentsKey) {
+    contentsContextRef.current = {
+      generation: contentsContextRef.current.generation + 1,
+      key: activeContentsKey,
+    };
+    contentRequestRef.current += 1;
+  }
   const storedContentsKey = contentsKey(
     contents.folder || "",
     contents.q || "",
@@ -175,39 +271,76 @@ export function useVaultResources({
   const sidebarChildren = useMemo(() => sidebar.folder_children || {}, [sidebar.folder_children]);
   const sidebarMetadata = useMemo(() => sidebar.folder_metadata || {}, [sidebar.folder_metadata]);
   const folderChildren = useMemo(() => {
-    return { ...sidebarChildren, ...contentsChildren };
+    return mergeFolderChildrenMaps(sidebarChildren, contentsChildren);
   }, [contentsChildren, sidebarChildren]);
   const folderMetadata = useMemo(() => {
     return { ...sidebarMetadata, ...contentsMetadata };
   }, [contentsMetadata, sidebarMetadata]);
   const selectedDoc = selectedDocDetail || docs.find((doc) => doc.id === selectedId) || null;
   const myEdits = myEditsState.documents || [];
+  const displayedContentsKey = contentsKey(
+    displayedContents.folder || "",
+    displayedContents.q || "",
+    displayedContents.recursive
+  );
+  const contentsHasMore = Boolean(
+    displayedContentsKey === activeContentsKey && displayedContents.next_cursor
+  );
+  const contentsLoadingMore = Boolean(
+    loadingMoreRequest &&
+    loadingMoreRequest.key === activeContentsKey &&
+    loadingMoreRequest.contextGeneration === contentsContextRef.current.generation
+  );
+  const sidebarHasMore = Boolean(sidebar.next_cursor);
+  const sidebarLoadingMore = Boolean(
+    sidebarLoadingMoreRequest &&
+    sidebarLoadingMoreRequest.requestId === sidebarRequestRef.current &&
+    sidebarLoadingMoreRequest.generation === sidebarGenerationRef.current
+  );
 
   const invalidateContentsCache = useCallback(() => {
+    contentsCacheGenerationRef.current += 1;
+    contentRequestRef.current += 1;
     contentsCacheRef.current.clear();
     prefetchingKeysRef.current.clear();
+    loadingMoreRequestRef.current = null;
+    setLoadingMoreRequest(null);
+    setContents((previous) => ({ ...previous, next_cursor: null }));
     setContentsChildren({});
   }, []);
 
+  const invalidateSidebar = useCallback(() => {
+    sidebarGenerationRef.current += 1;
+    sidebarRequestRef.current += 1;
+    sidebarLoadingMoreRequestRef.current = null;
+    setSidebarLoadingMoreRequest(null);
+    const invalidated = { ...sidebarRef.current, next_cursor: null };
+    sidebarRef.current = invalidated;
+    setSidebar(invalidated);
+  }, []);
+
   const rememberContents = useCallback((data) => {
-    const key = contentsKey(data.folder || "", data.q || "", data.recursive);
-    contentsCacheRef.current.set(key, data);
-    if (!data.q && !data.recursive) {
+    const normalized = normalizeContentsPage(data);
+    const key = contentsKey(normalized.folder || "", normalized.q || "", normalized.recursive);
+    contentsCacheRef.current.set(key, normalized);
+    if (!normalized.q && !normalized.recursive) {
       setContentsChildren((prev) => ({
         ...prev,
-        [data.folder || ""]: childrenFromContents(data),
+        [normalized.folder || ""]: childrenFromContents(normalized),
       }));
       setContentsMetadata((prev) => ({
         ...prev,
-        ...metadataFromContents(data),
+        ...metadataFromContents(normalized),
       }));
     }
+    return normalized;
   }, []);
 
   const fetchContents = useCallback(
     async (nextFolder, options = {}) => {
       const background = Boolean(options.background);
       const requestId = background ? null : contentRequestRef.current + 1;
+      const cacheGeneration = contentsCacheGenerationRef.current;
       if (!background) {
         contentRequestRef.current = requestId;
       }
@@ -238,8 +371,11 @@ export function useVaultResources({
       if (!res.ok) {
         throw new Error("Could not refresh contents");
       }
-      const data = await res.json();
-      rememberContents(data);
+      const responseData = await res.json();
+      if (cacheGeneration !== contentsCacheGenerationRef.current) {
+        return null;
+      }
+      const data = rememberContents(responseData);
       if (background) {
         return null;
       }
@@ -256,6 +392,80 @@ export function useVaultResources({
     [apiFetch, rememberContents]
   );
 
+  const loadMoreContents = useCallback(async () => {
+    const targetFolder = folderRef.current;
+    const q = searchQueryRef.current;
+    const recursive = recursiveSearchRef.current;
+    const key = contentsKey(targetFolder, q, recursive);
+    const current = contentsCacheRef.current.get(key);
+    const cursor = current?.next_cursor;
+    const contextGeneration = contentsContextRef.current.generation;
+    const activeLoad = loadingMoreRequestRef.current;
+    if (
+      !cursor ||
+      (activeLoad?.key === key && activeLoad.contextGeneration === contextGeneration)
+    ) {
+      return null;
+    }
+
+    const requestId = contentRequestRef.current + 1;
+    contentRequestRef.current = requestId;
+    const cacheGeneration = contentsCacheGenerationRef.current;
+    const request = { contextGeneration, key, requestId };
+    loadingMoreRequestRef.current = request;
+    setLoadingMoreRequest(request);
+
+    const isCurrentRequest = () =>
+      requestId === contentRequestRef.current &&
+      cacheGeneration === contentsCacheGenerationRef.current &&
+      contentsContextRef.current.key === key &&
+      contentsContextRef.current.generation === contextGeneration;
+
+    try {
+      const params = new URLSearchParams({
+        folder: targetFolder || "",
+        q: q || "",
+        recursive: recursive ? "true" : "false",
+        cursor,
+      });
+      const res = await apiFetch(`/api/folders/contents?${params.toString()}`);
+      if (!isCurrentRequest()) {
+        return null;
+      }
+      if (!res.ok) {
+        throw new Error("Could not load more contents");
+      }
+      const page = normalizeContentsPage(await res.json());
+      if (!isCurrentRequest()) {
+        return null;
+      }
+      if (contentsKey(page.folder || "", page.q || "", page.recursive) !== key) {
+        throw new Error("Contents page did not match the current view");
+      }
+      const latest = contentsCacheRef.current.get(key);
+      if (!latest || latest.next_cursor !== cursor) {
+        return null;
+      }
+      const merged = mergeContentsPage(latest, page);
+      rememberContents(merged);
+      if (!isCurrentRequest()) {
+        return null;
+      }
+      setContents(merged);
+      return merged;
+    } catch {
+      if (isCurrentRequest()) {
+        setError("Could not load more contents.");
+      }
+      return null;
+    } finally {
+      if (loadingMoreRequestRef.current?.requestId === requestId) {
+        loadingMoreRequestRef.current = null;
+        setLoadingMoreRequest(null);
+      }
+    }
+  }, [apiFetch, rememberContents, setError]);
+
   const prefetchContents = useCallback(
     (targetFolder) => {
       const key = contentsKey(targetFolder, "", false);
@@ -271,14 +481,77 @@ export function useVaultResources({
   );
 
   const fetchSidebar = useCallback(async () => {
+    const requestId = sidebarRequestRef.current + 1;
+    sidebarRequestRef.current = requestId;
+    sidebarLoadingMoreRequestRef.current = null;
+    setSidebarLoadingMoreRequest(null);
+    const generation = sidebarGenerationRef.current;
     const res = await apiFetch("/api/folders/sidebar");
+    if (requestId !== sidebarRequestRef.current || generation !== sidebarGenerationRef.current) {
+      return null;
+    }
     if (!res.ok) {
       throw new Error("Could not refresh folders");
     }
-    const data = await res.json();
+    const data = normalizeSidebarPage(await res.json());
+    if (requestId !== sidebarRequestRef.current || generation !== sidebarGenerationRef.current) {
+      return null;
+    }
+    sidebarRef.current = data;
     setSidebar(data);
     return data;
   }, [apiFetch]);
+
+  const loadMoreSidebar = useCallback(async () => {
+    const cursor = sidebarRef.current.next_cursor;
+    const activeLoad = sidebarLoadingMoreRequestRef.current;
+    if (!cursor || activeLoad) {
+      return null;
+    }
+
+    const requestId = sidebarRequestRef.current + 1;
+    sidebarRequestRef.current = requestId;
+    const generation = sidebarGenerationRef.current;
+    const request = { generation, requestId };
+    sidebarLoadingMoreRequestRef.current = request;
+    setSidebarLoadingMoreRequest(request);
+
+    const isCurrentRequest = () =>
+      requestId === sidebarRequestRef.current && generation === sidebarGenerationRef.current;
+
+    try {
+      const params = new URLSearchParams({ cursor });
+      const res = await apiFetch(`/api/folders/sidebar?${params.toString()}`);
+      if (!isCurrentRequest()) {
+        return null;
+      }
+      if (!res.ok) {
+        throw new Error("Could not load more folders");
+      }
+      const page = normalizeSidebarPage(await res.json());
+      if (!isCurrentRequest()) {
+        return null;
+      }
+      const latest = sidebarRef.current;
+      if (latest.next_cursor !== cursor) {
+        return null;
+      }
+      const merged = mergeSidebarPage(latest, page);
+      sidebarRef.current = merged;
+      setSidebar(merged);
+      return merged;
+    } catch {
+      if (isCurrentRequest()) {
+        setError("Could not load more folders.");
+      }
+      return null;
+    } finally {
+      if (sidebarLoadingMoreRequestRef.current?.requestId === requestId) {
+        sidebarLoadingMoreRequestRef.current = null;
+        setSidebarLoadingMoreRequest(null);
+      }
+    }
+  }, [apiFetch, setError]);
 
   const fetchMyEdits = useCallback(async () => {
     const res = await apiFetch("/api/my-edits");
@@ -340,6 +613,9 @@ export function useVaultResources({
       if (options.invalidateContents) {
         invalidateContentsCache();
       }
+      if (options.sidebar) {
+        invalidateSidebar();
+      }
       const [contentsRefresh, sidebarRefresh] = await Promise.all([
         criticalRefresh(
           fetchContents(nextFolder, {
@@ -368,6 +644,7 @@ export function useVaultResources({
       fetchMyEdits,
       fetchSidebar,
       invalidateContentsCache,
+      invalidateSidebar,
       setError,
     ]
   );
@@ -444,6 +721,7 @@ export function useVaultResources({
         fetchContents().catch(() => setError("Could not refresh contents."));
       }
       if (resources.has("sidebar")) {
+        invalidateSidebar();
         fetchSidebar().catch(() => setError("Could not refresh folders."));
       }
       if (resources.has("my_edits")) {
@@ -514,6 +792,7 @@ export function useVaultResources({
     fetchSettings,
     fetchSidebar,
     invalidateContentsCache,
+    invalidateSidebar,
     setError,
     showNotice,
   ]);
@@ -522,8 +801,11 @@ export function useVaultResources({
     docs,
     folderChildren,
     folderMetadata,
+    contentsHasMore,
+    contentsLoadingMore,
     contentsPending,
     contentsPendingEmptySearch,
+    loadMoreContents,
     myEdits,
     recursiveSearch,
     refresh,
@@ -531,6 +813,11 @@ export function useVaultResources({
     selectedDoc,
     setRecursiveSearch,
     setSearchQuery,
+    sidebarPagination: {
+      hasMore: sidebarHasMore,
+      loadMore: loadMoreSidebar,
+      loadingMore: sidebarLoadingMore,
+    },
     subfolders,
     updateDocumentInViews,
   };

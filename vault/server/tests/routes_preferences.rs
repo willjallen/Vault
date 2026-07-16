@@ -8,7 +8,8 @@ use vault_server::auth::AuthSettings;
 use vault_server::config::Config;
 use vault_server::db;
 use vault_server::folders::{
-    VAULT_ROOT_KEY, add_folder_permission, get_or_create_folder_path, get_root_folder,
+    ARCHIVE_ROOT_KEY, VAULT_ROOT_KEY, add_folder_permission, get_or_create_folder_path,
+    get_root_folder,
 };
 use vault_server::http::{self, AppState};
 use vault_server::storage::LocalBlobStorage;
@@ -119,6 +120,21 @@ async fn insert_versioned_document(pool: &sqlx::SqlitePool, folder_id: i64, name
     .await
     .expect("current version");
     document_id
+}
+
+async fn set_archived_access(
+    pool: &sqlx::SqlitePool,
+    document_id: i64,
+    source_folder: &str,
+    group_id: i64,
+) {
+    sqlx::query("UPDATE documents SET archived_from_folder = ?, archived_access = ? WHERE id = ?")
+        .bind(source_folder)
+        .bind(format!(r#"{{"{group_id}":2}}"#))
+        .bind(document_id)
+        .execute(pool)
+        .await
+        .expect("archive snapshot");
 }
 
 async fn response_json(response: axum::response::Response) -> Value {
@@ -629,6 +645,184 @@ async fn preferences_filter_document_favorite_after_current_folder_becomes_inacc
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["preferences"]["favoriteItems"], json!([]));
+}
+
+#[tokio::test]
+async fn archive_folder_favorite_excludes_inaccessible_document_metadata() {
+    let (state, _temp_dir) = test_state().await;
+    let readers = create_group(&state.db, "readers").await;
+    let confidential = create_group(&state.db, "confidential").await;
+    let vault_root = get_root_folder(&state.db, VAULT_ROOT_KEY)
+        .await
+        .expect("vault root");
+    let archive_root = get_root_folder(&state.db, ARCHIVE_ROOT_KEY)
+        .await
+        .expect("archive root");
+    for root_id in [vault_root.id, archive_root.id] {
+        add_folder_permission(&state.db, root_id, readers, true, true, false)
+            .await
+            .expect("reader root access");
+    }
+    let visible_id = insert_versioned_document(&state.db, archive_root.id, "visible.txt").await;
+    let hidden_id = insert_versioned_document(&state.db, archive_root.id, "hidden.txt").await;
+    set_archived_access(&state.db, visible_id, "Project", readers).await;
+    set_archived_access(&state.db, hidden_id, "Secret", confidential).await;
+    sqlx::query(
+        r"
+        UPDATE document_versions
+        SET committed_at = '2026-01-01T00:00:00Z', committed_by_name = 'Visible Author'
+        WHERE document_id = ?
+        ",
+    )
+    .bind(visible_id)
+    .execute(&state.db)
+    .await
+    .expect("visible version metadata");
+    sqlx::query(
+        r"
+        UPDATE document_versions
+        SET committed_at = '2030-01-01T00:00:00Z', committed_by_name = 'Secret Author'
+        WHERE document_id = ?
+        ",
+    )
+    .bind(hidden_id)
+    .execute(&state.db)
+    .await
+    .expect("hidden version metadata");
+    sqlx::query(
+        r"
+        UPDATE blobs
+        SET size_bytes = 999
+        WHERE id = (
+            SELECT blob_id FROM document_versions WHERE document_id = ?
+        )
+        ",
+    )
+    .bind(hidden_id)
+    .execute(&state.db)
+    .await
+    .expect("hidden blob metadata");
+    sqlx::query("UPDATE documents SET current_version_id = 'missing-version' WHERE id = ?")
+        .bind(hidden_id)
+        .execute(&state.db)
+        .await
+        .expect("hidden inconsistent pointer");
+
+    let response = http::router(state)
+        .oneshot(authed_patch(
+            "/api/preferences",
+            "reader",
+            "readers",
+            &json!({
+                "preferences": {
+                    "favoriteItems": [{"type": "folder", "id": archive_root.id}]
+                }
+            }),
+        ))
+        .await
+        .expect("preferences");
+    let status = response.status();
+    let json = response_json(response).await;
+    let favorite = &json["preferences"]["favoriteItems"][0];
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(favorite["path"], "Archive");
+    assert_eq!(favorite["size_bytes"], 3);
+    assert_eq!(favorite["latest_by"], "Visible Author");
+    assert_eq!(favorite["modified_at"], "2026-01-01T00:00:00+00:00");
+}
+
+#[tokio::test]
+async fn favorite_resolution_ignores_inconsistent_documents_outside_its_scope() {
+    let (state, _temp_dir) = test_state().await;
+    let readers = create_group(&state.db, "readers").await;
+    let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
+        .await
+        .expect("root");
+    add_folder_permission(&state.db, root.id, readers, true, true, false)
+        .await
+        .expect("reader root");
+    let favorite_folder = get_or_create_folder_path(&state.db, Some("Favorite"))
+        .await
+        .expect("favorite folder");
+    let sibling = get_or_create_folder_path(&state.db, Some("Sibling"))
+        .await
+        .expect("sibling folder");
+    let favorite_id =
+        insert_versioned_document(&state.db, favorite_folder.id, "favorite.txt").await;
+    let sibling_id = insert_versioned_document(&state.db, sibling.id, "broken.txt").await;
+    sqlx::query("UPDATE documents SET current_version_id = 'missing-version' WHERE id = ?")
+        .bind(sibling_id)
+        .execute(&state.db)
+        .await
+        .expect("corrupt sibling pointer");
+
+    let response = http::router(state)
+        .oneshot(authed_patch(
+            "/api/preferences",
+            "reader",
+            "readers",
+            &json!({
+                "preferences": {
+                    "favoriteItems": [{"type": "document", "id": favorite_id}]
+                }
+            }),
+        ))
+        .await
+        .expect("preferences");
+    let status = response.status();
+    let json = response_json(response).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["preferences"]["favoriteItems"][0]["id"], favorite_id);
+}
+
+#[tokio::test]
+async fn overlapping_folder_favorites_do_not_double_count_descendant_sizes() {
+    let (state, _temp_dir) = test_state().await;
+    let readers = create_group(&state.db, "readers").await;
+    let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
+        .await
+        .expect("root");
+    add_folder_permission(&state.db, root.id, readers, true, true, false)
+        .await
+        .expect("reader root");
+    let parent = get_or_create_folder_path(&state.db, Some("Parent"))
+        .await
+        .expect("parent");
+    let child = get_or_create_folder_path(&state.db, Some("Parent/Child"))
+        .await
+        .expect("child");
+    insert_versioned_document(&state.db, parent.id, "parent.txt").await;
+    insert_versioned_document(&state.db, child.id, "child.txt").await;
+
+    let response = http::router(state)
+        .oneshot(authed_patch(
+            "/api/preferences",
+            "reader",
+            "readers",
+            &json!({
+                "preferences": {
+                    "favoriteItems": [
+                        {"type": "folder", "id": parent.id},
+                        {"type": "folder", "id": child.id}
+                    ]
+                }
+            }),
+        ))
+        .await
+        .expect("preferences");
+    let status = response.status();
+    let json = response_json(response).await;
+    let favorites = json["preferences"]["favoriteItems"]
+        .as_array()
+        .expect("favorites");
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(favorites[0]["id"], parent.id);
+    assert_eq!(favorites[0]["size_bytes"], 6);
+    assert_eq!(favorites[1]["id"], child.id);
+    assert_eq!(favorites[1]["size_bytes"], 3);
 }
 
 #[tokio::test]

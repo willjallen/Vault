@@ -591,6 +591,157 @@ async fn sidebar_exposes_only_visible_root_children() {
 }
 
 #[tokio::test]
+async fn sidebar_hidden_rows_do_not_consume_the_visible_child_limit() {
+    let (state, _temp_dir) = test_state().await;
+    let viewers = create_group(&state.db, "viewers").await;
+    let outsiders = create_group(&state.db, "outsiders").await;
+    let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
+        .await
+        .expect("root");
+    add_folder_permission(&state.db, root.id, viewers, true, true, false)
+        .await
+        .expect("viewer root");
+    sqlx::query(
+        r"
+        WITH RECURSIVE numbers(value) AS (
+            VALUES (1)
+            UNION ALL
+            SELECT value + 1 FROM numbers WHERE value < 805
+        )
+        INSERT INTO folders (root_key, parent_id, name, is_root)
+        SELECT 'vault', ?, printf('Hidden-%03d', value), 0
+        FROM numbers
+        ",
+    )
+    .bind(root.id)
+    .execute(&state.db)
+    .await
+    .expect("hidden folders");
+    sqlx::query(
+        r"
+        INSERT INTO folder_permissions (folder_id, group_id, can_view, can_read, can_write)
+        SELECT id, ?, 1, 1, 0
+        FROM folders
+        WHERE parent_id = ? AND name LIKE 'Hidden-%'
+        ",
+    )
+    .bind(outsiders)
+    .bind(root.id)
+    .execute(&state.db)
+    .await
+    .expect("hidden folder boundaries");
+    let visible = get_or_create_folder_path(&state.db, Some("Visible late"))
+        .await
+        .expect("visible folder");
+    add_folder_permission(&state.db, visible.id, viewers, true, true, false)
+        .await
+        .expect("visible folder access");
+
+    let app = http::router(state);
+    let first = app
+        .clone()
+        .oneshot(authed_get("/api/folders/sidebar", "viewer", "viewers"))
+        .await
+        .expect("first sidebar page");
+    assert_eq!(first.status(), StatusCode::OK);
+    let first_json = response_json(first).await;
+    assert_eq!(first_json["folder_children"][""], json!([]));
+    let cursor = first_json["next_cursor"].as_str().expect("sidebar cursor");
+
+    let response = app
+        .oneshot(authed_get(
+            &format!("/api/folders/sidebar?cursor={cursor}"),
+            "viewer",
+            "viewers",
+        ))
+        .await
+        .expect("second sidebar page");
+    let status = response.status();
+    let json = response_json(response).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["folder_children"][""], json!(["Visible late"]));
+    assert_eq!(json["folder_metadata"]["Visible late"]["id"], visible.id);
+    assert!(json.get("next_cursor").is_none());
+}
+
+#[tokio::test]
+async fn sidebar_paginates_more_than_two_hundred_visible_root_children() {
+    let (state, _temp_dir) = test_state().await;
+    grant_writer_roots(&state.db).await;
+    let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
+        .await
+        .expect("root");
+    sqlx::query(
+        r"
+        WITH RECURSIVE numbers(value) AS (
+            VALUES (1)
+            UNION ALL
+            SELECT value + 1 FROM numbers WHERE value < 205
+        )
+        INSERT INTO folders (root_key, parent_id, name, is_root)
+        SELECT 'vault', ?, printf('Visible-%03d', value), 0
+        FROM numbers
+        ",
+    )
+    .bind(root.id)
+    .execute(&state.db)
+    .await
+    .expect("visible folders");
+    let app = http::router(state);
+
+    let first = app
+        .clone()
+        .oneshot(authed_get("/api/folders/sidebar", "writer", "writers"))
+        .await
+        .expect("first sidebar page");
+    assert_eq!(first.status(), StatusCode::OK);
+    let first_json = response_json(first).await;
+    let cursor = first_json["next_cursor"].as_str().expect("sidebar cursor");
+    let first_children = first_json["folder_children"][""]
+        .as_array()
+        .expect("first children");
+    assert_eq!(first_children.len(), 200);
+
+    let second = app
+        .clone()
+        .oneshot(authed_get(
+            &format!("/api/folders/sidebar?cursor={cursor}"),
+            "writer",
+            "writers",
+        ))
+        .await
+        .expect("second sidebar page");
+    assert_eq!(second.status(), StatusCode::OK);
+    let second_json = response_json(second).await;
+    let second_children = second_json["folder_children"][""]
+        .as_array()
+        .expect("second children");
+    assert_eq!(second_children.len(), 5);
+    assert!(second_json.get("next_cursor").is_none());
+    let names = first_children
+        .iter()
+        .chain(second_children)
+        .map(|value| value.as_str().expect("folder name"))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(names.len(), 205);
+    assert!(names.contains("Visible-001"));
+    assert!(names.contains("Visible-205"));
+
+    let invalid = app
+        .oneshot(authed_get(
+            "/api/folders/sidebar?cursor=not-a-cursor",
+            "writer",
+            "writers",
+        ))
+        .await
+        .expect("invalid sidebar cursor");
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+    let invalid_json = response_json(invalid).await;
+    assert_eq!(invalid_json["detail"], "Invalid sidebar cursor");
+}
+
+#[tokio::test]
 async fn sidebar_root_children_use_python_path_sorting() {
     let (state, _temp_dir) = test_state().await;
     grant_writer_roots(&state.db).await;
@@ -836,6 +987,339 @@ async fn folder_contents_recursive_scope_only_expands_search_results() {
 }
 
 #[tokio::test]
+async fn folder_contents_paginates_visible_recursive_results_without_gaps_or_duplicates() {
+    let (state, _temp_dir) = test_state().await;
+    let viewers = create_group(&state.db, "viewers").await;
+    let restricted = create_group(&state.db, "restricted").await;
+    let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
+        .await
+        .expect("root");
+    add_folder_permission(&state.db, root.id, viewers, true, true, false)
+        .await
+        .expect("viewer root");
+    let project = get_or_create_folder_path(&state.db, Some("Project"))
+        .await
+        .expect("project");
+
+    let mut expected_folder_ids = BTreeSet::new();
+    let mut expected_document_ids = BTreeSet::new();
+    for index in 0..5 {
+        let folder =
+            get_or_create_folder_path(&state.db, Some(&format!("Project/needle-visible-{index}")))
+                .await
+                .expect("visible folder");
+        expected_folder_ids.insert(folder.id);
+        expected_document_ids.insert(
+            insert_document(
+                &state.db,
+                folder.id,
+                &format!("needle-document-{index}.txt"),
+            )
+            .await,
+        );
+    }
+
+    let hidden = get_or_create_folder_path(&state.db, Some("Project/needle-hidden"))
+        .await
+        .expect("hidden folder");
+    add_folder_permission(&state.db, hidden.id, restricted, true, true, false)
+        .await
+        .expect("hidden ACL boundary");
+    let hidden_leaf =
+        get_or_create_folder_path(&state.db, Some("Project/needle-hidden/needle-deep"))
+            .await
+            .expect("hidden descendant");
+    let hidden_document =
+        insert_document(&state.db, hidden_leaf.id, "needle-secret-document.txt").await;
+    let hidden_folder_ids = BTreeSet::from([hidden.id, hidden_leaf.id]);
+
+    let app = http::router(state);
+    let mut cursor = None;
+    let mut seen_cursors = BTreeSet::new();
+    let mut actual_folder_ids = BTreeSet::new();
+    let mut actual_document_ids = BTreeSet::new();
+
+    for _ in 0..10 {
+        let mut uri =
+            "/api/folders/contents?folder=Project&q=needle&recursive=true&limit=2".to_string();
+        if let Some(value) = cursor.as_deref() {
+            uri.push_str("&cursor=");
+            uri.push_str(value);
+        }
+        let response = app
+            .clone()
+            .oneshot(authed_get(&uri, "viewer", "viewers"))
+            .await
+            .expect("contents page");
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        let folders = payload["folders"].as_array().expect("folders");
+        let documents = payload["documents"].as_array().expect("documents");
+        assert!(folders.len() <= 2);
+        assert!(documents.len() <= 2);
+
+        for row in folders {
+            let id = row["id"].as_i64().expect("folder id");
+            assert!(!hidden_folder_ids.contains(&id), "hidden folder leaked");
+            assert!(actual_folder_ids.insert(id), "duplicate folder {id}");
+        }
+        for row in documents {
+            let id = row["id"].as_i64().expect("document id");
+            assert_ne!(id, hidden_document, "hidden document leaked");
+            assert!(actual_document_ids.insert(id), "duplicate document {id}");
+        }
+
+        let Some(next_cursor) = payload.get("next_cursor").and_then(Value::as_str) else {
+            cursor = None;
+            break;
+        };
+        assert!(
+            seen_cursors.insert(next_cursor.to_string()),
+            "pagination cursor repeated"
+        );
+        cursor = Some(next_cursor.to_string());
+    }
+
+    assert!(cursor.is_none(), "pagination did not terminate");
+    assert_eq!(actual_folder_ids, expected_folder_ids);
+    assert_eq!(actual_document_ids, expected_document_ids);
+    assert!(!actual_folder_ids.contains(&project.id));
+}
+
+#[tokio::test]
+async fn recursive_search_does_not_double_count_overlapping_folder_summaries() {
+    let (state, _temp_dir) = test_state().await;
+    grant_writer_roots(&state.db).await;
+    let parent = get_or_create_folder_path(&state.db, Some("Project/needle-parent"))
+        .await
+        .expect("parent");
+    let child = get_or_create_folder_path(&state.db, Some("Project/needle-parent/needle-child"))
+        .await
+        .expect("child");
+    insert_versioned_document_at(
+        &state.db,
+        parent.id,
+        "parent.txt",
+        "2026-01-01T00:00:00Z",
+        "Parent Author",
+    )
+    .await;
+    insert_versioned_document_at(
+        &state.db,
+        child.id,
+        "child.txt",
+        "2026-01-02T00:00:00Z",
+        "Child Author",
+    )
+    .await;
+
+    let response = http::router(state)
+        .oneshot(authed_get(
+            "/api/folders/contents?folder=Project&q=needle&recursive=true",
+            "writer",
+            "writers",
+        ))
+        .await
+        .expect("recursive contents");
+    let status = response.status();
+    let payload = response_json(response).await;
+    let rows = payload["folders"].as_array().expect("folders");
+    let parent_row = rows
+        .iter()
+        .find(|row| row["id"] == parent.id)
+        .expect("parent row");
+    let child_row = rows
+        .iter()
+        .find(|row| row["id"] == child.id)
+        .expect("child row");
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(parent_row["size_bytes"], 12);
+    assert_eq!(parent_row["latest_by"], "Child Author");
+    assert_eq!(child_row["size_bytes"], 6);
+}
+
+#[tokio::test]
+async fn folder_summaries_exclude_hidden_descendants_and_include_deeper_reopened_grants() {
+    let (state, _temp_dir) = test_state().await;
+    let readers = create_group(&state.db, "readers").await;
+    let confidential = create_group(&state.db, "confidential").await;
+    let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
+        .await
+        .expect("root");
+    add_folder_permission(&state.db, root.id, readers, true, true, false)
+        .await
+        .expect("reader root");
+    let container = get_or_create_folder_path(&state.db, Some("Project/Container"))
+        .await
+        .expect("container");
+    let hidden = get_or_create_folder_path(&state.db, Some("Project/Container/Hidden"))
+        .await
+        .expect("hidden");
+    let reopened = get_or_create_folder_path(&state.db, Some("Project/Container/Hidden/Reopened"))
+        .await
+        .expect("reopened");
+    add_folder_permission(&state.db, hidden.id, confidential, true, true, false)
+        .await
+        .expect("hidden boundary");
+    add_folder_permission(&state.db, reopened.id, readers, true, true, false)
+        .await
+        .expect("reopened boundary");
+    insert_versioned_document_at(
+        &state.db,
+        container.id,
+        "container.txt",
+        "2026-01-01T00:00:00Z",
+        "Container Author",
+    )
+    .await;
+    insert_versioned_document_at(
+        &state.db,
+        hidden.id,
+        "hidden.txt",
+        "2026-01-03T00:00:00Z",
+        "Hidden Author",
+    )
+    .await;
+    insert_versioned_document_at(
+        &state.db,
+        reopened.id,
+        "reopened.txt",
+        "2026-01-02T00:00:00Z",
+        "Reopened Author",
+    )
+    .await;
+
+    let response = http::router(state)
+        .oneshot(authed_get(
+            "/api/folders/contents?folder=Project",
+            "reader",
+            "readers",
+        ))
+        .await
+        .expect("contents");
+    let status = response.status();
+    let payload = response_json(response).await;
+    let container_row = payload["folders"]
+        .as_array()
+        .expect("folders")
+        .iter()
+        .find(|row| row["id"] == container.id)
+        .expect("container row");
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(container_row["size_bytes"], 12);
+    assert_eq!(container_row["latest_by"], "Reopened Author");
+    assert_eq!(container_row["modified_at"], "2026-01-02T00:00:00+00:00");
+}
+
+#[tokio::test]
+async fn folder_contents_cursor_is_bound_to_scope_and_rejects_malformed_values() {
+    let (state, _temp_dir) = test_state().await;
+    grant_writer_roots(&state.db).await;
+    let project = get_or_create_folder_path(&state.db, Some("Project"))
+        .await
+        .expect("project");
+    get_or_create_folder_path(&state.db, Some("Project/needle-one"))
+        .await
+        .expect("first child");
+    get_or_create_folder_path(&state.db, Some("Project/needle-two"))
+        .await
+        .expect("second child");
+    insert_document(&state.db, project.id, "needle-one.txt").await;
+    insert_document(&state.db, project.id, "needle-two.txt").await;
+    get_or_create_folder_path(&state.db, Some("Elsewhere"))
+        .await
+        .expect("elsewhere");
+    let app = http::router(state);
+
+    let first_page = app
+        .clone()
+        .oneshot(authed_get(
+            "/api/folders/contents?folder=Project&q=needle&recursive=true&limit=1",
+            "writer",
+            "writers",
+        ))
+        .await
+        .expect("first page");
+    assert_eq!(first_page.status(), StatusCode::OK);
+    let first_payload = response_json(first_page).await;
+    let cursor = first_payload["next_cursor"].as_str().expect("next cursor");
+
+    let invalid_requests = [
+        format!(
+            "/api/folders/contents?folder=Elsewhere&q=needle&recursive=true&limit=1&cursor={cursor}"
+        ),
+        format!(
+            "/api/folders/contents?folder=Project&q=other&recursive=true&limit=1&cursor={cursor}"
+        ),
+        format!(
+            "/api/folders/contents?folder=Project&q=needle&recursive=false&limit=1&cursor={cursor}"
+        ),
+        "/api/folders/contents?folder=Project&q=needle&recursive=true&limit=1&cursor=definitely-not-json"
+            .to_string(),
+    ];
+    for uri in invalid_requests {
+        let response = app
+            .clone()
+            .oneshot(authed_get(&uri, "writer", "writers"))
+            .await
+            .expect("invalid cursor response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+        let payload = response_json(response).await;
+        assert_eq!(payload["detail"], "Invalid contents cursor", "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn folder_contents_ignores_inconsistent_documents_outside_the_requested_scope() {
+    let (state, _temp_dir) = test_state().await;
+    let readers = create_group(&state.db, "readers").await;
+    let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
+        .await
+        .expect("root");
+    add_folder_permission(&state.db, root.id, readers, true, true, false)
+        .await
+        .expect("reader root");
+    let project = get_or_create_folder_path(&state.db, Some("Project"))
+        .await
+        .expect("project");
+    let sibling = get_or_create_folder_path(&state.db, Some("Sibling"))
+        .await
+        .expect("sibling");
+    let target_document = insert_document(&state.db, project.id, "target.txt").await;
+    let corrupt = insert_versioned_document_at(
+        &state.db,
+        sibling.id,
+        "corrupt-sibling.txt",
+        "2026-06-26T18:00:00Z",
+        "Author",
+    )
+    .await;
+    sqlx::query("UPDATE documents SET current_version_id = 'missing-version' WHERE id = ?")
+        .bind(corrupt)
+        .execute(&state.db)
+        .await
+        .expect("corrupt sibling current version pointer");
+    let app = http::router(state);
+
+    let response = app
+        .oneshot(authed_get(
+            "/api/folders/contents?folder=Project",
+            "reader",
+            "readers",
+        ))
+        .await
+        .expect("target contents");
+    let status = response.status();
+    let payload = response_json(response).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["documents"][0]["id"], target_document);
+    assert_eq!(payload["documents"].as_array().expect("documents").len(), 1);
+}
+
+#[tokio::test]
 async fn folder_contents_sort_and_search_use_python_unicode_lowercase() {
     let (state, _temp_dir) = test_state().await;
     grant_writer_roots(&state.db).await;
@@ -983,7 +1467,6 @@ async fn folder_contents_and_properties_default_to_vault_root() {
 
 struct PayloadShapeFixture {
     document_id: i64,
-    assets_id: i64,
 }
 
 async fn seed_payload_shape_fixture(state: &AppState) -> PayloadShapeFixture {
@@ -1024,17 +1507,19 @@ async fn seed_payload_shape_fixture(state: &AppState) -> PayloadShapeFixture {
         "Asset Author",
     )
     .await;
-    PayloadShapeFixture {
-        document_id,
-        assets_id: assets.id,
-    }
+    PayloadShapeFixture { document_id }
 }
 
-fn assert_sidebar_payload_shape(sidebar_json: &Value, assets_id: i64) {
+fn assert_sidebar_payload_shape(sidebar_json: &Value) {
     assert_object_keys(sidebar_json, &["folder_children", "folder_metadata"]);
     assert_eq!(sidebar_json["folder_children"][""], json!(["Project"]));
     assert_eq!(sidebar_json["folder_children"]["Archive"], json!([]));
-    let metadata = &sidebar_json["folder_metadata"]["Project/Assets"];
+    assert!(
+        sidebar_json["folder_metadata"]
+            .get("Project/Assets")
+            .is_none()
+    );
+    let metadata = &sidebar_json["folder_metadata"]["Project"];
     assert_object_keys(
         metadata,
         &[
@@ -1051,13 +1536,13 @@ fn assert_sidebar_payload_shape(sidebar_json: &Value, assets_id: i64) {
         ],
     );
     assert_object_keys(&metadata["access"], &["read", "visible", "write"]);
-    assert_eq!(metadata["color"], "#445566");
-    assert_eq!(metadata["icon"], "palette");
-    assert_eq!(metadata["default_ttl_days"], 14);
-    assert_eq!(metadata["default_ttl_action"], "archive");
-    assert_eq!(metadata["effective_ttl_days"], 14);
-    assert_eq!(metadata["effective_ttl_action"], "archive");
-    assert_eq!(metadata["effective_ttl_source_id"], assets_id);
+    assert_eq!(metadata["color"], "");
+    assert_eq!(metadata["icon"], "");
+    assert_eq!(metadata["default_ttl_days"], Value::Null);
+    assert_eq!(metadata["default_ttl_action"], "none");
+    assert_eq!(metadata["effective_ttl_days"], Value::Null);
+    assert_eq!(metadata["effective_ttl_action"], "none");
+    assert_eq!(metadata["effective_ttl_source_id"], Value::Null);
     assert_eq!(metadata["effective_ttl_inherited"], false);
     assert_eq!(
         metadata["access"],
@@ -1202,7 +1687,7 @@ async fn folder_sidebar_and_contents_payloads_expose_python_compatible_shape() {
 
     let sidebar_json = response_json(sidebar_response).await;
     let contents_json = response_json(contents_response).await;
-    assert_sidebar_payload_shape(&sidebar_json, fixture.assets_id);
+    assert_sidebar_payload_shape(&sidebar_json);
     assert_contents_payload_base(&contents_json);
     assert_folder_summary_payload_shape(&contents_json["folders"][0]);
     assert_document_row_payload_shape(&contents_json["documents"][0], fixture.document_id);

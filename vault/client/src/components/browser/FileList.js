@@ -160,7 +160,35 @@ function ContentsHeaderCell({
   );
 }
 
+function ContentsLoadMore({ hasMore, loading, onLoadMore }) {
+  if (!hasMore && !loading) {
+    return null;
+  }
+  return h(
+    "div",
+    {
+      "aria-live": "polite",
+      className: "contents-load-more",
+      onClick: (e) => e.stopPropagation(),
+      onMouseDown: (e) => e.stopPropagation(),
+    },
+    h(
+      "button",
+      {
+        "aria-busy": loading ? "true" : undefined,
+        "aria-label": loading ? "Loading more contents" : "Load more contents",
+        className: "btn secondary contents-load-more-button",
+        disabled: loading,
+        onClick: onLoadMore,
+        type: "button",
+      },
+      loading ? "Loading more…" : "Load more"
+    )
+  );
+}
+
 function fileListState({
+  contentsHasMore,
   contentsPending,
   contentsPendingEmptySearch,
   files,
@@ -177,7 +205,8 @@ function fileListState({
   const createDraft = draftInFolder && inlineFolderDraft.mode === "create";
   const hasRows = files.length > 0 || subfolders.length > 0 || createDraft;
   const searchActive = Boolean(searchQuery || recursiveSearch);
-  const emptyState = !hasRows && (!contentsPending || contentsPendingEmptySearch);
+  const emptyState =
+    !hasRows && !contentsHasMore && (!contentsPending || contentsPendingEmptySearch);
   const selectedSet = new Set(selectedKeys);
   const orderedKeys = orderedItems.map(itemSelectionKey);
   const selectedItems = orderedItems.filter((item) => selectedSet.has(itemSelectionKey(item)));
@@ -221,6 +250,8 @@ export function VaultFileList({
   recursiveSearch = false,
   contentsPending = false,
   contentsPendingEmptySearch = false,
+  contentsHasMore,
+  contentsLoadingMore,
   draggingId,
   draggingFolderPath,
   dropHint,
@@ -234,6 +265,7 @@ export function VaultFileList({
   onSortChange,
   onBackgroundClick,
   onMarqueeSelectionChange,
+  loadMoreContents,
   onOpenFile,
   onFileDragStart,
   onFileDragEnd,
@@ -275,6 +307,7 @@ export function VaultFileList({
     selectedSizeDisplay,
     visibleKeys,
   } = fileListState({
+    contentsHasMore,
     contentsPending,
     contentsPendingEmptySearch,
     files,
@@ -895,6 +928,12 @@ export function VaultFileList({
           ...orderedItems.map((item) =>
             item.type === "folder" ? renderFolderRow(item) : renderFileRow(item)
           ),
+          h(ContentsLoadMore, {
+            hasMore: contentsHasMore,
+            key: "contents-load-more",
+            loading: contentsLoadingMore,
+            onLoadMore: loadMoreContents,
+          }),
           emptyState ? h(EmptyState, { onUpload: onUploadClick, search: searchActive }) : null,
         ]
       ),

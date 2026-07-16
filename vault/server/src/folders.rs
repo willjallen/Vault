@@ -117,11 +117,14 @@ pub enum FolderError {
 }
 
 #[derive(Debug, FromRow)]
-struct PermissionRow {
-    can_view: bool,
-    can_read: bool,
-    can_write: bool,
-    group_name: String,
+struct FolderAccessRow {
+    request_id: i64,
+    target_found: bool,
+    broken_parent: bool,
+    can_view: Option<bool>,
+    can_read: Option<bool>,
+    can_write: Option<bool>,
+    group_name: Option<String>,
 }
 
 #[derive(Debug, FromRow)]
@@ -283,6 +286,107 @@ pub async fn get_folder_by_path(
         current = child;
     }
     Ok(Some(current))
+}
+
+/// Resolves a folder path without bootstrapping roots or issuing per-segment queries.
+pub async fn get_folder_by_path_read(
+    pool: &SqlitePool,
+    path: &str,
+) -> Result<Option<FolderRecord>, FolderError> {
+    let parsed = parse_public_folder_path(Some(path))?;
+    if parsed.root_key == ARCHIVE_ROOT_KEY && !parsed.relative_path.is_empty() {
+        return Ok(None);
+    }
+    let segments = if parsed.relative_path.is_empty() {
+        Vec::new()
+    } else {
+        parsed.relative_path.split('/').collect::<Vec<_>>()
+    };
+    Ok(sqlx::query_as::<_, FolderRecord>(
+        r"
+        WITH RECURSIVE
+        segments(depth, name) AS (
+            SELECT CAST(key AS INTEGER) + 1, value
+            FROM json_each(?)
+            WHERE type = 'text'
+        ),
+        resolved(
+            id,
+            root_key,
+            parent_id,
+            name,
+            is_root,
+            created_at,
+            created_by,
+            created_by_name,
+            color,
+            icon,
+            default_ttl_days,
+            default_ttl_action,
+            depth
+        ) AS (
+            SELECT
+                id,
+                root_key,
+                parent_id,
+                name,
+                is_root,
+                created_at,
+                created_by,
+                created_by_name,
+                color,
+                icon,
+                default_ttl_days,
+                default_ttl_action,
+                0
+            FROM folders
+            WHERE root_key = ? AND is_root = 1
+
+            UNION ALL
+
+            SELECT
+                child.id,
+                child.root_key,
+                child.parent_id,
+                child.name,
+                child.is_root,
+                child.created_at,
+                child.created_by,
+                child.created_by_name,
+                child.color,
+                child.icon,
+                child.default_ttl_days,
+                child.default_ttl_action,
+                resolved.depth + 1
+            FROM resolved
+            JOIN segments ON segments.depth = resolved.depth + 1
+            JOIN folders AS child
+              ON child.parent_id = resolved.id
+             AND child.name = segments.name
+             AND child.is_root = 0
+        )
+        SELECT
+            id,
+            root_key,
+            parent_id,
+            name,
+            is_root,
+            created_at,
+            created_by,
+            created_by_name,
+            color,
+            icon,
+            default_ttl_days,
+            default_ttl_action
+        FROM resolved
+        WHERE depth = (SELECT COUNT(*) FROM segments)
+        LIMIT 1
+        ",
+    )
+    .bind(sqlx::types::Json(segments))
+    .bind(&parsed.root_key)
+    .fetch_optional(pool)
+    .await?)
 }
 
 pub async fn get_or_create_folder_path(
@@ -760,38 +864,33 @@ pub async fn folder_access_level(
     folder_id: i64,
     user: &UserContext,
 ) -> Result<i64, FolderError> {
+    folder_access_levels(pool, &[folder_id], user)
+        .await?
+        .remove(&folder_id)
+        .ok_or_else(|| sqlx::Error::RowNotFound.into())
+}
+
+/// Resolves the effective access level for each existing folder in one query.
+///
+/// The first ancestor (including the folder itself) with any permission rows is
+/// the authorization boundary. A user who matches no group at that boundary is
+/// denied rather than inheriting permissions from a more distant ancestor.
+pub async fn folder_access_levels(
+    pool: &SqlitePool,
+    folder_ids: &[i64],
+    user: &UserContext,
+) -> Result<HashMap<i64, i64>, FolderError> {
     if user.is_admin {
-        return Ok(3);
+        return Ok(admin_access_levels(folder_ids));
     }
-    let groups = user_group_names(user);
-    let ancestor_ids = folder_ancestor_ids(pool, folder_id).await?;
-    for ancestor_id in ancestor_ids {
-        let rows = sqlx::query_as::<_, PermissionRow>(
-            r"
-            SELECT
-                fp.can_view,
-                fp.can_read,
-                fp.can_write,
-                vg.name AS group_name
-            FROM folder_permissions fp
-            JOIN vault_groups vg ON vg.id = fp.group_id
-            WHERE fp.folder_id = ?
-            ",
-        )
-        .bind(ancestor_id)
+    if folder_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows = sqlx::query_as::<_, FolderAccessRow>(folder_access_levels_sql())
+        .bind(sqlx::types::Json(folder_ids))
         .fetch_all(pool)
         .await?;
-        if rows.is_empty() {
-            continue;
-        }
-        return Ok(rows
-            .iter()
-            .filter(|row| groups.contains(&row.group_name.trim().to_ascii_lowercase()))
-            .map(|row| access_level(row.can_view, row.can_read, row.can_write))
-            .max()
-            .unwrap_or(0));
-    }
-    Ok(0)
+    Ok(access_levels_from_rows(rows, &user_group_names(user)))
 }
 
 pub(crate) async fn folder_access_level_in_tx(
@@ -799,38 +898,28 @@ pub(crate) async fn folder_access_level_in_tx(
     folder_id: i64,
     user: &UserContext,
 ) -> Result<i64, FolderError> {
+    folder_access_levels_in_tx(transaction, &[folder_id], user)
+        .await?
+        .remove(&folder_id)
+        .ok_or_else(|| sqlx::Error::RowNotFound.into())
+}
+
+pub(crate) async fn folder_access_levels_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    folder_ids: &[i64],
+    user: &UserContext,
+) -> Result<HashMap<i64, i64>, FolderError> {
     if user.is_admin {
-        return Ok(3);
+        return Ok(admin_access_levels(folder_ids));
     }
-    let groups = user_group_names(user);
-    let ancestor_ids = folder_ancestor_ids_in_tx(transaction, folder_id).await?;
-    for ancestor_id in ancestor_ids {
-        let rows = sqlx::query_as::<_, PermissionRow>(
-            r"
-            SELECT
-                fp.can_view,
-                fp.can_read,
-                fp.can_write,
-                vg.name AS group_name
-            FROM folder_permissions fp
-            JOIN vault_groups vg ON vg.id = fp.group_id
-            WHERE fp.folder_id = ?
-            ",
-        )
-        .bind(ancestor_id)
+    if folder_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows = sqlx::query_as::<_, FolderAccessRow>(folder_access_levels_sql())
+        .bind(sqlx::types::Json(folder_ids))
         .fetch_all(&mut **transaction)
         .await?;
-        if rows.is_empty() {
-            continue;
-        }
-        return Ok(rows
-            .iter()
-            .filter(|row| groups.contains(&row.group_name.trim().to_ascii_lowercase()))
-            .map(|row| access_level(row.can_view, row.can_read, row.can_write))
-            .max()
-            .unwrap_or(0));
-    }
-    Ok(0)
+    Ok(access_levels_from_rows(rows, &user_group_names(user)))
 }
 
 pub async fn nearest_existing_folder_for_path(
@@ -1113,39 +1202,6 @@ async fn get_or_create_folder_path_parts_in_tx(
         current = fetch_folder_by_id_in_tx(transaction, inserted.last_insert_rowid()).await?;
     }
     Ok(current)
-}
-
-async fn folder_ancestor_ids(pool: &SqlitePool, folder_id: i64) -> Result<Vec<i64>, FolderError> {
-    let mut ids = Vec::new();
-    let mut seen = HashSet::new();
-    let mut current_id = Some(folder_id);
-    while let Some(id) = current_id {
-        if !seen.insert(id) {
-            break;
-        }
-        let folder = fetch_folder_by_id(pool, id).await?;
-        ids.push(folder.id);
-        current_id = folder.parent_id;
-    }
-    Ok(ids)
-}
-
-async fn folder_ancestor_ids_in_tx(
-    transaction: &mut Transaction<'_, Sqlite>,
-    folder_id: i64,
-) -> Result<Vec<i64>, FolderError> {
-    let mut ids = Vec::new();
-    let mut seen = HashSet::new();
-    let mut current_id = Some(folder_id);
-    while let Some(id) = current_id {
-        if !seen.insert(id) {
-            break;
-        }
-        let folder = fetch_folder_by_id_in_tx(transaction, id).await?;
-        ids.push(folder.id);
-        current_id = folder.parent_id;
-    }
-    Ok(ids)
 }
 
 fn compute_folder_path(
@@ -1501,6 +1557,111 @@ fn user_group_names(user: &UserContext) -> HashSet<String> {
             if group.is_empty() { None } else { Some(group) }
         })
         .collect()
+}
+
+fn admin_access_levels(folder_ids: &[i64]) -> HashMap<i64, i64> {
+    folder_ids
+        .iter()
+        .copied()
+        .map(|folder_id| (folder_id, 3))
+        .collect()
+}
+
+fn access_levels_from_rows(
+    rows: Vec<FolderAccessRow>,
+    groups: &HashSet<String>,
+) -> HashMap<i64, i64> {
+    let mut levels = HashMap::new();
+    for row in rows {
+        if !row.target_found || row.broken_parent {
+            continue;
+        }
+        let level = levels.entry(row.request_id).or_insert(0);
+        let Some(group_name) = row.group_name else {
+            continue;
+        };
+        if !groups.contains(&group_name.trim().to_ascii_lowercase()) {
+            continue;
+        }
+        if let (Some(can_view), Some(can_read), Some(can_write)) =
+            (row.can_view, row.can_read, row.can_write)
+        {
+            *level = (*level).max(access_level(can_view, can_read, can_write));
+        }
+    }
+    levels
+}
+
+fn folder_access_levels_sql() -> &'static str {
+    r"
+    WITH RECURSIVE
+    requested(request_id) AS (
+        SELECT DISTINCT CAST(value AS INTEGER)
+        FROM json_each(?)
+        WHERE type = 'integer'
+    ),
+    ancestry(request_id, folder_id, parent_id, depth, visited) AS (
+        SELECT
+            requested.request_id,
+            folders.id,
+            folders.parent_id,
+            0,
+            ',' || folders.id || ','
+        FROM requested
+        JOIN folders ON folders.id = requested.request_id
+
+        UNION ALL
+
+        SELECT
+            ancestry.request_id,
+            parent.id,
+            parent.parent_id,
+            ancestry.depth + 1,
+            ancestry.visited || parent.id || ','
+        FROM ancestry
+        JOIN folders AS parent ON parent.id = ancestry.parent_id
+        WHERE instr(ancestry.visited, ',' || parent.id || ',') = 0
+    ),
+    boundary_depth(request_id, depth) AS (
+        SELECT ancestry.request_id, MIN(ancestry.depth)
+        FROM ancestry
+        WHERE EXISTS (
+            SELECT 1
+            FROM folder_permissions
+            WHERE folder_permissions.folder_id = ancestry.folder_id
+        )
+        GROUP BY ancestry.request_id
+    ),
+    boundaries(request_id, folder_id) AS (
+        SELECT ancestry.request_id, ancestry.folder_id
+        FROM ancestry
+        JOIN boundary_depth
+          ON boundary_depth.request_id = ancestry.request_id
+         AND boundary_depth.depth = ancestry.depth
+    ),
+    broken_parents(request_id) AS (
+        SELECT ancestry.request_id
+        FROM ancestry
+        LEFT JOIN folders AS parent ON parent.id = ancestry.parent_id
+        WHERE ancestry.parent_id IS NOT NULL
+          AND parent.id IS NULL
+        GROUP BY ancestry.request_id
+    )
+    SELECT
+        requested.request_id,
+        target.id IS NOT NULL AS target_found,
+        broken_parents.request_id IS NOT NULL AS broken_parent,
+        folder_permissions.can_view,
+        folder_permissions.can_read,
+        folder_permissions.can_write,
+        vault_groups.name AS group_name
+    FROM requested
+    LEFT JOIN folders AS target ON target.id = requested.request_id
+    LEFT JOIN boundaries ON boundaries.request_id = requested.request_id
+    LEFT JOIN broken_parents ON broken_parents.request_id = requested.request_id
+    LEFT JOIN folder_permissions ON folder_permissions.folder_id = boundaries.folder_id
+    LEFT JOIN vault_groups ON vault_groups.id = folder_permissions.group_id
+    "
 }
 
 fn root_name(root_key: &str) -> Result<&'static str, FolderError> {

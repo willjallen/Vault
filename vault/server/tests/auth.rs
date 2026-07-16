@@ -1,10 +1,13 @@
+use std::collections::BTreeSet;
+
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Map, Value, json};
 use sqlx::Row;
 use vault_server::auth::{
-    AuthError, AuthSettings, SessionSecretRequirement, SessionSecretSource, UserContext,
-    cookie_value, folder_permission_count_for_group, header_identity, oidc_token_urlsafe,
-    session_identity, sign_session_payload, split_groups, verify_session_payload,
+    AuthError, AuthMode, AuthSettings, SessionSecretRequirement, SessionSecretSource, UserContext,
+    cookie_value, effective_admin_from_parts, folder_permission_count_for_group, header_identity,
+    oidc_identity, oidc_token_urlsafe, session_identity, sign_session_payload, split_groups,
+    verify_session_payload,
 };
 use vault_server::db;
 
@@ -159,6 +162,153 @@ async fn bootstrap_admin_email_grants_effective_admin_without_persisting_admin_f
             .await
             .expect("stored user");
     assert_eq!(stored_admin, 0);
+}
+
+#[test]
+fn oidc_bootstrap_admin_subject_is_exact_and_bound_to_the_configured_issuer() {
+    let settings = AuthSettings {
+        bootstrap_admin_emails: ["owner@example.com".to_string()].into_iter().collect(),
+        mode: AuthMode::Oidc,
+        oidc_bootstrap_admin_subjects: ["Kevin".to_string()].into_iter().collect(),
+        oidc_issuer: "https://issuer.example.com".to_string(),
+        ..AuthSettings::default()
+    };
+
+    assert!(effective_admin_from_parts(
+        &settings,
+        false,
+        "https://issuer.example.com",
+        "Kevin",
+        None,
+        &[],
+    ));
+    assert!(!effective_admin_from_parts(
+        &settings,
+        false,
+        "https://issuer.example.com",
+        "kevin",
+        Some("owner@example.com"),
+        &[],
+    ));
+    assert!(!effective_admin_from_parts(
+        &settings,
+        false,
+        "https://issuer.example.com",
+        " Kevin",
+        None,
+        &[],
+    ));
+    assert!(!effective_admin_from_parts(
+        &settings,
+        false,
+        "https://other.example.com",
+        "Kevin",
+        Some("owner@example.com"),
+        &[],
+    ));
+
+    let header_settings = AuthSettings {
+        mode: AuthMode::Headers,
+        oidc_bootstrap_admin_subjects: ["Kevin".to_string()].into_iter().collect(),
+        oidc_issuer: "https://issuer.example.com".to_string(),
+        ..AuthSettings::default()
+    };
+    assert!(!effective_admin_from_parts(
+        &header_settings,
+        false,
+        "headers",
+        "Kevin",
+        None,
+        &[],
+    ));
+    let dev_settings = AuthSettings {
+        mode: AuthMode::Dev,
+        oidc_bootstrap_admin_subjects: ["Kevin".to_string()].into_iter().collect(),
+        oidc_issuer: "https://issuer.example.com".to_string(),
+        ..AuthSettings::default()
+    };
+    assert!(!effective_admin_from_parts(
+        &dev_settings,
+        false,
+        "dev",
+        "Kevin",
+        None,
+        &[],
+    ));
+}
+
+#[tokio::test]
+async fn legacy_oidc_email_does_not_grant_bootstrap_admin_to_an_existing_session() {
+    let pool = test_pool().await;
+    let settings = AuthSettings {
+        bootstrap_admin_emails: ["owner@example.com".to_string()].into_iter().collect(),
+        mode: AuthMode::Oidc,
+        oidc_issuer: "https://issuer.example.com".to_string(),
+        session_secret: "legacy-session-test-secret".to_string(),
+        ..AuthSettings::default()
+    };
+    sqlx::query(
+        r"
+        INSERT INTO vault_users (issuer, subject, email, name, is_admin, is_active)
+        VALUES ('https://issuer.example.com', 'legacy', 'owner@example.com', 'Legacy', 0, 1)
+        ",
+    )
+    .execute(&pool)
+    .await
+    .expect("legacy OIDC user");
+    let session = sign_session_payload(
+        &settings,
+        &Map::from_iter([
+            ("uid".to_string(), json!(1)),
+            ("exp".to_string(), json!(4_102_444_800_i64)),
+        ]),
+    )
+    .expect("session");
+
+    let user = session_identity(
+        &settings,
+        &pool,
+        Some(&format!("{}={session}", settings.session_cookie_name)),
+    )
+    .await
+    .expect("session lookup")
+    .expect("user");
+
+    assert!(!user.is_admin);
+}
+
+#[tokio::test]
+async fn oidc_relogin_without_a_verified_email_preserves_the_existing_profile_email() {
+    let pool = test_pool().await;
+    let settings = AuthSettings {
+        mode: AuthMode::Oidc,
+        oidc_issuer: "https://issuer.example.com".to_string(),
+        ..AuthSettings::default()
+    };
+    let groups = BTreeSet::default();
+    oidc_identity(
+        &settings,
+        &pool,
+        "subject",
+        Some("verified@example.com"),
+        Some("Verified User"),
+        &groups,
+    )
+    .await
+    .expect("initial identity");
+
+    let user = oidc_identity(
+        &settings,
+        &pool,
+        "subject",
+        None,
+        Some("Verified User"),
+        &groups,
+    )
+    .await
+    .expect("relogin identity");
+
+    assert_eq!(user.email, "verified@example.com");
 }
 
 #[tokio::test]
@@ -539,8 +689,10 @@ fn runtime_validation_rejects_insecure_production_urls() {
 #[test]
 fn runtime_validation_rejects_incomplete_or_insecure_oidc_config() {
     let settings = AuthSettings {
+        bootstrap_admin_emails: ["owner@example.com".to_string()].into_iter().collect(),
         mode: vault_server::auth::AuthMode::Oidc,
         auth_mode_raw: "oidc".to_string(),
+        header_auth_issuer: "http://idp.example.com".to_string(),
         oidc_issuer: "http://idp.example.com".to_string(),
         oidc_client_id: String::new(),
         oidc_client_secret: String::new(),
@@ -556,6 +708,13 @@ fn runtime_validation_rejects_incomplete_or_insecure_oidc_config() {
         .to_string();
 
     assert!(error.contains("VAULT_OIDC_ISSUER must use https outside local development"));
+    assert!(error.contains(
+        "VAULT_BOOTSTRAP_ADMIN_EMAILS does not apply to OIDC; use VAULT_OIDC_BOOTSTRAP_ADMIN_SUBJECTS"
+    ));
+    assert!(
+        error
+            .contains("VAULT_OIDC_ISSUER must differ from header and development identity issuers")
+    );
     assert!(error.contains("VAULT_OIDC_CLIENT_ID is required when VAULT_AUTH_MODE=oidc"));
     assert!(
         error.contains("VAULT_OIDC_CLIENT_SECRET is required for confidential OIDC client auth")

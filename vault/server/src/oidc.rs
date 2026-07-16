@@ -115,6 +115,8 @@ pub async fn complete_callback(
         exchange_code_for_token(auth, &discovery, request.code, request.redirect_uri).await?;
     let id_token = string_claim(&token, "id_token").ok_or(OidcError::MissingIdToken)?;
     let mut identity = verified_id_claims(auth, &discovery, &id_token, &nonce).await?;
+    let subject = subject_claim(&identity).ok_or(AuthError::MissingSubject)?;
+    let id_token_email = verified_email_claim(&identity, &auth.oidc_email_claim);
     let userinfo = userinfo(
         auth,
         &discovery,
@@ -123,14 +125,18 @@ pub async fn complete_callback(
             .unwrap_or_default(),
     )
     .await?;
-    if !userinfo.is_empty() && userinfo.get("sub") != identity.get("sub") {
-        return Err(OidcError::UserinfoSubjectMismatch);
+    if !userinfo.is_empty() {
+        let userinfo_subject =
+            subject_claim(&userinfo).ok_or(OidcError::UserinfoSubjectMismatch)?;
+        if userinfo_subject != subject {
+            return Err(OidcError::UserinfoSubjectMismatch);
+        }
     }
+    let email = verified_email_claim(&userinfo, &auth.oidc_email_claim).or(id_token_email);
     identity.extend(userinfo);
+    identity.insert("sub".to_string(), Value::String(subject.clone()));
 
-    let subject = string_claim(&identity, "sub").ok_or(AuthError::MissingSubject)?;
     let groups = groups_from_claim(identity.get(&auth.oidc_groups_claim));
-    let email = string_claim(&identity, &auth.oidc_email_claim);
     let name = string_claim(&identity, &auth.oidc_name_claim)
         .or_else(|| string_claim(&identity, &auth.oidc_username_claim))
         .or_else(|| email.clone())
@@ -255,13 +261,13 @@ async fn verified_id_claims(
             continue;
         };
         let claims = token.claims;
-        if string_claim(&claims, "iss").as_deref() != Some(auth.oidc_issuer.as_str()) {
+        if exact_string_claim(&claims, "iss").as_deref() != Some(auth.oidc_issuer.as_str()) {
             continue;
         }
         if !audience_matches(claims.get("aud"), &auth.oidc_client_id) {
             continue;
         }
-        if string_claim(&claims, "nonce").as_deref() != Some(nonce) {
+        if exact_string_claim(&claims, "nonce").as_deref() != Some(nonce) {
             continue;
         }
         return Ok(claims);
@@ -407,6 +413,31 @@ fn string_claim(claims: &Map<String, Value>, name: &str) -> Option<String> {
             let value = value.trim().to_string();
             (!value.is_empty()).then_some(value)
         })
+}
+
+fn strict_string_claim(claims: &Map<String, Value>, name: &str) -> Option<String> {
+    claims.get(name).and_then(Value::as_str).and_then(|value| {
+        let value = value.trim().to_string();
+        (!value.is_empty()).then_some(value)
+    })
+}
+
+fn subject_claim(claims: &Map<String, Value>) -> Option<String> {
+    exact_string_claim(claims, "sub")
+}
+
+fn exact_string_claim(claims: &Map<String, Value>, name: &str) -> Option<String> {
+    claims
+        .get(name)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn verified_email_claim(claims: &Map<String, Value>, email_claim: &str) -> Option<String> {
+    (claims.get("email_verified") == Some(&Value::Bool(true)))
+        .then(|| strict_string_claim(claims, email_claim))
+        .flatten()
 }
 
 fn value_to_string(value: &Value) -> Option<String> {

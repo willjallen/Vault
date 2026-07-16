@@ -341,18 +341,32 @@ async fn mock_userinfo(AxumState(state): AxumState<MockProviderState>) -> AxumJs
 }
 
 fn signed_id_token(issuer: &str, nonce: &str) -> String {
+    signed_id_token_with_profile(
+        issuer,
+        nonce,
+        &json!({
+            "email": "claims@example.com",
+            "email_verified": true,
+            "name": "Claims Name",
+            "groups": ["claims-group"],
+        }),
+    )
+}
+
+fn signed_id_token_with_profile(issuer: &str, nonce: &str, profile: &Value) -> String {
     let expires_at = unix_timestamp_now() + 600;
-    let claims = json!({
+    let mut claims = json!({
         "iss": issuer,
         "sub": "kevin",
         "aud": "vault-client",
         "exp": expires_at,
         "iat": expires_at - 60,
         "nonce": nonce,
-        "email": "claims@example.com",
-        "name": "Claims Name",
-        "groups": ["claims-group"],
-    });
+    })
+    .as_object()
+    .expect("base claims")
+    .clone();
+    claims.extend(profile.as_object().expect("profile claims object").clone());
     let mut header = Header::new(Algorithm::RS256);
     header.kid = Some("test-key".to_string());
     encode(
@@ -374,6 +388,18 @@ fn signed_state_cookie(auth: &AuthSettings, state: &str, nonce: &str, rd: &str) 
 
 fn callback_request(uri: &str, auth: &AuthSettings, state_cookie: &str) -> Request<Body> {
     callback_request_with_headers(uri, auth, state_cookie, &[])
+}
+
+fn session_request(uri: &str, auth: &AuthSettings, session_cookie: &str) -> Request<Body> {
+    Request::builder()
+        .method(Method::GET)
+        .uri(uri)
+        .header(
+            header::COOKIE,
+            format!("{}={session_cookie}", auth.session_cookie_name),
+        )
+        .body(Body::empty())
+        .expect("session request")
 }
 
 fn callback_request_with_headers(
@@ -865,6 +891,7 @@ async fn oidc_callback_verifies_provider_token_syncs_user_and_sets_session_cooki
         json!({
             "sub": "kevin",
             "email": "kevin@example.com",
+            "email_verified": true,
             "name": "Kevin Chien",
             "groups": ["vault-admin", "artists"],
         }),
@@ -933,6 +960,277 @@ async fn oidc_callback_verifies_provider_token_syncs_user_and_sets_session_cooki
     );
     assert!(token_requests[0].body.contains("code=auth-code"));
     assert!(token_requests[0].body.contains("client_id=vault-client"));
+}
+
+#[tokio::test]
+async fn oidc_callback_rejects_non_boolean_email_verification_as_an_admin_credential() {
+    let profiles = [
+        (
+            "missing",
+            json!({"email": "owner@example.com", "groups": ["artists"]}),
+        ),
+        (
+            "false",
+            json!({
+                "email": "owner@example.com",
+                "email_verified": false,
+                "groups": ["artists"]
+            }),
+        ),
+        (
+            "string",
+            json!({
+                "email": "owner@example.com",
+                "email_verified": "true",
+                "groups": ["artists"]
+            }),
+        ),
+        (
+            "number",
+            json!({
+                "email": "owner@example.com",
+                "email_verified": 1,
+                "groups": ["artists"]
+            }),
+        ),
+    ];
+
+    for (label, profile) in profiles {
+        let provider =
+            start_mock_provider_with_token_response(json!({"sub": "kevin"}), move |issuer| {
+                json!({
+                    "id_token": signed_id_token_with_profile(issuer, "nonce-123", &profile),
+                    "access_token": "access-token",
+                })
+            })
+            .await;
+        let mut auth = oidc_provider_auth(&provider.issuer);
+        auth.bootstrap_admin_emails = ["owner@example.com".to_string()].into_iter().collect();
+        let state_cookie = signed_state_cookie(&auth, "state-123", "nonce-123", "/");
+        let (state, _temp_dir) = test_state(auth.clone()).await;
+        let db = state.db.clone();
+        let app = http::router(state);
+
+        let callback = app
+            .clone()
+            .oneshot(callback_request(
+                "/auth/callback?code=auth-code&state=state-123",
+                &auth,
+                &state_cookie,
+            ))
+            .await
+            .expect("callback");
+        assert_eq!(callback.status(), StatusCode::SEE_OTHER, "{label}");
+        let session_cookie = set_cookie_value(&callback, &auth.session_cookie_name);
+        let bootstrap = app
+            .oneshot(session_request("/api/bootstrap", &auth, &session_cookie))
+            .await
+            .expect("bootstrap");
+        let bootstrap_json = response_json(bootstrap).await;
+        let email: Option<String> =
+            sqlx::query_scalar("SELECT email FROM vault_users WHERE subject = 'kevin'")
+                .fetch_one(&db)
+                .await
+                .expect("stored email");
+
+        assert_eq!(email, None, "{label}");
+        assert_eq!(bootstrap_json["user"]["is_admin"], false, "{label}");
+    }
+}
+
+#[tokio::test]
+async fn oidc_callback_does_not_splice_or_override_verified_email_claims() {
+    let provider = start_mock_provider(
+        "nonce-123",
+        json!({
+            "sub": "kevin",
+            "email": "owner@example.com",
+            "email_verified": false,
+            "groups": ["artists"],
+        }),
+    )
+    .await;
+    let mut auth = oidc_provider_auth(&provider.issuer);
+    auth.bootstrap_admin_emails = ["owner@example.com".to_string()].into_iter().collect();
+    let state_cookie = signed_state_cookie(&auth, "state-123", "nonce-123", "/");
+    let (state, _temp_dir) = test_state(auth.clone()).await;
+    let db = state.db.clone();
+    let app = http::router(state);
+
+    let callback = app
+        .clone()
+        .oneshot(callback_request(
+            "/auth/callback?code=auth-code&state=state-123",
+            &auth,
+            &state_cookie,
+        ))
+        .await
+        .expect("callback");
+    assert_eq!(callback.status(), StatusCode::SEE_OTHER);
+    let session_cookie = set_cookie_value(&callback, &auth.session_cookie_name);
+    let bootstrap = app
+        .oneshot(session_request("/api/bootstrap", &auth, &session_cookie))
+        .await
+        .expect("bootstrap");
+    let bootstrap_json = response_json(bootstrap).await;
+    let email: String = sqlx::query_scalar("SELECT email FROM vault_users WHERE subject = 'kevin'")
+        .fetch_one(&db)
+        .await
+        .expect("stored email");
+
+    assert_eq!(email, "claims@example.com");
+    assert_eq!(bootstrap_json["user"]["is_admin"], false);
+
+    let cross_source_provider = start_mock_provider_with_token_response(
+        json!({"sub": "kevin", "email_verified": true}),
+        |issuer| {
+            json!({
+                "id_token": signed_id_token_with_profile(
+                    issuer,
+                    "nonce-456",
+                    &json!({"email": "owner@example.com", "groups": ["artists"]}),
+                ),
+                "access_token": "access-token",
+            })
+        },
+    )
+    .await;
+    let cross_auth = oidc_provider_auth(&cross_source_provider.issuer);
+    let cross_state_cookie = signed_state_cookie(&cross_auth, "state-456", "nonce-456", "/");
+    let (cross_state, _cross_temp_dir) = test_state(cross_auth.clone()).await;
+    let cross_db = cross_state.db.clone();
+    let cross_response = http::router(cross_state)
+        .oneshot(callback_request(
+            "/auth/callback?code=auth-code&state=state-456",
+            &cross_auth,
+            &cross_state_cookie,
+        ))
+        .await
+        .expect("cross-source callback");
+    let cross_email: Option<String> =
+        sqlx::query_scalar("SELECT email FROM vault_users WHERE subject = 'kevin'")
+            .fetch_one(&cross_db)
+            .await
+            .expect("cross-source email");
+
+    assert_eq!(cross_response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(cross_email, None);
+}
+
+#[tokio::test]
+async fn oidc_bootstrap_admin_subject_grants_admin_without_persisting_an_admin_flag() {
+    let provider =
+        start_mock_provider("nonce-123", json!({"sub": "kevin", "groups": ["artists"]})).await;
+    let mut auth = oidc_provider_auth(&provider.issuer);
+    auth.oidc_bootstrap_admin_subjects = ["kevin".to_string()].into_iter().collect();
+    let state_cookie = signed_state_cookie(&auth, "state-123", "nonce-123", "/");
+    let (state, _temp_dir) = test_state(auth.clone()).await;
+    let db = state.db.clone();
+    let app = http::router(state);
+
+    let callback = app
+        .clone()
+        .oneshot(callback_request(
+            "/auth/callback?code=auth-code&state=state-123",
+            &auth,
+            &state_cookie,
+        ))
+        .await
+        .expect("callback");
+    assert_eq!(callback.status(), StatusCode::SEE_OTHER);
+    let session_cookie = set_cookie_value(&callback, &auth.session_cookie_name);
+    let directory = app
+        .oneshot(session_request(
+            "/api/admin/directory",
+            &auth,
+            &session_cookie,
+        ))
+        .await
+        .expect("admin directory");
+    let stored_admin: i64 =
+        sqlx::query_scalar("SELECT is_admin FROM vault_users WHERE subject = 'kevin'")
+            .fetch_one(&db)
+            .await
+            .expect("stored admin flag");
+
+    assert_eq!(directory.status(), StatusCode::OK);
+    assert_eq!(stored_admin, 0);
+}
+
+#[tokio::test]
+async fn oidc_bootstrap_subject_preserves_whitespace_as_part_of_the_opaque_identifier() {
+    let provider = start_mock_provider_with_token_response(
+        json!({"sub": " kevin ", "groups": ["artists"]}),
+        |issuer| {
+            json!({
+                "id_token": signed_id_token_with_profile(
+                    issuer,
+                    "nonce-123",
+                    &json!({"sub": " kevin ", "groups": ["artists"]}),
+                ),
+                "access_token": "access-token",
+            })
+        },
+    )
+    .await;
+    let mut auth = oidc_provider_auth(&provider.issuer);
+    auth.oidc_bootstrap_admin_subjects = ["kevin".to_string()].into_iter().collect();
+    let state_cookie = signed_state_cookie(&auth, "state-123", "nonce-123", "/");
+    let (state, _temp_dir) = test_state(auth.clone()).await;
+    let app = http::router(state);
+
+    let callback = app
+        .clone()
+        .oneshot(callback_request(
+            "/auth/callback?code=auth-code&state=state-123",
+            &auth,
+            &state_cookie,
+        ))
+        .await
+        .expect("callback");
+    assert_eq!(callback.status(), StatusCode::SEE_OTHER);
+    let session_cookie = set_cookie_value(&callback, &auth.session_cookie_name);
+    let bootstrap = app
+        .oneshot(session_request("/api/bootstrap", &auth, &session_cookie))
+        .await
+        .expect("bootstrap");
+    let bootstrap_json = response_json(bootstrap).await;
+
+    assert_eq!(bootstrap_json["user"]["subject"], " kevin ");
+    assert_eq!(bootstrap_json["user"]["is_admin"], false);
+}
+
+#[tokio::test]
+async fn oidc_callback_rejects_whitespace_distinct_id_token_issuer() {
+    let provider = start_mock_provider_with_token_response(json!({"sub": "kevin"}), |issuer| {
+        json!({
+            "id_token": signed_id_token_with_profile(
+                issuer,
+                "nonce-123",
+                &json!({"iss": format!(" {issuer} ")}),
+            ),
+            "access_token": "access-token",
+        })
+    })
+    .await;
+    let auth = oidc_provider_auth(&provider.issuer);
+    let state_cookie = signed_state_cookie(&auth, "state-123", "nonce-123", "/");
+    let (state, _temp_dir) = test_state(auth.clone()).await;
+
+    let response = http::router(state)
+        .oneshot(callback_request(
+            "/auth/callback?code=auth-code&state=state-123",
+            &auth,
+            &state_cookie,
+        ))
+        .await
+        .expect("callback");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        response_json(response).await["detail"],
+        "OIDC ID token validation failed"
+    );
 }
 
 #[tokio::test]
@@ -1092,6 +1390,68 @@ async fn oidc_callback_rejects_userinfo_subject_mismatch() {
     let app = http::router(state);
 
     let response = app
+        .oneshot(callback_request(
+            "/auth/callback?code=auth-code&state=state-123",
+            &auth,
+            &state_cookie,
+        ))
+        .await
+        .expect("callback");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        response_json(response).await["detail"],
+        "OIDC userinfo subject mismatch"
+    );
+}
+
+#[tokio::test]
+async fn oidc_callback_rejects_non_string_userinfo_subject() {
+    let provider = start_mock_provider(
+        "nonce-123",
+        json!({
+            "sub": 123,
+            "email": "kevin@example.com",
+            "email_verified": true,
+        }),
+    )
+    .await;
+    let auth = oidc_provider_auth(&provider.issuer);
+    let state_cookie = signed_state_cookie(&auth, "state-123", "nonce-123", "/Project");
+    let (state, _temp_dir) = test_state(auth.clone()).await;
+
+    let response = http::router(state)
+        .oneshot(callback_request(
+            "/auth/callback?code=auth-code&state=state-123",
+            &auth,
+            &state_cookie,
+        ))
+        .await
+        .expect("callback");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        response_json(response).await["detail"],
+        "OIDC userinfo subject mismatch"
+    );
+}
+
+#[tokio::test]
+async fn oidc_callback_rejects_whitespace_distinct_userinfo_subject() {
+    let provider = start_mock_provider(
+        "nonce-123",
+        json!({
+            "sub": " kevin ",
+            "email": "kevin@example.com",
+            "email_verified": true,
+        }),
+    )
+    .await;
+    let auth = oidc_provider_auth(&provider.issuer);
+    let state_cookie = signed_state_cookie(&auth, "state-123", "nonce-123", "/Project");
+    let (state, _temp_dir) = test_state(auth.clone()).await;
+
+    let response = http::router(state)
         .oneshot(callback_request(
             "/auth/callback?code=auth-code&state=state-123",
             &auth,

@@ -300,6 +300,11 @@ fn production_compose_uses_latest_image_single_data_volume_and_hardened_defaults
     assert!(compose.contains("VAULT_CONTENT_SECURITY_POLICY: ${VAULT_CONTENT_SECURITY_POLICY:-}"));
     assert!(compose.contains("VAULT_HSTS_PRELOAD: ${VAULT_HSTS_PRELOAD:-0}"));
     assert!(compose.contains("VAULT_OIDC_ISSUER: ${VAULT_OIDC_ISSUER:-}"));
+    assert!(
+        compose.contains(
+            "VAULT_OIDC_BOOTSTRAP_ADMIN_SUBJECTS: ${VAULT_OIDC_BOOTSTRAP_ADMIN_SUBJECTS:-}"
+        )
+    );
     assert!(compose.contains("VAULT_OIDC_CLIENT_ID: ${VAULT_OIDC_CLIENT_ID:-}"));
     assert!(compose.contains("VAULT_OIDC_CLIENT_SECRET: ${VAULT_OIDC_CLIENT_SECRET:-}"));
     assert!(

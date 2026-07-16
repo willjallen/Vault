@@ -75,6 +75,7 @@ pub struct AuthSettings {
     pub dev_auth_issuer: String,
     pub admin_groups: HashSet<String>,
     pub bootstrap_admin_emails: HashSet<String>,
+    pub oidc_bootstrap_admin_subjects: HashSet<String>,
     pub oidc_issuer: String,
     pub oidc_client_id: String,
     pub oidc_client_secret: String,
@@ -145,6 +146,7 @@ impl Default for AuthSettings {
             dev_auth_issuer: "dev".to_string(),
             admin_groups: split_groups_set("admin,vault-admin"),
             bootstrap_admin_emails: HashSet::new(),
+            oidc_bootstrap_admin_subjects: HashSet::new(),
             oidc_issuer: String::new(),
             oidc_client_id: String::new(),
             oidc_client_secret: String::new(),
@@ -211,6 +213,10 @@ impl AuthSettings {
             admin_groups: split_groups_set(&env_string("VAULT_ADMIN_GROUPS", "admin,vault-admin")),
             bootstrap_admin_emails: split_groups_set(&env_string(
                 "VAULT_BOOTSTRAP_ADMIN_EMAILS",
+                "",
+            )),
+            oidc_bootstrap_admin_subjects: split_exact_set(&env_string(
+                "VAULT_OIDC_BOOTSTRAP_ADMIN_SUBJECTS",
                 "",
             )),
             oidc_issuer: env_string("VAULT_OIDC_ISSUER", "")
@@ -544,7 +550,7 @@ async fn upsert_vault_user_once(
         }
         if mark_login {
             sqlx::query(
-                "UPDATE vault_users SET email = ?, name = ?, last_seen_at = ?, last_login_at = ? WHERE id = ?",
+                "UPDATE vault_users SET email = COALESCE(?, email), name = ?, last_seen_at = ?, last_login_at = ? WHERE id = ?",
             )
             .bind(email)
             .bind(&display_name)
@@ -555,7 +561,7 @@ async fn upsert_vault_user_once(
             .await?;
         } else {
             sqlx::query(
-                "UPDATE vault_users SET email = ?, name = ?, last_seen_at = ? WHERE id = ?",
+                "UPDATE vault_users SET email = COALESCE(?, email), name = ?, last_seen_at = ? WHERE id = ?",
             )
             .bind(email)
             .bind(&display_name)
@@ -710,8 +716,14 @@ async fn context_for_user(
     user: &VaultUserRecord,
 ) -> Result<UserContext, AuthError> {
     let groups = group_names_for_user(pool, user.id).await?;
-    let is_admin =
-        effective_admin_from_parts(settings, user.is_admin != 0, user.email.as_deref(), &groups);
+    let is_admin = effective_admin_from_parts(
+        settings,
+        user.is_admin != 0,
+        &user.issuer,
+        &user.subject,
+        user.email.as_deref(),
+        &groups,
+    );
     Ok(UserContext {
         id: user.id.to_string(),
         vault_user_id: user.id,
@@ -743,6 +755,8 @@ async fn group_names_for_user(pool: &SqlitePool, user_id: i64) -> Result<Vec<Str
 pub fn effective_admin_from_parts(
     settings: &AuthSettings,
     is_stored_admin: bool,
+    issuer: &str,
+    subject: &str,
     email: Option<&str>,
     groups: &[String],
 ) -> bool {
@@ -750,7 +764,16 @@ pub fn effective_admin_from_parts(
         return true;
     }
     let email = email.unwrap_or_default().trim().to_ascii_lowercase();
-    settings.bootstrap_admin_emails.contains(&email)
+    let oidc_identity = settings.mode == AuthMode::Oidc
+        && !settings.oidc_issuer.is_empty()
+        && issuer == settings.oidc_issuer;
+    let trusted_email_identity = match settings.mode {
+        AuthMode::Headers => issuer == settings.header_auth_issuer,
+        AuthMode::Dev => issuer == settings.dev_auth_issuer,
+        AuthMode::Oidc => false,
+    };
+    (oidc_identity && settings.oidc_bootstrap_admin_subjects.contains(subject))
+        || (trusted_email_identity && settings.bootstrap_admin_emails.contains(&email))
         || groups.iter().any(|group| {
             settings
                 .admin_groups
@@ -827,6 +850,15 @@ pub fn split_groups(value: &str) -> BTreeSet<String> {
 
 fn split_groups_set(value: &str) -> HashSet<String> {
     split_groups(value).into_iter().collect()
+}
+
+fn split_exact_set(value: &str) -> HashSet<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToString::to_string)
+        .collect()
 }
 
 fn env_string(name: &str, default: &str) -> String {
@@ -945,10 +977,24 @@ fn validate_public_url(settings: &AuthSettings, errors: &mut Vec<String>) {
 }
 
 fn validate_oidc_runtime_config(settings: &AuthSettings, errors: &mut Vec<String>) {
+    if !settings.bootstrap_admin_emails.is_empty() {
+        errors.push(
+            "VAULT_BOOTSTRAP_ADMIN_EMAILS does not apply to OIDC; use VAULT_OIDC_BOOTSTRAP_ADMIN_SUBJECTS"
+                .to_string(),
+        );
+    }
     if settings.oidc_issuer.trim().is_empty() {
         errors.push("VAULT_OIDC_ISSUER is required when VAULT_AUTH_MODE=oidc".to_string());
     } else if !url_uses_secure_transport(&settings.oidc_issuer, settings.oidc_allow_insecure_http) {
         errors.push("VAULT_OIDC_ISSUER must use https outside local development".to_string());
+    }
+    if settings.oidc_issuer == settings.header_auth_issuer
+        || settings.oidc_issuer == settings.dev_auth_issuer
+    {
+        errors.push(
+            "VAULT_OIDC_ISSUER must differ from header and development identity issuers"
+                .to_string(),
+        );
     }
     if settings.oidc_client_id.trim().is_empty() {
         errors.push("VAULT_OIDC_CLIENT_ID is required when VAULT_AUTH_MODE=oidc".to_string());

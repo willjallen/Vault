@@ -412,6 +412,8 @@ fn user_payload(
         is_admin: effective_admin_from_parts(
             auth,
             user.is_admin,
+            &user.issuer,
+            &user.subject,
             user.email.as_deref(),
             &group_names,
         ),
@@ -497,7 +499,14 @@ async fn ensure_not_last_active_admin(
     let groups_by_user =
         group_names_by_user_after_group_change(pool, GroupAdminChange::None).await?;
     let group_names = groups_by_user.get(&target.id).cloned().unwrap_or_default();
-    if !effective_admin_from_parts(auth, target.is_admin, target.email.as_deref(), &group_names) {
+    if !effective_admin_from_parts(
+        auth,
+        target.is_admin,
+        &target.issuer,
+        &target.subject,
+        target.email.as_deref(),
+        &group_names,
+    ) {
         return Ok(());
     }
     let active_admins = active_admin_user_ids(pool, auth, &groups_by_user).await?;
@@ -535,6 +544,8 @@ async fn active_admin_user_ids(
             effective_admin_from_parts(
                 auth,
                 user.is_admin,
+                &user.issuer,
+                &user.subject,
                 user.email.as_deref(),
                 groups_by_user
                     .get(&user.id)

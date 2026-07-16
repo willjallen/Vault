@@ -12,6 +12,7 @@ use crate::storage::{SharedBlobStorage, StorageError};
 
 const DEFAULT_SWEEP_LIMIT: i64 = 250;
 const DEFAULT_STARTUP_EXPORT_LIMIT: i64 = 1000;
+const MAX_UPLOAD_PART_METADATA_BYTES: u64 = 4096;
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct TransferSweepResult {
@@ -42,8 +43,6 @@ pub enum TransferMaintenanceError {
     Storage(#[from] StorageError),
     #[error(transparent)]
     Export(#[from] ExportError),
-    #[error(transparent)]
-    Json(#[from] serde_json::Error),
     #[error(transparent)]
     TimeFormat(#[from] time::error::Format),
 }
@@ -159,7 +158,6 @@ async fn recover_interrupted_transfers_inner(
     let uploads = interrupted_uploads(pool, &now).await?;
     let exports = interrupted_exports(pool, &now).await?;
     let mut result = TransferRecoveryResult::default();
-    let mut failed_upload_dirs = Vec::new();
     let mut artifact_blob_ids = Vec::new();
 
     let mut transaction = pool.begin().await?;
@@ -187,7 +185,7 @@ async fn recover_interrupted_transfers_inner(
                 SET status = 'failed',
                     verification_total_bytes = 0,
                     verification_processed_bytes = 0,
-                    error = 'Upload completion interrupted and part files are missing',
+                    error = 'Upload completion interrupted and staged parts are missing or invalid',
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 ",
@@ -196,7 +194,6 @@ async fn recover_interrupted_transfers_inner(
             .execute(&mut *transaction)
             .await?;
             result.failed_uploads.push(upload.id.clone());
-            failed_upload_dirs.push(upload.id.clone());
         }
     }
 
@@ -230,9 +227,6 @@ async fn recover_interrupted_transfers_inner(
     delete_unreferenced_blobs(&mut transaction, &artifact_blob_ids).await?;
     transaction.commit().await?;
 
-    for session_id in failed_upload_dirs {
-        clear_upload_session_files(transfers_path, &session_id).await;
-    }
     for job_id in &result.requeued_exports {
         if clear_export_temp_file(transfers_path, job_id).await? {
             result
@@ -353,46 +347,92 @@ async fn upload_has_recoverable_parts(
     transfers_path: &Path,
     upload: &InterruptedUploadRow,
 ) -> Result<bool, TransferMaintenanceError> {
-    if upload.part_count < 0 || upload.chunk_size <= 0 || upload.total_size < 0 {
+    if !is_safe_transfer_id(&upload.id)
+        || canonical_part_count(upload.total_size, upload.chunk_size) != Some(upload.part_count)
+    {
         return Ok(false);
     }
     let session_dir = transfers_path.join("uploads").join(&upload.id);
+    if upload.part_count > 0 {
+        let session_metadata = match fs::symlink_metadata(&session_dir).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        if !session_metadata.file_type().is_dir() {
+            return Ok(false);
+        }
+    }
     let mut recovered_size = 0_i64;
     for part_number in 1..=upload.part_count {
         let metadata_path = session_dir.join(format!("{part_number:08}.json"));
         let part_path = session_dir.join(format!("{part_number:08}.part"));
-        let metadata_bytes = match fs::read(&metadata_path).await {
-            Ok(bytes) => bytes,
+        let Some(expected_offset) = part_number
+            .checked_sub(1)
+            .and_then(|index| index.checked_mul(upload.chunk_size))
+        else {
+            return Ok(false);
+        };
+        let Some(expected_size) = upload
+            .total_size
+            .checked_sub(expected_offset)
+            .map(|remaining| remaining.min(upload.chunk_size))
+            .filter(|size| *size > 0)
+        else {
+            return Ok(false);
+        };
+        let part_metadata = match fs::symlink_metadata(&part_path).await {
+            Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error.into()),
         };
-        let metadata: UploadPartMetadata = serde_json::from_slice(&metadata_bytes)?;
-        if metadata.part_number != part_number {
-            return Ok(false);
-        }
-        let expected_offset = (part_number - 1) * upload.chunk_size;
-        let expected_size = if part_number == upload.part_count {
-            upload.total_size - expected_offset
-        } else {
-            upload.chunk_size
-        };
-        if expected_size < 0
-            || metadata.offset_bytes != expected_offset
-            || metadata.size_bytes != expected_size
+        if !part_metadata.file_type().is_file()
+            || i64::try_from(part_metadata.len()).ok() != Some(expected_size)
         {
             return Ok(false);
         }
-        let part_size = match fs::metadata(&part_path).await {
-            Ok(metadata) => metadata.len(),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        match fs::symlink_metadata(&metadata_path).await {
+            Ok(metadata)
+                if !metadata.file_type().is_file()
+                    || metadata.len() > MAX_UPLOAD_PART_METADATA_BYTES =>
+            {
+                return Ok(false);
+            }
+            Ok(_) => {
+                let metadata_bytes = fs::read(&metadata_path).await?;
+                let Ok(metadata) = serde_json::from_slice::<UploadPartMetadata>(&metadata_bytes)
+                else {
+                    return Ok(false);
+                };
+                if metadata.part_number != part_number
+                    || metadata.offset_bytes != expected_offset
+                    || metadata.size_bytes != expected_size
+                {
+                    return Ok(false);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
-        };
-        if i64::try_from(part_size).ok() != Some(expected_size) {
-            return Ok(false);
         }
-        recovered_size += expected_size;
+        let Some(next_recovered_size) = recovered_size.checked_add(expected_size) else {
+            return Ok(false);
+        };
+        recovered_size = next_recovered_size;
     }
     Ok(recovered_size == upload.total_size)
+}
+
+fn canonical_part_count(total_size: i64, chunk_size: i64) -> Option<i64> {
+    if total_size < 0 || chunk_size <= 0 {
+        return None;
+    }
+    if total_size == 0 {
+        return Some(0);
+    }
+    total_size
+        .checked_sub(1)?
+        .checked_div(chunk_size)?
+        .checked_add(1)
 }
 
 async fn sweep_upload_rows(

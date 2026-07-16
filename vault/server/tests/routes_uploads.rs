@@ -25,6 +25,7 @@ use vault_server::storage::{
     BlobStorageBackend, LocalBlobStorage, SharedBlobStorage, StorageError, StoredBlob,
     multipart_manifest_key_for_hash,
 };
+use vault_server::transfers::recover_interrupted_transfers;
 use vault_server::uploads::{
     self, CreateUploadRequest, UploadPartHeaders, UploadPartIngest, UploadRuntimeSettings,
 };
@@ -885,6 +886,83 @@ async fn upload_part_does_not_require_client_checksum_header() {
         ))
         .await
         .expect("download");
+    assert_eq!(downloaded.status(), StatusCode::OK);
+    assert_eq!(response_bytes(downloaded).await, data);
+}
+
+#[tokio::test]
+async fn restart_recovers_checksum_free_browser_upload_parts() {
+    let (state, _temp_dir) =
+        test_state_with_upload_settings(5 * 1024 * 1024 * 1024, 4, 86_400).await;
+    grant_writer_root(&state.db).await;
+    let transfers_path = state.config.transfers_path();
+    let app = http::router(state.clone());
+    let data = b"abcdefgh";
+    let session_id =
+        uploaded_session_without_part_checksums(app.clone(), "restart-browser-upload.txt", data, 4)
+            .await;
+    let session_dir = transfers_path.join("uploads").join(&session_id);
+    for part_number in 1..=2 {
+        assert!(session_dir.join(format!("{part_number:08}.part")).is_file());
+        assert!(!session_dir.join(format!("{part_number:08}.json")).exists());
+    }
+
+    let restarted = restart_after_interrupted_upload_completion(
+        state,
+        app,
+        &session_id,
+        i64::try_from(data.len()).expect("data size"),
+    )
+    .await;
+    for part_number in 1..=2 {
+        assert!(session_dir.join(format!("{part_number:08}.part")).is_file());
+    }
+    let app = http::router(restarted);
+    let resumed = app
+        .clone()
+        .oneshot(authed_request(
+            Method::GET,
+            &format!("/api/uploads/{session_id}"),
+            Body::empty(),
+        ))
+        .await
+        .expect("resumed upload");
+    let resumed_json = response_json(resumed).await;
+    assert_eq!(resumed_json["status"], "active");
+    assert_eq!(resumed_json["uploaded_bytes"], data.len());
+    assert_eq!(
+        resumed_json["uploaded_parts"].as_array().map(Vec::len),
+        Some(2)
+    );
+    assert!(
+        resumed_json["uploaded_parts"]
+            .as_array()
+            .expect("uploaded parts")
+            .iter()
+            .all(|part| part["sha256"].is_null())
+    );
+
+    let completed = app
+        .clone()
+        .oneshot(authed_json_request(
+            Method::POST,
+            &format!("/api/uploads/{session_id}/complete"),
+            &json!({}),
+        ))
+        .await
+        .expect("complete recovered upload");
+    assert_eq!(completed.status(), StatusCode::OK);
+    let document_id = response_json(completed).await["id"]
+        .as_i64()
+        .expect("document id");
+    let downloaded = app
+        .oneshot(authed_request(
+            Method::GET,
+            &format!("/documents/{document_id}/download"),
+            Body::empty(),
+        ))
+        .await
+        .expect("download recovered upload");
     assert_eq!(downloaded.status(), StatusCode::OK);
     assert_eq!(response_bytes(downloaded).await, data);
 }
@@ -2250,6 +2328,124 @@ async fn uploaded_session_with_fixed_parts(
         assert_eq!(uploaded.status(), StatusCode::NO_CONTENT);
     }
     session_id
+}
+
+async fn uploaded_session_without_part_checksums(
+    app: axum::Router,
+    filename: &str,
+    data: &[u8],
+    part_size: usize,
+) -> String {
+    let created = app
+        .clone()
+        .oneshot(authed_json_request(
+            Method::POST,
+            "/api/uploads",
+            &json!({
+                "mode": "create",
+                "folder": "",
+                "filename": filename,
+                "mime_type": "text/plain",
+                "size_bytes": data.len()
+            }),
+        ))
+        .await
+        .expect("create upload");
+    assert_eq!(created.status(), StatusCode::OK);
+    let session_id = response_json(created).await["id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    for (index, chunk) in data.chunks(part_size).enumerate() {
+        let part_number = i64::try_from(index + 1).expect("part number");
+        let offset = i64::try_from(index * part_size).expect("part offset");
+        let uploaded = app
+            .clone()
+            .oneshot(upload_part_request_without_checksum(
+                &session_id,
+                part_number,
+                offset,
+                chunk,
+            ))
+            .await
+            .expect("upload part without checksum");
+        assert_eq!(uploaded.status(), StatusCode::NO_CONTENT);
+    }
+    session_id
+}
+
+async fn restart_after_interrupted_upload_completion(
+    state: AppState,
+    app: axum::Router,
+    session_id: &str,
+    expected_bytes: i64,
+) -> AppState {
+    let coordinator = state.upload_hash_coordinator.clone();
+    for _ in 0..100 {
+        if coordinator.preverified_bytes(session_id).await == Some(expected_bytes) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        coordinator.preverified_bytes(session_id).await,
+        Some(expected_bytes)
+    );
+    coordinator.forget(session_id).await;
+    sqlx::query(
+        r"
+        UPDATE upload_sessions
+        SET status = 'completing',
+            verification_total_bytes = ?,
+            verification_processed_bytes = ?,
+            error = 'stale completion state'
+        WHERE id = ?
+        ",
+    )
+    .bind(expected_bytes)
+    .bind(expected_bytes)
+    .bind(session_id)
+    .execute(&state.db)
+    .await
+    .expect("interrupt upload completion");
+    let config = state.config.as_ref().clone();
+    let auth = state.auth.as_ref().clone();
+    state.db.close().await;
+    drop(app);
+    drop(state);
+
+    let db = db::connect(&config.db_path())
+        .await
+        .expect("restart database");
+    let storage = LocalBlobStorage::new(config.objects_path(), &config.storage_prefix);
+    let restarted = AppState::new(config, auth, db, Arc::new(storage));
+    assert_eq!(
+        restarted
+            .upload_hash_coordinator
+            .preverified_bytes(session_id)
+            .await,
+        None
+    );
+    let transfers_path = restarted.config.transfers_path();
+    let recovery =
+        recover_interrupted_transfers(&restarted.db, &restarted.storage, &transfers_path, false)
+            .await
+            .expect("recover interrupted upload");
+    assert_eq!(recovery.resumed_uploads, vec![session_id]);
+    assert!(recovery.failed_uploads.is_empty());
+    let state: (String, i64, i64, Option<String>) = sqlx::query_as(
+        r"
+        SELECT status, verification_total_bytes, verification_processed_bytes, error
+        FROM upload_sessions
+        WHERE id = ?
+        ",
+    )
+    .bind(session_id)
+    .fetch_one(&restarted.db)
+    .await
+    .expect("recovered upload state");
+    assert_eq!(state, ("active".to_string(), 0, 0, None));
+    restarted
 }
 
 async fn directly_uploaded_session_with_fixed_parts(

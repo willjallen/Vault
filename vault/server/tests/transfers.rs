@@ -411,7 +411,9 @@ async fn recovery_resumes_recoverable_completing_uploads_and_fails_missing_parts
             "failed".to_string(),
             0,
             0,
-            Some("Upload completion interrupted and part files are missing".to_string()),
+            Some(
+                "Upload completion interrupted and staged parts are missing or invalid".to_string()
+            ),
         ),
     );
     assert!(
@@ -419,7 +421,84 @@ async fn recovery_resumes_recoverable_completing_uploads_and_fails_missing_parts
             .await
             .is_ok()
     );
-    assert!(tokio::fs::metadata(missing_dir).await.is_err());
+    assert!(
+        tokio::fs::metadata(missing_dir).await.is_ok(),
+        "failed recovery must preserve staging until normal expiry"
+    );
+}
+
+#[tokio::test]
+async fn recovery_rejects_invalid_layouts_without_deleting_staging() {
+    let (state, _temp_dir) = test_state(AuthSettings::default()).await;
+    for session_id in [
+        "noncanonical-upload",
+        "oversized-sidecar-upload",
+        "zero-upload",
+    ] {
+        insert_upload_session_with_expiration(&state.db, session_id, "completing", FUTURE_AT).await;
+    }
+    sqlx::query("UPDATE upload_sessions SET part_count = 2 WHERE id = 'noncanonical-upload'")
+        .execute(&state.db)
+        .await
+        .expect("noncanonical layout");
+    sqlx::query(
+        "UPDATE upload_sessions SET total_size = 0, part_count = 0 WHERE id = 'zero-upload'",
+    )
+    .execute(&state.db)
+    .await
+    .expect("zero-byte layout");
+    let transfers_path = state.config.transfers_path();
+    let upload_root = transfers_path.join("uploads");
+    let noncanonical_dir = upload_root.join("noncanonical-upload");
+    tokio::fs::create_dir_all(&noncanonical_dir)
+        .await
+        .expect("noncanonical directory");
+    for part_number in 1..=2 {
+        tokio::fs::write(
+            noncanonical_dir.join(format!("{part_number:08}.part")),
+            b"x",
+        )
+        .await
+        .expect("noncanonical part");
+    }
+    let oversized_dir = upload_root.join("oversized-sidecar-upload");
+    tokio::fs::create_dir_all(&oversized_dir)
+        .await
+        .expect("oversized sidecar directory");
+    tokio::fs::write(oversized_dir.join("00000001.part"), b"x")
+        .await
+        .expect("oversized sidecar part");
+    tokio::fs::write(oversized_dir.join("00000001.json"), vec![b'x'; 4097])
+        .await
+        .expect("oversized sidecar");
+
+    let mut result =
+        recover_interrupted_transfers(&state.db, &state.storage, &transfers_path, false)
+            .await
+            .expect("recover");
+    result.resumed_uploads.sort();
+    result.failed_uploads.sort();
+    let statuses =
+        sqlx::query_as::<_, (String, String)>("SELECT id, status FROM upload_sessions ORDER BY id")
+            .fetch_all(&state.db)
+            .await
+            .expect("recovery statuses");
+
+    assert_eq!(result.resumed_uploads, vec!["zero-upload"]);
+    assert_eq!(
+        result.failed_uploads,
+        vec!["noncanonical-upload", "oversized-sidecar-upload"]
+    );
+    assert_eq!(
+        statuses,
+        vec![
+            ("noncanonical-upload".to_string(), "failed".to_string()),
+            ("oversized-sidecar-upload".to_string(), "failed".to_string()),
+            ("zero-upload".to_string(), "active".to_string()),
+        ]
+    );
+    assert!(noncanonical_dir.join("00000001.part").is_file());
+    assert!(oversized_dir.join("00000001.part").is_file());
 }
 
 #[tokio::test]

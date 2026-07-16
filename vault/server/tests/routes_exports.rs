@@ -1,12 +1,16 @@
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use axum::body::{Body, to_bytes};
+use axum::body::{Body, Bytes, to_bytes};
 use axum::http::{Method, Request, StatusCode};
+use crc::{CRC_32_ISO_HDLC, Crc};
 use flate2::read::DeflateDecoder;
+use futures_util::{Stream, StreamExt, stream};
 use serde_json::{Value, json};
 use std::io::Read;
 use time::OffsetDateTime;
@@ -24,7 +28,7 @@ use vault_server::folders::{
 use vault_server::http::{self, AppState};
 use vault_server::storage::{
     BlobByteStream, BlobReadRange, BlobStorageBackend, BlobWriteKind, LocalBlobStorage,
-    SharedBlobStorage, StorageError, StoredBlob,
+    STORAGE_CHUNK_SIZE, SharedBlobStorage, StorageError, StoredBlob,
 };
 use vault_server::transfers::sweep_expired_transfers;
 
@@ -327,43 +331,77 @@ impl BlobStorageBackend for CancelAfterReadStorage {
 
     async fn read_location_bytes(
         &self,
+        _backend: &str,
+        _bucket: &str,
+        _object_key: &str,
+    ) -> Result<Vec<u8>, StorageError> {
+        Err(StorageError::UnsupportedOperation(
+            "export must use the bounded blob stream".to_string(),
+        ))
+    }
+
+    async fn stream_location_range(
+        &self,
         backend: &str,
         bucket: &str,
         object_key: &str,
-    ) -> Result<Vec<u8>, StorageError> {
-        self.entered_read.notify_one();
-        self.release_read.notified().await;
-        let bytes = self
+        range: BlobReadRange,
+    ) -> Result<BlobByteStream, StorageError> {
+        let source = self
             .inner
-            .read_location_bytes(backend, bucket, object_key)
+            .stream_location_range(backend, bucket, object_key, range)
             .await?;
         let pool = self.pool.clone();
-        let job_id = self.job_id.lock().await.clone();
-        tokio::spawn(async move {
-            tokio::task::yield_now().await;
-            if let Some(job_id) = job_id {
-                let _ = sqlx::query(
-                    r"
+        let job_id = self.job_id.clone();
+        let entered_read = self.entered_read.clone();
+        let release_read = self.release_read.clone();
+        Ok(Box::pin(stream::unfold(
+            (source, 0_usize, false),
+            move |(mut source, mut frames_read, mut cancelled)| {
+                let pool = pool.clone();
+                let job_id = job_id.clone();
+                let entered_read = entered_read.clone();
+                let release_read = release_read.clone();
+                async move {
+                    let item = source.next().await?;
+                    frames_read += 1;
+                    if frames_read == 2 && !cancelled {
+                        entered_read.notify_one();
+                        release_read.notified().await;
+                        let job_id_value = job_id.lock().await.clone();
+                        if let Some(job_id) = job_id_value
+                            && let Err(error) = sqlx::query(
+                                r"
                     UPDATE export_jobs
                     SET status = 'cancelled',
                         cancelled_at = CURRENT_TIMESTAMP,
                         updated_at = CURRENT_TIMESTAMP
                     WHERE id = ?
                     ",
-                )
-                .bind(job_id)
-                .execute(&pool)
-                .await;
-            }
-        });
-        Ok(bytes)
+                            )
+                            .bind(job_id)
+                            .execute(&pool)
+                            .await
+                        {
+                            return Some((
+                                Err(StorageError::Remote(format!(
+                                    "failed to cancel export job: {error}"
+                                ))),
+                                (source, frames_read, true),
+                            ));
+                        }
+                        cancelled = true;
+                    }
+                    Some((item, (source, frames_read, cancelled)))
+                }
+            },
+        )))
     }
 }
 
 #[derive(Debug)]
 struct BlockAfterProgressRangeStorage {
     inner: LocalBlobStorage,
-    range_reads: Arc<AtomicUsize>,
     entered_after_progress: Arc<Notify>,
     release_range: Arc<Notify>,
 }
@@ -422,13 +460,7 @@ impl BlobStorageBackend for BlockAfterProgressRangeStorage {
         start: u64,
         end: u64,
     ) -> Result<Vec<u8>, StorageError> {
-        let bytes = self.inner.read_range(object_key, start, end).await?;
-        let reads = self.range_reads.fetch_add(1, Ordering::SeqCst) + 1;
-        if reads == 2 {
-            self.entered_after_progress.notify_one();
-            self.release_range.notified().await;
-        }
-        Ok(bytes)
+        self.inner.read_range(object_key, start, end).await
     }
 
     async fn stream_range(
@@ -445,6 +477,543 @@ impl BlobStorageBackend for BlockAfterProgressRangeStorage {
 
     async fn delete_object(&self, object_key: &str) -> Result<(), StorageError> {
         self.inner.delete_object(object_key).await
+    }
+
+    async fn stream_location_range(
+        &self,
+        backend: &str,
+        bucket: &str,
+        object_key: &str,
+        range: BlobReadRange,
+    ) -> Result<BlobByteStream, StorageError> {
+        let source = self
+            .inner
+            .stream_location_range(backend, bucket, object_key, range)
+            .await?;
+        let entered_after_progress = self.entered_after_progress.clone();
+        let release_range = self.release_range.clone();
+        Ok(Box::pin(stream::unfold(
+            (source, 0_usize),
+            move |(mut source, mut frames_read)| {
+                let entered_after_progress = entered_after_progress.clone();
+                let release_range = release_range.clone();
+                async move {
+                    let item = source.next().await?;
+                    frames_read += 1;
+                    if frames_read == 34 {
+                        entered_after_progress.notify_one();
+                        release_range.notified().await;
+                    }
+                    Some((item, (source, frames_read)))
+                }
+            },
+        )))
+    }
+}
+
+#[derive(Debug)]
+struct StreamOnlyExportStorage {
+    inner: LocalBlobStorage,
+}
+
+#[async_trait]
+impl BlobStorageBackend for StreamOnlyExportStorage {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn bucket(&self) -> &str {
+        self.inner.bucket()
+    }
+
+    async fn ensure(&self) -> Result<(), StorageError> {
+        self.inner.ensure().await
+    }
+
+    fn planned_object_key(
+        &self,
+        hash_algo: &str,
+        digest: &str,
+        write_kind: BlobWriteKind,
+    ) -> Result<String, StorageError> {
+        self.inner.planned_object_key(hash_algo, digest, write_kind)
+    }
+
+    async fn put_bytes(&self, data: &[u8]) -> Result<StoredBlob, StorageError> {
+        self.inner.put_bytes(data).await
+    }
+
+    async fn put_file(
+        &self,
+        source_path: &Path,
+        digest: &str,
+        size_bytes: u64,
+    ) -> Result<StoredBlob, StorageError> {
+        self.inner.put_file(source_path, digest, size_bytes).await
+    }
+
+    async fn put_part_files(
+        &self,
+        part_paths: &[PathBuf],
+        expected_digest: Option<&str>,
+    ) -> Result<StoredBlob, StorageError> {
+        self.inner.put_part_files(part_paths, expected_digest).await
+    }
+
+    async fn read_bytes(&self, object_key: &str) -> Result<Vec<u8>, StorageError> {
+        self.inner.read_bytes(object_key).await
+    }
+
+    async fn read_range(
+        &self,
+        object_key: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<u8>, StorageError> {
+        self.inner.read_range(object_key, start, end).await
+    }
+
+    async fn stream_range(
+        &self,
+        object_key: &str,
+        range: BlobReadRange,
+    ) -> Result<BlobByteStream, StorageError> {
+        self.inner.stream_range(object_key, range).await
+    }
+
+    async fn list_object_keys(&self) -> Result<Vec<String>, StorageError> {
+        self.inner.list_object_keys().await
+    }
+
+    async fn delete_object(&self, object_key: &str) -> Result<(), StorageError> {
+        self.inner.delete_object(object_key).await
+    }
+
+    async fn read_location_bytes(
+        &self,
+        _backend: &str,
+        _bucket: &str,
+        _object_key: &str,
+    ) -> Result<Vec<u8>, StorageError> {
+        Err(StorageError::UnsupportedOperation(
+            "export must not buffer an entire source blob".to_string(),
+        ))
+    }
+
+    async fn read_location_range(
+        &self,
+        _backend: &str,
+        _bucket: &str,
+        _object_key: &str,
+        _start: u64,
+        _end: u64,
+    ) -> Result<Vec<u8>, StorageError> {
+        Err(StorageError::UnsupportedOperation(
+            "export must use the canonical blob stream".to_string(),
+        ))
+    }
+
+    async fn stream_location_range(
+        &self,
+        backend: &str,
+        bucket: &str,
+        object_key: &str,
+        range: BlobReadRange,
+    ) -> Result<BlobByteStream, StorageError> {
+        self.inner
+            .stream_location_range(backend, bucket, object_key, range)
+            .await
+    }
+}
+
+struct PendingOpenDropGuard {
+    dropped: Arc<AtomicBool>,
+    dropped_notify: Arc<Notify>,
+}
+
+impl Drop for PendingOpenDropGuard {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::SeqCst);
+        self.dropped_notify.notify_one();
+    }
+}
+
+#[derive(Debug)]
+struct PendingOpenStorage {
+    inner: LocalBlobStorage,
+    source_object_key: String,
+    source_size: u64,
+    entered_open: Arc<Notify>,
+    open_call_count: Arc<AtomicUsize>,
+    open_dropped: Arc<AtomicBool>,
+    open_dropped_notify: Arc<Notify>,
+    legacy_read_count: Arc<AtomicUsize>,
+    frame_poll_count: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl BlobStorageBackend for PendingOpenStorage {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn bucket(&self) -> &str {
+        self.inner.bucket()
+    }
+
+    async fn ensure(&self) -> Result<(), StorageError> {
+        self.inner.ensure().await
+    }
+
+    fn planned_object_key(
+        &self,
+        hash_algo: &str,
+        digest: &str,
+        write_kind: BlobWriteKind,
+    ) -> Result<String, StorageError> {
+        self.inner.planned_object_key(hash_algo, digest, write_kind)
+    }
+
+    async fn put_bytes(&self, data: &[u8]) -> Result<StoredBlob, StorageError> {
+        self.inner.put_bytes(data).await
+    }
+
+    async fn put_file(
+        &self,
+        source_path: &Path,
+        digest: &str,
+        size_bytes: u64,
+    ) -> Result<StoredBlob, StorageError> {
+        self.inner.put_file(source_path, digest, size_bytes).await
+    }
+
+    async fn put_part_files(
+        &self,
+        part_paths: &[PathBuf],
+        expected_digest: Option<&str>,
+    ) -> Result<StoredBlob, StorageError> {
+        self.inner.put_part_files(part_paths, expected_digest).await
+    }
+
+    async fn read_bytes(&self, object_key: &str) -> Result<Vec<u8>, StorageError> {
+        if object_key == self.source_object_key {
+            self.legacy_read_count.fetch_add(1, Ordering::SeqCst);
+            return Err(StorageError::UnsupportedOperation(
+                "pending-open source rejects whole-object reads".to_string(),
+            ));
+        }
+        self.inner.read_bytes(object_key).await
+    }
+
+    async fn read_range(
+        &self,
+        object_key: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<u8>, StorageError> {
+        if object_key == self.source_object_key {
+            self.legacy_read_count.fetch_add(1, Ordering::SeqCst);
+            return Err(StorageError::UnsupportedOperation(
+                "pending-open source rejects buffered range reads".to_string(),
+            ));
+        }
+        self.inner.read_range(object_key, start, end).await
+    }
+
+    async fn stream_range(
+        &self,
+        object_key: &str,
+        range: BlobReadRange,
+    ) -> Result<BlobByteStream, StorageError> {
+        self.inner.stream_range(object_key, range).await
+    }
+
+    async fn list_object_keys(&self) -> Result<Vec<String>, StorageError> {
+        self.inner.list_object_keys().await
+    }
+
+    async fn delete_object(&self, object_key: &str) -> Result<(), StorageError> {
+        self.inner.delete_object(object_key).await
+    }
+
+    async fn read_location_bytes(
+        &self,
+        backend: &str,
+        bucket: &str,
+        object_key: &str,
+    ) -> Result<Vec<u8>, StorageError> {
+        if object_key == self.source_object_key {
+            self.legacy_read_count.fetch_add(1, Ordering::SeqCst);
+            return Err(StorageError::UnsupportedOperation(
+                "pending-open source rejects whole-object reads".to_string(),
+            ));
+        }
+        self.inner
+            .read_location_bytes(backend, bucket, object_key)
+            .await
+    }
+
+    async fn read_location_range(
+        &self,
+        backend: &str,
+        bucket: &str,
+        object_key: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<u8>, StorageError> {
+        if object_key == self.source_object_key {
+            self.legacy_read_count.fetch_add(1, Ordering::SeqCst);
+            return Err(StorageError::UnsupportedOperation(
+                "pending-open source rejects buffered range reads".to_string(),
+            ));
+        }
+        self.inner
+            .read_location_range(backend, bucket, object_key, start, end)
+            .await
+    }
+
+    async fn stream_location_range(
+        &self,
+        backend: &str,
+        bucket: &str,
+        object_key: &str,
+        range: BlobReadRange,
+    ) -> Result<BlobByteStream, StorageError> {
+        if object_key != self.source_object_key {
+            return self
+                .inner
+                .stream_location_range(backend, bucket, object_key, range)
+                .await;
+        }
+        self.require_location(backend, bucket)?;
+        if range
+            != (BlobReadRange {
+                expected_size: self.source_size,
+                offset: 0,
+                length: self.source_size,
+            })
+        {
+            return Err(StorageError::InvalidRange);
+        }
+        self.open_call_count.fetch_add(1, Ordering::SeqCst);
+        let _guard = PendingOpenDropGuard {
+            dropped: self.open_dropped.clone(),
+            dropped_notify: self.open_dropped_notify.clone(),
+        };
+        self.entered_open.notify_one();
+        std::future::pending::<()>().await;
+        let frame_poll_count = self.frame_poll_count.clone();
+        Ok(Box::pin(stream::poll_fn(move |_context| {
+            frame_poll_count.fetch_add(1, Ordering::SeqCst);
+            Poll::Ready(None::<Result<Bytes, StorageError>>)
+        })))
+    }
+}
+
+const LOGICAL_LARGE_SOURCE_SIZE: i64 = 5 * 1024 * 1024 * 1024;
+const LOGICAL_LARGE_PREFIX_FRAMES: usize = 8;
+
+struct LogicalLargeSourceStream {
+    frames_emitted: usize,
+    frame_count: Arc<AtomicUsize>,
+    poll_count: Arc<AtomicUsize>,
+    entered_pending: Arc<Notify>,
+    pending_notified: bool,
+    dropped: Arc<AtomicBool>,
+    dropped_notify: Arc<Notify>,
+}
+
+impl Stream for LogicalLargeSourceStream {
+    type Item = Result<Bytes, StorageError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.poll_count.fetch_add(1, Ordering::SeqCst);
+        if self.frames_emitted < LOGICAL_LARGE_PREFIX_FRAMES {
+            self.frames_emitted += 1;
+            self.frame_count.fetch_add(1, Ordering::SeqCst);
+            return Poll::Ready(Some(Ok(Bytes::from(vec![b'x'; STORAGE_CHUNK_SIZE]))));
+        }
+        if !self.pending_notified {
+            self.pending_notified = true;
+            self.entered_pending.notify_one();
+        }
+        Poll::Pending
+    }
+}
+
+impl Drop for LogicalLargeSourceStream {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::SeqCst);
+        self.dropped_notify.notify_one();
+    }
+}
+
+#[derive(Debug)]
+struct LogicalLargeCancelStorage {
+    inner: LocalBlobStorage,
+    logical_object_key: String,
+    legacy_read_count: Arc<AtomicUsize>,
+    frame_count: Arc<AtomicUsize>,
+    poll_count: Arc<AtomicUsize>,
+    entered_pending: Arc<Notify>,
+    dropped: Arc<AtomicBool>,
+    dropped_notify: Arc<Notify>,
+}
+
+#[async_trait]
+impl BlobStorageBackend for LogicalLargeCancelStorage {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn bucket(&self) -> &str {
+        self.inner.bucket()
+    }
+
+    async fn ensure(&self) -> Result<(), StorageError> {
+        self.inner.ensure().await
+    }
+
+    fn planned_object_key(
+        &self,
+        hash_algo: &str,
+        digest: &str,
+        write_kind: BlobWriteKind,
+    ) -> Result<String, StorageError> {
+        self.inner.planned_object_key(hash_algo, digest, write_kind)
+    }
+
+    async fn put_bytes(&self, data: &[u8]) -> Result<StoredBlob, StorageError> {
+        self.inner.put_bytes(data).await
+    }
+
+    async fn put_file(
+        &self,
+        source_path: &Path,
+        digest: &str,
+        size_bytes: u64,
+    ) -> Result<StoredBlob, StorageError> {
+        self.inner.put_file(source_path, digest, size_bytes).await
+    }
+
+    async fn put_part_files(
+        &self,
+        part_paths: &[PathBuf],
+        expected_digest: Option<&str>,
+    ) -> Result<StoredBlob, StorageError> {
+        self.inner.put_part_files(part_paths, expected_digest).await
+    }
+
+    async fn read_bytes(&self, object_key: &str) -> Result<Vec<u8>, StorageError> {
+        if object_key == self.logical_object_key {
+            self.legacy_read_count.fetch_add(1, Ordering::SeqCst);
+            return Err(StorageError::UnsupportedOperation(
+                "logical source rejects whole-object reads".to_string(),
+            ));
+        }
+        self.inner.read_bytes(object_key).await
+    }
+
+    async fn read_range(
+        &self,
+        object_key: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<u8>, StorageError> {
+        if object_key == self.logical_object_key {
+            self.legacy_read_count.fetch_add(1, Ordering::SeqCst);
+            return Err(StorageError::UnsupportedOperation(
+                "logical source rejects buffered range reads".to_string(),
+            ));
+        }
+        self.inner.read_range(object_key, start, end).await
+    }
+
+    async fn stream_range(
+        &self,
+        object_key: &str,
+        range: BlobReadRange,
+    ) -> Result<BlobByteStream, StorageError> {
+        self.inner.stream_range(object_key, range).await
+    }
+
+    async fn list_object_keys(&self) -> Result<Vec<String>, StorageError> {
+        self.inner.list_object_keys().await
+    }
+
+    async fn delete_object(&self, object_key: &str) -> Result<(), StorageError> {
+        self.inner.delete_object(object_key).await
+    }
+
+    async fn read_location_bytes(
+        &self,
+        _backend: &str,
+        _bucket: &str,
+        object_key: &str,
+    ) -> Result<Vec<u8>, StorageError> {
+        if object_key == self.logical_object_key {
+            self.legacy_read_count.fetch_add(1, Ordering::SeqCst);
+            return Err(StorageError::UnsupportedOperation(
+                "logical source rejects whole-object reads".to_string(),
+            ));
+        }
+        Err(StorageError::UnsupportedOperation(
+            "unexpected location read".to_string(),
+        ))
+    }
+
+    async fn read_location_range(
+        &self,
+        _backend: &str,
+        _bucket: &str,
+        object_key: &str,
+        _start: u64,
+        _end: u64,
+    ) -> Result<Vec<u8>, StorageError> {
+        if object_key == self.logical_object_key {
+            self.legacy_read_count.fetch_add(1, Ordering::SeqCst);
+            return Err(StorageError::UnsupportedOperation(
+                "logical source rejects buffered range reads".to_string(),
+            ));
+        }
+        Err(StorageError::UnsupportedOperation(
+            "unexpected location range read".to_string(),
+        ))
+    }
+
+    async fn stream_location_range(
+        &self,
+        backend: &str,
+        bucket: &str,
+        object_key: &str,
+        range: BlobReadRange,
+    ) -> Result<BlobByteStream, StorageError> {
+        if object_key != self.logical_object_key {
+            return self
+                .inner
+                .stream_location_range(backend, bucket, object_key, range)
+                .await;
+        }
+        self.require_location(backend, bucket)?;
+        let expected_size = u64::try_from(LOGICAL_LARGE_SOURCE_SIZE).expect("logical source size");
+        if range
+            != (BlobReadRange {
+                expected_size,
+                offset: 0,
+                length: expected_size,
+            })
+        {
+            return Err(StorageError::InvalidRange);
+        }
+        Ok(Box::pin(LogicalLargeSourceStream {
+            frames_emitted: 0,
+            frame_count: self.frame_count.clone(),
+            poll_count: self.poll_count.clone(),
+            entered_pending: self.entered_pending.clone(),
+            pending_notified: false,
+            dropped: self.dropped.clone(),
+            dropped_notify: self.dropped_notify.clone(),
+        }))
     }
 }
 
@@ -569,6 +1138,98 @@ async fn insert_stored_document_with_mime(
     document_id
 }
 
+async fn insert_logical_document(
+    pool: &sqlx::SqlitePool,
+    folder_id: i64,
+    name: &str,
+    size_bytes: i64,
+    backend: &str,
+    bucket: &str,
+    object_key: &str,
+) -> i64 {
+    let blob_id = sqlx::query(
+        r"
+        INSERT INTO blobs (hash_algo, hash, size_bytes)
+        VALUES ('sha256', ?, ?)
+        ",
+    )
+    .bind("0".repeat(64))
+    .bind(size_bytes)
+    .execute(pool)
+    .await
+    .expect("logical blob")
+    .last_insert_rowid();
+    sqlx::query(
+        r"
+        INSERT INTO blob_locations (blob_id, backend, bucket, object_key)
+        VALUES (?, ?, ?, ?)
+        ",
+    )
+    .bind(blob_id)
+    .bind(backend)
+    .bind(bucket)
+    .bind(object_key)
+    .execute(pool)
+    .await
+    .expect("logical blob location");
+    let document_id = sqlx::query(
+        r"
+        INSERT INTO documents
+            (folder_id, name, created_by, created_by_name, latest_modified_by)
+        VALUES
+            (?, ?, 'admin', 'Admin', 'admin')
+        ",
+    )
+    .bind(folder_id)
+    .bind(name)
+    .execute(pool)
+    .await
+    .expect("logical document")
+    .last_insert_rowid();
+    let version_id = format!("logical-export-version-{document_id}");
+    sqlx::query(
+        r"
+        INSERT INTO document_versions
+            (
+                id,
+                document_id,
+                blob_id,
+                version_number,
+                committed_by,
+                committed_by_name,
+                message,
+                mime_type,
+                original_filename,
+                created_via
+            )
+        VALUES
+            (?, ?, ?, 1, 'admin', 'Admin', 'Logical test blob', 'text/plain', ?, 'upload')
+        ",
+    )
+    .bind(&version_id)
+    .bind(document_id)
+    .bind(blob_id)
+    .bind(name)
+    .execute(pool)
+    .await
+    .expect("logical version");
+    sqlx::query(
+        r"
+        UPDATE documents
+        SET current_version_id = ?,
+            latest_version_number = 1,
+            version_count = 1
+        WHERE id = ?
+        ",
+    )
+    .bind(version_id)
+    .bind(document_id)
+    .execute(pool)
+    .await
+    .expect("logical current version");
+    document_id
+}
+
 async fn response_json(response: axum::response::Response) -> Value {
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
@@ -636,11 +1297,30 @@ fn body_contains(body: &[u8], needle: &[u8]) -> bool {
     body.windows(needle.len()).any(|window| window == needle)
 }
 
+fn deterministic_pseudorandom_bytes(length: usize) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(length);
+    let mut state = 0x4d59_5df4_d0f3_3173_u64;
+    while bytes.len() < length {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let block = state.to_le_bytes();
+        let remaining = length - bytes.len();
+        bytes.extend_from_slice(&block[..remaining.min(block.len())]);
+    }
+    bytes
+}
+
 #[derive(Debug)]
 struct LocalZipEntry {
     name: String,
+    flags: u16,
     method: u16,
+    crc32: u32,
+    compressed_size: u64,
+    uncompressed_size: u64,
     data: Vec<u8>,
+    data_descriptor: Option<Vec<u8>>,
 }
 
 async fn wait_for_export_status(
@@ -873,33 +1553,153 @@ async fn wait_for_export_event_count(pool: &sqlx::SqlitePool, expected: i64) {
     panic!("export event count did not reach {expected}");
 }
 
+#[allow(clippy::too_many_lines)] // Keeping central, local, and descriptor offsets together aids auditability.
 fn local_zip_entries(bytes: &[u8]) -> Vec<LocalZipEntry> {
+    let end_record_offset = bytes
+        .windows(4)
+        .rposition(|window| window == b"PK\x05\x06")
+        .expect("end of central directory");
+    assert!(
+        end_record_offset + 22 <= bytes.len(),
+        "truncated end of central directory"
+    );
+    let expected_entries = le_u16(bytes, end_record_offset + 10);
+    assert_ne!(
+        expected_entries,
+        u16::MAX,
+        "test ZIP parser does not support ZIP64 entry counts"
+    );
+    let central_directory_size = le_u32(bytes, end_record_offset + 12);
+    let central_directory_offset = le_u32(bytes, end_record_offset + 16);
+    assert_ne!(
+        central_directory_size,
+        u32::MAX,
+        "test ZIP parser does not support ZIP64 directory sizes"
+    );
+    assert_ne!(
+        central_directory_offset,
+        u32::MAX,
+        "test ZIP parser does not support ZIP64 archive offsets"
+    );
     let mut entries = Vec::new();
-    let mut offset = 0_usize;
-    while offset + 30 <= bytes.len() && &bytes[offset..offset + 4] == b"PK\x03\x04" {
-        let method = le_u16(bytes, offset + 8);
-        let compressed_size = le_u32(bytes, offset + 18) as usize;
-        let name_len = le_u16(bytes, offset + 26) as usize;
-        let extra_len = le_u16(bytes, offset + 28) as usize;
-        let name_start = offset + 30;
+    let mut offset = usize::try_from(central_directory_offset).expect("central directory offset");
+    let central_directory_end =
+        offset + usize::try_from(central_directory_size).expect("central directory size");
+    assert_eq!(central_directory_end, end_record_offset);
+    while offset + 46 <= central_directory_end && &bytes[offset..offset + 4] == b"PK\x01\x02" {
+        let flags = le_u16(bytes, offset + 8);
+        let method = le_u16(bytes, offset + 10);
+        let crc32 = le_u32(bytes, offset + 16);
+        let compressed_size_32 = le_u32(bytes, offset + 20);
+        let uncompressed_size_32 = le_u32(bytes, offset + 24);
+        let name_len = le_u16(bytes, offset + 28) as usize;
+        let extra_len = le_u16(bytes, offset + 30) as usize;
+        let comment_len = le_u16(bytes, offset + 32) as usize;
+        let local_header_offset_32 = le_u32(bytes, offset + 42);
+        let name_start = offset + 46;
         let name_end = name_start + name_len;
-        let data_start = name_end + extra_len;
-        let data_end = data_start + compressed_size;
+        let extra_end = name_end + extra_len;
+        let record_end = extra_end + comment_len;
         assert!(
-            data_end <= bytes.len(),
+            record_end <= central_directory_end,
+            "central ZIP entry exceeds central directory"
+        );
+        let mut zip64_values = central_zip64_values(&bytes[name_end..extra_end]).into_iter();
+        let uncompressed_size = zip_u32_or_zip64(uncompressed_size_32, &mut zip64_values);
+        let compressed_size = zip_u32_or_zip64(compressed_size_32, &mut zip64_values);
+        let local_header_offset = zip_u32_or_zip64(local_header_offset_32, &mut zip64_values);
+        let local_header_offset =
+            usize::try_from(local_header_offset).expect("local ZIP header offset");
+        assert!(
+            local_header_offset + 30 <= bytes.len()
+                && &bytes[local_header_offset..local_header_offset + 4] == b"PK\x03\x04",
+            "missing local ZIP header"
+        );
+        assert_eq!(le_u16(bytes, local_header_offset + 6), flags);
+        assert_eq!(le_u16(bytes, local_header_offset + 8), method);
+        let local_name_len = le_u16(bytes, local_header_offset + 26) as usize;
+        let local_extra_len = le_u16(bytes, local_header_offset + 28) as usize;
+        let local_name_start = local_header_offset + 30;
+        let local_name_end = local_name_start + local_name_len;
+        let data_start = local_name_end + local_extra_len;
+        let data_end =
+            data_start + usize::try_from(compressed_size).expect("compressed ZIP entry size");
+        assert!(
+            local_name_end <= bytes.len() && data_end <= bytes.len(),
             "local ZIP entry exceeds archive length"
         );
         let name = std::str::from_utf8(&bytes[name_start..name_end])
             .expect("zip entry name")
             .to_string();
+        assert_eq!(
+            &bytes[local_name_start..local_name_end],
+            &bytes[name_start..name_end],
+            "local and central ZIP entry names differ"
+        );
+        let data_descriptor = if flags & 0x0008 == 0 {
+            None
+        } else {
+            let uses_zip64_descriptor =
+                compressed_size_32 == u32::MAX || uncompressed_size_32 == u32::MAX;
+            let descriptor_len = if uses_zip64_descriptor { 24 } else { 16 };
+            let descriptor_end = data_end + descriptor_len;
+            assert!(
+                descriptor_end <= bytes.len(),
+                "truncated ZIP data descriptor"
+            );
+            assert_eq!(&bytes[data_end..data_end + 4], b"PK\x07\x08");
+            assert_eq!(le_u32(bytes, data_end + 4), crc32);
+            if uses_zip64_descriptor {
+                assert_eq!(le_u64(bytes, data_end + 8), compressed_size);
+                assert_eq!(le_u64(bytes, data_end + 16), uncompressed_size);
+            } else {
+                assert_eq!(u64::from(le_u32(bytes, data_end + 8)), compressed_size);
+                assert_eq!(u64::from(le_u32(bytes, data_end + 12)), uncompressed_size);
+            }
+            Some(bytes[data_end..descriptor_end].to_vec())
+        };
         entries.push(LocalZipEntry {
             name,
+            flags,
             method,
+            crc32,
+            compressed_size,
+            uncompressed_size,
             data: bytes[data_start..data_end].to_vec(),
+            data_descriptor,
         });
-        offset = data_end;
+        offset = record_end;
     }
+    assert_eq!(offset, central_directory_end);
+    assert_eq!(entries.len(), usize::from(expected_entries));
     entries
+}
+
+fn central_zip64_values(extra: &[u8]) -> Vec<u64> {
+    let mut offset = 0_usize;
+    while offset + 4 <= extra.len() {
+        let field_id = le_u16(extra, offset);
+        let field_len = le_u16(extra, offset + 2) as usize;
+        let field_end = offset + 4 + field_len;
+        assert!(field_end <= extra.len(), "truncated ZIP extra field");
+        if field_id == 0x0001 {
+            assert_eq!(field_len % 8, 0, "invalid ZIP64 extra field");
+            return extra[offset + 4..field_end]
+                .chunks_exact(8)
+                .map(|chunk| u64::from_le_bytes(chunk.try_into().expect("ZIP64 value")))
+                .collect();
+        }
+        offset = field_end;
+    }
+    Vec::new()
+}
+
+fn zip_u32_or_zip64(classic_value: u32, zip64_values: &mut impl Iterator<Item = u64>) -> u64 {
+    if classic_value == u32::MAX {
+        zip64_values.next().expect("missing ZIP64 value")
+    } else {
+        u64::from(classic_value)
+    }
 }
 
 fn zip_entry_payload(entry: &LocalZipEntry) -> Vec<u8> {
@@ -926,6 +1726,14 @@ fn le_u32(bytes: &[u8], offset: usize) -> u32 {
         bytes[offset + 2],
         bytes[offset + 3],
     ])
+}
+
+fn le_u64(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(
+        bytes[offset..offset + 8]
+            .try_into()
+            .expect("little-endian u64"),
+    )
 }
 
 #[tokio::test]
@@ -1959,7 +2767,120 @@ async fn export_artifact_failure_rolls_back_blob_and_location_metadata() {
 }
 
 #[tokio::test]
-async fn cancelled_export_during_large_entry_write_cleans_partial_zip() {
+#[allow(clippy::too_many_lines)] // One pending-open race retains all drop and cleanup assertions.
+async fn cancelled_export_drops_pending_source_open_and_cleans_temp() {
+    let (mut state, _temp_dir) = test_state().await;
+    let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
+        .await
+        .expect("root");
+    let source = b"small compressible source";
+    let document_id = insert_stored_document(
+        &state.db,
+        &state.storage,
+        root.id,
+        "pending-open.txt",
+        source,
+    )
+    .await;
+    let mut expected_keys = state
+        .storage
+        .list_object_keys()
+        .await
+        .expect("initial physical keys");
+    expected_keys.sort();
+    assert_eq!(expected_keys.len(), 1);
+    let entered_open = Arc::new(Notify::new());
+    let open_call_count = Arc::new(AtomicUsize::new(0));
+    let open_dropped = Arc::new(AtomicBool::new(false));
+    let open_dropped_notify = Arc::new(Notify::new());
+    let legacy_read_count = Arc::new(AtomicUsize::new(0));
+    let frame_poll_count = Arc::new(AtomicUsize::new(0));
+    state.storage = Arc::new(PendingOpenStorage {
+        inner: LocalBlobStorage::new(state.config.objects_path(), &state.config.storage_prefix),
+        source_object_key: expected_keys[0].clone(),
+        source_size: u64::try_from(source.len()).expect("source size"),
+        entered_open: entered_open.clone(),
+        open_call_count: open_call_count.clone(),
+        open_dropped: open_dropped.clone(),
+        open_dropped_notify: open_dropped_notify.clone(),
+        legacy_read_count: legacy_read_count.clone(),
+        frame_poll_count: frame_poll_count.clone(),
+    });
+    let pool = state.db.clone();
+    let storage = state.storage.clone();
+    let transfers_path = state.config.transfers_path();
+    let app = http::router(state);
+
+    let response = app
+        .clone()
+        .oneshot(authed_json_post(
+            "/api/exports",
+            "admin",
+            "vault-admin",
+            &json!({"items": [{"type": "document", "id": document_id}]}),
+        ))
+        .await
+        .expect("export response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let job_id = response_json(response).await["id"]
+        .as_str()
+        .expect("job id")
+        .to_string();
+    let temp_path = transfers_path
+        .join("exports")
+        .join(format!("{job_id}.zip.tmp"));
+    timeout(Duration::from_secs(5), entered_open.notified())
+        .await
+        .expect("source open should become pending");
+    assert!(
+        tokio::fs::metadata(&temp_path)
+            .await
+            .expect("pending export temp file")
+            .is_file()
+    );
+    assert_eq!(open_call_count.load(Ordering::SeqCst), 1);
+    assert_eq!(legacy_read_count.load(Ordering::SeqCst), 0);
+    assert_eq!(frame_poll_count.load(Ordering::SeqCst), 0);
+
+    let cancelled = app
+        .oneshot(authed_delete(
+            &format!("/api/exports/{job_id}"),
+            "admin",
+            "vault-admin",
+        ))
+        .await
+        .expect("cancel response");
+    assert_eq!(cancelled.status(), StatusCode::OK);
+    assert_eq!(response_json(cancelled).await["status"], "cancelled");
+    if !open_dropped.load(Ordering::SeqCst) {
+        timeout(Duration::from_secs(5), open_dropped_notify.notified())
+            .await
+            .expect("cancelled export should drop the pending open future");
+    }
+    assert!(open_dropped.load(Ordering::SeqCst));
+    wait_for_cancelled_export_cleanup(&pool, &storage, &job_id, &expected_keys).await;
+    wait_for_path_missing(&temp_path).await;
+
+    let artifact_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM export_artifacts WHERE job_id = ?")
+            .bind(&job_id)
+            .fetch_one(&pool)
+            .await
+            .expect("artifact count");
+    let mut final_keys = storage
+        .list_object_keys()
+        .await
+        .expect("final physical keys");
+    final_keys.sort();
+    assert_eq!(artifact_count, 0);
+    assert_eq!(final_keys, expected_keys);
+    assert_eq!(open_call_count.load(Ordering::SeqCst), 1);
+    assert_eq!(legacy_read_count.load(Ordering::SeqCst), 0);
+    assert_eq!(frame_poll_count.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn cancelled_export_during_streaming_entry_write_cleans_partial_zip() {
     let (mut state, _temp_dir) = test_state().await;
     let job_id_slot = Arc::new(AsyncMutex::new(None));
     let entered_read = Arc::new(Notify::new());
@@ -1974,7 +2895,7 @@ async fn cancelled_export_during_large_entry_write_cleans_partial_zip() {
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
         .await
         .expect("root");
-    let data = vec![b'x'; 20 * 1024 * 1024];
+    let data = vec![b'x'; 2 * 1024 * 1024];
     let document_id =
         insert_stored_document(&state.db, &state.storage, root.id, "large.bin", &data).await;
     let mut expected_keys = state
@@ -2018,20 +2939,150 @@ async fn cancelled_export_during_large_entry_write_cleans_partial_zip() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // One cancellation race must retain all stream and cleanup assertions.
+async fn logical_five_gib_export_cancels_while_source_stream_is_pending() {
+    let (mut state, _temp_dir) = test_state().await;
+    let logical_object_key = "logical/five-gib-text".to_string();
+    let legacy_read_count = Arc::new(AtomicUsize::new(0));
+    let frame_count = Arc::new(AtomicUsize::new(0));
+    let poll_count = Arc::new(AtomicUsize::new(0));
+    let entered_pending = Arc::new(Notify::new());
+    let dropped = Arc::new(AtomicBool::new(false));
+    let dropped_notify = Arc::new(Notify::new());
+    state.storage = Arc::new(LogicalLargeCancelStorage {
+        inner: LocalBlobStorage::new(state.config.objects_path(), &state.config.storage_prefix),
+        logical_object_key: logical_object_key.clone(),
+        legacy_read_count: legacy_read_count.clone(),
+        frame_count: frame_count.clone(),
+        poll_count: poll_count.clone(),
+        entered_pending: entered_pending.clone(),
+        dropped: dropped.clone(),
+        dropped_notify: dropped_notify.clone(),
+    });
+    let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
+        .await
+        .expect("root");
+    let _ = insert_stored_document(
+        &state.db,
+        &state.storage,
+        root.id,
+        "retained.txt",
+        b"physical object that must remain",
+    )
+    .await;
+    let mut expected_keys = state
+        .storage
+        .list_object_keys()
+        .await
+        .expect("initial physical keys");
+    expected_keys.sort();
+    assert!(!expected_keys.is_empty());
+    let document_id = insert_logical_document(
+        &state.db,
+        root.id,
+        "logical-five-gib.txt",
+        LOGICAL_LARGE_SOURCE_SIZE,
+        state.storage.name(),
+        state.storage.bucket(),
+        &logical_object_key,
+    )
+    .await;
+    let pool = state.db.clone();
+    let storage = state.storage.clone();
+    let transfers_path = state.config.transfers_path();
+    let app = http::router(state);
+
+    let response = app
+        .clone()
+        .oneshot(authed_json_post(
+            "/api/exports",
+            "admin",
+            "vault-admin",
+            &json!({"items": [{"type": "document", "id": document_id}]}),
+        ))
+        .await
+        .expect("export response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let job_id = response_json(response).await["id"]
+        .as_str()
+        .expect("job id")
+        .to_string();
+    let temp_path = transfers_path
+        .join("exports")
+        .join(format!("{job_id}.zip.tmp"));
+    timeout(Duration::from_secs(5), entered_pending.notified())
+        .await
+        .expect("logical source should become pending after its bounded prefix");
+    assert!(
+        tokio::fs::metadata(&temp_path)
+            .await
+            .expect("partial export temp file")
+            .is_file()
+    );
+    assert_eq!(
+        frame_count.load(Ordering::SeqCst),
+        LOGICAL_LARGE_PREFIX_FRAMES
+    );
+    assert_eq!(legacy_read_count.load(Ordering::SeqCst), 0);
+
+    let cancelled = app
+        .oneshot(authed_delete(
+            &format!("/api/exports/{job_id}"),
+            "admin",
+            "vault-admin",
+        ))
+        .await
+        .expect("cancel response");
+    assert_eq!(cancelled.status(), StatusCode::OK);
+    assert_eq!(response_json(cancelled).await["status"], "cancelled");
+    if !dropped.load(Ordering::SeqCst) {
+        timeout(Duration::from_secs(5), dropped_notify.notified())
+            .await
+            .expect("cancelled export should drop the pending source stream");
+    }
+    assert!(dropped.load(Ordering::SeqCst));
+    wait_for_cancelled_export_cleanup(&pool, &storage, &job_id, &expected_keys).await;
+    wait_for_path_missing(&temp_path).await;
+
+    let artifact_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM export_artifacts WHERE job_id = ?")
+            .bind(&job_id)
+            .fetch_one(&pool)
+            .await
+            .expect("artifact count");
+    let mut final_keys = storage
+        .list_object_keys()
+        .await
+        .expect("final physical keys");
+    final_keys.sort();
+    let observed_polls = poll_count.load(Ordering::SeqCst);
+    assert_eq!(artifact_count, 0);
+    assert_eq!(final_keys, expected_keys);
+    assert_eq!(legacy_read_count.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        frame_count.load(Ordering::SeqCst),
+        LOGICAL_LARGE_PREFIX_FRAMES
+    );
+    assert!(
+        (LOGICAL_LARGE_PREFIX_FRAMES + 1..=32).contains(&observed_polls),
+        "pending source was polled an unexpected number of times: {observed_polls}"
+    );
+}
+
+#[tokio::test]
 async fn large_stored_export_reports_byte_progress_before_entry_finishes() {
     let (mut state, _temp_dir) = test_state().await;
     let entered_after_progress = Arc::new(Notify::new());
     let release_range = Arc::new(Notify::new());
     state.storage = Arc::new(BlockAfterProgressRangeStorage {
         inner: LocalBlobStorage::new(state.config.objects_path(), &state.config.storage_prefix),
-        range_reads: Arc::new(AtomicUsize::new(0)),
         entered_after_progress: entered_after_progress.clone(),
         release_range: release_range.clone(),
     });
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
         .await
         .expect("root");
-    let data = vec![b'x'; 65 * 1024 * 1024];
+    let data = vec![b'x'; 34 * 1024 * 1024];
     let document_id = insert_stored_document_with_mime(
         &state.db,
         &state.storage,
@@ -2199,12 +3250,17 @@ async fn export_route_uses_configured_ttl_for_created_jobs() {
 }
 
 #[tokio::test]
-async fn export_route_uses_configured_zip_compression_settings() {
-    let (state, _temp_dir) = test_state_with_export_settings(86_400, 1, 1, 1).await;
+async fn export_route_streams_configured_compression_with_data_descriptor() {
+    let (mut state, _temp_dir) = test_state_with_export_settings(86_400, 1, 1, 1).await;
+    state.storage = Arc::new(StreamOnlyExportStorage {
+        inner: LocalBlobStorage::new(state.config.objects_path(), &state.config.storage_prefix),
+    });
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
         .await
         .expect("root");
-    let text = "configured route compression\n".repeat(4096).into_bytes();
+    let text = "configured route compression\n"
+        .repeat(128 * 1024)
+        .into_bytes();
     let document_id = insert_stored_document_with_mime(
         &state.db,
         &state.storage,
@@ -2260,6 +3316,106 @@ async fn export_route_uses_configured_zip_compression_settings() {
         .expect("zip entry");
 
     assert_eq!(entry.method, 8);
+    assert_ne!(entry.flags & 0x0008, 0);
+    assert_eq!(
+        entry.crc32,
+        Crc::<u32>::new(&CRC_32_ISO_HDLC).checksum(&text)
+    );
+    assert_eq!(
+        entry.uncompressed_size,
+        u64::try_from(text.len()).expect("text length")
+    );
+    assert_eq!(
+        entry.compressed_size,
+        u64::try_from(entry.data.len()).expect("compressed length")
+    );
+    assert!(entry.compressed_size < entry.uncompressed_size);
+    assert!(entry.data_descriptor.is_some());
+    assert_eq!(zip_entry_payload(entry), text);
+}
+
+#[tokio::test]
+async fn export_streams_multiple_incompressible_deflate_batches_without_losing_output() {
+    let (mut state, _temp_dir) = test_state_with_export_settings(86_400, 1, 1, 1).await;
+    state.storage = Arc::new(StreamOnlyExportStorage {
+        inner: LocalBlobStorage::new(state.config.objects_path(), &state.config.storage_prefix),
+    });
+    let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
+        .await
+        .expect("root");
+    let text = deterministic_pseudorandom_bytes(9 * 1024 * 1024);
+    let document_id = insert_stored_document_with_mime(
+        &state.db,
+        &state.storage,
+        root.id,
+        "pseudorandom.txt",
+        &text,
+        "text/plain",
+    )
+    .await;
+    let app = http::router(state);
+
+    let response = app
+        .clone()
+        .oneshot(authed_json_post(
+            "/api/exports",
+            "admin",
+            "vault-admin",
+            &json!({"items": [{"type": "document", "id": document_id}]}),
+        ))
+        .await
+        .expect("export response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload = response_json(response).await;
+    let completed = wait_for_export_status(
+        app.clone(),
+        payload["id"].as_str().expect("id"),
+        "admin",
+        "vault-admin",
+        "complete",
+    )
+    .await;
+    let download = app
+        .oneshot(authed_get(
+            completed["download_url"].as_str().expect("download url"),
+            "admin",
+            "vault-admin",
+        ))
+        .await
+        .expect("download response");
+    assert_eq!(download.status(), StatusCode::OK);
+    let zip_body = to_bytes(download.into_body(), usize::MAX)
+        .await
+        .expect("zip body");
+    let entries = local_zip_entries(&zip_body);
+    let entry = entries
+        .iter()
+        .find(|entry| entry.name == "pseudorandom.txt")
+        .expect("zip entry");
+
+    assert_eq!(entry.method, 8);
+    assert_ne!(entry.flags & 0x0008, 0);
+    assert_eq!(
+        entry.crc32,
+        Crc::<u32>::new(&CRC_32_ISO_HDLC).checksum(&text)
+    );
+    assert_eq!(
+        entry.uncompressed_size,
+        u64::try_from(text.len()).expect("text length")
+    );
+    assert_eq!(
+        entry.compressed_size,
+        u64::try_from(entry.data.len()).expect("compressed length")
+    );
+    assert!(entry.compressed_size > 8 * 1024 * 1024);
+    assert_eq!(
+        entry
+            .data_descriptor
+            .as_ref()
+            .expect("data descriptor")
+            .len(),
+        24
+    );
     assert_eq!(zip_entry_payload(entry), text);
 }
 

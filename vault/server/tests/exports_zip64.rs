@@ -1,4 +1,6 @@
-use vault_server::exports::{ZipHeaderProbeInput, zip_header_probe};
+use vault_server::exports::{
+    StreamingZipHeaderProbeInput, ZipHeaderProbeInput, streaming_zip_header_probe, zip_header_probe,
+};
 
 #[test]
 fn zip_headers_keep_classic_fields_when_values_fit() {
@@ -114,6 +116,106 @@ fn zip_footer_uses_zip64_records_when_archive_directory_exceeds_classic_fields()
     assert_eq!(le_u16(&footer, 86), u16::MAX);
     assert_eq!(le_u32(&footer, 88), u32::MAX);
     assert_eq!(le_u32(&footer, 92), u32::MAX);
+}
+
+#[test]
+fn streaming_deflated_entry_reserves_zip64_before_sizes_are_known() {
+    let compressed_size = 37;
+    let uncompressed_size = 4096;
+    let local_header_offset = 128;
+    let probe = streaming_zip_header_probe(StreamingZipHeaderProbeInput {
+        name: "streamed.txt",
+        deflated: true,
+        compressed_size,
+        uncompressed_size,
+        local_header_offset,
+    })
+    .expect("streaming ZIP probe");
+
+    assert_eq!(le_u32(&probe.local_file_header, 0), 0x0403_4b50);
+    assert_eq!(le_u16(&probe.local_file_header, 4), 45);
+    assert_eq!(le_u16(&probe.local_file_header, 6), 0x0008);
+    assert_eq!(le_u16(&probe.local_file_header, 8), 8);
+    assert_eq!(le_u32(&probe.local_file_header, 18), 0);
+    assert_eq!(le_u32(&probe.local_file_header, 22), 0);
+    assert_eq!(le_u16(&probe.local_file_header, 28), 20);
+    let local_extra_offset = 30 + "streamed.txt".len();
+    assert_eq!(
+        zip64_extra_values(&probe.local_file_header[local_extra_offset..]),
+        vec![0, 0],
+    );
+
+    assert_eq!(probe.data_descriptor.len(), 24);
+    assert_eq!(le_u32(&probe.data_descriptor, 0), 0x0807_4b50);
+    assert_eq!(le_u64(&probe.data_descriptor, 8), compressed_size);
+    assert_eq!(le_u64(&probe.data_descriptor, 16), uncompressed_size);
+
+    assert_eq!(le_u16(&probe.central_directory_header, 4), 45);
+    assert_eq!(le_u16(&probe.central_directory_header, 6), 45);
+    assert_eq!(le_u16(&probe.central_directory_header, 8), 0x0008);
+    assert_eq!(le_u16(&probe.central_directory_header, 10), 8);
+    assert_eq!(le_u32(&probe.central_directory_header, 20), u32::MAX);
+    assert_eq!(le_u32(&probe.central_directory_header, 24), u32::MAX);
+    assert_eq!(le_u16(&probe.central_directory_header, 30), 28);
+    assert_eq!(le_u32(&probe.central_directory_header, 42), u32::MAX);
+    let central_extra_offset = 46 + "streamed.txt".len();
+    assert_eq!(
+        zip64_extra_values(&probe.central_directory_header[central_extra_offset..]),
+        vec![uncompressed_size, compressed_size, local_header_offset],
+    );
+}
+
+#[test]
+fn streaming_small_stored_entry_uses_classic_descriptor_fields() {
+    let size = 11_u32;
+    let probe = streaming_zip_header_probe(StreamingZipHeaderProbeInput {
+        name: "small-stream.bin",
+        deflated: false,
+        compressed_size: u64::from(size),
+        uncompressed_size: u64::from(size),
+        local_header_offset: 32,
+    })
+    .expect("streaming ZIP probe");
+
+    assert_eq!(le_u16(&probe.local_file_header, 4), 20);
+    assert_eq!(le_u16(&probe.local_file_header, 6), 0x0008);
+    assert_eq!(le_u16(&probe.local_file_header, 8), 0);
+    assert_eq!(le_u32(&probe.local_file_header, 18), 0);
+    assert_eq!(le_u32(&probe.local_file_header, 22), 0);
+    assert_eq!(le_u16(&probe.local_file_header, 28), 0);
+    assert_eq!(probe.data_descriptor.len(), 16);
+    assert_eq!(le_u32(&probe.data_descriptor, 8), size);
+    assert_eq!(le_u32(&probe.data_descriptor, 12), size);
+    assert_eq!(le_u16(&probe.central_directory_header, 6), 20);
+    assert_eq!(le_u16(&probe.central_directory_header, 8), 0x0008);
+    assert_eq!(le_u32(&probe.central_directory_header, 20), size);
+    assert_eq!(le_u32(&probe.central_directory_header, 24), size);
+    assert_eq!(le_u16(&probe.central_directory_header, 30), 0);
+    assert_eq!(le_u32(&probe.central_directory_header, 42), 32);
+}
+
+#[test]
+fn streaming_stored_entry_switches_to_zip64_at_the_classic_size_sentinel() {
+    let size = u64::from(u32::MAX);
+    let probe = streaming_zip_header_probe(StreamingZipHeaderProbeInput {
+        name: "sentinel.bin",
+        deflated: false,
+        compressed_size: size,
+        uncompressed_size: size,
+        local_header_offset: 64,
+    })
+    .expect("streaming ZIP probe");
+
+    assert_eq!(le_u16(&probe.local_file_header, 4), 45);
+    assert_eq!(le_u16(&probe.local_file_header, 6), 0x0008);
+    assert_eq!(le_u16(&probe.local_file_header, 8), 0);
+    assert_eq!(le_u32(&probe.local_file_header, 18), 0);
+    assert_eq!(le_u32(&probe.local_file_header, 22), 0);
+    assert_eq!(probe.data_descriptor.len(), 24);
+    assert_eq!(le_u64(&probe.data_descriptor, 8), size);
+    assert_eq!(le_u64(&probe.data_descriptor, 16), size);
+    assert_eq!(le_u32(&probe.central_directory_header, 20), u32::MAX);
+    assert_eq!(le_u32(&probe.central_directory_header, 24), u32::MAX);
 }
 
 fn zip64_extra_values(extra: &[u8]) -> Vec<u64> {

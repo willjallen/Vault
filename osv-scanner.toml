@@ -1,0 +1,24 @@
+[[IgnoredVulns]]
+id = "RUSTSEC-2023-0071"
+ignoreUntil = 2026-10-15
+reason = "rsa is lockfile-only through an unused optional SQLx backend; cargo tree --invert rsa --target all has no active path"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0098"
+ignoreUntil = 2026-10-15
+reason = "AWS/S3 TLS is exposed only after CA misissuance; upgrade must be reviewed in a separate dependency-only commit"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0099"
+ignoreUntil = 2026-10-15
+reason = "AWS/S3 TLS is exposed only after CA misissuance; upgrade must be reviewed in a separate dependency-only commit"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0104"
+ignoreUntil = 2026-10-15
+reason = "the application does not configure or parse certificate revocation lists; upgrade belongs in a dependency-only commit"
+
+[[IgnoredVulns]]
+id = "GHSA-h395-gr6q-cpjc"
+ignoreUntil = 2026-10-15
+reason = "OIDC uses Validation::new, requires a parseable exp claim, and does not enable nbf validation; malformed optional claims cannot bypass current validation"

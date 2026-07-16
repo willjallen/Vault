@@ -59,6 +59,14 @@ repos:
         args:
           - "-c"
           - "cargo test --workspace"
+      - id: dependency-security-audit
+        name: RustSec and OSV dependency audit
+        entry: bash
+        language: system
+        pass_filenames: false
+        always_run: true
+        args:
+          - "extras/security-audit.sh"
       - id: npm-audit
         name: npm audit
         entry: bash

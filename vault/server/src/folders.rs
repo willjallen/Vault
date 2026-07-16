@@ -794,6 +794,45 @@ pub async fn folder_access_level(
     Ok(0)
 }
 
+pub(crate) async fn folder_access_level_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    folder_id: i64,
+    user: &UserContext,
+) -> Result<i64, FolderError> {
+    if user.is_admin {
+        return Ok(3);
+    }
+    let groups = user_group_names(user);
+    let ancestor_ids = folder_ancestor_ids_in_tx(transaction, folder_id).await?;
+    for ancestor_id in ancestor_ids {
+        let rows = sqlx::query_as::<_, PermissionRow>(
+            r"
+            SELECT
+                fp.can_view,
+                fp.can_read,
+                fp.can_write,
+                vg.name AS group_name
+            FROM folder_permissions fp
+            JOIN vault_groups vg ON vg.id = fp.group_id
+            WHERE fp.folder_id = ?
+            ",
+        )
+        .bind(ancestor_id)
+        .fetch_all(&mut **transaction)
+        .await?;
+        if rows.is_empty() {
+            continue;
+        }
+        return Ok(rows
+            .iter()
+            .filter(|row| groups.contains(&row.group_name.trim().to_ascii_lowercase()))
+            .map(|row| access_level(row.can_view, row.can_read, row.can_write))
+            .max()
+            .unwrap_or(0));
+    }
+    Ok(0)
+}
+
 pub async fn nearest_existing_folder_for_path(
     pool: &SqlitePool,
     path: &str,
@@ -819,6 +858,22 @@ pub async fn require_write_for_folder_path(
 ) -> Result<(), FolderError> {
     let folder = nearest_existing_folder_for_path(pool, path).await?;
     let level = folder_access_level(pool, folder.id, user).await?;
+    if level >= 3 {
+        return Ok(());
+    }
+    if level > 0 {
+        return Err(FolderError::InsufficientFolderAccess);
+    }
+    Err(FolderError::FolderNotFound)
+}
+
+pub(crate) async fn require_write_for_folder_path_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    path: &str,
+    user: &UserContext,
+) -> Result<(), FolderError> {
+    let folder = nearest_existing_folder_for_path_in_tx(transaction, path).await?;
+    let level = folder_access_level_in_tx(transaction, folder.id, user).await?;
     if level >= 3 {
         return Ok(());
     }
@@ -963,7 +1018,7 @@ async fn find_child_folder_in_tx(
     .await?)
 }
 
-async fn all_folders_in_tx(
+pub(crate) async fn all_folders_in_tx(
     transaction: &mut Transaction<'_, Sqlite>,
 ) -> Result<Vec<FolderRecord>, FolderError> {
     Ok(sqlx::query_as::<_, FolderRecord>(folder_select_sql())
@@ -990,6 +1045,24 @@ async fn get_folder_by_path_in_tx(
         current = child;
     }
     Ok(Some(current))
+}
+
+async fn nearest_existing_folder_for_path_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    path: &str,
+) -> Result<FolderRecord, FolderError> {
+    let parsed = parse_public_folder_path(Some(path))?;
+    let mut current = fetch_root_folder_in_tx(transaction, &parsed.root_key).await?;
+    if parsed.relative_path.is_empty() {
+        return Ok(current);
+    }
+    for part in parsed.relative_path.split('/') {
+        let Some(child) = find_child_folder_in_tx(transaction, current.id, part).await? else {
+            return Ok(current);
+        };
+        current = child;
+    }
+    Ok(current)
 }
 
 async fn get_or_create_vault_folder_path_in_tx(
@@ -1051,6 +1124,24 @@ async fn folder_ancestor_ids(pool: &SqlitePool, folder_id: i64) -> Result<Vec<i6
             break;
         }
         let folder = fetch_folder_by_id(pool, id).await?;
+        ids.push(folder.id);
+        current_id = folder.parent_id;
+    }
+    Ok(ids)
+}
+
+async fn folder_ancestor_ids_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    folder_id: i64,
+) -> Result<Vec<i64>, FolderError> {
+    let mut ids = Vec::new();
+    let mut seen = HashSet::new();
+    let mut current_id = Some(folder_id);
+    while let Some(id) = current_id {
+        if !seen.insert(id) {
+            break;
+        }
+        let folder = fetch_folder_by_id_in_tx(transaction, id).await?;
         ids.push(folder.id);
         current_id = folder.parent_id;
     }

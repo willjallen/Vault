@@ -2109,6 +2109,9 @@ fn document_action_error_detail(error: DocumentError) -> Result<String, ApiError
             Ok("Document is locked by another user".to_string())
         }
         DocumentError::DocumentNotLocked => Ok("Document is not locked".to_string()),
+        DocumentError::DocumentStateChanged => {
+            Ok("Document changed while the operation was in progress".to_string())
+        }
         DocumentError::MoveDocumentToArchiveBeforeDeleting => {
             Ok("Move the document to Archive before deleting".to_string())
         }
@@ -3704,6 +3707,10 @@ fn document_error_response(error: DocumentError) -> (StatusCode, String) {
         DocumentError::DocumentNotLocked => (
             StatusCode::BAD_REQUEST,
             "Document is not locked".to_string(),
+        ),
+        DocumentError::DocumentStateChanged => (
+            StatusCode::CONFLICT,
+            "Document changed while the operation was in progress".to_string(),
         ),
         DocumentError::MoveDocumentToArchiveBeforeDeleting => (
             StatusCode::BAD_REQUEST,

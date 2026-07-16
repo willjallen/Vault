@@ -1,9 +1,11 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode};
 use serde_json::{Value, json};
 use sqlx::Row;
+use tokio::sync::oneshot;
 use tower::ServiceExt;
 use vault_server::auth::{AuthMode, AuthSettings, UserContext};
 use vault_server::config::Config;
@@ -137,6 +139,71 @@ async fn insert_document_modified_at(
     .await
     .expect("insert document")
     .last_insert_rowid()
+}
+
+async fn assert_waiting_on_writer_gate<T>(task: &mut tokio::task::JoinHandle<T>) {
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut *task)
+            .await
+            .is_err(),
+        "retention sweep completed before the competing writer committed",
+    );
+}
+
+async fn assert_retention_race_state(
+    pool: &sqlx::SqlitePool,
+    temp_id: i64,
+    safe_id: i64,
+    renewed_id: i64,
+    locked_id: i64,
+    moved_id: i64,
+) {
+    let renewed = sqlx::query_as::<_, (i64, Option<String>, i64)>(
+        r"
+        SELECT folder_id, expiry_action, datetime(expires_at) > datetime('now')
+        FROM documents
+        WHERE id = ?
+        ",
+    )
+    .bind(renewed_id)
+    .fetch_one(pool)
+    .await
+    .expect("renewed document remains");
+    assert_eq!(renewed, (temp_id, Some("delete".to_string()), 1));
+    let locked = sqlx::query_as::<_, (i64, Option<String>, i64)>(
+        r"
+        SELECT
+            d.folder_id,
+            d.expiry_action,
+            EXISTS(
+                SELECT 1
+                FROM document_locks l
+                WHERE l.document_id = d.id AND l.is_active = 1
+            )
+        FROM documents d
+        WHERE d.id = ?
+        ",
+    )
+    .bind(locked_id)
+    .fetch_one(pool)
+    .await
+    .expect("locked document remains");
+    assert_eq!(locked, (temp_id, Some("delete".to_string()), 1));
+    let moved = sqlx::query_as::<_, (i64, Option<String>, Option<String>)>(
+        "SELECT folder_id, expires_at, expiry_action FROM documents WHERE id = ?",
+    )
+    .bind(moved_id)
+    .fetch_one(pool)
+    .await
+    .expect("moved document remains");
+    assert_eq!(moved, (safe_id, None, None));
+    let retention_events = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM state_events WHERE event_type = 'retention.expired'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("retention state events");
+    assert_eq!(retention_events, 0);
 }
 
 #[tokio::test]
@@ -416,4 +483,69 @@ async fn debug_sweep_ttl_route_returns_real_document_retention_result() {
         body["result"]["documents"]["archived"],
         json!(["Archive/route.txt"])
     );
+}
+
+#[tokio::test]
+async fn sweep_rechecks_renewed_locked_and_moved_documents_after_writer_gate() {
+    let (state, _temp_dir) = test_state(AuthSettings::default()).await;
+    let temp = get_or_create_folder_path(&state.db, Some("Temp"))
+        .await
+        .expect("temp folder");
+    let safe = get_or_create_folder_path(&state.db, Some("Safe"))
+        .await
+        .expect("safe folder");
+    let renewed_id = insert_expired_document(&state.db, temp.id, "renewed.txt", "delete").await;
+    let locked_id = insert_expired_document(&state.db, temp.id, "locked.txt", "delete").await;
+    let moved_id = insert_expired_document(&state.db, temp.id, "moved.txt", "delete").await;
+
+    let mut gate = state
+        .db
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .expect("writer gate");
+    let sweep_pool = state.db.clone();
+    let (started_tx, started_rx) = oneshot::channel();
+    let mut sweep = tokio::spawn(async move {
+        started_tx.send(()).expect("signal sweep start");
+        sweep_expired_documents(&sweep_pool, 250).await
+    });
+    started_rx.await.expect("sweep started");
+    assert_waiting_on_writer_gate(&mut sweep).await;
+
+    sqlx::query("UPDATE documents SET expires_at = datetime('now', '+30 days') WHERE id = ?")
+        .bind(renewed_id)
+        .execute(&mut *gate)
+        .await
+        .expect("renew document");
+    sqlx::query(
+        "INSERT INTO document_locks (document_id, locked_by, is_active) VALUES (?, 'editor', 1)",
+    )
+    .bind(locked_id)
+    .execute(&mut *gate)
+    .await
+    .expect("lock document");
+    sqlx::query(
+        r"
+        UPDATE documents
+        SET folder_id = ?, expires_at = NULL, expiry_action = NULL
+        WHERE id = ?
+        ",
+    )
+    .bind(safe.id)
+    .bind(moved_id)
+    .execute(&mut *gate)
+    .await
+    .expect("move document out of retention scope");
+    gate.commit().await.expect("commit retention changes");
+
+    let result = tokio::time::timeout(Duration::from_secs(5), sweep)
+        .await
+        .expect("retention sweep timed out")
+        .expect("sweep task")
+        .expect("retention sweep");
+    assert!(result.archived.is_empty());
+    assert!(result.deleted.is_empty());
+    assert_eq!(result.skipped, vec!["Temp/locked.txt"]);
+
+    assert_retention_race_state(&state.db, temp.id, safe.id, renewed_id, locked_id, moved_id).await;
 }

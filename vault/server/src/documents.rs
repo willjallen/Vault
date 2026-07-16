@@ -7,10 +7,11 @@ use thiserror::Error;
 
 use crate::auth::UserContext;
 use crate::folders::{
-    ARCHIVE_ROOT, ARCHIVE_ROOT_KEY, FolderError, FolderRecord, access_level, all_folders,
+    ARCHIVE_ROOT, ARCHIVE_ROOT_KEY, FolderError, FolderRecord, access_level, all_folders_in_tx,
     apply_effective_ttl_to_document_in_tx, build_folder_path_cache, folder_access_level,
-    folder_path_by_id, folder_path_from_cache, get_or_create_folder_path_in_tx, get_root_folder,
-    join_path, normalize_folder, parse_public_folder_path, require_write_for_folder_path,
+    folder_access_level_in_tx, folder_path_by_id, folder_path_from_cache,
+    get_or_create_folder_path_in_tx, get_root_folder, join_path, normalize_folder,
+    parse_public_folder_path, require_write_for_folder_path, require_write_for_folder_path_in_tx,
     subtree_folder_ids_from_records,
 };
 use crate::state_events::state_event_resources_json;
@@ -85,6 +86,8 @@ pub enum DocumentError {
     DocumentLockedByOtherUser,
     #[error("document is not locked")]
     DocumentNotLocked,
+    #[error("document changed while the operation was in progress")]
+    DocumentStateChanged,
     #[error("move the document to Archive before deleting")]
     MoveDocumentToArchiveBeforeDeleting,
     #[error("file name is required")]
@@ -171,6 +174,7 @@ struct ExpiredDocumentRow {
     id: i64,
     folder_id: i64,
     name: String,
+    expires_at: String,
     expiry_action: Option<String>,
 }
 
@@ -187,6 +191,8 @@ struct ArchiveDocumentMutation<'a> {
 
 struct ExpiredArchivePlan {
     document: DocumentRecord,
+    expires_at: String,
+    expiry_action: Option<String>,
     source_path: String,
     source_folder_path: String,
     archived_access: String,
@@ -236,15 +242,37 @@ pub async fn try_fetch_document_by_id(
     .await?)
 }
 
+async fn try_fetch_document_by_id_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    document_id: i64,
+) -> Result<Option<DocumentRecord>, DocumentError> {
+    Ok(sqlx::query_as::<_, DocumentRecord>(
+        r"
+        SELECT
+            id,
+            folder_id,
+            name,
+            archived_from_folder,
+            archived_original_name,
+            archived_access
+        FROM documents
+        WHERE id = ?
+        ",
+    )
+    .bind(document_id)
+    .fetch_optional(&mut **transaction)
+    .await?)
+}
+
 pub async fn lock_document(
     pool: &SqlitePool,
     document_id: i64,
     user: &UserContext,
     meta: &ClientMeta,
 ) -> Result<DocumentLockResult, DocumentError> {
-    let document = editable_document_for_write(pool, document_id, user).await?;
-    let path = document_path(pool, &document).await?;
-    let mut transaction = pool.begin().await?;
+    let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let document = editable_document_for_write_in_tx(&mut transaction, document_id, user).await?;
+    let path = document_path_in_tx(&mut transaction, &document).await?;
     if let Some(lock) = active_lock_in_tx(&mut transaction, document.id).await? {
         ensure_lock_owner_or_admin(&lock, user)?;
         transaction.commit().await?;
@@ -326,52 +354,96 @@ pub async fn delete_document_forever(
     document_id: i64,
     user: &UserContext,
 ) -> Result<String, DocumentError> {
-    let document = if user.is_admin {
-        try_fetch_document_by_id(pool, document_id)
-            .await?
-            .ok_or(DocumentError::DocumentNotFound)?
-    } else {
-        document_for_write(pool, document_id, user).await?
-    };
-    if !document_is_archive(pool, &document).await? {
+    let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
+    if !permanent_delete_allowed_in_tx(&mut transaction, user).await? {
+        return Err(DocumentError::InsufficientDocumentAccess);
+    }
+    let document = document_for_write_in_tx(&mut transaction, document_id, user).await?;
+    if !document_is_archive_in_tx(&mut transaction, &document).await? {
         return Err(DocumentError::MoveDocumentToArchiveBeforeDeleting);
     }
-    let path = document_path(pool, &document).await?;
-    let mut transaction = pool.begin().await?;
+    let folders = all_folders_in_tx(&mut transaction).await?;
+    let path_cache = build_folder_path_cache(&folders)?;
+    let path = document_path_from_records(&document, &folders, &path_cache)?;
     if let Some(lock) = active_lock_in_tx(&mut transaction, document.id).await? {
         ensure_lock_owner_or_admin(&lock, user)?;
     }
-    sqlx::query("DELETE FROM documents WHERE id = ?")
-        .bind(document.id)
-        .execute(&mut *transaction)
-        .await?;
+    let deleted = sqlx::query(
+        r"
+        DELETE FROM documents
+        WHERE id = ?
+          AND folder_id = ?
+          AND name = ?
+          AND folder_id IN (
+              SELECT id FROM folders WHERE root_key = ? AND is_root = 1
+          )
+        ",
+    )
+    .bind(document.id)
+    .bind(document.folder_id)
+    .bind(&document.name)
+    .bind(ARCHIVE_ROOT_KEY)
+    .execute(&mut *transaction)
+    .await?;
+    if deleted.rows_affected() != 1 {
+        return Err(DocumentError::DocumentStateChanged);
+    }
     transaction.commit().await?;
     Ok(path)
+}
+
+async fn permanent_delete_allowed_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    user: &UserContext,
+) -> Result<bool, DocumentError> {
+    if user.is_admin {
+        return Ok(true);
+    }
+    let raw = sqlx::query_scalar::<_, String>(
+        "SELECT value FROM vault_settings WHERE key = 'archivePermanentDeleteAdminOnly'",
+    )
+    .fetch_optional(&mut **transaction)
+    .await?;
+    let admin_only = match raw {
+        Some(raw) => serde_json::from_str::<Value>(&raw)?
+            .as_bool()
+            .unwrap_or(true),
+        None => true,
+    };
+    Ok(!admin_only)
 }
 
 pub async fn sweep_expired_documents(
     pool: &SqlitePool,
     limit: i64,
 ) -> Result<RetentionSweepResult, DocumentError> {
-    let archive_root = get_root_folder(pool, ARCHIVE_ROOT_KEY).await?;
-    let folders = all_folders(pool).await?;
+    let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let docs = expired_documents_in_tx(&mut transaction, limit).await?;
+    if docs.is_empty() {
+        transaction.commit().await?;
+        return Ok(RetentionSweepResult::default());
+    }
+    let folders = all_folders_in_tx(&mut transaction).await?;
+    let archive_root = folders
+        .iter()
+        .find(|folder| folder.is_root && folder.root_key == ARCHIVE_ROOT_KEY)
+        .cloned()
+        .ok_or(FolderError::FolderNotFound)?;
     let folder_by_id = folders
         .iter()
         .map(|folder| (folder.id, folder.clone()))
         .collect::<HashMap<_, _>>();
     let path_cache = build_folder_path_cache(&folders)?;
-    let docs = expired_documents(pool, limit).await?;
-    if docs.is_empty() {
-        return Ok(RetentionSweepResult::default());
-    }
-    let locked_ids = active_locked_document_ids(pool, docs.iter().map(|doc| doc.id)).await?;
+    let locked_ids =
+        active_locked_document_ids_in_tx(&mut transaction, docs.iter().map(|doc| doc.id)).await?;
     let system = system_user();
     let meta = system_meta();
-    let timestamp = current_utc_minute_label(pool).await?;
+    let timestamp = current_utc_minute_label_in_tx(&mut transaction).await?;
     let mut result = RetentionSweepResult::default();
     let mut archives = Vec::new();
     let mut deletes = Vec::new();
     let mut clears = Vec::new();
+    let mut archived_access_by_folder = HashMap::<i64, String>::new();
 
     for doc in docs {
         let path = expired_document_path(&doc, &folder_by_id, &path_cache)?;
@@ -382,15 +454,25 @@ pub async fn sweep_expired_documents(
         match normalized_expiry_action(doc.expiry_action.as_deref()).as_deref() {
             Some("archive") => {
                 if expired_document_is_archived(&doc, &folder_by_id)? {
-                    clears.push(doc.id);
+                    clears.push(doc);
                 } else {
                     let source_folder_path =
                         expired_document_folder_path(&doc, &folder_by_id, &path_cache)?;
-                    let archived_access = serde_json::to_string(
-                        &archive_access_snapshot(pool, doc.folder_id).await?,
-                    )?;
+                    let archived_access = if let Some(snapshot) =
+                        archived_access_by_folder.get(&doc.folder_id)
+                    {
+                        snapshot.clone()
+                    } else {
+                        let snapshot = serde_json::to_string(
+                            &archive_access_snapshot_in_tx(&mut transaction, doc.folder_id).await?,
+                        )?;
+                        archived_access_by_folder.insert(doc.folder_id, snapshot.clone());
+                        snapshot
+                    };
                     result.archived.push(join_path(&[ARCHIVE_ROOT, &doc.name]));
                     archives.push(ExpiredArchivePlan {
+                        expires_at: doc.expires_at.clone(),
+                        expiry_action: doc.expiry_action.clone(),
                         document: expired_row_document_record(doc),
                         source_path: path,
                         source_folder_path,
@@ -400,15 +482,14 @@ pub async fn sweep_expired_documents(
             }
             Some("delete") => {
                 result.deleted.push(path);
-                deletes.push(doc.id);
+                deletes.push(doc);
             }
-            _ => clears.push(doc.id),
+            _ => clears.push(doc),
         }
     }
 
-    let mut transaction = pool.begin().await?;
-    for document_id in clears {
-        clear_document_expiry_in_tx(&mut transaction, document_id).await?;
+    for document in &clears {
+        clear_document_expiry_in_tx(&mut transaction, document).await?;
     }
     for plan in archives {
         archive_expired_document_in_tx(
@@ -421,11 +502,8 @@ pub async fn sweep_expired_documents(
         )
         .await?;
     }
-    for document_id in deletes {
-        sqlx::query("DELETE FROM documents WHERE id = ?")
-            .bind(document_id)
-            .execute(&mut *transaction)
-            .await?;
+    for document in &deletes {
+        delete_expired_document_in_tx(&mut transaction, document).await?;
     }
     if result.has_state_changes() {
         record_retention_expired_state_in_tx(&mut transaction).await?;
@@ -593,9 +671,10 @@ pub async fn record_checkout_event_and_lock(
     user: &UserContext,
     meta: &ClientMeta,
 ) -> Result<(), DocumentError> {
-    let document = editable_document_for_write(pool, download.document_id, user).await?;
-    let path = document_path(pool, &document).await?;
-    let mut transaction = pool.begin().await?;
+    let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let document =
+        editable_document_for_write_in_tx(&mut transaction, download.document_id, user).await?;
+    let path = document_path_in_tx(&mut transaction, &document).await?;
     if let Some(lock) = active_lock_in_tx(&mut transaction, document.id).await? {
         ensure_lock_owner_or_admin(&lock, user)?;
     } else {
@@ -708,7 +787,7 @@ pub async fn restore_document(
         document.id,
     )
     .await?;
-    sqlx::query(
+    let restored = sqlx::query(
         r"
         UPDATE documents
         SET
@@ -720,14 +799,23 @@ pub async fn restore_document(
             archived_original_name = NULL,
             archived_access = NULL
         WHERE id = ?
+          AND folder_id = ?
+          AND name = ?
+          AND archived_from_folder IS ?
         ",
     )
     .bind(target_folder.id)
     .bind(&target_name)
     .bind(&user.id)
     .bind(document.id)
+    .bind(document.folder_id)
+    .bind(&document.name)
+    .bind(&document.archived_from_folder)
     .execute(&mut *transaction)
     .await?;
+    if restored.rows_affected() != 1 {
+        return Err(DocumentError::DocumentStateChanged);
+    }
     apply_effective_ttl_to_document_in_tx(&mut transaction, document.id, target_folder.id).await?;
     record_document_event_in_tx(
         &mut transaction,
@@ -748,10 +836,12 @@ pub async fn archive_folder(
     user: &UserContext,
     meta: &ClientMeta,
 ) -> Result<String, DocumentError> {
-    let folders = all_folders(pool).await?;
+    let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let folders = all_folders_in_tx(&mut transaction).await?;
     let source = folders
         .iter()
         .find(|folder| folder.id == folder_id)
+        .cloned()
         .ok_or(FolderError::FolderNotFound)?;
     if source.is_root {
         return Err(DocumentError::CannotArchiveRootFolder);
@@ -761,17 +851,22 @@ pub async fn archive_folder(
     }
     let source_ids = subtree_folder_ids_from_records(source.id, &folders);
     for subtree_id in &source_ids {
-        require_folder_write(pool, *subtree_id, user).await?;
+        require_folder_write_in_tx(&mut transaction, *subtree_id, user).await?;
     }
-    let docs = documents_in_folders(pool, &source_ids).await?;
+    let docs = documents_in_folders_in_tx(&mut transaction, &source_ids).await?;
     if docs.is_empty() {
         return Err(DocumentError::FolderHasNoFilesToArchive);
     }
 
     let path_cache = build_folder_path_cache(&folders)?;
-    let archive_root = get_root_folder(pool, ARCHIVE_ROOT_KEY).await?;
-    require_folder_write(pool, archive_root.id, user).await?;
+    let archive_root = folders
+        .iter()
+        .find(|folder| folder.is_root && folder.root_key == ARCHIVE_ROOT_KEY)
+        .cloned()
+        .ok_or(FolderError::FolderNotFound)?;
+    require_folder_write_in_tx(&mut transaction, archive_root.id, user).await?;
     let mut archive_items = Vec::with_capacity(docs.len());
+    let mut archived_access_by_folder = HashMap::<i64, String>::new();
     for document in &docs {
         let Some(folder) = folders
             .iter()
@@ -780,17 +875,24 @@ pub async fn archive_folder(
             return Err(DocumentError::Folder(FolderError::FolderNotFound));
         };
         let folder_path = folder_path_from_cache(folder, &path_cache)?;
+        let archived_access =
+            if let Some(snapshot) = archived_access_by_folder.get(&document.folder_id) {
+                snapshot.clone()
+            } else {
+                let snapshot = serde_json::to_string(
+                    &archive_access_snapshot_in_tx(&mut transaction, document.folder_id).await?,
+                )?;
+                archived_access_by_folder.insert(document.folder_id, snapshot.clone());
+                snapshot
+            };
         archive_items.push(ArchiveDocumentItem {
             document: document.clone(),
             source_path: join_path(&[&folder_path, &document.name]),
             source_folder_path: folder_path,
-            archived_access: serde_json::to_string(
-                &archive_access_snapshot(pool, document.folder_id).await?,
-            )?,
+            archived_access,
         });
     }
 
-    let mut transaction = pool.begin().await?;
     for item in &archive_items {
         if let Some(lock) = active_lock_in_tx(&mut transaction, item.document.id).await? {
             ensure_lock_owner_or_admin(&lock, user)?;
@@ -811,7 +913,8 @@ pub async fn archive_folder(
         )
         .await?;
     }
-    delete_folders_in_tx(&mut transaction, &source_ids).await?;
+    ensure_folders_have_no_documents_in_tx(&mut transaction, &source_ids).await?;
+    delete_folder_subtree_in_tx(&mut transaction, source.id).await?;
     transaction.commit().await?;
     Ok(ARCHIVE_ROOT.to_string())
 }
@@ -861,31 +964,35 @@ async fn move_or_rename_document(
     user: &UserContext,
     meta: &ClientMeta,
 ) -> Result<String, DocumentError> {
-    let document = document_for_write(pool, document_id, user).await?;
-    let target_name = match name {
-        Some(name) => normalize_file_name(name)?,
+    let normalized_name = name.map(normalize_file_name).transpose()?;
+    let normalized_destination = destination_folder
+        .map(|path| normalize_folder(Some(path)))
+        .transpose()?;
+    let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let document = document_for_write_in_tx(&mut transaction, document_id, user).await?;
+    let target_name = match normalized_name {
+        Some(name) => name,
         None => document.name.clone(),
     };
-    let source_path = document_path(pool, &document).await?;
-    let destination_path = match destination_folder {
-        Some(path) => normalize_folder(Some(path))?,
-        None => document_folder_path(pool, &document).await?,
+    let source_path = document_path_in_tx(&mut transaction, &document).await?;
+    let destination_path = match normalized_destination {
+        Some(path) => path,
+        None => document_folder_path_in_tx(&mut transaction, &document).await?,
     };
     let source_root_key: String = sqlx::query_scalar("SELECT root_key FROM folders WHERE id = ?")
         .bind(document.folder_id)
-        .fetch_one(pool)
+        .fetch_one(&mut *transaction)
         .await?;
     let target_ref = parse_public_folder_path(Some(&destination_path))?;
     if source_root_key != target_ref.root_key {
         return Err(DocumentError::UseArchiveOrRestoreForArchiveMoves);
     }
     let target_is_archive = target_ref.root_key == ARCHIVE_ROOT_KEY;
-    if name.is_some() && document_is_archive(pool, &document).await? {
+    if name.is_some() && document_is_archive_in_tx(&mut transaction, &document).await? {
         return Err(DocumentError::RestoreArchivedBeforeRenaming);
     }
-    require_write_for_folder_path(pool, &destination_path, user).await?;
+    require_write_for_folder_path_in_tx(&mut transaction, &destination_path, user).await?;
 
-    let mut transaction = pool.begin().await?;
     if let Some(lock) = active_lock_in_tx(&mut transaction, document.id).await? {
         ensure_lock_owner_or_admin(&lock, user)?;
     }
@@ -912,7 +1019,7 @@ async fn move_or_rename_document(
             return Err(DocumentError::DocumentPathAlreadyExists);
         }
     }
-    sqlx::query(
+    let moved = sqlx::query(
         r"
         UPDATE documents
         SET
@@ -921,14 +1028,23 @@ async fn move_or_rename_document(
             latest_modified_at = CURRENT_TIMESTAMP,
             latest_modified_by = ?
         WHERE id = ?
+          AND folder_id = ?
+          AND name = ?
+          AND archived_from_folder IS ?
         ",
     )
     .bind(target_folder.id)
     .bind(&target_name)
     .bind(&user.id)
     .bind(document.id)
+    .bind(document.folder_id)
+    .bind(&document.name)
+    .bind(&document.archived_from_folder)
     .execute(&mut *transaction)
     .await?;
+    if moved.rows_affected() != 1 {
+        return Err(DocumentError::DocumentStateChanged);
+    }
     apply_effective_ttl_to_document_in_tx(&mut transaction, document.id, target_folder.id).await?;
 
     let target_path = join_path(&[&destination_path, &target_name]);
@@ -1017,6 +1133,22 @@ pub async fn archive_access_snapshot(
     Ok(snapshot)
 }
 
+async fn archive_access_snapshot_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    folder_id: i64,
+) -> Result<HashMap<String, i64>, DocumentError> {
+    let groups = all_groups_in_tx(transaction).await?;
+    let mut snapshot = HashMap::new();
+    for group in groups {
+        let user = group_access_context(&group);
+        let level = folder_access_level_in_tx(transaction, folder_id, &user).await?;
+        if level > 0 {
+            snapshot.insert(group.id.to_string(), level);
+        }
+    }
+    Ok(snapshot)
+}
+
 pub async fn archived_access_level(
     pool: &SqlitePool,
     document: &DocumentRecord,
@@ -1053,6 +1185,106 @@ pub async fn document_access_level(
         return archived_access_level(pool, document, user).await;
     }
     Ok(folder_access_level(pool, document.folder_id, user).await?)
+}
+
+async fn document_access_level_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    document: &DocumentRecord,
+    user: &UserContext,
+) -> Result<i64, DocumentError> {
+    if user.is_admin {
+        return Ok(3);
+    }
+    if document_is_archive_in_tx(transaction, document).await? {
+        return archived_access_level_in_tx(transaction, document, user).await;
+    }
+    Ok(folder_access_level_in_tx(transaction, document.folder_id, user).await?)
+}
+
+async fn archived_access_level_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    document: &DocumentRecord,
+    user: &UserContext,
+) -> Result<i64, DocumentError> {
+    let archive_level = folder_access_level_in_tx(transaction, document.folder_id, user).await?;
+    if archive_level <= 0 {
+        return Ok(0);
+    }
+    let snapshot = parse_archived_access(document.archived_access.as_deref())?;
+    let groups = user_group_names(user);
+    if groups.is_empty() {
+        return Ok(0);
+    }
+    let source_level = all_groups_in_tx(transaction)
+        .await?
+        .iter()
+        .filter(|group| groups.contains(&group.name.trim().to_ascii_lowercase()))
+        .filter_map(|group| snapshot.get(&group.id.to_string()).copied())
+        .max()
+        .unwrap_or(0);
+    Ok(archive_level.min(source_level))
+}
+
+async fn document_for_write_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    document_id: i64,
+    user: &UserContext,
+) -> Result<DocumentRecord, DocumentError> {
+    let document = try_fetch_document_by_id_in_tx(transaction, document_id)
+        .await?
+        .ok_or(DocumentError::DocumentNotFound)?;
+    let level = document_access_level_in_tx(transaction, &document, user).await?;
+    if level >= 3 {
+        return Ok(document);
+    }
+    if level > 0 {
+        return Err(DocumentError::InsufficientDocumentAccess);
+    }
+    Err(DocumentError::DocumentNotFound)
+}
+
+async fn editable_document_for_write_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    document_id: i64,
+    user: &UserContext,
+) -> Result<DocumentRecord, DocumentError> {
+    let document = document_for_write_in_tx(transaction, document_id, user).await?;
+    if document_is_archive_in_tx(transaction, &document).await? {
+        return Err(DocumentError::RestoreBeforeEditing);
+    }
+    Ok(document)
+}
+
+async fn document_path_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    document: &DocumentRecord,
+) -> Result<String, DocumentError> {
+    let folder_path = document_folder_path_in_tx(transaction, document).await?;
+    Ok(join_path(&[&folder_path, &document.name]))
+}
+
+async fn document_folder_path_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    document: &DocumentRecord,
+) -> Result<String, DocumentError> {
+    let folders = all_folders_in_tx(transaction).await?;
+    let path_cache = build_folder_path_cache(&folders)?;
+    let folder = folders
+        .iter()
+        .find(|folder| folder.id == document.folder_id)
+        .ok_or(FolderError::FolderNotFound)?;
+    Ok(folder_path_from_cache(folder, &path_cache)?)
+}
+
+async fn document_is_archive_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    document: &DocumentRecord,
+) -> Result<bool, DocumentError> {
+    let root_key: String = sqlx::query_scalar("SELECT root_key FROM folders WHERE id = ?")
+        .bind(document.folder_id)
+        .fetch_one(&mut **transaction)
+        .await?;
+    Ok(root_key == ARCHIVE_ROOT_KEY)
 }
 
 pub async fn editable_document_for_write(
@@ -1103,13 +1335,13 @@ pub async fn document_for_read(
     Err(DocumentError::DocumentNotFound)
 }
 
-async fn expired_documents(
-    pool: &SqlitePool,
+async fn expired_documents_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
     limit: i64,
 ) -> Result<Vec<ExpiredDocumentRow>, DocumentError> {
     Ok(sqlx::query_as::<_, ExpiredDocumentRow>(
         r"
-        SELECT id, folder_id, name, expiry_action
+        SELECT id, folder_id, name, expires_at, expiry_action
         FROM documents
         WHERE expires_at IS NOT NULL
           AND datetime(expires_at) <= datetime('now')
@@ -1118,12 +1350,12 @@ async fn expired_documents(
         ",
     )
     .bind(limit.max(1))
-    .fetch_all(pool)
+    .fetch_all(&mut **transaction)
     .await?)
 }
 
-async fn active_locked_document_ids<I>(
-    pool: &SqlitePool,
+async fn active_locked_document_ids_in_tx<I>(
+    transaction: &mut Transaction<'_, Sqlite>,
     document_ids: I,
 ) -> Result<HashSet<i64>, DocumentError>
 where
@@ -1143,7 +1375,7 @@ where
     separated.push_unseparated(")");
     Ok(builder
         .build_query_scalar::<i64>()
-        .fetch_all(pool)
+        .fetch_all(&mut **transaction)
         .await?
         .into_iter()
         .collect())
@@ -1155,6 +1387,19 @@ fn expired_document_path(
     path_cache: &HashMap<i64, String>,
 ) -> Result<String, DocumentError> {
     let folder_path = expired_document_folder_path(document, folder_by_id, path_cache)?;
+    Ok(join_path(&[&folder_path, &document.name]))
+}
+
+fn document_path_from_records(
+    document: &DocumentRecord,
+    folders: &[FolderRecord],
+    path_cache: &HashMap<i64, String>,
+) -> Result<String, DocumentError> {
+    let folder = folders
+        .iter()
+        .find(|folder| folder.id == document.folder_id)
+        .ok_or(FolderError::FolderNotFound)?;
+    let folder_path = folder_path_from_cache(folder, path_cache)?;
     Ok(join_path(&[&folder_path, &document.name]))
 }
 
@@ -1197,12 +1442,35 @@ fn normalized_expiry_action(action: Option<&str>) -> Option<String> {
 
 async fn clear_document_expiry_in_tx(
     transaction: &mut Transaction<'_, Sqlite>,
-    document_id: i64,
+    document: &ExpiredDocumentRow,
 ) -> Result<(), DocumentError> {
-    sqlx::query("UPDATE documents SET expires_at = NULL, expiry_action = NULL WHERE id = ?")
-        .bind(document_id)
-        .execute(&mut **transaction)
-        .await?;
+    let cleared = sqlx::query(
+        r"
+        UPDATE documents
+        SET expires_at = NULL, expiry_action = NULL
+        WHERE id = ?
+          AND folder_id = ?
+          AND name = ?
+          AND expires_at = ?
+          AND expiry_action IS ?
+          AND datetime(expires_at) <= datetime('now')
+          AND NOT EXISTS (
+              SELECT 1
+              FROM document_locks
+              WHERE document_id = documents.id AND is_active = 1
+          )
+        ",
+    )
+    .bind(document.id)
+    .bind(document.folder_id)
+    .bind(&document.name)
+    .bind(&document.expires_at)
+    .bind(&document.expiry_action)
+    .execute(&mut **transaction)
+    .await?;
+    if cleared.rows_affected() != 1 {
+        return Err(DocumentError::DocumentStateChanged);
+    }
     Ok(())
 }
 
@@ -1214,7 +1482,7 @@ async fn archive_expired_document_in_tx(
     user: &UserContext,
     meta: &ClientMeta,
 ) -> Result<(), DocumentError> {
-    sqlx::query(
+    let archived = sqlx::query(
         r"
         UPDATE documents
         SET
@@ -1226,6 +1494,18 @@ async fn archive_expired_document_in_tx(
             archived_original_name = ?,
             archived_access = ?
         WHERE id = ?
+          AND folder_id = ?
+          AND name = ?
+          AND archived_from_folder IS ?
+          AND expires_at = ?
+          AND expiry_action IS ?
+          AND datetime(expires_at) <= datetime('now')
+          AND lower(trim(expiry_action)) = 'archive'
+          AND NOT EXISTS (
+              SELECT 1
+              FROM document_locks
+              WHERE document_id = documents.id AND is_active = 1
+          )
         ",
     )
     .bind(archive_folder_id)
@@ -1235,8 +1515,16 @@ async fn archive_expired_document_in_tx(
     .bind(&plan.document.name)
     .bind(&plan.archived_access)
     .bind(plan.document.id)
+    .bind(plan.document.folder_id)
+    .bind(&plan.document.name)
+    .bind(&plan.document.archived_from_folder)
+    .bind(&plan.expires_at)
+    .bind(&plan.expiry_action)
     .execute(&mut **transaction)
     .await?;
+    if archived.rows_affected() != 1 {
+        return Err(DocumentError::DocumentStateChanged);
+    }
     apply_effective_ttl_to_document_in_tx(transaction, plan.document.id, archive_folder_id).await?;
     record_document_event_in_tx(
         transaction,
@@ -1247,6 +1535,40 @@ async fn archive_expired_document_in_tx(
         meta,
     )
     .await?;
+    Ok(())
+}
+
+async fn delete_expired_document_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    document: &ExpiredDocumentRow,
+) -> Result<(), DocumentError> {
+    let deleted = sqlx::query(
+        r"
+        DELETE FROM documents
+        WHERE id = ?
+          AND folder_id = ?
+          AND name = ?
+          AND expires_at = ?
+          AND expiry_action IS ?
+          AND datetime(expires_at) <= datetime('now')
+          AND lower(trim(expiry_action)) = 'delete'
+          AND NOT EXISTS (
+              SELECT 1
+              FROM document_locks
+              WHERE document_id = documents.id AND is_active = 1
+          )
+        ",
+    )
+    .bind(document.id)
+    .bind(document.folder_id)
+    .bind(&document.name)
+    .bind(&document.expires_at)
+    .bind(&document.expiry_action)
+    .execute(&mut **transaction)
+    .await?;
+    if deleted.rows_affected() != 1 {
+        return Err(DocumentError::DocumentStateChanged);
+    }
     Ok(())
 }
 
@@ -1270,10 +1592,12 @@ async fn record_retention_expired_state_in_tx(
     Ok(())
 }
 
-async fn current_utc_minute_label(pool: &SqlitePool) -> Result<String, DocumentError> {
+async fn current_utc_minute_label_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+) -> Result<String, DocumentError> {
     Ok(
         sqlx::query_scalar("SELECT strftime('%Y-%m-%d %H:%M UTC', 'now')")
-            .fetch_one(pool)
+            .fetch_one(&mut **transaction)
             .await?,
     )
 }
@@ -1359,6 +1683,21 @@ async fn require_folder_write(
     Err(DocumentError::Folder(FolderError::FolderNotFound))
 }
 
+async fn require_folder_write_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    folder_id: i64,
+    user: &UserContext,
+) -> Result<(), DocumentError> {
+    let level = folder_access_level_in_tx(transaction, folder_id, user).await?;
+    if level >= 3 {
+        return Ok(());
+    }
+    if level > 0 {
+        return Err(DocumentError::Folder(FolderError::InsufficientFolderAccess));
+    }
+    Err(DocumentError::Folder(FolderError::FolderNotFound))
+}
+
 async fn ensure_unique_document_name_in_tx(
     transaction: &mut Transaction<'_, Sqlite>,
     folder_id: i64,
@@ -1391,7 +1730,7 @@ async fn archive_document_in_tx(
     transaction: &mut Transaction<'_, Sqlite>,
     mutation: ArchiveDocumentMutation<'_>,
 ) -> Result<(), DocumentError> {
-    sqlx::query(
+    let archived = sqlx::query(
         r"
         UPDATE documents
         SET
@@ -1403,6 +1742,9 @@ async fn archive_document_in_tx(
             archived_original_name = ?,
             archived_access = ?
         WHERE id = ?
+          AND folder_id = ?
+          AND name = ?
+          AND archived_from_folder IS ?
         ",
     )
     .bind(mutation.archive_folder_id)
@@ -1412,8 +1754,14 @@ async fn archive_document_in_tx(
     .bind(mutation.source_name)
     .bind(mutation.archived_access)
     .bind(mutation.document.id)
+    .bind(mutation.document.folder_id)
+    .bind(&mutation.document.name)
+    .bind(&mutation.document.archived_from_folder)
     .execute(&mut **transaction)
     .await?;
+    if archived.rows_affected() != 1 {
+        return Err(DocumentError::DocumentStateChanged);
+    }
     apply_effective_ttl_to_document_in_tx(
         transaction,
         mutation.document.id,
@@ -1432,8 +1780,8 @@ async fn archive_document_in_tx(
     Ok(())
 }
 
-async fn documents_in_folders(
-    pool: &SqlitePool,
+async fn documents_in_folders_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
     folder_ids: &[i64],
 ) -> Result<Vec<DocumentRecord>, DocumentError> {
     if folder_ids.is_empty() {
@@ -1459,24 +1807,64 @@ async fn documents_in_folders(
     separated.push_unseparated(") ORDER BY id");
     Ok(builder
         .build_query_as::<DocumentRecord>()
-        .fetch_all(pool)
+        .fetch_all(&mut **transaction)
         .await?)
 }
 
-async fn delete_folders_in_tx(
+async fn ensure_folders_have_no_documents_in_tx(
     transaction: &mut Transaction<'_, Sqlite>,
     folder_ids: &[i64],
 ) -> Result<(), DocumentError> {
     if folder_ids.is_empty() {
         return Ok(());
     }
-    let mut builder = QueryBuilder::<Sqlite>::new("DELETE FROM folders WHERE id IN (");
+    let mut builder =
+        QueryBuilder::<Sqlite>::new("SELECT COUNT(*) FROM documents WHERE folder_id IN (");
     let mut separated = builder.separated(", ");
     for folder_id in folder_ids {
         separated.push_bind(folder_id);
     }
     separated.push_unseparated(")");
-    builder.build().execute(&mut **transaction).await?;
+    let count = builder
+        .build_query_scalar::<i64>()
+        .fetch_one(&mut **transaction)
+        .await?;
+    if count != 0 {
+        return Err(DocumentError::DocumentStateChanged);
+    }
+    Ok(())
+}
+
+async fn delete_folder_subtree_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    folder_id: i64,
+) -> Result<(), DocumentError> {
+    let deleted = sqlx::query(
+        r"
+        WITH RECURSIVE subtree(id) AS (
+            SELECT id FROM folders WHERE id = ? AND is_root = 0
+            UNION
+            SELECT folders.id
+            FROM folders
+            JOIN subtree ON folders.parent_id = subtree.id
+        )
+        DELETE FROM folders
+        WHERE id = ?
+          AND is_root = 0
+          AND NOT EXISTS (
+              SELECT 1
+              FROM documents
+              JOIN subtree ON subtree.id = documents.folder_id
+          )
+        ",
+    )
+    .bind(folder_id)
+    .bind(folder_id)
+    .execute(&mut **transaction)
+    .await?;
+    if deleted.rows_affected() != 1 {
+        return Err(DocumentError::DocumentStateChanged);
+    }
     Ok(())
 }
 
@@ -1568,6 +1956,16 @@ async fn all_groups(pool: &SqlitePool) -> Result<Vec<GroupRecord>, DocumentError
     Ok(
         sqlx::query_as::<_, GroupRecord>("SELECT id, name FROM vault_groups ORDER BY name")
             .fetch_all(pool)
+            .await?,
+    )
+}
+
+async fn all_groups_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+) -> Result<Vec<GroupRecord>, DocumentError> {
+    Ok(
+        sqlx::query_as::<_, GroupRecord>("SELECT id, name FROM vault_groups ORDER BY name")
+            .fetch_all(&mut **transaction)
             .await?,
     )
 }

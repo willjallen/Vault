@@ -79,7 +79,7 @@ async fn incompatible_existing_schema_is_rejected_without_dropping_data() {
 }
 
 #[tokio::test]
-async fn known_additive_columns_and_tables_are_added_without_dropping_data() {
+async fn noncanonical_schema_is_rejected_without_additive_changes() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let db_path = temp_dir.path().join("vault.db");
     initialize_valid_database(&db_path).await;
@@ -114,41 +114,144 @@ async fn known_additive_columns_and_tables_are_added_without_dropping_data() {
     .expect("insert existing user");
     raw.close().await;
 
-    let pool = db::connect(&db_path).await.expect("additive migration");
+    assert_startup_rejected(&db_path, "noncanonical schema should reject").await;
+
+    let raw = raw_pool(&db_path).await;
     let columns: Vec<String> =
         sqlx::query_scalar("SELECT name FROM pragma_table_info('vault_users')")
-            .fetch_all(&pool)
+            .fetch_all(&raw)
             .await
             .expect("columns");
-    assert!(columns.iter().any(|column| column == "preferences"));
-    let preferences: String =
-        sqlx::query_scalar("SELECT preferences FROM vault_users WHERE subject = 'alice'")
-            .fetch_one(&pool)
+    assert!(!columns.iter().any(|column| column == "preferences"));
+    let user_name: String =
+        sqlx::query_scalar("SELECT name FROM vault_users WHERE subject = 'alice'")
+            .fetch_one(&raw)
             .await
-            .expect("preferences");
-    assert_eq!(preferences, "{}");
+            .expect("existing user");
+    assert_eq!(user_name, "Alice");
     let settings_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'vault_settings'",
     )
-    .fetch_one(&pool)
+    .fetch_one(&raw)
     .await
     .expect("settings table");
-    assert_eq!(settings_count, 1);
+    assert_eq!(settings_count, 0);
     let upload_columns: Vec<String> =
         sqlx::query_scalar("SELECT name FROM pragma_table_info('upload_sessions')")
-            .fetch_all(&pool)
+            .fetch_all(&raw)
             .await
             .expect("upload columns");
     assert!(
         upload_columns
             .iter()
-            .any(|column| column == "verification_total_bytes")
+            .all(|column| column != "verification_total_bytes")
     );
     assert!(
         upload_columns
             .iter()
-            .any(|column| column == "verification_processed_bytes")
+            .all(|column| column != "verification_processed_bytes")
     );
+    raw.close().await;
+}
+
+#[tokio::test]
+async fn legacy_share_link_schema_is_rejected_without_mutation() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let db_path = temp_dir.path().join("vault.db");
+    initialize_valid_database(&db_path).await;
+
+    let raw = raw_pool(&db_path).await;
+    sqlx::query("DROP TABLE share_links")
+        .execute(&raw)
+        .await
+        .expect("replace share links fixture");
+    sqlx::query(
+        r"
+        CREATE TABLE share_links (
+            id INTEGER PRIMARY KEY,
+            code TEXT NOT NULL UNIQUE,
+            item_type TEXT NOT NULL,
+            item_id INTEGER NOT NULL,
+            created_by TEXT,
+            created_by_name TEXT,
+            created_at TEXT NOT NULL,
+            expires_at TEXT
+        )
+        ",
+    )
+    .execute(&raw)
+    .await
+    .expect("legacy share links fixture");
+    sqlx::query(
+        r"
+        INSERT INTO share_links (
+            id, code, item_type, item_id, created_by, created_by_name, created_at
+        )
+        VALUES (7, 'keep-share', 'document', 42, 'alice', 'Alice', '2026-01-02 03:04:05')
+        ",
+    )
+    .execute(&raw)
+    .await
+    .expect("legacy share row");
+    let table_sql_before: String = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'share_links'",
+    )
+    .fetch_one(&raw)
+    .await
+    .expect("legacy table SQL");
+    let columns_before: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('share_links') ORDER BY cid")
+            .fetch_all(&raw)
+            .await
+            .expect("legacy columns");
+    raw.close().await;
+
+    assert_startup_rejected(&db_path, "legacy share schema should reject").await;
+
+    let raw = raw_pool(&db_path).await;
+    let table_sql_after: String = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'share_links'",
+    )
+    .fetch_one(&raw)
+    .await
+    .expect("share table SQL after rejection");
+    let columns_after: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('share_links') ORDER BY cid")
+            .fetch_all(&raw)
+            .await
+            .expect("share columns after rejection");
+    assert_eq!(table_sql_after, table_sql_before);
+    assert_eq!(columns_after, columns_before);
+    let row: (
+        i64,
+        String,
+        String,
+        i64,
+        Option<String>,
+        Option<String>,
+        String,
+    ) = sqlx::query_as(
+        r"
+            SELECT id, code, item_type, item_id, created_by, created_by_name, created_at
+            FROM share_links
+            ",
+    )
+    .fetch_one(&raw)
+    .await
+    .expect("legacy share row after rejection");
+    assert_eq!(
+        row,
+        (
+            7,
+            "keep-share".to_string(),
+            "document".to_string(),
+            42,
+            Some("alice".to_string()),
+            Some("Alice".to_string()),
+            "2026-01-02 03:04:05".to_string(),
+        )
+    );
+    raw.close().await;
 }
 
 #[tokio::test]

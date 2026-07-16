@@ -1,6 +1,6 @@
 mod schema;
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
@@ -69,13 +69,11 @@ pub async fn reset(pool: &DbPool) -> anyhow::Result<()> {
 
 async fn init_schema(pool: &DbPool) -> anyhow::Result<()> {
     let existing_tables = user_table_names(pool).await?;
-    let mut tx = pool.begin().await?;
     if existing_tables.is_empty() {
+        let mut tx = pool.begin().await?;
         apply_schema_statements(&mut tx).await?;
-    } else {
-        apply_known_additive_migrations(&mut tx, &existing_tables).await?;
+        tx.commit().await?;
     }
-    tx.commit().await?;
 
     validate_schema(pool).await?;
 
@@ -90,231 +88,6 @@ async fn apply_schema_statements(tx: &mut Transaction<'_, Sqlite>) -> anyhow::Re
     for statement in schema::STATEMENTS {
         tx.execute(*statement).await?;
     }
-    Ok(())
-}
-
-async fn apply_known_additive_migrations(
-    tx: &mut Transaction<'_, Sqlite>,
-    existing_tables: &BTreeSet<String>,
-) -> anyhow::Result<()> {
-    if existing_tables.contains("vault_users") {
-        for table in [
-            "vault_settings",
-            "upload_sessions",
-            "upload_parts",
-            "export_jobs",
-            "export_artifacts",
-        ] {
-            if !existing_tables.contains(table) {
-                create_schema_for_table(tx, table).await?;
-            }
-        }
-        migrate_vault_users(tx).await?;
-    }
-    if existing_tables.contains("upload_sessions") {
-        migrate_upload_sessions(tx).await?;
-    }
-    if existing_tables.contains("share_links") {
-        migrate_share_links(tx).await?;
-    }
-    if existing_tables.contains("export_jobs") {
-        migrate_export_jobs(tx).await?;
-    }
-    Ok(())
-}
-
-async fn create_schema_for_table(
-    tx: &mut Transaction<'_, Sqlite>,
-    table: &str,
-) -> anyhow::Result<()> {
-    for statement in schema::STATEMENTS {
-        if schema_statement_targets_table(statement, table) {
-            tx.execute(*statement).await?;
-        }
-    }
-    Ok(())
-}
-
-fn schema_statement_targets_table(statement: &str, table: &str) -> bool {
-    let normalized = normalize_sql(statement);
-    normalized.starts_with(&format!("create table if not exists {table} "))
-        || normalized.contains(&format!(" on {table}("))
-        || normalized.contains(&format!(" on {table} ("))
-}
-
-async fn migrate_vault_users(tx: &mut Transaction<'_, Sqlite>) -> anyhow::Result<()> {
-    let rows = sqlx::query("PRAGMA table_info(vault_users)")
-        .fetch_all(&mut **tx)
-        .await?;
-    let mut columns = rows
-        .iter()
-        .filter_map(|row| row.try_get::<String, _>("name").ok())
-        .collect::<HashSet<_>>();
-
-    add_column(
-        tx,
-        &mut columns,
-        "vault_users",
-        "preferences",
-        "preferences TEXT NOT NULL DEFAULT '{}'",
-    )
-    .await
-}
-
-async fn migrate_upload_sessions(tx: &mut Transaction<'_, Sqlite>) -> anyhow::Result<()> {
-    let rows = sqlx::query("PRAGMA table_info(upload_sessions)")
-        .fetch_all(&mut **tx)
-        .await?;
-    let mut columns = rows
-        .iter()
-        .filter_map(|row| row.try_get::<String, _>("name").ok())
-        .collect::<HashSet<_>>();
-
-    add_column(
-        tx,
-        &mut columns,
-        "upload_sessions",
-        "verification_total_bytes",
-        "verification_total_bytes INTEGER NOT NULL DEFAULT 0",
-    )
-    .await?;
-    add_column(
-        tx,
-        &mut columns,
-        "upload_sessions",
-        "verification_processed_bytes",
-        "verification_processed_bytes INTEGER NOT NULL DEFAULT 0",
-    )
-    .await
-}
-
-async fn migrate_export_jobs(tx: &mut Transaction<'_, Sqlite>) -> anyhow::Result<()> {
-    let rows = sqlx::query("PRAGMA table_info(export_jobs)")
-        .fetch_all(&mut **tx)
-        .await?;
-    let mut columns = rows
-        .iter()
-        .filter_map(|row| row.try_get::<String, _>("name").ok())
-        .collect::<HashSet<_>>();
-
-    add_column(
-        tx,
-        &mut columns,
-        "export_jobs",
-        "request_payload",
-        "request_payload TEXT NOT NULL DEFAULT '{}'",
-    )
-    .await?;
-    add_column(
-        tx,
-        &mut columns,
-        "export_jobs",
-        "completed_at",
-        "completed_at TEXT",
-    )
-    .await?;
-    add_column(
-        tx,
-        &mut columns,
-        "export_jobs",
-        "cancelled_at",
-        "cancelled_at TEXT",
-    )
-    .await?;
-    Ok(())
-}
-
-async fn migrate_share_links(tx: &mut Transaction<'_, Sqlite>) -> anyhow::Result<()> {
-    let rows = sqlx::query("PRAGMA table_info(share_links)")
-        .fetch_all(&mut **tx)
-        .await?;
-    let mut columns = rows
-        .iter()
-        .filter_map(|row| row.try_get::<String, _>("name").ok())
-        .collect::<HashSet<_>>();
-
-    add_share_link_column(tx, &mut columns, "target_type", "target_type TEXT").await?;
-    add_share_link_column(tx, &mut columns, "document_id", "document_id INTEGER").await?;
-    add_share_link_column(tx, &mut columns, "folder_id", "folder_id INTEGER").await?;
-    add_share_link_column(
-        tx,
-        &mut columns,
-        "access_mode",
-        "access_mode TEXT NOT NULL DEFAULT 'internal'",
-    )
-    .await?;
-    add_share_link_column(
-        tx,
-        &mut columns,
-        "created_by_user_id",
-        "created_by_user_id INTEGER",
-    )
-    .await?;
-    add_share_link_column(tx, &mut columns, "disabled_at", "disabled_at TEXT").await?;
-    add_share_link_column(tx, &mut columns, "item_type", "item_type TEXT").await?;
-    add_share_link_column(tx, &mut columns, "item_id", "item_id INTEGER").await?;
-
-    sqlx::query(
-        r"
-        UPDATE share_links
-        SET target_type =
-            CASE
-                WHEN item_type IN ('document', 'file') THEN 'document'
-                WHEN item_type = 'folder' THEN 'folder'
-                ELSE item_type
-            END
-        WHERE target_type IS NULL
-          AND item_type IS NOT NULL
-        ",
-    )
-    .execute(&mut **tx)
-    .await?;
-    sqlx::query(
-        r"
-        UPDATE share_links
-        SET document_id = item_id
-        WHERE document_id IS NULL
-          AND item_type IN ('document', 'file')
-        ",
-    )
-    .execute(&mut **tx)
-    .await?;
-    sqlx::query(
-        r"
-        UPDATE share_links
-        SET folder_id = item_id
-        WHERE folder_id IS NULL
-          AND item_type = 'folder'
-        ",
-    )
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
-}
-
-async fn add_share_link_column(
-    tx: &mut Transaction<'_, Sqlite>,
-    columns: &mut HashSet<String>,
-    name: &str,
-    definition: &str,
-) -> anyhow::Result<()> {
-    add_column(tx, columns, "share_links", name, definition).await
-}
-
-async fn add_column(
-    tx: &mut Transaction<'_, Sqlite>,
-    columns: &mut HashSet<String>,
-    table: &str,
-    name: &str,
-    definition: &str,
-) -> anyhow::Result<()> {
-    if columns.contains(name) {
-        return Ok(());
-    }
-    sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN {definition}"))
-        .execute(&mut **tx)
-        .await?;
-    columns.insert(name.to_string());
     Ok(())
 }
 

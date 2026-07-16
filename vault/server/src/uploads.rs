@@ -694,6 +694,7 @@ where
 }
 
 pub async fn ingest_upload_part_with_token<S, E>(
+    pool: &SqlitePool,
     ingest: UploadPartIngest<'_>,
     token_claims: UploadPartTokenClaims,
     stream: S,
@@ -702,7 +703,15 @@ where
     S: Stream<Item = Result<Bytes, E>> + Unpin,
     E: Display,
 {
-    ingest_upload_part_for_session(ingest, token_claims.into_session_row(), stream).await
+    let session = fetch_upload_session(pool, ingest.session_id)
+        .await?
+        .ok_or(UploadError::UploadSessionNotFound)?;
+    if !token_claims.matches_session(&session) {
+        return Err(UploadError::UploadTokenInvalid);
+    }
+    require_part_authorization(&session, PartAuthorization::OwnerId(&token_claims.owner_id))?;
+    ensure_active_session(pool, ingest.transfers_path, &session).await?;
+    ingest_upload_part_for_session(ingest, session, stream).await
 }
 
 async fn ingest_upload_part_authorized<S, E>(
@@ -827,31 +836,15 @@ impl UploadPartTokenClaims {
             .map_or(true, |expires_at| expires_at < OffsetDateTime::now_utc())
     }
 
-    fn into_session_row(self) -> UploadSessionRow {
-        UploadSessionRow {
-            id: self.session_id,
-            mode: self.mode,
-            status: "active".to_string(),
-            folder_path: None,
-            document_id: None,
-            filename: self.filename,
-            total_size: self.total_size,
-            chunk_size: self.chunk_size,
-            part_count: self.part_count,
-            verification_total_bytes: 0,
-            verification_processed_bytes: 0,
-            mime_type: None,
-            note: None,
-            rename_to_upload: false,
-            created_by: self.owner_id,
-            created_by_name: None,
-            upload_ip: None,
-            upload_user_agent: None,
-            expires_at: self.expires_at,
-            result_document_id: None,
-            result_version_id: None,
-            result_path: None,
-        }
+    fn matches_session(&self, session: &UploadSessionRow) -> bool {
+        self.session_id == session.id
+            && self.owner_id == session.created_by
+            && self.mode == session.mode
+            && self.filename == session.filename
+            && self.total_size == session.total_size
+            && self.chunk_size == session.chunk_size
+            && self.part_count == session.part_count
+            && self.expires_at == session.expires_at
     }
 }
 
@@ -993,23 +986,33 @@ pub async fn abort_upload_session(
         .await?
         .ok_or(UploadError::UploadSessionNotFound)?;
     require_transfer_owner(&session, user)?;
-    if session.status != "complete" {
-        sqlx::query(
-            r"
-            UPDATE upload_sessions
-            SET status = 'aborted',
-                aborted_at = ?,
-                updated_at = ?
-            WHERE id = ?
-            ",
-        )
-        .bind(now_rfc3339()?)
-        .bind(now_rfc3339()?)
-        .bind(session_id)
-        .execute(pool)
-        .await?;
+    let now = now_rfc3339()?;
+    let aborted = sqlx::query(
+        r"
+        UPDATE upload_sessions
+        SET status = 'aborted',
+            aborted_at = ?,
+            updated_at = ?
+        WHERE id = ?
+          AND status IN ('active', 'completing')
+        ",
+    )
+    .bind(&now)
+    .bind(&now)
+    .bind(session_id)
+    .execute(pool)
+    .await?;
+    let current_status: String =
+        sqlx::query_scalar("SELECT status FROM upload_sessions WHERE id = ?")
+            .bind(session_id)
+            .fetch_optional(pool)
+            .await?
+            .ok_or(UploadError::UploadSessionNotFound)?;
+    if aborted.rows_affected() > 0
+        || matches!(current_status.as_str(), "aborted" | "failed" | "expired")
+    {
+        clear_upload_session_files(transfers_path, session_id).await;
     }
-    clear_upload_session_files(transfers_path, session_id).await;
     upload_session_payload(pool, transfers_path, token_secret, session_id).await
 }
 
@@ -1084,7 +1087,7 @@ async fn complete_upload_session_after_store(
         &["contents", "sidebar", "document_detail"],
     )
     .await?;
-    sqlx::query(
+    let completed = sqlx::query(
         r"
         UPDATE upload_sessions
         SET status = 'complete',
@@ -1096,6 +1099,7 @@ async fn complete_upload_session_after_store(
             result_version_id = ?,
             result_path = ?
         WHERE id = ?
+          AND status = 'completing'
         ",
     )
     .bind(session.total_size)
@@ -1108,6 +1112,18 @@ async fn complete_upload_session_after_store(
     .bind(&session.id)
     .execute(&mut *transaction)
     .await?;
+    if completed.rows_affected() == 0 {
+        let status: Option<String> =
+            sqlx::query_scalar("SELECT status FROM upload_sessions WHERE id = ?")
+                .bind(&session.id)
+                .fetch_optional(&mut *transaction)
+                .await?;
+        transaction.rollback().await?;
+        return Err(match status {
+            Some(status) => UploadError::UploadSessionStatus(status),
+            None => UploadError::UploadSessionNotFound,
+        });
+    }
     transaction.commit().await?;
     Ok(result)
 }
@@ -2275,23 +2291,44 @@ async fn ensure_session_not_expired(
     transfers_path: &Path,
     session: &UploadSessionRow,
 ) -> Result<(), UploadError> {
-    if OffsetDateTime::parse(&session.expires_at, &Rfc3339)? > OffsetDateTime::now_utc() {
+    let now = OffsetDateTime::now_utc();
+    if OffsetDateTime::parse(&session.expires_at, &Rfc3339)? > now {
         return Ok(());
     }
-    sqlx::query(
+    let now = now.format(&Rfc3339)?;
+    let expired = sqlx::query(
         r"
         UPDATE upload_sessions
         SET status = 'expired',
             updated_at = ?
-        WHERE id = ? AND status = 'active'
+        WHERE id = ?
+          AND status = 'active'
+          AND datetime(expires_at) <= datetime(?)
         ",
     )
-    .bind(now_rfc3339()?)
+    .bind(&now)
     .bind(&session.id)
+    .bind(&now)
     .execute(pool)
     .await?;
-    clear_upload_session_files(transfers_path, &session.id).await;
-    Err(UploadError::UploadSessionExpired)
+    if expired.rows_affected() > 0 {
+        clear_upload_session_files(transfers_path, &session.id).await;
+        return Err(UploadError::UploadSessionExpired);
+    }
+    let status: Option<String> =
+        sqlx::query_scalar("SELECT status FROM upload_sessions WHERE id = ?")
+            .bind(&session.id)
+            .fetch_optional(pool)
+            .await?;
+    match status.as_deref() {
+        Some("expired") => {
+            clear_upload_session_files(transfers_path, &session.id).await;
+            Err(UploadError::UploadSessionExpired)
+        }
+        Some("active") => Ok(()),
+        Some(status) => Err(UploadError::UploadSessionStatus(status.to_string())),
+        None => Err(UploadError::UploadSessionNotFound),
+    }
 }
 
 async fn mark_upload_failed(
@@ -2300,13 +2337,13 @@ async fn mark_upload_failed(
     session_id: &str,
     message: &str,
 ) -> Result<(), UploadError> {
-    sqlx::query(
+    let failed = sqlx::query(
         r"
         UPDATE upload_sessions
         SET status = 'failed',
             error = ?,
             updated_at = ?
-        WHERE id = ? AND status != 'complete' AND status != 'aborted'
+        WHERE id = ? AND status = 'completing'
         ",
     )
     .bind(message)
@@ -2314,7 +2351,9 @@ async fn mark_upload_failed(
     .bind(session_id)
     .execute(pool)
     .await?;
-    clear_upload_session_files(transfers_path, session_id).await;
+    if failed.rows_affected() > 0 {
+        clear_upload_session_files(transfers_path, session_id).await;
+    }
     Ok(())
 }
 

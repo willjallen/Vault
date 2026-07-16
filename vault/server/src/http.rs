@@ -1381,7 +1381,7 @@ async fn api_upload_session_part(
     if let Some(token) = header_value_by_name(&headers, "x-upload-token") {
         let token_claims =
             uploads::verify_upload_token_claims(&state.auth.session_secret, token, &session_id)?;
-        uploads::ingest_upload_part_with_token(ingest, token_claims, stream).await?;
+        uploads::ingest_upload_part_with_token(&state.db, ingest, token_claims, stream).await?;
     } else {
         let user = current_user(&state, &headers).await?;
         uploads::ingest_upload_part(&state.db, ingest, &user, stream).await?;

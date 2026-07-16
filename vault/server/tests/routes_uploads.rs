@@ -1523,6 +1523,7 @@ async fn create_completion_rechecks_duplicate_path_without_deleting_promoted_obj
 async fn upload_part_accepts_signed_token_without_user_headers() {
     let (state, _temp_dir) = test_state().await;
     grant_writer_root(&state.db).await;
+    let pool = state.db.clone();
     let app = http::router(state);
     let data = b"token upload";
     let created = app
@@ -1574,10 +1575,25 @@ async fn upload_part_accepts_signed_token_without_user_headers() {
     );
 
     let uploaded = app
+        .clone()
         .oneshot(upload_part_token_request(session_id, 1, data, token))
         .await
         .expect("token upload response");
     assert_eq!(uploaded.status(), StatusCode::NO_CONTENT);
+
+    sqlx::query("UPDATE upload_sessions SET status = 'aborted' WHERE id = ?")
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .expect("abort token upload session");
+    let rejected = app
+        .oneshot(upload_part_token_request(session_id, 1, data, token))
+        .await
+        .expect("terminal token upload response");
+    let rejected_status = rejected.status();
+    let rejected_json = response_json(rejected).await;
+    assert_eq!(rejected_status, StatusCode::CONFLICT);
+    assert_eq!(rejected_json["detail"], "Upload session is aborted");
 }
 
 #[tokio::test]
@@ -2727,6 +2743,86 @@ async fn cancelled_upload_completion_returns_to_active_and_can_retry() {
     .await
     .expect("completion after cancellation");
     assert_eq!(completed.path, "retry-cancelled.txt");
+}
+
+#[tokio::test]
+async fn abort_wins_against_in_flight_completion_without_committing_metadata() {
+    let (state, _temp_dir) =
+        test_state_with_upload_settings(5 * 1024 * 1024 * 1024, 4, 86_400).await;
+    grant_writer_root(&state.db).await;
+    let pool = state.db.clone();
+    let transfers_path = state.config.transfers_path();
+    let token_secret = state.auth.session_secret.clone();
+    let user = writer_context();
+    let data = b"abcdefgh";
+    let digest = sha256_hex(data);
+    let session_id = directly_uploaded_session_with_fixed_parts(
+        &state,
+        &user,
+        "abort-racing-completion.txt",
+        data,
+        4,
+    )
+    .await;
+    let waiting = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let storage = BlockingPartStorage {
+        release: release.clone(),
+        stored: test_stored_blob(&digest, data.len()),
+        waiting: waiting.clone(),
+    };
+    let complete_pool = pool.clone();
+    let complete_transfers_path = transfers_path.clone();
+    let complete_session_id = session_id.clone();
+    let complete_digest = digest.clone();
+    let completion_user = user.clone();
+    let mut completion = tokio::spawn(async move {
+        uploads::complete_upload_session(
+            &complete_pool,
+            &storage,
+            &complete_transfers_path,
+            &complete_session_id,
+            Some(&complete_digest),
+            &completion_user,
+        )
+        .await
+    });
+
+    wait_for_storage_block(&waiting, &mut completion).await;
+    let aborted =
+        uploads::abort_upload_session(&pool, &transfers_path, &token_secret, &session_id, &user)
+            .await
+            .expect("abort should win while storage publication is blocked");
+    assert_eq!(aborted.status, "aborted");
+    assert!(!transfers_path.join("uploads").join(&session_id).exists());
+
+    release.notify_one();
+    let error = completion
+        .await
+        .expect("completion task")
+        .expect_err("aborted completion must not commit");
+    assert!(
+        matches!(error, uploads::UploadError::UploadSessionStatus(ref status) if status == "aborted"),
+        "unexpected completion error: {error:?}"
+    );
+    let status: String = sqlx::query_scalar("SELECT status FROM upload_sessions WHERE id = ?")
+        .bind(&session_id)
+        .fetch_one(&pool)
+        .await
+        .expect("aborted status");
+    let counts = sqlx::query_as::<_, (i64, i64, i64)>(
+        r"
+        SELECT
+            (SELECT COUNT(*) FROM documents),
+            (SELECT COUNT(*) FROM blobs),
+            (SELECT COUNT(*) FROM blob_locations)
+        ",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("metadata counts");
+    assert_eq!(status, "aborted");
+    assert_eq!(counts, (0, 0, 0));
 }
 
 #[tokio::test]

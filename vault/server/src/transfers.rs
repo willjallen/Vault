@@ -101,8 +101,8 @@ pub async fn sweep_expired_transfers_with_limit(
     let mut result = TransferSweepResult::default();
 
     let mut transaction = pool.begin().await?;
-    sweep_upload_rows(&mut transaction, &uploads, &mut result).await?;
-    sweep_export_rows(&mut transaction, &exports, &mut result).await?;
+    sweep_upload_rows(&mut transaction, &uploads, &now, &mut result).await?;
+    sweep_export_rows(&mut transaction, &exports, &now, &mut result).await?;
     transaction.commit().await?;
 
     for session_id in result
@@ -398,28 +398,46 @@ async fn upload_has_recoverable_parts(
 async fn sweep_upload_rows(
     transaction: &mut Transaction<'_, Sqlite>,
     uploads: &[ExpiredUploadRow],
+    now: &str,
     result: &mut TransferSweepResult,
 ) -> Result<(), sqlx::Error> {
     for upload in uploads {
         if matches!(upload.status.as_str(), "active" | "completing") {
-            sqlx::query(
+            let expired = sqlx::query(
                 r"
                 UPDATE upload_sessions
                 SET status = 'expired',
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
+                  AND status = ?
+                  AND datetime(expires_at) <= datetime(?)
                 ",
             )
             .bind(&upload.id)
+            .bind(&upload.status)
+            .bind(now)
             .execute(&mut **transaction)
             .await?;
-            result.expired_uploads.push(upload.id.clone());
+            if expired.rows_affected() > 0 {
+                result.expired_uploads.push(upload.id.clone());
+            }
         } else {
-            sqlx::query("DELETE FROM upload_sessions WHERE id = ?")
-                .bind(&upload.id)
-                .execute(&mut **transaction)
-                .await?;
-            result.deleted_uploads.push(upload.id.clone());
+            let deleted = sqlx::query(
+                r"
+                DELETE FROM upload_sessions
+                WHERE id = ?
+                  AND status = ?
+                  AND datetime(expires_at) <= datetime(?)
+                ",
+            )
+            .bind(&upload.id)
+            .bind(&upload.status)
+            .bind(now)
+            .execute(&mut **transaction)
+            .await?;
+            if deleted.rows_affected() > 0 {
+                result.deleted_uploads.push(upload.id.clone());
+            }
         }
     }
     Ok(())
@@ -428,23 +446,30 @@ async fn sweep_upload_rows(
 async fn sweep_export_rows(
     transaction: &mut Transaction<'_, Sqlite>,
     exports: &[ExpiredExportRow],
+    now: &str,
     result: &mut TransferSweepResult,
 ) -> Result<(), sqlx::Error> {
     let mut deleted_blob_ids = Vec::new();
     for export in exports {
         if matches!(export.status.as_str(), "queued" | "running" | "finalizing") {
-            sqlx::query(
+            let cancelled = sqlx::query(
                 r"
                 UPDATE export_jobs
                 SET status = 'cancelled',
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
+                  AND status = ?
+                  AND datetime(expires_at) <= datetime(?)
                 ",
             )
             .bind(&export.id)
+            .bind(&export.status)
+            .bind(now)
             .execute(&mut **transaction)
             .await?;
-            result.cancelled_exports.push(export.id.clone());
+            if cancelled.rows_affected() > 0 {
+                result.cancelled_exports.push(export.id.clone());
+            }
         } else {
             let artifact_blob_ids = sqlx::query_scalar::<_, i64>(
                 "SELECT blob_id FROM export_artifacts WHERE job_id = ?",
@@ -452,12 +477,23 @@ async fn sweep_export_rows(
             .bind(&export.id)
             .fetch_all(&mut **transaction)
             .await?;
-            deleted_blob_ids.extend(artifact_blob_ids);
-            sqlx::query("DELETE FROM export_jobs WHERE id = ?")
-                .bind(&export.id)
-                .execute(&mut **transaction)
-                .await?;
-            result.deleted_exports.push(export.id.clone());
+            let deleted = sqlx::query(
+                r"
+                DELETE FROM export_jobs
+                WHERE id = ?
+                  AND status = ?
+                  AND datetime(expires_at) <= datetime(?)
+                ",
+            )
+            .bind(&export.id)
+            .bind(&export.status)
+            .bind(now)
+            .execute(&mut **transaction)
+            .await?;
+            if deleted.rows_affected() > 0 {
+                deleted_blob_ids.extend(artifact_blob_ids);
+                result.deleted_exports.push(export.id.clone());
+            }
         }
     }
     delete_unreferenced_blobs(transaction, &deleted_blob_ids).await

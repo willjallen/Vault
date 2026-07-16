@@ -146,6 +146,53 @@ async fn insert_export_job_with_expiration(
     .expect("export job");
 }
 
+async fn upload_sweep_survivors(pool: &sqlx::SqlitePool) -> Vec<(String, String, String)> {
+    sqlx::query_as(
+        r"
+        SELECT id, status, expires_at
+        FROM upload_sessions
+        WHERE id != 'driver-upload'
+        ORDER BY id
+        ",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("surviving upload rows")
+}
+
+async fn export_sweep_survivors(pool: &sqlx::SqlitePool) -> Vec<(String, String, String)> {
+    sqlx::query_as(
+        r"
+        SELECT id, status, expires_at
+        FROM export_jobs
+        WHERE id != 'driver-export'
+        ORDER BY id
+        ",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("surviving export rows")
+}
+
+async fn export_artifact_and_blob_counts(
+    pool: &sqlx::SqlitePool,
+    job_id: &str,
+    blob_id: i64,
+) -> (i64, i64) {
+    let artifact_count =
+        sqlx::query_scalar("SELECT COUNT(*) FROM export_artifacts WHERE job_id = ?")
+            .bind(job_id)
+            .fetch_one(pool)
+            .await
+            .expect("preserved artifact");
+    let blob_count = sqlx::query_scalar("SELECT COUNT(*) FROM blobs WHERE id = ?")
+        .bind(blob_id)
+        .fetch_one(pool)
+        .await
+        .expect("preserved blob");
+    (artifact_count, blob_count)
+}
+
 async fn insert_stored_blob(state: &AppState, content: &[u8]) -> (i64, StoredBlob) {
     let stored = state
         .storage
@@ -557,6 +604,112 @@ async fn sweep_expired_uploads_marks_active_and_removes_terminal_sessions() {
 }
 
 #[tokio::test]
+async fn sweep_expired_uploads_ignores_stale_status_and_expiration_snapshots() {
+    let (state, _temp_dir) = test_state(AuthSettings::default()).await;
+    insert_upload_session_with_expiration(
+        &state.db,
+        "driver-upload",
+        "active",
+        "1997-01-01T00:00:00Z",
+    )
+    .await;
+    insert_upload_session_with_expiration(
+        &state.db,
+        "status-changed-upload",
+        "active",
+        "1998-01-01T00:00:00Z",
+    )
+    .await;
+    insert_upload_session_with_expiration(
+        &state.db,
+        "renewed-upload",
+        "active",
+        "1999-01-01T00:00:00Z",
+    )
+    .await;
+    insert_upload_session_with_expiration(
+        &state.db,
+        "terminal-changed-upload",
+        "failed",
+        EXPIRED_AT,
+    )
+    .await;
+    sqlx::query(
+        r"
+        CREATE TRIGGER mutate_later_uploads_during_sweep
+        AFTER UPDATE OF status ON upload_sessions
+        WHEN NEW.id = 'driver-upload' AND NEW.status = 'expired'
+        BEGIN
+            UPDATE upload_sessions
+            SET status = 'complete'
+            WHERE id = 'status-changed-upload';
+            UPDATE upload_sessions
+            SET expires_at = '2999-01-01T00:00:00Z'
+            WHERE id = 'renewed-upload';
+            UPDATE upload_sessions
+            SET status = 'active'
+            WHERE id = 'terminal-changed-upload';
+        END
+        ",
+    )
+    .execute(&state.db)
+    .await
+    .expect("stale upload snapshot trigger");
+    let transfers_path = state.config.transfers_path();
+    let upload_root = transfers_path.join("uploads");
+    for session_id in [
+        "driver-upload",
+        "status-changed-upload",
+        "renewed-upload",
+        "terminal-changed-upload",
+    ] {
+        let session_dir = upload_root.join(session_id);
+        tokio::fs::create_dir_all(&session_dir)
+            .await
+            .expect("upload scratch dir");
+        tokio::fs::write(session_dir.join("00000001.part"), b"x")
+            .await
+            .expect("upload scratch part");
+    }
+
+    let result = sweep_expired_transfers(&state.db, &state.storage, &transfers_path)
+        .await
+        .expect("sweep");
+    let rows = upload_sweep_survivors(&state.db).await;
+
+    assert_eq!(result.expired_uploads, vec!["driver-upload"]);
+    assert!(result.deleted_uploads.is_empty());
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "renewed-upload".to_string(),
+                "active".to_string(),
+                FUTURE_AT.to_string(),
+            ),
+            (
+                "status-changed-upload".to_string(),
+                "complete".to_string(),
+                "1998-01-01T00:00:00Z".to_string(),
+            ),
+            (
+                "terminal-changed-upload".to_string(),
+                "active".to_string(),
+                EXPIRED_AT.to_string(),
+            ),
+        ]
+    );
+    assert!(!upload_root.join("driver-upload").exists());
+    for session_id in [
+        "status-changed-upload",
+        "renewed-upload",
+        "terminal-changed-upload",
+    ] {
+        assert!(upload_root.join(session_id).join("00000001.part").is_file());
+    }
+}
+
+#[tokio::test]
 async fn sweep_expired_exports_cancels_active_and_deletes_terminal_artifacts() {
     let (state, _temp_dir) = test_state(AuthSettings::default()).await;
     insert_export_job(&state.db, "queued-export", "queued").await;
@@ -598,6 +751,106 @@ async fn sweep_expired_exports_cancels_active_and_deletes_terminal_artifacts() {
             .expect("object keys")
             .contains(&stored.object_key)
     );
+}
+
+#[tokio::test]
+async fn sweep_expired_exports_ignores_stale_status_and_expiration_snapshots() {
+    let (state, _temp_dir) = test_state(AuthSettings::default()).await;
+    insert_export_job_with_expiration(&state.db, "driver-export", "queued", "1997-01-01T00:00:00Z")
+        .await;
+    insert_export_job_with_expiration(
+        &state.db,
+        "status-changed-export",
+        "running",
+        "1998-01-01T00:00:00Z",
+    )
+    .await;
+    insert_export_job_with_expiration(
+        &state.db,
+        "renewed-export",
+        "queued",
+        "1999-01-01T00:00:00Z",
+    )
+    .await;
+    insert_export_job(&state.db, "terminal-changed-export", "complete").await;
+    let (blob_id, stored) = insert_stored_blob(&state, b"stale export artifact").await;
+    insert_export_artifact(&state.db, "terminal-changed-export", blob_id, &stored).await;
+    sqlx::query(
+        r"
+        CREATE TRIGGER mutate_later_exports_during_sweep
+        AFTER UPDATE OF status ON export_jobs
+        WHEN NEW.id = 'driver-export' AND NEW.status = 'cancelled'
+        BEGIN
+            UPDATE export_jobs
+            SET status = 'complete'
+            WHERE id = 'status-changed-export';
+            UPDATE export_jobs
+            SET expires_at = '2999-01-01T00:00:00Z'
+            WHERE id = 'renewed-export';
+            UPDATE export_jobs
+            SET status = 'cancelled'
+            WHERE id = 'terminal-changed-export';
+        END
+        ",
+    )
+    .execute(&state.db)
+    .await
+    .expect("stale export snapshot trigger");
+    let transfers_path = state.config.transfers_path();
+    let export_root = transfers_path.join("exports");
+    tokio::fs::create_dir_all(&export_root)
+        .await
+        .expect("export scratch dir");
+    for job_id in [
+        "driver-export",
+        "status-changed-export",
+        "renewed-export",
+        "terminal-changed-export",
+    ] {
+        tokio::fs::write(export_root.join(format!("{job_id}.zip.tmp")), b"partial")
+            .await
+            .expect("export scratch file");
+    }
+
+    let result = sweep_expired_transfers(&state.db, &state.storage, &transfers_path)
+        .await
+        .expect("sweep");
+    let rows = export_sweep_survivors(&state.db).await;
+    let (artifact_count, blob_count) =
+        export_artifact_and_blob_counts(&state.db, "terminal-changed-export", blob_id).await;
+
+    assert_eq!(result.cancelled_exports, vec!["driver-export"]);
+    assert!(result.deleted_exports.is_empty());
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "renewed-export".to_string(),
+                "queued".to_string(),
+                FUTURE_AT.to_string(),
+            ),
+            (
+                "status-changed-export".to_string(),
+                "complete".to_string(),
+                "1998-01-01T00:00:00Z".to_string(),
+            ),
+            (
+                "terminal-changed-export".to_string(),
+                "cancelled".to_string(),
+                EXPIRED_AT.to_string(),
+            ),
+        ]
+    );
+    assert_eq!(artifact_count, 1);
+    assert_eq!(blob_count, 1);
+    assert!(!export_root.join("driver-export.zip.tmp").exists());
+    for job_id in [
+        "status-changed-export",
+        "renewed-export",
+        "terminal-changed-export",
+    ] {
+        assert!(export_root.join(format!("{job_id}.zip.tmp")).is_file());
+    }
 }
 
 #[tokio::test]

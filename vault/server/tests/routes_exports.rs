@@ -1792,7 +1792,7 @@ async fn cancelled_export_cleans_object_promoted_before_artifact_metadata() {
 }
 
 #[tokio::test]
-async fn cancelled_export_cleans_blob_metadata_created_before_artifact_metadata() {
+async fn export_artifact_failure_rolls_back_blob_and_location_metadata() {
     let (mut state, _temp_dir) = test_state().await;
     let entered_put_file = Arc::new(Notify::new());
     let release_put_file = Arc::new(Notify::new());
@@ -1820,6 +1820,7 @@ async fn cancelled_export_cleans_blob_metadata_created_before_artifact_metadata(
     expected_keys.sort();
     let pool = state.db.clone();
     let storage = state.storage.clone();
+    let transfers_path = state.config.transfers_path();
     let app = http::router(state);
 
     let response = app
@@ -1843,26 +1844,48 @@ async fn cancelled_export_cleans_blob_metadata_created_before_artifact_metadata(
     timeout(Duration::from_secs(5), entered_put_file.notified())
         .await
         .expect("artifact promotion should be blocked before storage write");
-    sqlx::query(&format!(
+    sqlx::query(
         r"
-        CREATE TRIGGER cancel_export_after_artifact_blob_location
-        AFTER INSERT ON blob_locations
+        CREATE TRIGGER reject_export_artifact_metadata
+        BEFORE INSERT ON export_artifacts
         BEGIN
-            UPDATE export_jobs
-            SET status = 'cancelled',
-                cancelled_at = CURRENT_TIMESTAMP,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = '{}';
+            SELECT RAISE(ABORT, 'forced artifact metadata failure');
         END
         ",
-        job_id.replace('\'', "''")
-    ))
+    )
     .execute(&pool)
     .await
-    .expect("install cancellation trigger");
+    .expect("install artifact failure trigger");
 
     release_put_file.notify_one();
-    wait_for_cancelled_export_cleanup(&pool, &storage, &job_id, &expected_keys).await;
+    wait_for_export_status_in_db(&pool, &job_id, "failed").await;
+    wait_for_path_missing(
+        &transfers_path
+            .join("exports")
+            .join(format!("{job_id}.zip.tmp")),
+    )
+    .await;
+    let artifact_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM export_artifacts WHERE job_id = ?")
+            .bind(&job_id)
+            .fetch_one(&pool)
+            .await
+            .expect("artifact count");
+    let orphan_blob_count: i64 = sqlx::query_scalar(
+        r"
+        SELECT COUNT(*)
+        FROM blobs b
+        WHERE NOT EXISTS (SELECT 1 FROM document_versions v WHERE v.blob_id = b.id)
+          AND NOT EXISTS (SELECT 1 FROM export_artifacts a WHERE a.blob_id = b.id)
+        ",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("orphan blob count");
+    let keys = storage.list_object_keys().await.expect("object keys");
+    assert_eq!(artifact_count, 0);
+    assert_eq!(orphan_blob_count, 0);
+    assert!(expected_keys.iter().all(|key| keys.contains(key)));
 }
 
 #[tokio::test]

@@ -8,7 +8,7 @@ use flate2::write::{DeflateEncoder, ZlibEncoder};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use sqlx::{FromRow, QueryBuilder, Sqlite, SqlitePool};
+use sqlx::{FromRow, QueryBuilder, Sqlite, SqlitePool, Transaction};
 use thiserror::Error;
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
@@ -604,20 +604,19 @@ pub async fn cancel_export_job(
         .await?
         .ok_or(ExportError::ExportNotFound)?;
     require_transfer_owner(&row.created_by, user)?;
-    if matches!(row.status.as_str(), "queued" | "running" | "finalizing") {
-        sqlx::query(
-            r"
-            UPDATE export_jobs
-            SET status = 'cancelled',
-                cancelled_at = CURRENT_TIMESTAMP,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?
-            ",
-        )
-        .bind(job_id)
-        .execute(pool)
-        .await?;
-    }
+    sqlx::query(
+        r"
+        UPDATE export_jobs
+        SET status = 'cancelled',
+            cancelled_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+          AND status IN ('queued', 'running', 'finalizing')
+        ",
+    )
+    .bind(job_id)
+    .execute(pool)
+    .await?;
     get_export_job(pool, job_id, user).await
 }
 
@@ -827,15 +826,27 @@ async fn complete_export_job(
             return Err(error);
         }
     };
-    ensure_export_not_cancelled(pool, job_id).await?;
-    sqlx::query(
-        "UPDATE export_jobs SET status = 'finalizing', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-    )
-    .bind(job_id)
-    .execute(pool)
-    .await?;
-    ensure_export_not_cancelled(pool, job_id).await?;
-    let result = persist_export_artifact(pool, storage, job_id, &artifact).await;
+    let result = async {
+        ensure_export_not_cancelled(pool, job_id).await?;
+        let finalizing = sqlx::query(
+            r"
+            UPDATE export_jobs
+            SET status = 'finalizing',
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+              AND status = 'running'
+            ",
+        )
+        .bind(job_id)
+        .execute(pool)
+        .await?;
+        if finalizing.rows_affected() == 0 {
+            return Err(ExportError::ExportCancelled);
+        }
+        ensure_export_not_cancelled(pool, job_id).await?;
+        persist_export_artifact(pool, storage, job_id, &artifact).await
+    }
+    .await;
     let _ = fs::remove_file(&artifact.path).await;
     if result.is_ok() {
         record_export_events(pool, &downloads, &work.user).await?;
@@ -1019,13 +1030,14 @@ async fn update_export_totals(
     downloads: &[VersionDownload],
 ) -> Result<(), ExportError> {
     let (total_items, total_bytes) = export_totals(downloads)?;
-    sqlx::query(
+    let updated = sqlx::query(
         r"
         UPDATE export_jobs
         SET total_items = ?,
             total_bytes = ?,
             updated_at = CURRENT_TIMESTAMP
         WHERE id = ?
+          AND status = 'running'
         ",
     )
     .bind(total_items)
@@ -1033,6 +1045,9 @@ async fn update_export_totals(
     .bind(job_id)
     .execute(pool)
     .await?;
+    if updated.rows_affected() == 0 {
+        return Err(ExportError::ExportCancelled);
+    }
     Ok(())
 }
 
@@ -1070,7 +1085,7 @@ async fn record_export_entry_progress(
     processed_bytes: i64,
 ) -> Result<(), ExportError> {
     ensure_export_not_cancelled(pool, job_id).await?;
-    sqlx::query(
+    let updated = sqlx::query(
         r"
         UPDATE export_jobs
         SET processed_items = processed_items + 1,
@@ -1084,6 +1099,9 @@ async fn record_export_entry_progress(
     .bind(job_id)
     .execute(pool)
     .await?;
+    if updated.rows_affected() == 0 {
+        return Err(ExportError::ExportCancelled);
+    }
     Ok(())
 }
 
@@ -1096,7 +1114,7 @@ async fn record_export_byte_progress(
         return Ok(());
     }
     ensure_export_not_cancelled(pool, job_id).await?;
-    sqlx::query(
+    let updated = sqlx::query(
         r"
         UPDATE export_jobs
         SET processed_bytes = CASE
@@ -1113,12 +1131,15 @@ async fn record_export_byte_progress(
     .bind(job_id)
     .execute(pool)
     .await?;
+    if updated.rows_affected() == 0 {
+        return Err(ExportError::ExportCancelled);
+    }
     Ok(())
 }
 
 async fn record_export_item_complete(pool: &SqlitePool, job_id: &str) -> Result<(), ExportError> {
     ensure_export_not_cancelled(pool, job_id).await?;
-    sqlx::query(
+    let updated = sqlx::query(
         r"
         UPDATE export_jobs
         SET processed_items = processed_items + 1,
@@ -1130,6 +1151,9 @@ async fn record_export_item_complete(pool: &SqlitePool, job_id: &str) -> Result<
     .bind(job_id)
     .execute(pool)
     .await?;
+    if updated.rows_affected() == 0 {
+        return Err(ExportError::ExportCancelled);
+    }
     Ok(())
 }
 
@@ -1398,14 +1422,28 @@ async fn persist_export_artifact(
         );
         return Err(error);
     }
-    let blob_id = get_or_create_blob(pool, &stored).await?;
-    if let Err(error) = ensure_export_not_cancelled(pool, job_id).await {
-        cleanup_export_artifact_commit(pool, job_id, &stored).await;
-        return Err(error);
-    }
-    let job = export_job_row(pool, job_id)
-        .await?
-        .ok_or(ExportError::ExportNotFound)?;
+    let mut transaction = pool.begin().await?;
+    let job = sqlx::query_as::<_, (String, String)>(
+        r"
+        UPDATE export_jobs
+        SET status = 'complete',
+            processed_items = total_items,
+            processed_bytes = total_bytes,
+            completed_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+          AND status = 'finalizing'
+        RETURNING filename, expires_at
+        ",
+    )
+    .bind(job_id)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    let Some((filename, expires_at)) = job else {
+        transaction.rollback().await?;
+        return Err(ExportError::ExportCancelled);
+    };
+    let blob_id = get_or_create_blob_in_tx(&mut transaction, &stored).await?;
     sqlx::query(
         r"
         INSERT INTO export_artifacts
@@ -1425,101 +1463,14 @@ async fn persist_export_artifact(
     )
     .bind(job_id)
     .bind(blob_id)
-    .bind(&job.filename)
+    .bind(&filename)
     .bind(i64::try_from(stored.size_bytes).map_err(|_| ExportError::ZipLimitExceeded)?)
     .bind(&stored.digest)
-    .bind(&job.expires_at)
-    .execute(pool)
+    .bind(&expires_at)
+    .execute(&mut *transaction)
     .await?;
-    if let Err(error) = ensure_export_not_cancelled(pool, job_id).await {
-        cleanup_export_artifact_commit(pool, job_id, &stored).await;
-        return Err(error);
-    }
-    let completed = sqlx::query(
-        r"
-        UPDATE export_jobs
-        SET status = 'complete',
-            processed_items = total_items,
-            processed_bytes = total_bytes,
-            completed_at = CURRENT_TIMESTAMP,
-            updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-          AND status = 'finalizing'
-        ",
-    )
-    .bind(job_id)
-    .execute(pool)
-    .await?;
-    if completed.rows_affected() == 0 {
-        cleanup_export_artifact_commit(pool, job_id, &stored).await;
-        return Err(ExportError::ExportCancelled);
-    }
+    transaction.commit().await?;
     Ok(())
-}
-
-async fn cleanup_export_artifact_commit(pool: &SqlitePool, job_id: &str, stored: &StoredBlob) {
-    let _ = sqlx::query("DELETE FROM export_artifacts WHERE job_id = ?")
-        .bind(job_id)
-        .execute(pool)
-        .await;
-    cleanup_unreferenced_export_blob(pool, stored).await;
-}
-
-async fn cleanup_unreferenced_export_blob(pool: &SqlitePool, stored: &StoredBlob) {
-    let Ok(size_bytes) = i64::try_from(stored.size_bytes) else {
-        return;
-    };
-    let blob_id = sqlx::query_scalar::<_, i64>(
-        r"
-        SELECT id
-        FROM blobs
-        WHERE hash_algo = ? AND hash = ? AND size_bytes = ?
-        ",
-    )
-    .bind(&stored.hash_algo)
-    .bind(&stored.digest)
-    .bind(size_bytes)
-    .fetch_optional(pool)
-    .await;
-    let Some(blob_id) = blob_id.ok().flatten() else {
-        return;
-    };
-    let mut transaction = match pool.begin().await {
-        Ok(transaction) => transaction,
-        Err(error) => {
-            tracing::warn!(?error, "failed to begin export blob cleanup transaction");
-            return;
-        }
-    };
-    let references = sqlx::query_scalar::<_, i64>(
-        r"
-        SELECT
-            (SELECT COUNT(*) FROM document_versions WHERE blob_id = ?)
-            + (SELECT COUNT(*) FROM export_artifacts WHERE blob_id = ?)
-        ",
-    )
-    .bind(blob_id)
-    .bind(blob_id)
-    .fetch_one(&mut *transaction)
-    .await;
-    if !matches!(references, Ok(0)) {
-        return;
-    }
-    let deleted = sqlx::query("DELETE FROM blobs WHERE id = ?")
-        .bind(blob_id)
-        .execute(&mut *transaction)
-        .await;
-    if let Err(error) = deleted {
-        tracing::warn!(
-            ?error,
-            blob_id,
-            "failed to delete unreferenced export blob metadata"
-        );
-        return;
-    }
-    if let Err(error) = transaction.commit().await {
-        tracing::warn!(?error, blob_id, "failed to commit export blob cleanup");
-    }
 }
 
 async fn record_export_events(
@@ -1546,7 +1497,10 @@ async fn record_export_events(
     Ok(())
 }
 
-async fn get_or_create_blob(pool: &SqlitePool, stored: &StoredBlob) -> Result<i64, ExportError> {
+async fn get_or_create_blob_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    stored: &StoredBlob,
+) -> Result<i64, ExportError> {
     sqlx::query(
         r"
         INSERT OR IGNORE INTO blobs (hash_algo, hash, size_bytes)
@@ -1556,7 +1510,7 @@ async fn get_or_create_blob(pool: &SqlitePool, stored: &StoredBlob) -> Result<i6
     .bind(&stored.hash_algo)
     .bind(&stored.digest)
     .bind(i64::try_from(stored.size_bytes).map_err(|_| ExportError::ZipLimitExceeded)?)
-    .execute(pool)
+    .execute(&mut **transaction)
     .await?;
     let blob_id = sqlx::query_scalar::<_, i64>(
         r"
@@ -1568,7 +1522,7 @@ async fn get_or_create_blob(pool: &SqlitePool, stored: &StoredBlob) -> Result<i6
     .bind(&stored.hash_algo)
     .bind(&stored.digest)
     .bind(i64::try_from(stored.size_bytes).map_err(|_| ExportError::ZipLimitExceeded)?)
-    .fetch_one(pool)
+    .fetch_one(&mut **transaction)
     .await?;
     let existing_location = sqlx::query_scalar::<_, i64>(
         r"
@@ -1580,7 +1534,7 @@ async fn get_or_create_blob(pool: &SqlitePool, stored: &StoredBlob) -> Result<i6
     .bind(&stored.backend)
     .bind(&stored.bucket)
     .bind(&stored.object_key)
-    .fetch_optional(pool)
+    .fetch_optional(&mut **transaction)
     .await?;
     if existing_location.is_some_and(|existing_blob_id| existing_blob_id != blob_id) {
         return Err(ExportError::StorageLocationConflict);
@@ -1595,7 +1549,7 @@ async fn get_or_create_blob(pool: &SqlitePool, stored: &StoredBlob) -> Result<i6
     .bind(&stored.backend)
     .bind(&stored.bucket)
     .bind(&stored.object_key)
-    .execute(pool)
+    .execute(&mut **transaction)
     .await?;
     Ok(blob_id)
 }

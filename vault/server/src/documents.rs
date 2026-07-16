@@ -44,11 +44,19 @@ pub struct DocumentLockResult {
     pub detail: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermanentDeleteResult {
+    pub path: String,
+    pub terminated_uploads: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct RetentionSweepResult {
     pub archived: Vec<String>,
     pub deleted: Vec<String>,
     pub skipped: Vec<String>,
+    #[serde(skip_serializing)]
+    pub terminated_uploads: Vec<String>,
 }
 
 impl RetentionSweepResult {
@@ -353,7 +361,7 @@ pub async fn delete_document_forever(
     pool: &SqlitePool,
     document_id: i64,
     user: &UserContext,
-) -> Result<String, DocumentError> {
+) -> Result<PermanentDeleteResult, DocumentError> {
     let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
     if !permanent_delete_allowed_in_tx(&mut transaction, user).await? {
         return Err(DocumentError::InsufficientDocumentAccess);
@@ -368,6 +376,8 @@ pub async fn delete_document_forever(
     if let Some(lock) = active_lock_in_tx(&mut transaction, document.id).await? {
         ensure_lock_owner_or_admin(&lock, user)?;
     }
+    let terminated_uploads =
+        terminate_document_uploads_in_tx(&mut transaction, document.id).await?;
     let deleted = sqlx::query(
         r"
         DELETE FROM documents
@@ -389,7 +399,10 @@ pub async fn delete_document_forever(
         return Err(DocumentError::DocumentStateChanged);
     }
     transaction.commit().await?;
-    Ok(path)
+    Ok(PermanentDeleteResult {
+        path,
+        terminated_uploads,
+    })
 }
 
 async fn permanent_delete_allowed_in_tx(
@@ -503,6 +516,9 @@ pub async fn sweep_expired_documents(
         .await?;
     }
     for document in &deletes {
+        result
+            .terminated_uploads
+            .extend(terminate_document_uploads_in_tx(&mut transaction, document.id).await?);
         delete_expired_document_in_tx(&mut transaction, document).await?;
     }
     if result.has_state_changes() {
@@ -1576,6 +1592,35 @@ async fn delete_expired_document_in_tx(
         return Err(DocumentError::DocumentStateChanged);
     }
     Ok(())
+}
+
+async fn terminate_document_uploads_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    document_id: i64,
+) -> Result<Vec<String>, sqlx::Error> {
+    let session_ids = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM upload_sessions WHERE document_id = ? ORDER BY id",
+    )
+    .bind(document_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    if session_ids.is_empty() {
+        return Ok(session_ids);
+    }
+    sqlx::query(
+        r"
+        UPDATE upload_sessions
+        SET status = 'aborted',
+            aborted_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE document_id = ?
+          AND status IN ('active', 'completing')
+        ",
+    )
+    .bind(document_id)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(session_ids)
 }
 
 async fn record_retention_expired_state_in_tx(

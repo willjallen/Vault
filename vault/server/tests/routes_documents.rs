@@ -16,6 +16,7 @@ use vault_server::folders::{
 use vault_server::http::{self, AppState};
 use vault_server::storage::{LocalBlobStorage, SharedBlobStorage};
 use vault_server::transfers::sweep_expired_transfers;
+use vault_server::uploads::UploadHashCoordinator;
 
 async fn test_state() -> (AppState, tempfile::TempDir) {
     let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -54,6 +55,68 @@ async fn create_group(pool: &sqlx::SqlitePool, name: &str) -> i64 {
         .await
         .expect("create group")
         .last_insert_rowid()
+}
+
+async fn seed_tracked_checkin_upload(
+    state: &AppState,
+    document_id: i64,
+    upload_id: &str,
+) -> (std::path::PathBuf, UploadHashCoordinator) {
+    sqlx::query(
+        r"
+        INSERT INTO upload_sessions
+            (
+                id, mode, status, document_id, filename, total_size,
+                chunk_size, part_count, created_by, created_by_name,
+                user_context, expires_at
+            )
+        VALUES
+            (?, 'checkin', 'active', ?, 'plan.txt', 1, 1, 1,
+             'admin', 'Admin', '{}', '2999-01-01T00:00:00Z')
+        ",
+    )
+    .bind(upload_id)
+    .bind(document_id)
+    .execute(&state.db)
+    .await
+    .expect("dependent check-in upload");
+    let transfers_path = state.config.transfers_path();
+    let upload_dir = transfers_path.join("uploads").join(upload_id);
+    tokio::fs::create_dir_all(&upload_dir)
+        .await
+        .expect("check-in upload directory");
+    state
+        .upload_hash_coordinator
+        .schedule(state.db.clone(), transfers_path, upload_id.to_string());
+    for _ in 0..100 {
+        if state
+            .upload_hash_coordinator
+            .preverified_bytes(upload_id)
+            .await
+            .is_some()
+        {
+            return (upload_dir, state.upload_hash_coordinator.clone());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("hash state was not created for {upload_id}");
+}
+
+async fn assert_dependent_upload_cleaned(
+    pool: &sqlx::SqlitePool,
+    coordinator: &UploadHashCoordinator,
+    upload_dir: &std::path::Path,
+    upload_id: &str,
+) {
+    let upload_count =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM upload_sessions WHERE id = ?")
+            .bind(upload_id)
+            .fetch_one(pool)
+            .await
+            .expect("upload count");
+    assert_eq!(upload_count, 0);
+    assert!(!upload_dir.exists());
+    assert!(coordinator.preverified_bytes(upload_id).await.is_none());
 }
 
 async fn insert_versioned_document(pool: &sqlx::SqlitePool, folder_id: i64) -> i64 {
@@ -2295,6 +2358,9 @@ async fn delete_forever_defaults_to_admin_only_and_deletes_archived_documents() 
         &json!({writers.to_string(): 3}),
     )
     .await;
+    let upload_id = "cascade-checkin";
+    let (upload_dir, coordinator) =
+        seed_tracked_checkin_upload(&state, document_id, upload_id).await;
     let pool = state.db.clone();
     let app = http::router(state);
 
@@ -2354,6 +2420,7 @@ async fn delete_forever_defaults_to_admin_only_and_deletes_archived_documents() 
 
     assert_eq!(document_count, 0);
     assert_eq!(version_count, 0);
+    assert_dependent_upload_cleaned(&pool, &coordinator, &upload_dir, upload_id).await;
     assert_eq!(state_event.0, "document.deleted");
     assert_eq!(
         serde_json::from_str::<Value>(&state_event.1).expect("resources json"),
@@ -2473,9 +2540,15 @@ async fn retention_delete_followed_by_runtime_maintenance_removes_local_blob_cop
         .await
         .expect("retention sweep");
     assert_eq!(retention.deleted, vec!["plan.txt"]);
-    sweep_expired_transfers(&state.db, &state.storage, &state.config.transfers_path())
-        .await
-        .expect("runtime transfer and object maintenance");
+    sweep_expired_transfers(
+        &state.db,
+        &state.storage,
+        &state.config.transfers_path(),
+        &state.upload_hash_coordinator,
+        &state.transfer_maintenance,
+    )
+    .await
+    .expect("runtime transfer and object maintenance");
 
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM blobs WHERE id = ?")

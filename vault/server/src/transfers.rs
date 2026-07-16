@@ -1,24 +1,41 @@
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, Sqlite, SqlitePool, Transaction};
+use sqlx::{FromRow, QueryBuilder, Sqlite, SqlitePool, Transaction};
 use thiserror::Error;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::fs;
+use tokio::sync::Mutex;
 
 use crate::blob_lifecycle::collect_unreferenced_blobs_with_limit;
 use crate::exports::{self, ExportError, ExportExecutionContext};
 use crate::storage::{SharedBlobStorage, StorageError};
+use crate::uploads::{UploadHashCoordinator, clear_upload_session_files};
 
 const DEFAULT_SWEEP_LIMIT: i64 = 250;
 const DEFAULT_STARTUP_EXPORT_LIMIT: i64 = 1000;
 const MAX_UPLOAD_PART_METADATA_BYTES: u64 = 4096;
+const ORPHAN_UPLOAD_MINIMUM_AGE: Duration = Duration::from_mins(5);
+
+#[derive(Clone, Default)]
+pub struct TransferMaintenanceCoordinator {
+    orphan_upload_scan: Arc<Mutex<Option<OrphanUploadDirectoryScan>>>,
+}
+
+struct OrphanUploadDirectoryScan {
+    root: PathBuf,
+    entries: fs::ReadDir,
+}
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct TransferSweepResult {
     pub expired_uploads: Vec<String>,
     pub deleted_uploads: Vec<String>,
+    pub deleted_orphan_uploads: Vec<String>,
     pub cancelled_exports: Vec<String>,
     pub deleted_exports: Vec<String>,
     pub deleted_export_objects: Vec<String>,
@@ -84,14 +101,26 @@ pub async fn sweep_expired_transfers(
     pool: &SqlitePool,
     storage: &SharedBlobStorage,
     transfers_path: &Path,
+    hash_coordinator: &UploadHashCoordinator,
+    maintenance: &TransferMaintenanceCoordinator,
 ) -> Result<TransferSweepResult, TransferMaintenanceError> {
-    sweep_expired_transfers_with_limit(pool, storage, transfers_path, DEFAULT_SWEEP_LIMIT).await
+    sweep_expired_transfers_with_limit(
+        pool,
+        storage,
+        transfers_path,
+        hash_coordinator,
+        maintenance,
+        DEFAULT_SWEEP_LIMIT,
+    )
+    .await
 }
 
 pub async fn sweep_expired_transfers_with_limit(
     pool: &SqlitePool,
     storage: &SharedBlobStorage,
     transfers_path: &Path,
+    hash_coordinator: &UploadHashCoordinator,
+    maintenance: &TransferMaintenanceCoordinator,
     limit: i64,
 ) -> Result<TransferSweepResult, TransferMaintenanceError> {
     let now = OffsetDateTime::now_utc().format(&Rfc3339)?;
@@ -105,12 +134,25 @@ pub async fn sweep_expired_transfers_with_limit(
     sweep_export_rows(&mut transaction, &exports, &now, &mut result).await?;
     transaction.commit().await?;
 
-    for session_id in result
+    let terminal_uploads = result
         .expired_uploads
         .iter()
         .chain(result.deleted_uploads.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    cleanup_upload_session_resources(hash_coordinator, transfers_path, &terminal_uploads).await;
+    match sweep_orphaned_upload_directories(
+        pool,
+        hash_coordinator,
+        maintenance,
+        transfers_path,
+        ORPHAN_UPLOAD_MINIMUM_AGE,
+        limit,
+    )
+    .await
     {
-        clear_upload_session_files(transfers_path, session_id).await;
+        Ok(removed) => result.deleted_orphan_uploads = removed,
+        Err(error) => tracing::warn!(?error, "orphaned upload directory sweep failed"),
     }
     for job_id in result
         .cancelled_exports
@@ -126,6 +168,146 @@ pub async fn sweep_expired_transfers_with_limit(
         Err(error) => tracing::warn!(?error, "transfer object garbage collection failed"),
     }
     Ok(result)
+}
+
+pub async fn cleanup_upload_session_resources(
+    hash_coordinator: &UploadHashCoordinator,
+    transfers_path: &Path,
+    session_ids: &[String],
+) {
+    hash_coordinator.forget_many(session_ids).await;
+    for session_id in session_ids {
+        clear_upload_session_files(transfers_path, session_id).await;
+    }
+}
+
+pub async fn sweep_orphaned_upload_directories(
+    pool: &SqlitePool,
+    hash_coordinator: &UploadHashCoordinator,
+    maintenance: &TransferMaintenanceCoordinator,
+    transfers_path: &Path,
+    minimum_age: Duration,
+    limit: i64,
+) -> Result<Vec<String>, TransferMaintenanceError> {
+    let Some(upload_root) = validated_upload_root(transfers_path).await? else {
+        *maintenance.orphan_upload_scan.lock().await = None;
+        return Ok(Vec::new());
+    };
+    let now = SystemTime::now();
+    let entry_limit = usize::try_from(limit.max(1)).unwrap_or(usize::MAX);
+    let entries = next_orphan_scan_entries(maintenance, &upload_root, entry_limit).await?;
+    let mut candidates = Vec::new();
+    for entry in entries {
+        let Ok(session_id) = entry.file_name().into_string() else {
+            continue;
+        };
+        if !is_safe_transfer_id(&session_id) {
+            continue;
+        }
+        let expected_path = upload_root.join(&session_id);
+        if entry.path() != expected_path
+            || !old_enough_directory(&expected_path, now, minimum_age).await
+        {
+            continue;
+        }
+        candidates.push((session_id, expected_path));
+    }
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let live_session_ids =
+        live_upload_session_ids(pool, candidates.iter().map(|(session_id, _)| session_id)).await?;
+    let mut removed = Vec::new();
+    for (session_id, expected_path) in candidates {
+        if live_session_ids.contains(&session_id)
+            || validated_upload_root(transfers_path).await?.as_ref() != Some(&upload_root)
+            || !old_enough_directory(&expected_path, now, minimum_age).await
+        {
+            continue;
+        }
+        match fs::remove_dir_all(&expected_path).await {
+            Ok(()) => removed.push(session_id),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(
+                ?error,
+                path = %expected_path.display(),
+                "could not remove orphaned upload directory"
+            ),
+        }
+    }
+    hash_coordinator.forget_many(&removed).await;
+    Ok(removed)
+}
+
+async fn next_orphan_scan_entries(
+    maintenance: &TransferMaintenanceCoordinator,
+    upload_root: &Path,
+    limit: usize,
+) -> Result<Vec<fs::DirEntry>, std::io::Error> {
+    let mut cursor = maintenance.orphan_upload_scan.lock().await;
+    if cursor.as_ref().is_none_or(|scan| scan.root != upload_root) {
+        *cursor = Some(OrphanUploadDirectoryScan {
+            root: upload_root.to_path_buf(),
+            entries: fs::read_dir(upload_root).await?,
+        });
+    }
+    let mut entries = Vec::with_capacity(limit);
+    for _ in 0..limit {
+        let next = cursor
+            .as_mut()
+            .expect("orphan scan cursor initialized")
+            .entries
+            .next_entry()
+            .await;
+        match next {
+            Ok(Some(entry)) => entries.push(entry),
+            Ok(None) => {
+                *cursor = None;
+                break;
+            }
+            Err(error) => {
+                *cursor = None;
+                return Err(error);
+            }
+        }
+    }
+    Ok(entries)
+}
+
+async fn live_upload_session_ids<'a>(
+    pool: &SqlitePool,
+    session_ids: impl Iterator<Item = &'a String>,
+) -> Result<HashSet<String>, sqlx::Error> {
+    let mut query = QueryBuilder::<Sqlite>::new("SELECT id FROM upload_sessions WHERE id IN (");
+    let mut separated = query.separated(", ");
+    for session_id in session_ids {
+        separated.push_bind(session_id);
+    }
+    separated.push_unseparated(")");
+    Ok(query
+        .build_query_scalar::<String>()
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .collect())
+}
+
+async fn validated_upload_root(transfers_path: &Path) -> Result<Option<PathBuf>, std::io::Error> {
+    let upload_root = transfers_path.join("uploads");
+    match fs::symlink_metadata(&upload_root).await {
+        Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
+            Ok(Some(upload_root))
+        }
+        Ok(_) => {
+            tracing::warn!(
+                path = %upload_root.display(),
+                "refusing upload cleanup because the upload root is not a real directory"
+            );
+            Ok(None)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 pub async fn recover_interrupted_transfers(
@@ -542,10 +724,18 @@ async fn sweep_export_rows(
     Ok(())
 }
 
-async fn clear_upload_session_files(transfers_path: &Path, session_id: &str) {
-    if is_safe_transfer_id(session_id) {
-        let _ = fs::remove_dir_all(transfers_path.join("uploads").join(session_id)).await;
+async fn old_enough_directory(path: &Path, now: SystemTime, minimum_age: Duration) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(path).await else {
+        return false;
+    };
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return false;
     }
+    metadata
+        .modified()
+        .ok()
+        .and_then(|modified| now.duration_since(modified).ok())
+        .is_some_and(|age| age >= minimum_age)
 }
 
 async fn clear_export_temp_file(

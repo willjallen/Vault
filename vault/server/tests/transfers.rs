@@ -12,7 +12,10 @@ use vault_server::db;
 use vault_server::folders::{VAULT_ROOT_KEY, get_root_folder};
 use vault_server::http::{self, AppState};
 use vault_server::storage::{LocalBlobStorage, StoredBlob};
-use vault_server::transfers::{recover_interrupted_transfers, sweep_expired_transfers};
+use vault_server::transfers::{
+    TransferSweepResult, cleanup_upload_session_resources, recover_interrupted_transfers,
+    sweep_expired_transfers, sweep_orphaned_upload_directories,
+};
 
 const EXPIRED_AT: &str = "2000-01-01T00:00:00Z";
 const FUTURE_AT: &str = "2999-01-01T00:00:00Z";
@@ -70,6 +73,36 @@ async fn response_json(response: axum::response::Response) -> Value {
         .await
         .expect("body");
     serde_json::from_slice(&body).expect("json")
+}
+
+async fn wait_for_hash_state(state: &AppState, session_id: &str) {
+    for _ in 0..100 {
+        if state
+            .upload_hash_coordinator
+            .preverified_bytes(session_id)
+            .await
+            .is_some()
+        {
+            return;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    panic!("hash state was not created for {session_id}");
+}
+
+async fn sweep_state_transfers(
+    state: &AppState,
+    transfers_path: &std::path::Path,
+) -> TransferSweepResult {
+    sweep_expired_transfers(
+        &state.db,
+        &state.storage,
+        transfers_path,
+        &state.upload_hash_coordinator,
+        &state.transfer_maintenance,
+    )
+    .await
+    .expect("sweep")
 }
 
 async fn insert_upload_session(pool: &sqlx::SqlitePool, id: &str, status: &str) {
@@ -654,10 +687,14 @@ async fn sweep_expired_uploads_marks_active_and_removes_terminal_sessions() {
     tokio::fs::write(failed_dir.join("00000001.part"), b"failed")
         .await
         .expect("failed scratch");
+    state.upload_hash_coordinator.schedule(
+        state.db.clone(),
+        transfers_path.clone(),
+        "active-upload".to_string(),
+    );
+    wait_for_hash_state(&state, "active-upload").await;
 
-    let result = sweep_expired_transfers(&state.db, &state.storage, &transfers_path)
-        .await
-        .expect("sweep");
+    let result = sweep_state_transfers(&state, &transfers_path).await;
     let active_status: String =
         sqlx::query_scalar("SELECT status FROM upload_sessions WHERE id = ?")
             .bind("active-upload")
@@ -683,6 +720,158 @@ async fn sweep_expired_uploads_marks_active_and_removes_terminal_sessions() {
     assert_eq!(future_status, "active");
     assert!(tokio::fs::metadata(active_dir).await.is_err());
     assert!(tokio::fs::metadata(failed_dir).await.is_err());
+    assert!(
+        state
+            .upload_hash_coordinator
+            .preverified_bytes("active-upload")
+            .await
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn orphan_upload_sweep_removes_only_old_validated_unreferenced_directories() {
+    let (state, _temp_dir) = test_state(AuthSettings::default()).await;
+    insert_upload_session_with_expiration(&state.db, "live-upload", "active", FUTURE_AT).await;
+    let upload_root = state.config.transfers_path().join("uploads");
+    let orphan = upload_root.join("orphan-upload");
+    let live = upload_root.join("live-upload");
+    let unsafe_name = upload_root.join("not.an-upload");
+    tokio::fs::create_dir_all(&orphan)
+        .await
+        .expect("orphan directory");
+    tokio::fs::create_dir_all(&live)
+        .await
+        .expect("live directory");
+    tokio::fs::create_dir_all(&unsafe_name)
+        .await
+        .expect("unrecognized directory");
+
+    let recent = sweep_orphaned_upload_directories(
+        &state.db,
+        &state.upload_hash_coordinator,
+        &state.transfer_maintenance,
+        &state.config.transfers_path(),
+        Duration::from_hours(1),
+        250,
+    )
+    .await
+    .expect("age-gated orphan sweep");
+    assert!(recent.is_empty());
+    assert!(orphan.is_dir());
+
+    #[cfg(unix)]
+    let symlink = {
+        let external = state.config.data_dir.join("must-not-delete");
+        tokio::fs::create_dir_all(&external)
+            .await
+            .expect("external directory");
+        tokio::fs::write(external.join("sentinel"), b"safe")
+            .await
+            .expect("external sentinel");
+        let symlink = upload_root.join("symlink-upload");
+        std::os::unix::fs::symlink(&external, &symlink).expect("upload symlink");
+        (symlink, external)
+    };
+
+    let removed = sweep_orphaned_upload_directories(
+        &state.db,
+        &state.upload_hash_coordinator,
+        &state.transfer_maintenance,
+        &state.config.transfers_path(),
+        Duration::ZERO,
+        250,
+    )
+    .await
+    .expect("orphan sweep");
+
+    assert_eq!(removed, vec!["orphan-upload"]);
+    assert!(!orphan.exists());
+    assert!(live.is_dir());
+    assert!(unsafe_name.is_dir());
+    #[cfg(unix)]
+    {
+        assert!(symlink.0.is_symlink());
+        assert_eq!(
+            tokio::fs::read(symlink.1.join("sentinel"))
+                .await
+                .expect("external sentinel survives"),
+            b"safe"
+        );
+    }
+}
+
+#[tokio::test]
+async fn orphan_upload_sweep_advances_a_bounded_cursor_across_calls() {
+    let (state, _temp_dir) = test_state(AuthSettings::default()).await;
+    let upload_root = state.config.transfers_path().join("uploads");
+    for session_id in ["orphan-a", "orphan-b", "orphan-c"] {
+        tokio::fs::create_dir_all(upload_root.join(session_id))
+            .await
+            .expect("orphan directory");
+    }
+    let mut removed = Vec::new();
+    for _ in 0..4 {
+        removed.extend(
+            sweep_orphaned_upload_directories(
+                &state.db,
+                &state.upload_hash_coordinator,
+                &state.transfer_maintenance,
+                &state.config.transfers_path(),
+                Duration::ZERO,
+                1,
+            )
+            .await
+            .expect("bounded orphan sweep"),
+        );
+    }
+    removed.sort();
+    assert_eq!(removed, ["orphan-a", "orphan-b", "orphan-c"]);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn upload_cleanup_refuses_a_symlinked_upload_root() {
+    let (state, _temp_dir) = test_state(AuthSettings::default()).await;
+    let transfers_path = state.config.data_dir.join("symlinked-transfers");
+    let external_root = state.config.data_dir.join("external-upload-root");
+    let external_upload = external_root.join("external-upload");
+    tokio::fs::create_dir_all(&transfers_path)
+        .await
+        .expect("transfer root");
+    tokio::fs::create_dir_all(&external_upload)
+        .await
+        .expect("external upload");
+    tokio::fs::write(external_upload.join("sentinel"), b"safe")
+        .await
+        .expect("external sentinel");
+    std::os::unix::fs::symlink(&external_root, transfers_path.join("uploads"))
+        .expect("symlinked upload root");
+
+    cleanup_upload_session_resources(
+        &state.upload_hash_coordinator,
+        &transfers_path,
+        &["external-upload".to_string()],
+    )
+    .await;
+    let removed = sweep_orphaned_upload_directories(
+        &state.db,
+        &state.upload_hash_coordinator,
+        &state.transfer_maintenance,
+        &transfers_path,
+        Duration::ZERO,
+        250,
+    )
+    .await
+    .expect("symlink-safe orphan sweep");
+
+    assert!(removed.is_empty());
+    assert_eq!(
+        tokio::fs::read(external_upload.join("sentinel"))
+            .await
+            .expect("external sentinel survives"),
+        b"safe"
+    );
 }
 
 #[tokio::test]
@@ -753,10 +942,7 @@ async fn sweep_expired_uploads_ignores_stale_status_and_expiration_snapshots() {
             .await
             .expect("upload scratch part");
     }
-
-    let result = sweep_expired_transfers(&state.db, &state.storage, &transfers_path)
-        .await
-        .expect("sweep");
+    let result = sweep_state_transfers(&state, &transfers_path).await;
     let rows = upload_sweep_survivors(&state.db).await;
 
     assert_eq!(result.expired_uploads, vec!["driver-upload"]);
@@ -800,9 +986,7 @@ async fn sweep_expired_exports_cancels_active_and_deletes_terminal_artifacts() {
     insert_export_artifact(&state.db, "complete-export", blob_id, &stored).await;
     let transfers_path = state.config.transfers_path();
 
-    let result = sweep_expired_transfers(&state.db, &state.storage, &transfers_path)
-        .await
-        .expect("sweep");
+    let result = sweep_state_transfers(&state, &transfers_path).await;
     let queued_status: String = sqlx::query_scalar("SELECT status FROM export_jobs WHERE id = ?")
         .bind("queued-export")
         .fetch_one(&state.db)
@@ -897,9 +1081,7 @@ async fn sweep_expired_exports_ignores_stale_status_and_expiration_snapshots() {
             .expect("export scratch file");
     }
 
-    let result = sweep_expired_transfers(&state.db, &state.storage, &transfers_path)
-        .await
-        .expect("sweep");
+    let result = sweep_state_transfers(&state, &transfers_path).await;
     let rows = export_sweep_survivors(&state.db).await;
     let (artifact_count, blob_count) =
         export_artifact_and_blob_counts(&state.db, "terminal-changed-export", blob_id).await;
@@ -986,9 +1168,7 @@ async fn sweep_expired_export_preserves_artifact_blob_when_document_references_i
     .expect("version");
     let transfers_path = state.config.transfers_path();
 
-    let result = sweep_expired_transfers(&state.db, &state.storage, &transfers_path)
-        .await
-        .expect("sweep");
+    let result = sweep_state_transfers(&state, &transfers_path).await;
     let location_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM blob_locations WHERE blob_id = ?")
             .bind(blob_id)

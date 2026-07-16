@@ -30,10 +30,23 @@ async fn main() -> anyhow::Result<()> {
     assets::validate_static_assets(&config.static_dir).await?;
     let state = AppState::new(config, auth, db, storage);
     let document_sweep = documents::sweep_expired_documents(&state.db, 250).await?;
+    transfers::cleanup_upload_session_resources(
+        &state.upload_hash_coordinator,
+        &transfers_path,
+        &document_sweep.terminated_uploads,
+    )
+    .await;
     if document_sweep.has_state_changes() {
         notify_state_event_committed();
     }
-    transfers::sweep_expired_transfers(&state.db, &state.storage, &transfers_path).await?;
+    transfers::sweep_expired_transfers(
+        &state.db,
+        &state.storage,
+        &transfers_path,
+        &state.upload_hash_coordinator,
+        &state.transfer_maintenance,
+    )
+    .await?;
     transfers::recover_interrupted_transfers_with_export_runtime(
         &state.db,
         &state.storage,
@@ -60,14 +73,26 @@ fn spawn_ttl_sweeper(state: AppState, transfers_path: PathBuf) {
             tokio::time::sleep(interval).await;
             match documents::sweep_expired_documents(&state.db, 250).await {
                 Ok(result) => {
+                    transfers::cleanup_upload_session_resources(
+                        &state.upload_hash_coordinator,
+                        &transfers_path,
+                        &result.terminated_uploads,
+                    )
+                    .await;
                     if result.has_state_changes() {
                         notify_state_event_committed();
                     }
                 }
                 Err(error) => tracing::error!(%error, "document TTL sweep failed"),
             }
-            if let Err(error) =
-                transfers::sweep_expired_transfers(&state.db, &state.storage, &transfers_path).await
+            if let Err(error) = transfers::sweep_expired_transfers(
+                &state.db,
+                &state.storage,
+                &transfers_path,
+                &state.upload_hash_coordinator,
+                &state.transfer_maintenance,
+            )
+            .await
             {
                 tracing::error!(%error, "transfer TTL sweep failed");
             }

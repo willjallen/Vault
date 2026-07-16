@@ -36,8 +36,12 @@ pub async fn connect(db_path: &Path) -> anyhow::Result<DbPool> {
     Ok(pool)
 }
 
-pub async fn reset(pool: &DbPool) -> anyhow::Result<()> {
+pub async fn reset(pool: &DbPool) -> anyhow::Result<Vec<String>> {
     let mut tx = pool.begin().await?;
+    let upload_session_ids =
+        sqlx::query_scalar::<_, String>("SELECT id FROM upload_sessions ORDER BY id")
+            .fetch_all(&mut *tx)
+            .await?;
     for table in [
         "share_links",
         "export_artifacts",
@@ -64,7 +68,7 @@ pub async fn reset(pool: &DbPool) -> anyhow::Result<()> {
     seed_root_folder(&mut tx, "vault", "", "Vault").await?;
     seed_root_folder(&mut tx, "archive", "Archive", "Archive").await?;
     tx.commit().await?;
-    Ok(())
+    Ok(upload_session_ids)
 }
 
 async fn init_schema(pool: &DbPool) -> anyhow::Result<()> {

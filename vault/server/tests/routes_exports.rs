@@ -30,7 +30,8 @@ use vault_server::storage::{
     BlobByteStream, BlobReadRange, BlobStorageBackend, BlobWriteKind, LocalBlobStorage,
     STORAGE_CHUNK_SIZE, SharedBlobStorage, StorageError, StoredBlob,
 };
-use vault_server::transfers::sweep_expired_transfers;
+use vault_server::transfers::{TransferMaintenanceCoordinator, sweep_expired_transfers};
+use vault_server::uploads::UploadHashCoordinator;
 
 async fn test_state() -> (AppState, tempfile::TempDir) {
     test_state_with_export_settings(86_400, 1, 3 * 1024 * 1024 * 1024, 1).await
@@ -1455,9 +1456,15 @@ async fn assert_expired_export_swept(
     blob_id: i64,
     object_key: &str,
 ) {
-    let swept = sweep_expired_transfers(pool, storage, transfers_path)
-        .await
-        .expect("sweep transfers");
+    let swept = sweep_expired_transfers(
+        pool,
+        storage,
+        transfers_path,
+        &UploadHashCoordinator::new(),
+        &TransferMaintenanceCoordinator::default(),
+    )
+    .await
+    .expect("sweep transfers");
     assert_eq!(swept.deleted_exports, vec![job_id.to_string()]);
     assert_eq!(swept.deleted_export_objects, vec![object_key.to_string()]);
     let job_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM export_jobs WHERE id = ?")

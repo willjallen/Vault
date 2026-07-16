@@ -57,6 +57,10 @@ const UPLOAD_CHUNK_ROUNDING_BYTES: i64 = 1024 * 1024;
 const SMALL_PART_MEMORY_BUFFER_BYTES: i64 = 8 * 1024 * 1024;
 const VERIFICATION_PROGRESS_UPDATE_BYTES: i64 = 32 * 1024 * 1024;
 const UPLOAD_RESUME_IDENTITY_CONTEXT_KEY: &str = "_upload_resume_identity_sha256";
+// Preverification is an optimization. Stop caching new sessions at this bound;
+// completion can use a request-owned state and hash the immutable parts without
+// evicting an active state or retaining it for the process lifetime.
+const MAX_UPLOAD_HASH_STATES: usize = 256;
 
 #[derive(Debug, Clone, Copy)]
 pub struct UploadRuntimeSettings {
@@ -296,9 +300,14 @@ struct CompletedParts {
     paths: Vec<PathBuf>,
 }
 
+#[derive(Debug, Default)]
+struct UploadHashCoordinatorInner {
+    states: HashMap<String, Arc<UploadHashState>>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct UploadHashCoordinator {
-    states: Arc<Mutex<HashMap<String, Arc<UploadHashState>>>>,
+    inner: Arc<Mutex<UploadHashCoordinatorInner>>,
 }
 
 // Large uploads should not finish network transfer and then start integrity
@@ -341,11 +350,20 @@ impl UploadHashCoordinator {
         Self::default()
     }
 
+    #[must_use]
+    pub const fn cache_capacity() -> usize {
+        MAX_UPLOAD_HASH_STATES
+    }
+
+    pub async fn cached_session_count(&self) -> usize {
+        self.inner.lock().await.states.len()
+    }
+
     pub fn schedule(&self, pool: SqlitePool, transfers_path: PathBuf, session_id: String) {
         let coordinator = self.clone();
         tokio::spawn(async move {
             if let Err(error) = coordinator
-                .advance_session(&pool, &transfers_path, &session_id)
+                .advance_session(&pool, &transfers_path, &session_id, false)
                 .await
             {
                 tracing::debug!(?error, session_id, "upload hash preverification paused");
@@ -354,7 +372,18 @@ impl UploadHashCoordinator {
     }
 
     pub async fn forget(&self, session_id: &str) {
-        self.states.lock().await.remove(session_id);
+        let mut inner = self.inner.lock().await;
+        inner.states.remove(session_id);
+    }
+
+    pub async fn forget_many(&self, session_ids: &[String]) {
+        if session_ids.is_empty() {
+            return;
+        }
+        let mut inner = self.inner.lock().await;
+        for session_id in session_ids {
+            inner.states.remove(session_id);
+        }
     }
 
     pub async fn preverified_bytes(&self, session_id: &str) -> Option<i64> {
@@ -363,9 +392,9 @@ impl UploadHashCoordinator {
 
     async fn processed_bytes(&self, session_id: &str) -> Option<i64> {
         let state = {
-            let states = self.states.lock().await;
-            states.get(session_id).cloned()
-        }?;
+            let inner = self.inner.lock().await;
+            inner.states.get(session_id).cloned()?
+        };
         Some(state.processed_bytes.load(Ordering::Acquire))
     }
 
@@ -378,9 +407,10 @@ impl UploadHashCoordinator {
         expected_part_manifest_sha256: Option<&str>,
     ) -> Result<CompletedParts, UploadError> {
         let (size_bytes, paths) = completed_part_paths(transfers_path, session).await?;
-        self.advance_session(pool, transfers_path, &session.id)
-            .await?;
-        let state = self.state_for(&session.id).await;
+        let state = self
+            .advance_session(pool, transfers_path, &session.id, true)
+            .await?
+            .ok_or(UploadError::UploadSessionMissingParts)?;
         let inner = state.inner.lock().await;
         let digest = inner
             .digest
@@ -406,23 +436,49 @@ impl UploadHashCoordinator {
         pool: &SqlitePool,
         transfers_path: &Path,
         session_id: &str,
-    ) -> Result<(), UploadError> {
-        let session = fetch_upload_session(pool, session_id)
-            .await?
-            .ok_or(UploadError::UploadSessionNotFound)?;
+        allow_uncached: bool,
+    ) -> Result<Option<Arc<UploadHashState>>, UploadError> {
+        let Some(session) = fetch_upload_session(pool, session_id).await? else {
+            self.forget(session_id).await;
+            return Err(UploadError::UploadSessionNotFound);
+        };
         if !matches!(session.status.as_str(), "active" | "completing") {
-            return Ok(());
+            self.forget(session_id).await;
+            return Ok(None);
         }
-        let state = self.state_for(session_id).await;
-        advance_hash_state(pool, transfers_path, &session, &state).await
+        let Some(state) = self.state_for(session_id, allow_uncached).await else {
+            return Ok(None);
+        };
+        let result = advance_hash_state(pool, transfers_path, &session, &state).await;
+        // A terminal transition or document cascade can race a scheduled hash
+        // task after its initial status read. Recheck after every outcome so the
+        // task cannot recreate coordinator state after terminal cleanup.
+        let still_hashable = fetch_upload_session(pool, session_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|current| matches!(current.status.as_str(), "active" | "completing"));
+        if !still_hashable {
+            self.forget(session_id).await;
+        }
+        result.map(|()| Some(state))
     }
 
-    async fn state_for(&self, session_id: &str) -> Arc<UploadHashState> {
-        let mut states = self.states.lock().await;
-        states
-            .entry(session_id.to_string())
-            .or_insert_with(|| Arc::new(UploadHashState::new()))
-            .clone()
+    async fn state_for(
+        &self,
+        session_id: &str,
+        allow_uncached: bool,
+    ) -> Option<Arc<UploadHashState>> {
+        let mut inner = self.inner.lock().await;
+        if let Some(state) = inner.states.get(session_id).cloned() {
+            return Some(state);
+        }
+        if inner.states.len() >= MAX_UPLOAD_HASH_STATES {
+            return allow_uncached.then(|| Arc::new(UploadHashState::new()));
+        }
+        let state = Arc::new(UploadHashState::new());
+        inner.states.insert(session_id.to_string(), state.clone());
+        Some(state)
     }
 }
 
@@ -2825,10 +2881,51 @@ fn upload_session_dir(transfers_path: &Path, session_id: &str) -> Result<PathBuf
     Ok(transfers_path.join("uploads").join(session_id))
 }
 
-async fn clear_upload_session_files(transfers_path: &Path, session_id: &str) {
-    if let Ok(path) = upload_session_dir(transfers_path, session_id) {
-        let _ = fs::remove_dir_all(path).await;
+pub async fn clear_upload_session_files(transfers_path: &Path, session_id: &str) {
+    let Ok(path) = upload_session_dir(transfers_path, session_id) else {
+        return;
+    };
+    let upload_root = transfers_path.join("uploads");
+    if !real_directory(&upload_root).await {
+        tracing::warn!(
+            path = %upload_root.display(),
+            "refusing upload cleanup because the upload root is not a real directory"
+        );
+        return;
     }
+    let metadata = match fs::symlink_metadata(&path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            tracing::warn!(?error, path = %path.display(), "could not inspect upload directory");
+            return;
+        }
+    };
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        tracing::warn!(
+            path = %path.display(),
+            "refusing to remove upload path that is not a real directory"
+        );
+        return;
+    }
+    if !real_directory(&upload_root).await {
+        return;
+    }
+    match fs::remove_dir_all(&path).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => tracing::warn!(
+            ?error,
+            path = %path.display(),
+            "could not remove terminal upload directory"
+        ),
+    }
+}
+
+async fn real_directory(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .await
+        .is_ok_and(|metadata| metadata.file_type().is_dir() && !metadata.file_type().is_symlink())
 }
 
 fn sanitize_mime_type(mime_type: Option<&str>, filename: &str) -> String {

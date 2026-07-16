@@ -339,3 +339,69 @@ async fn dev_debug_emit_state_uses_default_resources_when_omitted() {
         ]
     );
 }
+
+#[tokio::test]
+async fn dev_database_reset_cleans_tracked_upload_resources() {
+    let (state, _temp_dir) = test_state(dev_auth()).await;
+    let upload_id = "reset-upload";
+    sqlx::query(
+        r"
+        INSERT INTO upload_sessions
+            (
+                id, mode, status, filename, total_size, chunk_size,
+                part_count, created_by, user_context, expires_at
+            )
+        VALUES
+            (?, 'create', 'active', 'reset.txt', 1, 1, 1,
+             'dev', '{}', '2999-01-01T00:00:00Z')
+        ",
+    )
+    .bind(upload_id)
+    .execute(&state.db)
+    .await
+    .expect("upload session");
+    let transfers_path = state.config.transfers_path();
+    let upload_dir = transfers_path.join("uploads").join(upload_id);
+    tokio::fs::create_dir_all(&upload_dir)
+        .await
+        .expect("upload directory");
+    state
+        .upload_hash_coordinator
+        .schedule(state.db.clone(), transfers_path, upload_id.to_string());
+    for _ in 0..100 {
+        if state
+            .upload_hash_coordinator
+            .preverified_bytes(upload_id)
+            .await
+            .is_some()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        state
+            .upload_hash_coordinator
+            .preverified_bytes(upload_id)
+            .await
+            .is_some()
+    );
+    let db = state.db.clone();
+    let coordinator = state.upload_hash_coordinator.clone();
+
+    let reset = http::router(state)
+        .oneshot(dev_post("/api/admin/debug/reset-database"))
+        .await
+        .expect("reset");
+
+    assert_eq!(reset.status(), StatusCode::OK);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM upload_sessions")
+            .fetch_one(&db)
+            .await
+            .expect("upload count"),
+        0
+    );
+    assert!(!upload_dir.exists());
+    assert!(coordinator.preverified_bytes(upload_id).await.is_none());
+}

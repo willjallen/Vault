@@ -100,6 +100,7 @@ pub struct AppState {
     pub storage: SharedBlobStorage,
     pub export_execution: Arc<ExportExecutionContext>,
     pub upload_hash_coordinator: uploads::UploadHashCoordinator,
+    pub transfer_maintenance: transfers::TransferMaintenanceCoordinator,
     upload_part_locks: Arc<AsyncMutex<HashSet<String>>>,
     download_slots: Arc<Semaphore>,
 }
@@ -135,6 +136,7 @@ impl AppState {
             storage,
             export_execution,
             upload_hash_coordinator: uploads::UploadHashCoordinator::new(),
+            transfer_maintenance: transfers::TransferMaintenanceCoordinator::default(),
             upload_part_locks: Arc::new(AsyncMutex::new(HashSet::new())),
             download_slots: Arc::new(Semaphore::new(download_limit.max(1))),
         }
@@ -909,6 +911,12 @@ async fn api_admin_debug_sweep_ttl(
     let _user = require_dev_admin(&state, &headers).await?;
     let transfers_path = state.config.transfers_path();
     let documents = sweep_expired_documents(&state.db, 250).await?;
+    transfers::cleanup_upload_session_resources(
+        &state.upload_hash_coordinator,
+        &transfers_path,
+        &documents.terminated_uploads,
+    )
+    .await;
     if documents.has_state_changes() {
         notify_state_event_committed();
     }
@@ -920,6 +928,8 @@ async fn api_admin_debug_sweep_ttl(
                 &state.db,
                 &state.storage,
                 &transfers_path,
+                &state.upload_hash_coordinator,
+                &state.transfer_maintenance,
             ).await?,
         },
     }))))
@@ -1005,9 +1015,15 @@ async fn api_admin_debug_reset_database(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     let _user = require_dev_admin(&state, &headers).await?;
-    crate::db::reset(&state.db)
+    let upload_session_ids = crate::db::reset(&state.db)
         .await
         .map_err(|error| ApiError::Internal(format!("Database reset failed: {error}")))?;
+    transfers::cleanup_upload_session_resources(
+        &state.upload_hash_coordinator,
+        &state.config.transfers_path(),
+        &upload_session_ids,
+    )
+    .await;
     notify_state_event_committed();
     Ok(Json(debug_action_result(json!({
         "action": "reset-database",
@@ -1734,8 +1750,14 @@ async fn api_delete_forever(
         match &item {
             NormalizedActionItem::Document { id } => {
                 match delete_document_forever(&state.db, *id, &user).await {
-                    Ok(detail) => {
-                        response.ok.push(action_result(&item, Some(detail)));
+                    Ok(deleted) => {
+                        transfers::cleanup_upload_session_resources(
+                            &state.upload_hash_coordinator,
+                            &state.config.transfers_path(),
+                            &deleted.terminated_uploads,
+                        )
+                        .await;
+                        response.ok.push(action_result(&item, Some(deleted.path)));
                         changed = true;
                     }
                     Err(error) => {

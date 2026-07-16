@@ -305,6 +305,22 @@ async fn expired_delete_ttl_deletes_unlocked_documents_and_skips_locked_document
     let deleted_id = insert_expired_document(&state.db, temp.id, "scratch.txt", "delete").await;
     let locked_id = insert_expired_document(&state.db, temp.id, "locked.txt", "delete").await;
     sqlx::query(
+        r"
+        INSERT INTO upload_sessions
+            (
+                id, mode, status, document_id, filename, total_size,
+                chunk_size, part_count, created_by, user_context, expires_at
+            )
+        VALUES
+            ('retention-checkin', 'checkin', 'active', ?, 'scratch.txt',
+             1, 1, 1, 'user', '{}', '2999-01-01T00:00:00Z')
+        ",
+    )
+    .bind(deleted_id)
+    .execute(&state.db)
+    .await
+    .expect("dependent retention upload");
+    sqlx::query(
         "INSERT INTO document_locks (document_id, locked_by, is_active) VALUES (?, 'user', 1)",
     )
     .bind(locked_id)
@@ -319,6 +335,7 @@ async fn expired_delete_ttl_deletes_unlocked_documents_and_skips_locked_document
     assert_eq!(result.deleted, vec!["Temp/scratch.txt"]);
     assert_eq!(result.skipped, vec!["Temp/locked.txt"]);
     assert!(result.archived.is_empty());
+    assert_eq!(result.terminated_uploads, vec!["retention-checkin"]);
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM documents WHERE id = ?")
             .bind(deleted_id)

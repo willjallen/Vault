@@ -225,7 +225,9 @@ Each item can be measured. None should be assumed as the dominant limiter withou
 
 ## Benchmark Harness
 
-The ad hoc benchmark is `extras/bench_transfers.py`. It is an optional one-off utility, not part of the required repository gate, and intentionally uses only the Python standard library so the project does not require a virtualenv, requirements file, or Python lint/test tooling. It starts a temporary Rust `vault-server` with a temporary data directory.
+The canonical per-change benchmark is the Criterion target at `vault/server/benches/vault_performance.rs`; commands, baseline comparison policy, and scenario coverage are documented in `docs/PERFORMANCE.md`. Its fixtures are deterministic and excluded from measured intervals, and it exercises real application functions plus an in-process Axum router.
+
+The deployment-scale benchmark is `extras/bench_transfers.py`. It remains an optional topology and throughput utility, not the canonical per-change regression suite, and intentionally uses only the Python standard library so the project does not require a virtualenv, requirements file, or Python lint/test tooling. It starts a temporary Rust `vault-server` with a temporary data directory.
 
 The script supports:
 

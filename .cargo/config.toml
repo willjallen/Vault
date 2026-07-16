@@ -1,0 +1,2 @@
+[alias]
+perf = "bench --package vault-server --bench vault_performance"

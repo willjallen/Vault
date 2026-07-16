@@ -37,5 +37,14 @@ uuid = { version = "1", features = ["serde", "v4", "v7"] }
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 
+[dev-dependencies.criterion]
+version = "=0.8.2"
+default-features = false
+features = ["async_tokio", "cargo_bench_support"]
+
+[[bench]]
+name = "vault_performance"
+harness = false
+
 [lints]
 workspace = true

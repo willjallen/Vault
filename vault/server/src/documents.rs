@@ -638,6 +638,9 @@ pub async fn version_download_by_id(
     })
 }
 
+/// Records an authorized download initiation, not confirmed network delivery.
+/// Once response headers are returned, disconnects and body-stream failures
+/// cannot safely perform a compensating database write.
 pub async fn record_download_event(
     pool: &SqlitePool,
     download: &VersionDownload,
@@ -646,10 +649,10 @@ pub async fn record_download_event(
     current_version: bool,
 ) -> Result<(), DocumentError> {
     let message = if current_version {
-        format!("Downloaded {}", download.document_path)
+        format!("Started download of {}", download.document_path)
     } else {
         format!(
-            "Downloaded version v{} of {}",
+            "Started download of version v{} of {}",
             download.version_number, download.document_path
         )
     };

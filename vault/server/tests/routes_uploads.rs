@@ -24,8 +24,8 @@ use vault_server::folders::{
 use vault_server::http::{self, AppState};
 use vault_server::reconciliation::storage_reconciliation_report;
 use vault_server::storage::{
-    BlobStorageBackend, BlobWriteKind, LocalBlobStorage, SharedBlobStorage, StorageError,
-    StoredBlob, multipart_manifest_key_for_hash,
+    BlobByteStream, BlobReadRange, BlobStorageBackend, BlobWriteKind, LocalBlobStorage,
+    SharedBlobStorage, StorageError, StoredBlob, multipart_manifest_key_for_hash,
 };
 use vault_server::transfers::recover_interrupted_transfers;
 use vault_server::uploads::{
@@ -143,6 +143,14 @@ impl BlobStorageBackend for BlockingPartStorage {
         _start: u64,
         _end: u64,
     ) -> Result<Vec<u8>, StorageError> {
+        Err(StorageError::NotFound)
+    }
+
+    async fn stream_range(
+        &self,
+        _object_key: &str,
+        _range: BlobReadRange,
+    ) -> Result<BlobByteStream, StorageError> {
         Err(StorageError::NotFound)
     }
 
@@ -875,6 +883,45 @@ async fn upload_session_adapts_chunk_size_from_runtime_config_and_client_paralle
     let large = create_upload_session_for_size(app, 512 * 1024 * 1024, None).await;
     assert_eq!(large["chunk_size"], 32 * 1024 * 1024);
     assert_eq!(large["part_count"], 16);
+}
+
+#[tokio::test]
+async fn upload_session_rejects_an_unbounded_part_count_without_inflating_chunks() {
+    let size = 5 * 1024 * 1024 * 1024_i64;
+    let (state, _temp_dir) = test_state_with_upload_settings(size, 1, 86_400).await;
+    grant_writer_root(&state.db).await;
+    let pool = state.db.clone();
+    let app = http::router(state);
+
+    let response = app
+        .oneshot(authed_json_request(
+            Method::POST,
+            "/api/uploads",
+            &json!({
+                "mode": "create",
+                "folder": "",
+                "filename": "too-many-parts.bin",
+                "mime_type": "application/octet-stream",
+                "size_bytes": size
+            }),
+        ))
+        .await
+        .expect("create upload response");
+    let status = response.status();
+    let payload = response_json(response).await;
+
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        payload["detail"],
+        "Upload requires more than 1024 parts; increase the transfer chunk size"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM upload_sessions")
+            .fetch_one(&pool)
+            .await
+            .expect("session count"),
+        0
+    );
 }
 
 #[tokio::test]

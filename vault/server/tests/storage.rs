@@ -1,9 +1,11 @@
 use std::path::PathBuf;
 
+use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use vault_server::storage::{
-    LocalBlobStorage, StorageError, is_multipart_part_key, multipart_manifest_key_for_hash,
-    multipart_part_key_for_hash, multipart_part_key_for_hash_layout, object_key_for_hash,
+    BlobReadRange, LocalBlobStorage, STORAGE_CHUNK_SIZE, StorageError, is_multipart_part_key,
+    multipart_manifest_key_for_hash, multipart_part_key_for_hash,
+    multipart_part_key_for_hash_layout, object_key_for_hash,
 };
 
 fn test_storage(root: &std::path::Path) -> LocalBlobStorage {
@@ -103,9 +105,50 @@ async fn range_reader_reads_exact_slice() {
         .read_range(&blob.object_key, 7, 6)
         .await
         .expect_err("invalid range");
+    let mut stream = storage
+        .stream_range(
+            &blob.object_key,
+            BlobReadRange {
+                expected_size: 11,
+                offset: 6,
+                length: 5,
+            },
+        )
+        .await
+        .expect("range stream");
+    let streamed = stream
+        .next()
+        .await
+        .expect("streamed chunk")
+        .expect("streamed range");
 
     assert_eq!(range, b"world");
+    assert_eq!(streamed, b"world"[..]);
+    assert!(stream.next().await.is_none());
     assert!(matches!(invalid, StorageError::InvalidRange));
+}
+
+#[tokio::test]
+async fn range_stream_rejects_object_size_drift_before_returning_headers() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let storage = test_storage(temp_dir.path());
+    let blob = storage.put_bytes(b"hello").await.expect("put bytes");
+    tokio::fs::write(storage.root().join(&blob.object_key), b"hello!")
+        .await
+        .expect("replace object with appended bytes");
+
+    let result = storage
+        .stream_range(
+            &blob.object_key,
+            BlobReadRange {
+                expected_size: 5,
+                offset: 0,
+                length: 5,
+            },
+        )
+        .await;
+
+    assert!(matches!(result, Err(StorageError::ContentMismatch)));
 }
 
 #[tokio::test]
@@ -159,6 +202,24 @@ async fn verified_part_files_promote_to_manifest_without_listing_parts() {
             .expect("manifest range"),
         b"cdef",
     );
+    let mut stream = storage
+        .stream_range(
+            &blob.object_key,
+            BlobReadRange {
+                expected_size: 8,
+                offset: 2,
+                length: 4,
+            },
+        )
+        .await
+        .expect("multipart stream");
+    let mut streamed = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.expect("multipart stream chunk");
+        assert!(chunk.len() <= STORAGE_CHUNK_SIZE);
+        streamed.extend_from_slice(&chunk);
+    }
+    assert_eq!(streamed, b"cdef");
     assert_eq!(
         storage.list_object_keys().await.expect("keys"),
         [manifest_key],
@@ -178,6 +239,128 @@ async fn verified_part_files_promote_to_manifest_without_listing_parts() {
         Vec::<String>::new(),
     );
     assert!(published_part_paths.iter().all(|path| !path.exists()));
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // One ordered concurrency scenario must retain both live streams.
+async fn multipart_stream_lease_blocks_only_its_own_object_deletion() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let part_dir = temp_dir.path().join("parts");
+    tokio::fs::create_dir_all(&part_dir)
+        .await
+        .expect("part directory");
+    let storage = test_storage(&temp_dir.path().join("store"));
+
+    let mut stored = Vec::new();
+    for (name, first, second) in [
+        ("a", b"abc".as_slice(), b"def".as_slice()),
+        ("b", b"ghi".as_slice(), b"jkl".as_slice()),
+    ] {
+        let first_path = part_dir.join(format!("{name}-1.part"));
+        let second_path = part_dir.join(format!("{name}-2.part"));
+        tokio::fs::write(&first_path, first)
+            .await
+            .expect("first part");
+        tokio::fs::write(&second_path, second)
+            .await
+            .expect("second part");
+        let content = [first, second].concat();
+        stored.push(
+            storage
+                .put_part_files(&[first_path, second_path], Some(&sha256_hex(&content)))
+                .await
+                .expect("multipart object"),
+        );
+    }
+    let first_part_paths = storage
+        .read_multipart_manifest(&stored[0].object_key)
+        .await
+        .expect("first manifest")
+        .parts
+        .into_iter()
+        .map(|part| part.path)
+        .collect::<Vec<_>>();
+
+    let mut first_stream = storage
+        .stream_range(
+            &stored[0].object_key,
+            BlobReadRange {
+                expected_size: 6,
+                offset: 0,
+                length: 6,
+            },
+        )
+        .await
+        .expect("first stream");
+    assert_eq!(
+        first_stream
+            .next()
+            .await
+            .expect("first object chunk")
+            .expect("first object bytes"),
+        b"abc"[..]
+    );
+    let deleting_first = tokio::spawn({
+        let storage = storage.clone();
+        let object_key = stored[0].object_key.clone();
+        async move { storage.delete_object(&object_key).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match storage
+                .stream_range(
+                    &stored[0].object_key,
+                    BlobReadRange {
+                        expected_size: 6,
+                        offset: 0,
+                        length: 6,
+                    },
+                )
+                .await
+            {
+                Err(StorageError::Busy) => break,
+                Ok(stream) => drop(stream),
+                Err(error) => panic!("unexpected same-object stream error: {error}"),
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("delete writer became observable");
+    assert!(!deleting_first.is_finished());
+
+    let mut second_stream = storage
+        .stream_range(
+            &stored[1].object_key,
+            BlobReadRange {
+                expected_size: 6,
+                offset: 0,
+                length: 6,
+            },
+        )
+        .await
+        .expect("unrelated stream is not head-of-line blocked");
+    let mut second_bytes = Vec::new();
+    while let Some(chunk) = second_stream.next().await {
+        second_bytes.extend_from_slice(&chunk.expect("second object bytes"));
+    }
+    assert_eq!(second_bytes, b"ghijkl");
+    storage
+        .delete_object(&stored[1].object_key)
+        .await
+        .expect("unrelated delete");
+
+    let mut first_bytes = b"abc".to_vec();
+    while let Some(chunk) = first_stream.next().await {
+        first_bytes.extend_from_slice(&chunk.expect("remaining first bytes"));
+    }
+    assert_eq!(first_bytes, b"abcdef");
+    deleting_first
+        .await
+        .expect("delete task")
+        .expect("deferred delete");
+    assert!(!storage.root().join(&stored[0].object_key).exists());
+    assert!(first_part_paths.iter().all(|path| !path.exists()));
 }
 
 #[tokio::test]
@@ -226,11 +409,25 @@ async fn multipart_delete_rejects_manifest_that_points_at_another_blobs_parts() 
     .await
     .expect("tamper first manifest");
 
+    let read_result = storage
+        .stream_range(
+            &first.object_key,
+            BlobReadRange {
+                expected_size: first.size_bytes,
+                offset: 0,
+                length: first.size_bytes,
+            },
+        )
+        .await;
     let error = storage
         .delete_object(&first.object_key)
         .await
         .expect_err("cross-object part reference must be rejected");
 
+    assert!(matches!(
+        read_result,
+        Err(StorageError::InvalidMultipartManifest)
+    ));
     assert!(matches!(error, StorageError::InvalidMultipartManifest));
     assert!(protected_part.path.is_file());
     assert_eq!(

@@ -9,7 +9,8 @@ use vault_server::blob_lifecycle::{
 };
 use vault_server::db;
 use vault_server::storage::{
-    BlobStorageBackend, BlobWriteKind, LocalBlobStorage, StorageError, StoredBlob, sha256_hex,
+    BlobByteStream, BlobReadRange, BlobStorageBackend, BlobWriteKind, LocalBlobStorage,
+    StorageError, StoredBlob, sha256_hex,
 };
 
 struct TestState {
@@ -88,6 +89,14 @@ impl BlobStorageBackend for FailOnceDeleteStorage {
         self.inner.read_range(object_key, start, end).await
     }
 
+    async fn stream_range(
+        &self,
+        object_key: &str,
+        range: BlobReadRange,
+    ) -> Result<BlobByteStream, StorageError> {
+        self.inner.stream_range(object_key, range).await
+    }
+
     async fn list_object_keys(&self) -> Result<Vec<String>, StorageError> {
         self.inner.list_object_keys().await
     }
@@ -163,6 +172,14 @@ impl BlobStorageBackend for DeleteThenErrorOnceStorage {
         end: u64,
     ) -> Result<Vec<u8>, StorageError> {
         self.inner.read_range(object_key, start, end).await
+    }
+
+    async fn stream_range(
+        &self,
+        object_key: &str,
+        range: BlobReadRange,
+    ) -> Result<BlobByteStream, StorageError> {
+        self.inner.stream_range(object_key, range).await
     }
 
     async fn list_object_keys(&self) -> Result<Vec<String>, StorageError> {

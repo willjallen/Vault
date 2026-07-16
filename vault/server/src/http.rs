@@ -18,8 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::Mutex as AsyncMutex;
-use tokio::sync::broadcast;
+use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore, broadcast};
 use tower_http::compression::predicate::{NotForContentType, Predicate, SizeAbove};
 use tower_http::compression::{CompressionLayer, CompressionLevel};
 use uuid::Uuid;
@@ -70,8 +69,8 @@ use crate::state_events::{
     record_state_event, state_events_after, subscribe_state_events,
 };
 use crate::storage::{
-    BlobStorageBackend, BlobWriteKind, LocalBlobStorage, SharedBlobStorage, StorageError,
-    StoredBlob, sha256_hex,
+    BlobByteStream, BlobReadRange, BlobWriteKind, LocalBlobStorage, STORAGE_CHUNK_SIZE,
+    SharedBlobStorage, StorageError, StoredBlob, sha256_hex,
 };
 use crate::transfers::{self, TransferMaintenanceError};
 use crate::uploads::{
@@ -89,6 +88,7 @@ const DEBUG_TIMEOUT_SECONDS: i64 = 10;
 const APP_SHELL_CACHE_CONTROL: &str = "no-store, max-age=0";
 const STATIC_IMMUTABLE_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 const STATIC_REVALIDATE_CACHE_CONTROL: &str = "no-cache";
+const DEFAULT_DOWNLOAD_CONCURRENCY_LIMIT: usize = 64;
 static DEBUG_EVENT_STREAM_GENERATION: AtomicI64 = AtomicI64::new(0);
 static DEBUG_EVENT_STREAM_RETRY_MS: AtomicI64 = AtomicI64::new(3000);
 
@@ -101,11 +101,29 @@ pub struct AppState {
     pub export_execution: Arc<ExportExecutionContext>,
     pub upload_hash_coordinator: uploads::UploadHashCoordinator,
     upload_part_locks: Arc<AsyncMutex<HashSet<String>>>,
+    download_slots: Arc<Semaphore>,
 }
 
 impl AppState {
     #[must_use]
     pub fn new(config: Config, auth: AuthSettings, db: DbPool, storage: SharedBlobStorage) -> Self {
+        Self::new_with_download_limit(
+            config,
+            auth,
+            db,
+            storage,
+            DEFAULT_DOWNLOAD_CONCURRENCY_LIMIT,
+        )
+    }
+
+    #[must_use]
+    pub fn new_with_download_limit(
+        config: Config,
+        auth: AuthSettings,
+        db: DbPool,
+        storage: SharedBlobStorage,
+        download_limit: usize,
+    ) -> Self {
         let config = config.normalized();
         let export_execution = Arc::new(ExportExecutionContext::new(export_runtime_settings(
             &config,
@@ -118,6 +136,7 @@ impl AppState {
             export_execution,
             upload_hash_coordinator: uploads::UploadHashCoordinator::new(),
             upload_part_locks: Arc::new(AsyncMutex::new(HashSet::new())),
+            download_slots: Arc::new(Semaphore::new(download_limit.max(1))),
         }
     }
 }
@@ -1276,8 +1295,7 @@ async fn api_download_items(
     let items = normalize_action_items(&state.db, &payload).await?;
     if let [NormalizedActionItem::Document { id }] = items.as_slice() {
         let download = current_version_download(&state.db, *id, &user).await?;
-        let response =
-            version_download_response(state.storage.as_ref(), &download, &headers).await?;
+        let response = version_download_response(&state, &download, &headers).await?;
         record_download_event(&state.db, &download, &user, &client_meta(&headers), true).await?;
         notify_state_event_committed();
         return Ok(response);
@@ -1357,7 +1375,7 @@ async fn download_export_artifact(
         bucket: artifact.bucket,
         object_key: artifact.object_key,
     };
-    version_download_response(state.storage.as_ref(), &download, &headers).await
+    version_download_response(&state, &download, &headers).await
 }
 
 async fn api_create_upload_session(
@@ -1549,7 +1567,7 @@ async fn download_current_document_version(
 ) -> Result<Response, ApiError> {
     let user = current_user(&state, &headers).await?;
     let download = current_version_download(&state.db, doc_id, &user).await?;
-    let response = version_download_response(state.storage.as_ref(), &download, &headers).await?;
+    let response = version_download_response(&state, &download, &headers).await?;
     record_download_event(&state.db, &download, &user, &client_meta(&headers), true).await?;
     notify_state_event_committed();
     Ok(response)
@@ -1562,7 +1580,7 @@ async fn checkout_document_version(
 ) -> Result<Response, ApiError> {
     let user = current_user(&state, &headers).await?;
     let download = checkout_version_download(&state.db, doc_id, &user).await?;
-    let response = version_download_response(state.storage.as_ref(), &download, &headers).await?;
+    let response = version_download_response(&state, &download, &headers).await?;
     record_checkout_event_and_lock(&state.db, &download, &user, &client_meta(&headers)).await?;
     notify_state_event_committed();
     Ok(response)
@@ -1590,7 +1608,7 @@ async fn download_document_version(
 ) -> Result<Response, ApiError> {
     let user = current_user(&state, &headers).await?;
     let download = version_download_by_id(&state.db, doc_id, &version_id, &user).await?;
-    let response = version_download_response(state.storage.as_ref(), &download, &headers).await?;
+    let response = version_download_response(&state, &download, &headers).await?;
     record_download_event(&state.db, &download, &user, &client_meta(&headers), false).await?;
     notify_state_event_committed();
     Ok(response)
@@ -2354,19 +2372,30 @@ struct DownloadRange {
 }
 
 async fn version_download_response(
-    storage: &dyn BlobStorageBackend,
+    state: &AppState,
     download: &VersionDownload,
     headers: &HeaderMap,
 ) -> Result<Response, ApiError> {
     let size = u64::try_from(download.size_bytes)
         .map_err(|_| ApiError::Storage(StorageError::ContentMismatch))?;
     let etag = blob_etag(download);
-    let range = parse_range_header(
-        header_value(headers, header::RANGE),
-        header_value(headers, header::IF_RANGE),
-        size,
-        &etag,
-    )?;
+    let mut if_range_values = headers.get_all(header::IF_RANGE).iter();
+    let if_range_matches = match (if_range_values.next(), if_range_values.next()) {
+        (None, _) => true,
+        (Some(value), None) => value.to_str().is_ok_and(|value| value.trim() == etag),
+        (Some(_), Some(_)) => false,
+    };
+    let range_header = if if_range_matches {
+        let mut values = headers.get_all(header::RANGE).iter();
+        match (values.next(), values.next()) {
+            (None, _) => None,
+            (Some(value), None) => Some(value.to_str().map_err(|_| byte_range_error(size))?),
+            (Some(_), Some(_)) => return Err(byte_range_error(size)),
+        }
+    } else {
+        None
+    };
+    let range = parse_range_header(range_header, size)?;
     if !download.hash_algo.eq_ignore_ascii_case("sha256") {
         return Err(ApiError::Storage(StorageError::ContentMismatch));
     }
@@ -2376,25 +2405,30 @@ async fn version_download_response(
     // look wedged at browser handoff. The canonical hash is verified before the
     // blob is committed; this path validates metadata/range coherence and reads
     // only the requested bytes.
-    let body = if range.len == 0 {
-        Vec::new()
-    } else {
-        let bytes = storage
-            .read_location_range(
-                &download.backend,
-                &download.bucket,
-                &download.object_key,
-                range.start,
-                range.end,
+    let permit = Arc::clone(&state.download_slots)
+        .try_acquire_owned()
+        .map_err(|_| {
+            ApiError::ServiceUnavailable(
+                "Download capacity is currently exhausted; retry shortly".to_string(),
             )
-            .await
-            .map_err(storage_download_error)?;
-        if u64::try_from(bytes.len()).ok() != Some(range.len) {
-            return Err(ApiError::Storage(StorageError::ContentMismatch));
-        }
-        bytes
-    };
-    let mut response = Response::new(Body::from(body));
+        })?;
+    let body = state
+        .storage
+        .stream_location_range(
+            &download.backend,
+            &download.bucket,
+            &download.object_key,
+            BlobReadRange {
+                expected_size: size,
+                offset: range.start,
+                length: range.len,
+            },
+        )
+        .await
+        .map_err(|error| storage_download_error(error, size))?;
+    let mut response = Response::new(Body::from_stream(limit_download_stream(
+        body, permit, range.len,
+    )));
     *response.status_mut() = range.status;
     let safe_name = safe_download_name(&download.filename);
     insert_header(
@@ -2425,35 +2459,72 @@ async fn version_download_response(
     Ok(response)
 }
 
-fn parse_range_header(
-    range_header: Option<&str>,
-    if_range: Option<&str>,
-    size: u64,
-    etag: &str,
-) -> Result<DownloadRange, ApiError> {
-    if size == 0 {
-        return Ok(DownloadRange {
-            start: 0,
-            end: 0,
-            status: StatusCode::OK,
-            len: 0,
-        });
-    }
-    let range_header = if if_range.is_some_and(|value| value.trim() != etag) {
-        None
-    } else {
-        range_header
-    };
+fn limit_download_stream(
+    source: BlobByteStream,
+    permit: OwnedSemaphorePermit,
+    expected_length: u64,
+) -> BlobByteStream {
+    Box::pin(stream::unfold(
+        (Some(source), Some(permit), expected_length),
+        |(source, permit, remaining)| async move {
+            let mut source = source?;
+            if remaining == 0 {
+                drop(permit);
+                return None;
+            }
+            match source.next().await {
+                Some(Ok(bytes))
+                    if !bytes.is_empty()
+                        && bytes.len() <= STORAGE_CHUNK_SIZE
+                        && bytes.len() as u64 <= remaining =>
+                {
+                    let remaining = remaining - bytes.len() as u64;
+                    if remaining == 0 {
+                        drop(source);
+                        Some((Ok(bytes), (None, permit, 0)))
+                    } else {
+                        Some((Ok(bytes), (Some(source), permit, remaining)))
+                    }
+                }
+                Some(Ok(_)) => {
+                    let error = StorageError::ContentMismatch;
+                    tracing::error!(?error, "download body violated its stream contract");
+                    drop(permit);
+                    Some((Err(error), (None, None, 0)))
+                }
+                Some(Err(error)) => {
+                    tracing::error!(?error, "download body stream failed");
+                    drop(permit);
+                    Some((Err(error), (None, None, 0)))
+                }
+                None => {
+                    let error = StorageError::ContentMismatch;
+                    tracing::error!(?error, "download body ended before its metadata length");
+                    drop(permit);
+                    Some((Err(error), (None, None, 0)))
+                }
+            }
+        },
+    ))
+}
+
+fn parse_range_header(range_header: Option<&str>, size: u64) -> Result<DownloadRange, ApiError> {
     let Some(value) = range_header
         .map(str::trim)
         .filter(|value| !value.is_empty())
     else {
         return Ok(full_download_range(size));
     };
-    if !value.starts_with("bytes=") || value.contains(',') {
+    let Some((unit, spec)) = value.split_once('=') else {
+        return Err(byte_range_error(size));
+    };
+    if !unit.eq_ignore_ascii_case("bytes") {
+        return Ok(full_download_range(size));
+    }
+    if size == 0 || spec.contains(',') {
         return Err(byte_range_error(size));
     }
-    let spec = value.trim_start_matches("bytes=").trim();
+    let spec = spec.trim();
     let Some((raw_start, raw_end)) = spec.split_once('-') else {
         return Err(byte_range_error(size));
     };
@@ -2489,7 +2560,7 @@ fn parse_range_header(
 fn full_download_range(size: u64) -> DownloadRange {
     DownloadRange {
         start: 0,
-        end: size - 1,
+        end: size.saturating_sub(1),
         status: StatusCode::OK,
         len: size,
     }
@@ -2501,10 +2572,13 @@ fn byte_range_error(size: u64) -> ApiError {
     }
 }
 
-fn storage_download_error(error: StorageError) -> ApiError {
+fn storage_download_error(error: StorageError, size: u64) -> ApiError {
     match error {
         StorageError::NotFound => ApiError::NotFound("Blob missing from storage".to_string()),
-        StorageError::InvalidRange => byte_range_error(0),
+        StorageError::InvalidRange => byte_range_error(size),
+        StorageError::Busy => ApiError::ServiceUnavailable(
+            "Blob is currently completing a lifecycle operation; retry shortly".to_string(),
+        ),
         error => ApiError::Storage(error),
     }
 }
@@ -3231,6 +3305,15 @@ impl IntoResponse for ApiError {
                 );
                 response
             }
+            Self::ServiceUnavailable(detail) => {
+                let mut response = (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ErrorPayload { detail }),
+                )
+                    .into_response();
+                insert_header(response.headers_mut(), header::RETRY_AFTER, "1");
+                response
+            }
             error => {
                 let (status, detail) = api_error_status_detail(error);
                 (status, Json(ErrorPayload { detail })).into_response()
@@ -3268,7 +3351,6 @@ fn api_error_status_detail(error: ApiError) -> (StatusCode, String) {
         }
         ApiError::Reconciliation(error) => reconciliation_error_response(error),
         ApiError::Settings(error) => site_settings_error_response(error),
-        ApiError::ServiceUnavailable(detail) => (StatusCode::SERVICE_UNAVAILABLE, detail),
         ApiError::Share(error) => share_error_response(error),
         ApiError::StateEvent(error) => state_event_error_response(&error),
         ApiError::TransferMaintenance(error) => transfer_maintenance_error_response(error),
@@ -3282,7 +3364,9 @@ fn api_error_status_detail(error: ApiError) -> (StatusCode, String) {
         ApiError::Storage(error) => storage_error_response(error),
         ApiError::Upload(error) => upload_error_response(error),
         ApiError::View(error) => view_error_response(error),
-        ApiError::LoginRedirect(_) | ApiError::RangeNotSatisfiable { .. } => {
+        ApiError::LoginRedirect(_)
+        | ApiError::RangeNotSatisfiable { .. }
+        | ApiError::ServiceUnavailable(_) => {
             unreachable!("handled before status mapping")
         }
     }
@@ -3384,10 +3468,9 @@ fn upload_error_response(error: UploadError) -> (StatusCode, String) {
             StatusCode::BAD_REQUEST,
             "Upload size must be non-negative".to_string(),
         ),
-        UploadError::UploadTooLarge(limit) => (
-            StatusCode::PAYLOAD_TOO_LARGE,
-            format!("Upload exceeds limit of {limit} bytes"),
-        ),
+        error @ (UploadError::UploadTooLarge(_) | UploadError::UploadTooManyParts(_)) => {
+            upload_limit_error_response(&error)
+        }
         UploadError::UploadNewDocumentsToVault => (
             StatusCode::BAD_REQUEST,
             "Upload new documents to Vault".to_string(),
@@ -3460,6 +3543,17 @@ fn upload_error_response(error: UploadError) -> (StatusCode, String) {
             )
         }
     }
+}
+
+fn upload_limit_error_response(error: &UploadError) -> (StatusCode, String) {
+    let detail = match error {
+        UploadError::UploadTooLarge(limit) => format!("Upload exceeds limit of {limit} bytes"),
+        UploadError::UploadTooManyParts(limit) => {
+            format!("Upload requires more than {limit} parts; increase the transfer chunk size")
+        }
+        _ => unreachable!("upload limit helper received a non-limit error"),
+    };
+    (StatusCode::PAYLOAD_TOO_LARGE, detail)
 }
 
 fn upload_integrity_error_response(error: &UploadError) -> (StatusCode, String) {

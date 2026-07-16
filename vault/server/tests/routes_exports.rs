@@ -23,8 +23,8 @@ use vault_server::folders::{
 };
 use vault_server::http::{self, AppState};
 use vault_server::storage::{
-    BlobStorageBackend, BlobWriteKind, LocalBlobStorage, SharedBlobStorage, StorageError,
-    StoredBlob,
+    BlobByteStream, BlobReadRange, BlobStorageBackend, BlobWriteKind, LocalBlobStorage,
+    SharedBlobStorage, StorageError, StoredBlob,
 };
 use vault_server::transfers::sweep_expired_transfers;
 
@@ -142,6 +142,14 @@ impl BlobStorageBackend for BlockingPutFileStorage {
         self.inner.read_range(object_key, start, end).await
     }
 
+    async fn stream_range(
+        &self,
+        object_key: &str,
+        range: BlobReadRange,
+    ) -> Result<BlobByteStream, StorageError> {
+        self.inner.stream_range(object_key, range).await
+    }
+
     async fn list_object_keys(&self) -> Result<Vec<String>, StorageError> {
         self.inner.list_object_keys().await
     }
@@ -218,6 +226,14 @@ impl BlobStorageBackend for BlockAfterPutFileStorage {
         self.inner.read_range(object_key, start, end).await
     }
 
+    async fn stream_range(
+        &self,
+        object_key: &str,
+        range: BlobReadRange,
+    ) -> Result<BlobByteStream, StorageError> {
+        self.inner.stream_range(object_key, range).await
+    }
+
     async fn list_object_keys(&self) -> Result<Vec<String>, StorageError> {
         self.inner.list_object_keys().await
     }
@@ -291,6 +307,14 @@ impl BlobStorageBackend for CancelAfterReadStorage {
         end: u64,
     ) -> Result<Vec<u8>, StorageError> {
         self.inner.read_range(object_key, start, end).await
+    }
+
+    async fn stream_range(
+        &self,
+        object_key: &str,
+        range: BlobReadRange,
+    ) -> Result<BlobByteStream, StorageError> {
+        self.inner.stream_range(object_key, range).await
     }
 
     async fn list_object_keys(&self) -> Result<Vec<String>, StorageError> {
@@ -405,6 +429,14 @@ impl BlobStorageBackend for BlockAfterProgressRangeStorage {
             self.release_range.notified().await;
         }
         Ok(bytes)
+    }
+
+    async fn stream_range(
+        &self,
+        object_key: &str,
+        range: BlobReadRange,
+    ) -> Result<BlobByteStream, StorageError> {
+        self.inner.stream_range(object_key, range).await
     }
 
     async fn list_object_keys(&self) -> Result<Vec<String>, StorageError> {

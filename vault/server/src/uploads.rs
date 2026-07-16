@@ -37,7 +37,9 @@ use crate::folders::{
     normalize_folder, parse_public_folder_path, require_write_for_folder_path,
 };
 use crate::state_events::state_event_resources_json;
-use crate::storage::{BlobStorageBackend, BlobWriteKind, StorageError, StoredBlob};
+use crate::storage::{
+    BlobStorageBackend, BlobWriteKind, STORAGE_MULTIPART_MAX_PARTS, StorageError, StoredBlob,
+};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -173,6 +175,8 @@ pub enum UploadError {
     UploadSizeNegative,
     #[error("upload exceeds limit of {0} bytes")]
     UploadTooLarge(i64),
+    #[error("upload requires more than {0} parts")]
+    UploadTooManyParts(usize),
     #[error("upload new documents to Vault")]
     UploadNewDocumentsToVault,
     #[error("check out the file before uploading a new version")]
@@ -566,6 +570,9 @@ pub async fn create_upload_session(
         settings.transfer_chunk_bytes,
     );
     let part_count = part_count(payload.size_bytes, chunk_size);
+    if usize::try_from(part_count).map_or(true, |count| count > STORAGE_MULTIPART_MAX_PARTS) {
+        return Err(UploadError::UploadTooManyParts(STORAGE_MULTIPART_MAX_PARTS));
+    }
     let (folder_path, document_id) =
         prepare_upload_target(pool, &mode, &filename, &payload, user).await?;
 
@@ -2757,7 +2764,7 @@ fn choose_upload_chunk_size(
     if size_bytes <= max_chunk {
         return size_bytes.max(1);
     }
-    let full_size_parts = (size_bytes + max_chunk - 1) / max_chunk;
+    let full_size_parts = positive_div_ceil(size_bytes, max_chunk);
     if full_size_parts >= target_parallelism {
         return max_chunk;
     }
@@ -2767,11 +2774,11 @@ fn choose_upload_chunk_size(
         target_parallelism
     } else {
         let target_chunk = target_upload_chunk_bytes(target_parallelism);
-        let target_parts = (size_bytes + target_chunk - 1) / target_chunk;
+        let target_parts = positive_div_ceil(size_bytes, target_chunk);
         target_parallelism.min(UPLOAD_MIN_ADAPTIVE_PARTS.max(target_parts))
     };
-    let target_chunk = (size_bytes + target_parts - 1) / target_parts;
-    let rounded = ((target_chunk + round_to - 1) / round_to) * round_to;
+    let target_chunk = positive_div_ceil(size_bytes, target_parts);
+    let rounded = positive_div_ceil(target_chunk, round_to).saturating_mul(round_to);
     max_chunk.min(min_chunk.max(rounded))
 }
 
@@ -2795,7 +2802,15 @@ fn part_count(size_bytes: i64, chunk_size: i64) -> i64 {
     if size_bytes <= 0 {
         0
     } else {
-        (size_bytes + chunk_size - 1) / chunk_size
+        positive_div_ceil(size_bytes, chunk_size)
+    }
+}
+
+fn positive_div_ceil(value: i64, divisor: i64) -> i64 {
+    if value <= 0 {
+        0
+    } else {
+        value / divisor + i64::from(value % divisor != 0)
     }
 }
 

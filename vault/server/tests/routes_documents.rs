@@ -1151,7 +1151,7 @@ async fn current_document_download_streams_range_headers_and_records_event() {
         event,
         (
             "download".to_string(),
-            "Downloaded Project/plan.txt".to_string()
+            "Started download of Project/plan.txt".to_string()
         )
     );
     assert_eq!(state_event, "document.download");
@@ -1227,7 +1227,7 @@ async fn api_download_single_document_streams_current_version_and_records_event(
         event,
         (
             "download".to_string(),
-            "Downloaded Project/plan.txt".to_string(),
+            "Started download of Project/plan.txt".to_string(),
         ),
     );
     assert_eq!(state_event, "document.download");
@@ -1378,7 +1378,7 @@ async fn explicit_version_download_uses_original_filename_and_records_version_ev
         event,
         (
             "download".to_string(),
-            "Downloaded version v1 of Project/plan.txt".to_string(),
+            "Started download of version v1 of Project/plan.txt".to_string(),
         ),
     );
 }

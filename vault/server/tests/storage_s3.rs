@@ -8,13 +8,15 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
 use axum::routing::{delete, get, head, put};
+use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use vault_server::blob_lifecycle::{begin_blob_publication, collect_unreferenced_blobs};
 use vault_server::db;
 use vault_server::storage::{
-    BlobStorageBackend, BlobWriteKind, S3CompatibleBlobStorage, S3StorageSettings, StorageError,
+    BlobReadRange, BlobStorageBackend, BlobWriteKind, S3CompatibleBlobStorage, S3StorageSettings,
+    STORAGE_CHUNK_SIZE, StorageError,
 };
 
 type ObjectMap = Arc<Mutex<HashMap<String, Vec<u8>>>>;
@@ -58,6 +60,24 @@ async fn s3_compatible_storage_puts_reads_ranges_and_deletes_objects() {
             .expect("read range"),
         b"remote",
     );
+    let mut stream = storage
+        .stream_range(
+            &stored.object_key,
+            BlobReadRange {
+                expected_size: content.len() as u64,
+                offset: 6,
+                length: 6,
+            },
+        )
+        .await
+        .expect("range stream");
+    let mut streamed = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.expect("range stream chunk");
+        assert!(chunk.len() <= STORAGE_CHUNK_SIZE);
+        streamed.extend_from_slice(&chunk);
+    }
+    assert_eq!(streamed, b"remote");
 
     storage
         .delete_object(&stored.object_key)
@@ -102,6 +122,99 @@ async fn s3_compatible_storage_overwrites_existing_digest_key_with_new_bytes() {
             .expect("read repaired remote"),
         content,
     );
+}
+
+#[tokio::test]
+async fn s3_full_object_stream_is_bounded_across_multiple_mebibytes() {
+    let (endpoint_url, objects) = start_s3_mock_with_objects().await;
+    let storage = S3CompatibleBlobStorage::from_settings(S3StorageSettings {
+        name: "s3".to_string(),
+        bucket: "vault-test".to_string(),
+        region: "us-east-1".to_string(),
+        endpoint_url: Some(endpoint_url),
+        access_key_id: Some("test-access".to_string()),
+        secret_access_key: Some("test-secret".to_string()),
+        session_token: None,
+        prefix: "objects".to_string(),
+    })
+    .await
+    .expect("s3 storage");
+    let size = STORAGE_CHUNK_SIZE * 2 + 17;
+    let object_key = "objects/large-stream".to_string();
+    objects
+        .lock()
+        .await
+        .insert(object_key.clone(), vec![b'z'; size]);
+
+    let mut stream = storage
+        .stream_range(
+            &object_key,
+            BlobReadRange {
+                expected_size: size as u64,
+                offset: 0,
+                length: size as u64,
+            },
+        )
+        .await
+        .expect("full object stream");
+    let mut streamed = 0_usize;
+    let mut chunks = 0_usize;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.expect("full object chunk");
+        assert!(!chunk.is_empty());
+        assert!(chunk.len() <= STORAGE_CHUNK_SIZE);
+        streamed += chunk.len();
+        chunks += 1;
+    }
+
+    assert_eq!(streamed, size);
+    assert!(chunks >= 3);
+}
+
+#[tokio::test]
+async fn s3_range_stream_rejects_a_provider_that_ignores_the_range() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let addr = listener.local_addr().expect("listener address");
+    let app = Router::new().route(
+        "/{bucket}/{*key}",
+        get(|| async {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_LENGTH, 6)
+                .body(Body::from("abcdef"))
+                .expect("ignored range response")
+        }),
+    );
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("ignored range mock");
+    });
+    let storage = S3CompatibleBlobStorage::from_settings(S3StorageSettings {
+        name: "s3".to_string(),
+        bucket: "vault-test".to_string(),
+        region: "us-east-1".to_string(),
+        endpoint_url: Some(endpoint_url(addr)),
+        access_key_id: Some("test-access".to_string()),
+        secret_access_key: Some("test-secret".to_string()),
+        session_token: None,
+        prefix: "objects".to_string(),
+    })
+    .await
+    .expect("s3 storage");
+
+    let result = storage
+        .stream_range(
+            "object",
+            BlobReadRange {
+                expected_size: 6,
+                offset: 2,
+                length: 2,
+            },
+        )
+        .await;
+
+    assert!(matches!(result, Err(StorageError::ContentMismatch)));
 }
 
 #[tokio::test]
@@ -393,17 +506,23 @@ async fn mock_get_object(
     else {
         return Response::builder()
             .status(StatusCode::OK)
+            .header(header::CONTENT_LENGTH, bytes.len())
             .body(Body::from(bytes))
             .expect("response");
     };
     if range.0 > range.1 || range.1 >= bytes.len() {
         return empty_response(StatusCode::RANGE_NOT_SATISFIABLE);
     }
+    let total_size = bytes.len();
+    let range_bytes = Bytes::copy_from_slice(&bytes[range.0..=range.1]);
     Response::builder()
         .status(StatusCode::PARTIAL_CONTENT)
-        .body(Body::from(Bytes::copy_from_slice(
-            &bytes[range.0..=range.1],
-        )))
+        .header(header::CONTENT_LENGTH, range_bytes.len())
+        .header(
+            header::CONTENT_RANGE,
+            format!("Bytes {:02}-{:02}/{total_size:03}", range.0, range.1),
+        )
+        .body(Body::from(range_bytes))
         .expect("response")
 }
 

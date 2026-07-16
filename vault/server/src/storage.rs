@@ -1,7 +1,8 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
@@ -10,11 +11,14 @@ use aws_credential_types::provider::SharedCredentialsProvider;
 use aws_sdk_s3::config::Region;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::{Client as S3Client, Config as S3ClientConfig};
+use axum::body::Bytes;
+use futures_util::{Stream, stream};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::sync::{OwnedRwLockReadGuard, RwLock};
 use uuid::Uuid;
 
 use crate::config::Config;
@@ -22,8 +26,35 @@ use crate::config::Config;
 pub const DEFAULT_STORAGE_PREFIX: &str = "objects";
 pub const LOCAL_MULTIPART_FORMAT: &str = "vault.local.multipart.v1";
 pub const STORAGE_CHUNK_SIZE: usize = 1024 * 1024;
+const MAX_LOCAL_MULTIPART_MANIFEST_BYTES: u64 = 512 * 1024;
+pub const STORAGE_MULTIPART_MAX_PARTS: usize = 1024;
 
 pub type SharedBlobStorage = Arc<dyn BlobStorageBackend>;
+/// Storage implementations must emit nonempty frames no larger than [`STORAGE_CHUNK_SIZE`].
+pub type BlobByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, StorageError>> + Send + 'static>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlobReadRange {
+    pub expected_size: u64,
+    pub offset: u64,
+    pub length: u64,
+}
+
+impl BlobReadRange {
+    fn validate(self) -> Result<(), StorageError> {
+        if self.length == 0 && (self.expected_size != 0 || self.offset != 0) {
+            return Err(StorageError::InvalidRange);
+        }
+        let end = self
+            .offset
+            .checked_add(self.length)
+            .ok_or(StorageError::InvalidRange)?;
+        if end > self.expected_size {
+            return Err(StorageError::InvalidRange);
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredBlob {
@@ -83,6 +114,8 @@ pub enum StorageError {
     Configuration(String),
     #[error("storage backend cannot serve this blob location")]
     BackendMismatch,
+    #[error("blob is temporarily unavailable during a lifecycle operation")]
+    Busy,
     #[error("{0}")]
     UnsupportedOperation(String),
     #[error("remote storage operation failed")]
@@ -136,6 +169,12 @@ pub trait BlobStorageBackend: std::fmt::Debug + Send + Sync {
         end: u64,
     ) -> Result<Vec<u8>, StorageError>;
 
+    async fn stream_range(
+        &self,
+        object_key: &str,
+        range: BlobReadRange,
+    ) -> Result<BlobByteStream, StorageError>;
+
     async fn list_object_keys(&self) -> Result<Vec<String>, StorageError>;
 
     async fn delete_object(&self, object_key: &str) -> Result<(), StorageError>;
@@ -162,6 +201,17 @@ pub trait BlobStorageBackend: std::fmt::Debug + Send + Sync {
         self.read_range(object_key, start, end).await
     }
 
+    async fn stream_location_range(
+        &self,
+        backend: &str,
+        bucket: &str,
+        object_key: &str,
+        range: BlobReadRange,
+    ) -> Result<BlobByteStream, StorageError> {
+        self.require_location(backend, bucket)?;
+        self.stream_range(object_key, range).await
+    }
+
     async fn delete_location(
         &self,
         backend: &str,
@@ -185,6 +235,7 @@ pub trait BlobStorageBackend: std::fmt::Debug + Send + Sync {
 pub struct LocalBlobStorage {
     root: Arc<PathBuf>,
     prefix: Arc<str>,
+    lifecycle_locks: Arc<ObjectLifecycleLocks>,
 }
 
 #[derive(Debug, Clone)]
@@ -205,6 +256,7 @@ pub struct S3CompatibleBlobStorage {
     bucket: Arc<str>,
     prefix: Arc<str>,
     client: S3Client,
+    lifecycle_locks: Arc<ObjectLifecycleLocks>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -228,12 +280,51 @@ enum MultipartManifestState {
     Replace,
 }
 
+#[derive(Debug, Default)]
+struct ObjectLifecycleLocks {
+    entries: StdMutex<HashMap<String, Weak<RwLock<()>>>>,
+}
+
+impl ObjectLifecycleLocks {
+    fn for_object(&self, object_key: &str) -> Arc<RwLock<()>> {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        entries.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = entries.get(object_key).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(RwLock::new(()));
+        entries.insert(object_key.to_string(), Arc::downgrade(&lock));
+        lock
+    }
+}
+
+struct LocalMultipartReadState {
+    parts: Vec<LocalMultipartPart>,
+    part_index: usize,
+    part_offset: u64,
+    part_remaining: u64,
+    source: Option<fs::File>,
+    remaining: u64,
+    _read_guard: OwnedRwLockReadGuard<()>,
+}
+
+struct S3ReadState {
+    body: ByteStream,
+    pending: Option<Bytes>,
+    remaining: u64,
+    _read_guard: OwnedRwLockReadGuard<()>,
+}
+
 impl LocalBlobStorage {
     #[must_use]
     pub fn new(root: impl Into<PathBuf>, prefix: impl AsRef<str>) -> Self {
         Self {
             root: Arc::new(root.into()),
             prefix: Arc::from(normalize_storage_prefix(prefix.as_ref())),
+            lifecycle_locks: Arc::new(ObjectLifecycleLocks::default()),
         }
     }
 
@@ -443,6 +534,44 @@ impl LocalBlobStorage {
         Ok(data)
     }
 
+    pub async fn stream_range(
+        &self,
+        object_key: &str,
+        range: BlobReadRange,
+    ) -> Result<BlobByteStream, StorageError> {
+        range.validate()?;
+        let read_guard = self
+            .lifecycle_locks
+            .for_object(object_key)
+            .try_read_owned()
+            .map_err(|_| StorageError::Busy)?;
+        if is_multipart_manifest_key(object_key) {
+            let manifest = self.read_multipart_manifest_structure(object_key).await?;
+            if manifest.size_bytes != range.expected_size {
+                return Err(StorageError::ContentMismatch);
+            }
+            return multipart_range_stream(manifest, range, read_guard).await;
+        }
+
+        let target = self.object_path(object_key)?;
+        let mut source = match fs::File::open(target).await {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(StorageError::NotFound);
+            }
+            Err(error) => return Err(StorageError::Io(error)),
+        };
+        let metadata = source.metadata().await?;
+        if !metadata.is_file() || metadata.len() != range.expected_size {
+            return Err(StorageError::ContentMismatch);
+        }
+        if range.length == 0 {
+            return Ok(empty_blob_stream(read_guard));
+        }
+        source.seek(std::io::SeekFrom::Start(range.offset)).await?;
+        Ok(exact_file_stream(source, range.length, read_guard))
+    }
+
     pub async fn list_object_keys(&self) -> Result<Vec<String>, StorageError> {
         self.ensure().await?;
         let mut keys = Vec::new();
@@ -452,6 +581,11 @@ impl LocalBlobStorage {
     }
 
     pub async fn delete_object(&self, object_key: &str) -> Result<(), StorageError> {
+        let _delete_guard = self
+            .lifecycle_locks
+            .for_object(object_key)
+            .write_owned()
+            .await;
         let multipart_parts = if is_multipart_manifest_key(object_key) {
             self.multipart_part_paths_for_delete(object_key).await?
         } else {
@@ -481,73 +615,23 @@ impl LocalBlobStorage {
         &self,
         object_key: &str,
     ) -> Result<Option<Vec<PathBuf>>, StorageError> {
-        let manifest_path = self.object_path(object_key)?;
-        let manifest_bytes = match fs::read(&manifest_path).await {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(StorageError::Io(error)),
+        let payload = match self.read_manifest_payload(object_key).await {
+            Ok(payload) => payload,
+            Err(StorageError::NotFound) => return Ok(None),
+            Err(error) => return Err(error),
         };
-        let payload: ManifestPayload = serde_json::from_slice(&manifest_bytes)
-            .map_err(|_| StorageError::UnreadableMultipartManifest)?;
-        if payload.format != LOCAL_MULTIPART_FORMAT
-            || payload.hash_algo != "sha256"
-            || payload.digest.is_empty()
-            || self.multipart_manifest_key_for_hash(&payload.hash_algo, &payload.digest)
-                != object_key
-        {
-            return Err(StorageError::InvalidMultipartManifest);
-        }
-        let part_prefix = object_key
-            .strip_suffix("manifest.json")
-            .ok_or(StorageError::InvalidMultipartManifest)?
-            .to_string()
-            + "parts/";
-        let mut paths = Vec::with_capacity(payload.parts.len());
-        let mut seen = HashSet::with_capacity(payload.parts.len());
-        let mut total_size = 0_u64;
-        for part in payload.parts {
-            if !part.object_key.starts_with(&part_prefix)
-                || !is_multipart_part_key(&part.object_key)
-                || !seen.insert(part.object_key.clone())
-            {
-                return Err(StorageError::InvalidMultipartManifest);
-            }
-            total_size = total_size
-                .checked_add(part.size_bytes)
-                .ok_or(StorageError::InvalidMultipartManifest)?;
-            paths.push(self.object_path(&part.object_key)?);
-        }
-        if total_size != payload.size_bytes {
-            return Err(StorageError::InvalidMultipartManifest);
-        }
-        Ok(Some(paths))
+        Ok(Some(
+            self.validated_manifest_part_paths(object_key, &payload)?,
+        ))
     }
 
     pub async fn read_multipart_manifest(
         &self,
         object_key: &str,
     ) -> Result<LocalMultipartManifest, StorageError> {
-        let manifest_path = self.object_path(object_key)?;
-        let manifest_bytes = match fs::read(&manifest_path).await {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(StorageError::NotFound);
-            }
-            Err(error) => return Err(StorageError::Io(error)),
-        };
-        let payload: ManifestPayload = serde_json::from_slice(&manifest_bytes)
-            .map_err(|_| StorageError::UnreadableMultipartManifest)?;
-        if payload.format != LOCAL_MULTIPART_FORMAT
-            || payload.hash_algo != "sha256"
-            || payload.digest.is_empty()
-        {
-            return Err(StorageError::InvalidMultipartManifest);
-        }
-        let mut parts = Vec::with_capacity(payload.parts.len());
-        let mut total_size = 0_u64;
-        for raw_part in payload.parts {
-            let part_path = self.object_path(&raw_part.object_key)?;
-            let metadata = match fs::metadata(&part_path).await {
+        let manifest = self.read_multipart_manifest_structure(object_key).await?;
+        for part in &manifest.parts {
+            let metadata = match fs::metadata(&part.path).await {
                 Ok(metadata) => metadata,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     return Err(StorageError::NotFound);
@@ -557,19 +641,29 @@ impl LocalBlobStorage {
             if !metadata.is_file() {
                 return Err(StorageError::NotFound);
             }
-            if metadata.len() != raw_part.size_bytes {
+            if metadata.len() != part.size_bytes {
                 return Err(StorageError::InvalidMultipartManifest);
             }
-            total_size += raw_part.size_bytes;
-            parts.push(LocalMultipartPart {
+        }
+        Ok(manifest)
+    }
+
+    async fn read_multipart_manifest_structure(
+        &self,
+        object_key: &str,
+    ) -> Result<LocalMultipartManifest, StorageError> {
+        let payload = self.read_manifest_payload(object_key).await?;
+        let part_paths = self.validated_manifest_part_paths(object_key, &payload)?;
+        let parts = payload
+            .parts
+            .into_iter()
+            .zip(part_paths)
+            .map(|(raw_part, path)| LocalMultipartPart {
                 object_key: raw_part.object_key,
-                path: part_path,
+                path,
                 size_bytes: raw_part.size_bytes,
-            });
-        }
-        if total_size != payload.size_bytes {
-            return Err(StorageError::InvalidMultipartManifest);
-        }
+            })
+            .collect();
         Ok(LocalMultipartManifest {
             hash_algo: payload.hash_algo,
             digest: payload.digest,
@@ -578,11 +672,109 @@ impl LocalBlobStorage {
         })
     }
 
+    fn validated_manifest_part_paths(
+        &self,
+        object_key: &str,
+        payload: &ManifestPayload,
+    ) -> Result<Vec<PathBuf>, StorageError> {
+        if payload.format != LOCAL_MULTIPART_FORMAT
+            || payload.hash_algo != "sha256"
+            || !is_canonical_sha256_digest(&payload.digest)
+            || self.multipart_manifest_key_for_hash(&payload.hash_algo, &payload.digest)
+                != object_key
+            || (payload.size_bytes == 0 && !payload.parts.is_empty())
+            || (payload.size_bytes > 0 && payload.parts.is_empty())
+        {
+            return Err(StorageError::InvalidMultipartManifest);
+        }
+        let mut total_size = 0_u64;
+        let mut part_sizes = Vec::with_capacity(payload.parts.len());
+        for part in &payload.parts {
+            if part.size_bytes == 0 {
+                return Err(StorageError::InvalidMultipartManifest);
+            }
+            total_size = total_size
+                .checked_add(part.size_bytes)
+                .ok_or(StorageError::InvalidMultipartManifest)?;
+            part_sizes.push(part.size_bytes);
+        }
+        if total_size != payload.size_bytes {
+            return Err(StorageError::InvalidMultipartManifest);
+        }
+        let layout_id = multipart_layout_id(&part_sizes);
+        let uses_layout_keys = payload.parts.first().is_some_and(|part| {
+            part.object_key
+                == multipart_part_key_for_hash_layout(
+                    &self.prefix,
+                    &payload.hash_algo,
+                    &payload.digest,
+                    &layout_id,
+                    1,
+                )
+        });
+        let mut paths = Vec::with_capacity(payload.parts.len());
+        for (index, part) in payload.parts.iter().enumerate() {
+            let part_number = index + 1;
+            let expected_key = if uses_layout_keys {
+                multipart_part_key_for_hash_layout(
+                    &self.prefix,
+                    &payload.hash_algo,
+                    &payload.digest,
+                    &layout_id,
+                    part_number,
+                )
+            } else {
+                self.multipart_part_key_for_hash(&payload.hash_algo, &payload.digest, part_number)
+            };
+            if part.object_key != expected_key {
+                return Err(StorageError::InvalidMultipartManifest);
+            }
+            paths.push(self.object_path(&part.object_key)?);
+        }
+        Ok(paths)
+    }
+
+    async fn read_manifest_payload(
+        &self,
+        object_key: &str,
+    ) -> Result<ManifestPayload, StorageError> {
+        let manifest_path = self.object_path(object_key)?;
+        let source = match fs::File::open(&manifest_path).await {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(StorageError::NotFound);
+            }
+            Err(error) => return Err(StorageError::Io(error)),
+        };
+        let metadata = source.metadata().await?;
+        if !metadata.is_file() || metadata.len() > MAX_LOCAL_MULTIPART_MANIFEST_BYTES {
+            return Err(StorageError::InvalidMultipartManifest);
+        }
+        let capacity =
+            usize::try_from(metadata.len()).map_err(|_| StorageError::InvalidMultipartManifest)?;
+        let mut manifest_bytes = Vec::with_capacity(capacity);
+        source
+            .take(MAX_LOCAL_MULTIPART_MANIFEST_BYTES + 1)
+            .read_to_end(&mut manifest_bytes)
+            .await?;
+        if manifest_bytes.len()
+            > usize::try_from(MAX_LOCAL_MULTIPART_MANIFEST_BYTES)
+                .map_err(|_| StorageError::InvalidMultipartManifest)?
+        {
+            return Err(StorageError::InvalidMultipartManifest);
+        }
+        serde_json::from_slice(&manifest_bytes)
+            .map_err(|_| StorageError::UnreadableMultipartManifest)
+    }
+
     async fn put_verified_part_manifest(
         &self,
         part_paths: &[PathBuf],
         digest: &str,
     ) -> Result<StoredBlob, StorageError> {
+        if part_paths.len() > STORAGE_MULTIPART_MAX_PARTS || !is_canonical_sha256_digest(digest) {
+            return Err(StorageError::InvalidMultipartManifest);
+        }
         self.ensure().await?;
         let manifest_key = self.multipart_manifest_key_for_hash("sha256", digest);
         let manifest_state = self
@@ -632,26 +824,45 @@ impl LocalBlobStorage {
         let mut size_bytes = 0_u64;
         for part_path in part_paths {
             let part_size = fs::metadata(part_path).await?.len();
+            if part_size == 0 {
+                return Err(StorageError::InvalidMultipartManifest);
+            }
             part_sizes.push(part_size);
-            size_bytes += part_size;
+            size_bytes = size_bytes
+                .checked_add(part_size)
+                .ok_or(StorageError::InvalidMultipartManifest)?;
         }
         let layout_id = multipart_layout_id(&part_sizes);
-        let mut part_entries = Vec::with_capacity(part_paths.len());
-        for (index, (part_path, part_size)) in part_paths.iter().zip(part_sizes.iter()).enumerate()
-        {
-            let part_key = multipart_part_key_for_hash_layout(
-                &self.prefix,
-                "sha256",
-                digest,
-                &layout_id,
-                index + 1,
-            );
-            let target_path = self.object_path(&part_key)?;
-            publish_part_file(part_path, &target_path, *part_size).await?;
-            part_entries.push(ManifestPartPayload {
-                object_key: part_key,
+        let part_entries = part_sizes
+            .iter()
+            .enumerate()
+            .map(|(index, part_size)| ManifestPartPayload {
+                object_key: multipart_part_key_for_hash_layout(
+                    &self.prefix,
+                    "sha256",
+                    digest,
+                    &layout_id,
+                    index + 1,
+                ),
                 size_bytes: *part_size,
-            });
+            })
+            .collect::<Vec<_>>();
+        let prospective_manifest = ManifestPayload {
+            format: LOCAL_MULTIPART_FORMAT.to_string(),
+            hash_algo: "sha256".to_string(),
+            digest: digest.to_string(),
+            size_bytes,
+            parts: part_entries.clone(),
+        };
+        if serde_json::to_vec(&prospective_manifest)?.len()
+            >= usize::try_from(MAX_LOCAL_MULTIPART_MANIFEST_BYTES)
+                .map_err(|_| StorageError::InvalidMultipartManifest)?
+        {
+            return Err(StorageError::InvalidMultipartManifest);
+        }
+        for (part_path, part) in part_paths.iter().zip(&part_entries) {
+            let target_path = self.object_path(&part.object_key)?;
+            publish_part_file(part_path, &target_path, part.size_bytes).await?;
         }
         Ok((size_bytes, part_entries))
     }
@@ -713,6 +924,12 @@ impl LocalBlobStorage {
         let write_result = async {
             let mut manifest_bytes = serde_json::to_vec(&payload)?;
             manifest_bytes.push(b'\n');
+            if manifest_bytes.len()
+                > usize::try_from(MAX_LOCAL_MULTIPART_MANIFEST_BYTES)
+                    .map_err(|_| StorageError::InvalidMultipartManifest)?
+            {
+                return Err(StorageError::InvalidMultipartManifest);
+            }
             fs::write(&temp_path, manifest_bytes).await?;
             if replace_existing {
                 rename_or_replace(&temp_path, &manifest_path).await?;
@@ -832,6 +1049,144 @@ impl LocalBlobStorage {
     }
 }
 
+fn empty_blob_stream(read_guard: OwnedRwLockReadGuard<()>) -> BlobByteStream {
+    Box::pin(stream::unfold(Some(read_guard), |read_guard| async move {
+        drop(read_guard);
+        None
+    }))
+}
+
+fn exact_file_stream(
+    source: fs::File,
+    remaining: u64,
+    read_guard: OwnedRwLockReadGuard<()>,
+) -> BlobByteStream {
+    Box::pin(stream::try_unfold(
+        (source, remaining, read_guard),
+        |(mut source, remaining, read_guard)| async move {
+            if remaining == 0 {
+                return Ok(None);
+            }
+            let requested = usize::try_from(remaining.min(STORAGE_CHUNK_SIZE as u64))
+                .map_err(|_| StorageError::InvalidRange)?;
+            let mut buffer = vec![0_u8; requested];
+            let read = source.read(&mut buffer).await?;
+            if read == 0 {
+                return Err(StorageError::ContentMismatch);
+            }
+            buffer.truncate(read);
+            Ok(Some((
+                Bytes::from(buffer),
+                (source, remaining - read as u64, read_guard),
+            )))
+        },
+    ))
+}
+
+async fn multipart_range_stream(
+    manifest: LocalMultipartManifest,
+    range: BlobReadRange,
+    read_guard: OwnedRwLockReadGuard<()>,
+) -> Result<BlobByteStream, StorageError> {
+    if range.length == 0 {
+        return Ok(empty_blob_stream(read_guard));
+    }
+    let mut part_index = 0_usize;
+    let mut part_offset = range.offset;
+    while let Some(part) = manifest.parts.get(part_index) {
+        if part_offset < part.size_bytes {
+            break;
+        }
+        part_offset -= part.size_bytes;
+        part_index += 1;
+    }
+    let Some(part) = manifest.parts.get(part_index) else {
+        return Err(StorageError::InvalidMultipartManifest);
+    };
+    let part_remaining = part.size_bytes - part_offset;
+    let source = open_multipart_part(part, part_offset, StorageError::NotFound).await?;
+    let state = LocalMultipartReadState {
+        parts: manifest.parts,
+        part_index,
+        part_offset,
+        part_remaining,
+        source: Some(source),
+        remaining: range.length,
+        _read_guard: read_guard,
+    };
+    Ok(Box::pin(stream::try_unfold(
+        state,
+        |mut state| async move {
+            loop {
+                if state.remaining == 0 {
+                    return Ok(None);
+                }
+                if state.part_remaining == 0 {
+                    state.source = None;
+                    state.part_index += 1;
+                    state.part_offset = 0;
+                    let Some(part) = state.parts.get(state.part_index) else {
+                        return Err(StorageError::ContentMismatch);
+                    };
+                    state.part_remaining = part.size_bytes;
+                    continue;
+                }
+                if state.source.is_none() {
+                    let part = state
+                        .parts
+                        .get(state.part_index)
+                        .ok_or(StorageError::ContentMismatch)?;
+                    state.source = Some(
+                        open_multipart_part(part, state.part_offset, StorageError::ContentMismatch)
+                            .await?,
+                    );
+                }
+                let requested = usize::try_from(
+                    state
+                        .remaining
+                        .min(state.part_remaining)
+                        .min(STORAGE_CHUNK_SIZE as u64),
+                )
+                .map_err(|_| StorageError::InvalidRange)?;
+                let mut buffer = vec![0_u8; requested];
+                let read = state
+                    .source
+                    .as_mut()
+                    .ok_or(StorageError::ContentMismatch)?
+                    .read(&mut buffer)
+                    .await?;
+                if read == 0 {
+                    return Err(StorageError::ContentMismatch);
+                }
+                let read_bytes = u64::try_from(read).map_err(|_| StorageError::ContentMismatch)?;
+                state.part_offset += read_bytes;
+                state.part_remaining -= read_bytes;
+                state.remaining -= read_bytes;
+                buffer.truncate(read);
+                return Ok(Some((Bytes::from(buffer), state)));
+            }
+        },
+    )))
+}
+
+async fn open_multipart_part(
+    part: &LocalMultipartPart,
+    offset: u64,
+    missing_error: StorageError,
+) -> Result<fs::File, StorageError> {
+    let mut source = match fs::File::open(&part.path).await {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Err(missing_error),
+        Err(error) => return Err(StorageError::Io(error)),
+    };
+    let metadata = source.metadata().await?;
+    if !metadata.is_file() || metadata.len() != part.size_bytes {
+        return Err(StorageError::ContentMismatch);
+    }
+    source.seek(std::io::SeekFrom::Start(offset)).await?;
+    Ok(source)
+}
+
 #[async_trait]
 impl BlobStorageBackend for LocalBlobStorage {
     fn name(&self) -> &'static str {
@@ -892,6 +1247,14 @@ impl BlobStorageBackend for LocalBlobStorage {
         end: u64,
     ) -> Result<Vec<u8>, StorageError> {
         LocalBlobStorage::read_range(self, object_key, start, end).await
+    }
+
+    async fn stream_range(
+        &self,
+        object_key: &str,
+        range: BlobReadRange,
+    ) -> Result<BlobByteStream, StorageError> {
+        LocalBlobStorage::stream_range(self, object_key, range).await
     }
 
     async fn list_object_keys(&self) -> Result<Vec<String>, StorageError> {
@@ -1035,6 +1398,7 @@ impl S3CompatibleBlobStorage {
             bucket: Arc::from(bucket),
             prefix: Arc::from(normalize_storage_prefix(&settings.prefix)),
             client: S3Client::from_conf(config_builder.build()),
+            lifecycle_locks: Arc::new(ObjectLifecycleLocks::default()),
         })
     }
 
@@ -1176,6 +1540,104 @@ impl BlobStorageBackend for S3CompatibleBlobStorage {
             .to_vec())
     }
 
+    async fn stream_range(
+        &self,
+        object_key: &str,
+        range: BlobReadRange,
+    ) -> Result<BlobByteStream, StorageError> {
+        range.validate()?;
+        let read_guard = self
+            .lifecycle_locks
+            .for_object(object_key)
+            .try_read_owned()
+            .map_err(|_| StorageError::Busy)?;
+        let mut request = self
+            .client
+            .get_object()
+            .bucket(self.bucket())
+            .key(object_key);
+        let is_partial = range.offset != 0 || range.length != range.expected_size;
+        if is_partial {
+            let end = range
+                .offset
+                .checked_add(range.length - 1)
+                .ok_or(StorageError::InvalidRange)?;
+            request = request.range(format!("bytes={}-{}", range.offset, end));
+        }
+        let output = request.send().await.map_err(|error| {
+            if error
+                .as_service_error()
+                .is_some_and(aws_sdk_s3::operation::get_object::GetObjectError::is_no_such_key)
+            {
+                StorageError::NotFound
+            } else {
+                remote_storage_error(error)
+            }
+        })?;
+        let expected_content_length =
+            i64::try_from(range.length).map_err(|_| StorageError::InvalidRange)?;
+        if output.content_length() != Some(expected_content_length) {
+            return Err(StorageError::ContentMismatch);
+        }
+        if is_partial {
+            let end = range.offset + range.length - 1;
+            if !s3_content_range_matches(
+                output.content_range(),
+                range.offset,
+                end,
+                range.expected_size,
+            ) {
+                return Err(StorageError::ContentMismatch);
+            }
+        } else if output.content_range().is_some() {
+            return Err(StorageError::ContentMismatch);
+        }
+        let state = S3ReadState {
+            body: output.body,
+            pending: None,
+            remaining: range.length,
+            _read_guard: read_guard,
+        };
+        Ok(Box::pin(stream::try_unfold(
+            state,
+            |mut state| async move {
+                let mut empty_frames = 0_u8;
+                loop {
+                    if state.remaining == 0 {
+                        return Ok(None);
+                    }
+                    let mut bytes = if let Some(bytes) = state.pending.take() {
+                        bytes
+                    } else {
+                        match state.body.next().await {
+                            Some(Ok(bytes)) => bytes,
+                            Some(Err(error)) => return Err(remote_storage_error(error)),
+                            None => return Err(StorageError::ContentMismatch),
+                        }
+                    };
+                    if bytes.is_empty() {
+                        empty_frames += 1;
+                        if empty_frames == 16 {
+                            tokio::task::yield_now().await;
+                            empty_frames = 0;
+                        }
+                        continue;
+                    }
+                    if bytes.len() as u64 > state.remaining {
+                        return Err(StorageError::ContentMismatch);
+                    }
+                    let emit_len = bytes.len().min(STORAGE_CHUNK_SIZE);
+                    let emit = bytes.split_to(emit_len);
+                    if !bytes.is_empty() {
+                        state.pending = Some(bytes);
+                    }
+                    state.remaining -= emit.len() as u64;
+                    return Ok(Some((emit, state)));
+                }
+            },
+        )))
+    }
+
     async fn list_object_keys(&self) -> Result<Vec<String>, StorageError> {
         Err(StorageError::UnsupportedOperation(
             "Object listing is only implemented for local storage".to_string(),
@@ -1183,6 +1645,11 @@ impl BlobStorageBackend for S3CompatibleBlobStorage {
     }
 
     async fn delete_object(&self, object_key: &str) -> Result<(), StorageError> {
+        let _delete_guard = self
+            .lifecycle_locks
+            .for_object(object_key)
+            .write_owned()
+            .await;
         self.client
             .delete_object()
             .bucket(self.bucket())
@@ -1315,6 +1782,13 @@ pub fn sha256_hex(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
     lower_hex(&hasher.finalize())
+}
+
+fn is_canonical_sha256_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn lower_hex(bytes: &[u8]) -> String {
@@ -1592,6 +2066,29 @@ where
 
 fn remote_storage_error(error: impl std::fmt::Display) -> StorageError {
     StorageError::Remote(error.to_string())
+}
+
+fn s3_content_range_matches(
+    value: Option<&str>,
+    expected_start: u64,
+    expected_end: u64,
+    expected_total: u64,
+) -> bool {
+    let Some((unit, value)) = value.and_then(|value| value.trim().split_once(' ')) else {
+        return false;
+    };
+    if !unit.eq_ignore_ascii_case("bytes") {
+        return false;
+    }
+    let Some((span, total)) = value.split_once('/') else {
+        return false;
+    };
+    let Some((start, end)) = span.split_once('-') else {
+        return false;
+    };
+    start.parse::<u64>().ok() == Some(expected_start)
+        && end.parse::<u64>().ok() == Some(expected_end)
+        && total.parse::<u64>().ok() == Some(expected_total)
 }
 
 fn collect_object_keys(

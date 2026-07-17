@@ -84,6 +84,7 @@ use crate::views::{
 
 const HEADER_PERCENT_HEX: &[u8; 16] = b"0123456789ABCDEF";
 const DEBUG_TIMEOUT_SECONDS: i64 = 10;
+const READINESS_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
 const APP_SHELL_CACHE_CONTROL: &str = "no-store, max-age=0";
 const STATIC_IMMUTABLE_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 const STATIC_REVALIDATE_CACHE_CONTROL: &str = "no-cache";
@@ -611,20 +612,37 @@ fn static_asset_cache_control(path: &str) -> &'static str {
     }
 }
 
-async fn api_health(State(state): State<AppState>) -> Json<HealthPayload> {
-    let db_ok = sqlx::query_scalar::<_, i64>("SELECT 1")
-        .fetch_one(&state.db)
-        .await
-        .is_ok();
-    Json(HealthPayload {
-        ok: db_ok,
-        storage_backend: state.config.storage_backend.clone(),
-    })
+async fn api_health(State(state): State<AppState>) -> (StatusCode, Json<HealthPayload>) {
+    let database = tokio::time::timeout(
+        READINESS_CHECK_TIMEOUT,
+        sqlx::query_scalar::<_, i64>("SELECT 1").fetch_one(&state.db),
+    );
+    let storage = tokio::time::timeout(READINESS_CHECK_TIMEOUT, state.storage.readiness_check());
+    let (database, storage) = tokio::join!(database, storage);
+    let database = matches!(database, Ok(Ok(1)));
+    let storage = matches!(storage, Ok(Ok(())));
+    let ok = database && storage;
+    let status = if ok {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(HealthPayload {
+            ok,
+            database,
+            storage,
+            storage_backend: state.config.storage_backend.clone(),
+        }),
+    )
 }
 
 #[derive(Debug, Serialize)]
 struct HealthPayload {
     ok: bool,
+    database: bool,
+    storage: bool,
     storage_backend: String,
 }
 

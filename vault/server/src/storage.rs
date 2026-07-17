@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tokio::sync::{Mutex, OwnedRwLockReadGuard, RwLock};
+use tokio::sync::{Mutex, OwnedRwLockReadGuard, RwLock, Semaphore};
 use uuid::Uuid;
 
 use crate::config::Config;
@@ -176,6 +176,10 @@ pub trait BlobStorageBackend: std::fmt::Debug + Send + Sync {
     fn bucket(&self) -> &str;
 
     async fn ensure(&self) -> Result<(), StorageError>;
+
+    async fn readiness_check(&self) -> Result<(), StorageError> {
+        self.ensure().await
+    }
 
     fn planned_object_key(
         &self,
@@ -386,6 +390,7 @@ pub struct LocalBlobStorage {
     prefix: Arc<str>,
     lifecycle_locks: Arc<ObjectLifecycleLocks>,
     multipart_inventory: Arc<Mutex<MultipartInventoryCursor>>,
+    readiness_permits: Arc<Semaphore>,
     durability_hook: Option<Arc<dyn LocalDurabilityHook>>,
 }
 
@@ -588,6 +593,7 @@ impl LocalBlobStorage {
         Self {
             lifecycle_locks: shared_local_lifecycle_locks(&root),
             multipart_inventory: Arc::new(Mutex::new(MultipartInventoryCursor::default())),
+            readiness_permits: Arc::new(Semaphore::new(1)),
             root: Arc::new(root),
             prefix: Arc::from(normalize_storage_prefix(prefix)),
             durability_hook,
@@ -607,6 +613,24 @@ impl LocalBlobStorage {
     pub async fn ensure(&self) -> Result<(), StorageError> {
         self.create_dir_all_durable(self.root(), LocalDurabilityPoint::DirectoryCreated)
             .await
+    }
+
+    pub async fn readiness_check(&self) -> Result<(), StorageError> {
+        let permit = self
+            .readiness_permits
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| StorageError::Busy)?;
+        let root = self.root.as_ref().clone();
+        let prefix = self.prefix.to_string();
+        tokio::spawn(async move {
+            let _permit = permit;
+            tokio::task::spawn_blocking(move || local_storage_readiness_probe(&root, &prefix))
+                .await
+                .map_err(|error| StorageError::Io(std::io::Error::other(error)))?
+        })
+        .await
+        .map_err(|error| StorageError::Io(std::io::Error::other(error)))?
     }
 
     fn before_sync(&self, point: LocalDurabilityPoint, path: &Path) -> Result<(), StorageError> {
@@ -1905,6 +1929,10 @@ impl BlobStorageBackend for LocalBlobStorage {
         LocalBlobStorage::ensure(self).await
     }
 
+    async fn readiness_check(&self) -> Result<(), StorageError> {
+        LocalBlobStorage::readiness_check(self).await
+    }
+
     fn planned_object_key(
         &self,
         hash_algo: &str,
@@ -2199,6 +2227,16 @@ impl BlobStorageBackend for S3CompatibleBlobStorage {
     }
 
     async fn ensure(&self) -> Result<(), StorageError> {
+        Ok(())
+    }
+
+    async fn readiness_check(&self) -> Result<(), StorageError> {
+        self.client
+            .head_bucket()
+            .bucket(self.bucket())
+            .send()
+            .await
+            .map_err(remote_storage_error)?;
         Ok(())
     }
 
@@ -2858,6 +2896,104 @@ fn stored_blob(digest: String, size_bytes: u64, object_key: String) -> StoredBlo
         bucket: String::new(),
         object_key,
     }
+}
+
+struct LocalReadinessProbeCleanup {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl LocalReadinessProbeCleanup {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn cleanup(mut self) -> Result<(), StorageError> {
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => {
+                self.armed = false;
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.armed = false;
+                Ok(())
+            }
+            Err(error) => Err(StorageError::Io(error)),
+        }
+    }
+}
+
+impl Drop for LocalReadinessProbeCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn local_storage_readiness_probe(root: &Path, prefix: &str) -> Result<(), StorageError> {
+    use std::io::{Read as _, Seek as _, Write as _};
+
+    const PROBE_BYTES: &[u8] = b"vault-storage-readiness-v1";
+
+    let root_metadata = std::fs::symlink_metadata(root)?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err(StorageError::InvalidStoragePath);
+    }
+    let components = Path::new(prefix)
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(component) => Some(Ok(component.to_os_string())),
+            std::path::Component::CurDir => None,
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => Some(Err(StorageError::InvalidStoragePath)),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut probe_parent = root.to_path_buf();
+    for component in components {
+        let candidate = probe_parent.join(component);
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(StorageError::InvalidStoragePath);
+            }
+            Ok(_) => probe_parent = candidate,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => return Err(StorageError::Io(error)),
+        }
+    }
+
+    let probe_path = probe_parent.join(format!(
+        ".vault-storage.lock.readiness-{}",
+        Uuid::new_v4().simple()
+    ));
+    let mut probe = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&probe_path)?;
+    let cleanup = LocalReadinessProbeCleanup::new(probe_path);
+    let operation = (|| {
+        probe.write_all(PROBE_BYTES)?;
+        probe.sync_all()?;
+        if !probe.metadata()?.is_file() || probe.metadata()?.len() != PROBE_BYTES.len() as u64 {
+            return Err(StorageError::ContentMismatch);
+        }
+        probe.seek(std::io::SeekFrom::Start(0))?;
+        let mut observed = [0_u8; PROBE_BYTES.len()];
+        probe.read_exact(&mut observed)?;
+        if observed != PROBE_BYTES {
+            return Err(StorageError::ContentMismatch);
+        }
+        let mut trailing = [0_u8; 1];
+        if probe.read(&mut trailing)? != 0 {
+            return Err(StorageError::ContentMismatch);
+        }
+        Ok(())
+    })();
+    drop(probe);
+    let cleanup_result = cleanup.cleanup();
+    operation.and(cleanup_result)
 }
 
 fn temp_sibling_path(target: &Path) -> Result<PathBuf, StorageError> {

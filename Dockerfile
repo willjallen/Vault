@@ -48,6 +48,6 @@ VOLUME ["/data"]
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD curl -fsS --max-time 2 http://127.0.0.1:8000/health > /dev/null || exit 1
+    CMD curl -fsS --max-time 4 http://127.0.0.1:8000/api/health > /dev/null || exit 1
 
 CMD ["/app/vault-server"]

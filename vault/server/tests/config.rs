@@ -274,7 +274,7 @@ fn dockerfile_runs_rust_server_with_single_data_volume_contract() {
     assert!(dockerfile.contains("EXPOSE 8000"));
     assert!(dockerfile.contains("USER vault"));
     assert!(dockerfile.contains("HEALTHCHECK"));
-    assert!(dockerfile.contains("curl -fsS --max-time 2 http://127.0.0.1:8000/health"));
+    assert!(dockerfile.contains("curl -fsS --max-time 4 http://127.0.0.1:8000/api/health"));
     assert!(dockerfile.contains("CMD [\"/app/vault-server\"]"));
     assert!(!dockerfile.contains("uvicorn"));
     assert!(!dockerfile.contains("python:3.11"));
@@ -402,6 +402,24 @@ fn development_compose_is_the_only_compose_file_that_enables_dev_auth() {
     assert!(!dev_compose.contains("VAULT_SESSION_SECRET"));
     assert!(!dev_compose.contains("dev-insecure-session-secret"));
     assert!(!dev_compose.contains("VAULT_VERSION"));
+}
+
+#[test]
+fn example_documents_remote_readiness_bucket_permissions() {
+    let example = root_file(".env.example");
+
+    for contract in [
+        "Docker readiness performs HeadBucket",
+        "bucket-level s3:ListBucket",
+        "prefix-conditioned ListBucket",
+        "equivalent authenticated HEAD-bucket operation",
+        "token and endpoint must support",
+    ] {
+        assert!(
+            example.contains(contract),
+            "missing readiness contract: {contract}"
+        );
+    }
 }
 
 #[test]

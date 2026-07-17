@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
 use axum::Router;
@@ -8,7 +9,7 @@ use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
-use axum::routing::{delete, get, head, put};
+use axum::routing::{any, delete, get, head, put};
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
@@ -28,6 +29,13 @@ type ObjectMap = Arc<Mutex<HashMap<String, Vec<u8>>>>;
 struct BlockedPutState {
     entered: Arc<Notify>,
     release: Arc<Notify>,
+}
+
+#[derive(Clone)]
+struct ReadinessMockState {
+    head_status: StatusCode,
+    head_calls: Arc<AtomicUsize>,
+    mutation_calls: Arc<AtomicUsize>,
 }
 
 #[tokio::test]
@@ -264,6 +272,27 @@ fn endpoint_policy_settings(
         secret_access_key: Some("test-secret".to_string()),
         session_token: None,
         prefix: "objects".to_string(),
+    }
+}
+
+#[tokio::test]
+async fn s3_readiness_uses_non_mutating_head_bucket_and_maps_failure() {
+    for (head_status, should_succeed) in [(StatusCode::OK, true), (StatusCode::FORBIDDEN, false)] {
+        let (endpoint_url, state) = start_s3_readiness_mock(head_status).await;
+        let storage =
+            S3CompatibleBlobStorage::from_settings(endpoint_policy_settings(&endpoint_url, true))
+                .await
+                .expect("S3 readiness storage");
+
+        let result = storage.readiness_check().await;
+
+        assert_eq!(result.is_ok(), should_succeed, "{result:?}");
+        assert!(
+            should_succeed || matches!(&result, Err(StorageError::Remote(_))),
+            "{result:?}"
+        );
+        assert!(state.head_calls.load(Ordering::SeqCst) >= 1);
+        assert_eq!(state.mutation_calls.load(Ordering::SeqCst), 0);
     }
 }
 
@@ -789,6 +818,25 @@ async fn start_s3_mock() -> String {
     start_s3_mock_with_objects().await.0
 }
 
+async fn start_s3_readiness_mock(status: StatusCode) -> (String, ReadinessMockState) {
+    let state = ReadinessMockState {
+        head_status: status,
+        head_calls: Arc::new(AtomicUsize::new(0)),
+        mutation_calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let app = Router::new()
+        .route("/{bucket}", head(mock_head_bucket))
+        .route("/{bucket}/", head(mock_head_bucket))
+        .fallback(any(mock_unexpected_readiness_mutation))
+        .with_state(state.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let addr = listener.local_addr().expect("listener address");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("S3 readiness mock");
+    });
+    (endpoint_url(addr), state)
+}
+
 async fn start_s3_mock_with_objects() -> (String, ObjectMap) {
     let objects = ObjectMap::default();
     let app = Router::new()
@@ -822,6 +870,19 @@ async fn mock_blocked_put(State(state): State<BlockedPutState>, _body: Body) -> 
     state.entered.notify_one();
     state.release.notified().await;
     StatusCode::OK
+}
+
+async fn mock_head_bucket(
+    State(state): State<ReadinessMockState>,
+    Path(_bucket): Path<String>,
+) -> StatusCode {
+    state.head_calls.fetch_add(1, Ordering::SeqCst);
+    state.head_status
+}
+
+async fn mock_unexpected_readiness_mutation(State(state): State<ReadinessMockState>) -> StatusCode {
+    state.mutation_calls.fetch_add(1, Ordering::SeqCst);
+    StatusCode::METHOD_NOT_ALLOWED
 }
 
 fn endpoint_url(addr: SocketAddr) -> String {

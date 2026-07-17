@@ -1,15 +1,49 @@
 use std::collections::BTreeSet;
 
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use hmac::{Hmac, Mac};
 use serde_json::{Map, Value, json};
+use sha2::Sha256;
 use sqlx::Row;
 use vault_server::auth::{
     AuthError, AuthMode, AuthSettings, SessionSecretRequirement, SessionSecretSource,
-    TrustedProxySet, UserContext, cookie_value, dev_identity, effective_admin_from_parts,
-    folder_permission_count_for_group, header_identity, oidc_identity, oidc_token_urlsafe,
-    session_identity, sign_session_payload, split_groups, verify_session_payload,
+    SigningKeyring, TrustedProxySet, UserContext, cookie_value, dev_identity,
+    effective_admin_from_parts, folder_permission_count_for_group, header_identity, oidc_identity,
+    oidc_token_urlsafe, session_identity, sign_session_payload, split_groups,
+    verify_session_payload,
 };
 use vault_server::db;
+
+const TEST_SIGNING_ROOT: &str = "a3f1c9e72b840d56ff196ab30ce2d785914b8c6230e7fa5d4921bc68e30fd754";
+const PREVIOUS_SIGNING_ROOT: &str =
+    "7d92b4e10a6fc83531de709bca4825f06e13d97a58c02bf46a91e53c7bd80462";
+const ROTATION_ROOTS: [&str; 5] = [
+    "20ee3593b37f5968968a070c8125dbaa3ab2c5e4c3c7fca1b200c61a3362dc25",
+    "1336544b9c387eff17187d18e5418f4afe8d4acf15c8ca550801d670b08c37c7",
+    "8e22758496353cb2d3c709657c9432123fff38ff5b2691e073b889a837be9296",
+    "671022217d3c023fdbd446f1e98a285f8d2dda481c247533b8c276b06f95f3a9",
+    "f21bde1a392007c78dc4bcf1a0a9a74a91ad13de195eda53a5f814b07c993bd7",
+];
+
+fn signing_keys(current: &str, previous: &[&str]) -> SigningKeyring {
+    SigningKeyring::from_configured(
+        current,
+        previous.iter().map(|value| (*value).to_string()).collect(),
+    )
+}
+
+fn explicit_dev_settings(current: &str, previous: &[&str]) -> AuthSettings {
+    AuthSettings {
+        mode: AuthMode::Dev,
+        auth_mode_raw: "dev".to_string(),
+        dev_mode: true,
+        signing_keys: signing_keys(current, previous),
+        session_secret_source: SessionSecretSource::Explicit,
+        ..AuthSettings::default()
+    }
+}
 
 async fn test_pool() -> sqlx::SqlitePool {
     let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -311,7 +345,7 @@ async fn legacy_oidc_email_does_not_grant_bootstrap_admin_to_an_existing_session
         bootstrap_admin_emails: ["owner@example.com".to_string()].into_iter().collect(),
         mode: AuthMode::Oidc,
         oidc_issuer: "https://issuer.example.com".to_string(),
-        session_secret: "legacy-session-test-secret".to_string(),
+        signing_keys: signing_keys(TEST_SIGNING_ROOT, &[]),
         ..AuthSettings::default()
     };
     sqlx::query(
@@ -656,7 +690,7 @@ async fn session_identity_ignores_inactive_users() {
 fn runtime_validation_rejects_missing_docker_session_secret() {
     let settings = AuthSettings {
         session_secret_requirement: SessionSecretRequirement::Required,
-        session_secret: "oidc-client-secret".to_string(),
+        signing_keys: SigningKeyring::from_configured("oidc-client-secret", vec![]),
         session_secret_source: SessionSecretSource::Fallback,
         oidc_client_secret: "oidc-client-secret".to_string(),
         ..AuthSettings::default()
@@ -671,12 +705,17 @@ fn runtime_validation_rejects_missing_docker_session_secret() {
             .to_string()
             .contains("VAULT_SESSION_SECRET is required when VAULT_REQUIRE_SESSION_SECRET=1")
     );
+    assert!(
+        error
+            .to_string()
+            .contains("fallback is available only for the built-in development secret")
+    );
 }
 
 #[test]
 fn runtime_validation_rejects_development_session_secret_outside_dev() {
     let settings = AuthSettings {
-        session_secret: "dev-insecure-session-secret".to_string(),
+        signing_keys: SigningKeyring::from_configured("dev-insecure-session-secret", vec![]),
         session_secret_source: SessionSecretSource::Fallback,
         dev_mode: false,
         ..AuthSettings::default()
@@ -699,7 +738,7 @@ fn runtime_validation_allows_development_session_secret_in_dev_mode() {
         mode: AuthMode::Dev,
         auth_mode_raw: "dev".to_string(),
         dev_mode: true,
-        session_secret: "dev-insecure-session-secret".to_string(),
+        signing_keys: SigningKeyring::from_configured("dev-insecure-session-secret", vec![]),
         session_secret_source: SessionSecretSource::Fallback,
         ..AuthSettings::default()
     };
@@ -707,6 +746,147 @@ fn runtime_validation_allows_development_session_secret_in_dev_mode() {
     settings
         .validate_runtime_config()
         .expect("dev mode may use development secret");
+}
+
+#[test]
+fn runtime_validation_requires_canonical_high_diversity_explicit_signing_roots() {
+    let weak_roots = [
+        "password".to_string(),
+        "g".repeat(64),
+        "0".repeat(64),
+        // Sixteen distinct bytes repeated exactly: periodic without low diversity.
+        "000102030405060708090a0b0c0d0e0f".repeat(2),
+        // A 17-byte period truncated to 32 bytes exercises non-divisor periods.
+        "000102030405060708090a0b0c0d0e0f10000102030405060708090a0b0c0d0e".to_string(),
+        // Sixteen distinct bytes, with one occurring nine times.
+        "0000000000000000000102030405060708090a0b0c0d0e0f0102030405060708".to_string(),
+        // A full-width arithmetic sequence.
+        "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f".to_string(),
+    ];
+    for root in weak_roots {
+        let error = explicit_dev_settings(&root, &[])
+            .validate_runtime_config()
+            .expect_err("weak explicit signing root must reject")
+            .to_string();
+        assert!(error.contains(
+            "VAULT_SESSION_SECRET must be exactly 64 hexadecimal characters generated from 32 random bytes",
+        ));
+    }
+
+    explicit_dev_settings(TEST_SIGNING_ROOT, &[])
+        .validate_runtime_config()
+        .expect("canonical 32-byte signing root");
+}
+
+#[test]
+fn runtime_validation_bounds_and_deduplicates_previous_signing_roots() {
+    let invalid = explicit_dev_settings(TEST_SIGNING_ROOT, &["not-hex"])
+        .validate_runtime_config()
+        .expect_err("invalid previous root must reject")
+        .to_string();
+    assert!(invalid.contains("VAULT_SESSION_SECRET_PREVIOUS must be exactly 64 hexadecimal"));
+
+    let low_diversity_root = "0".repeat(64);
+    let low_diversity = explicit_dev_settings(TEST_SIGNING_ROOT, &[low_diversity_root.as_str()])
+        .validate_runtime_config()
+        .expect_err("low-diversity previous root must reject")
+        .to_string();
+    assert!(low_diversity.contains("VAULT_SESSION_SECRET_PREVIOUS must be exactly 64 hexadecimal"));
+
+    let duplicate = explicit_dev_settings(TEST_SIGNING_ROOT, &[TEST_SIGNING_ROOT])
+        .validate_runtime_config()
+        .expect_err("duplicate previous root must reject")
+        .to_string();
+    assert!(duplicate.contains("must not repeat the current or another previous secret"));
+
+    let duplicate_previous =
+        explicit_dev_settings(TEST_SIGNING_ROOT, &[ROTATION_ROOTS[0], ROTATION_ROOTS[0]])
+            .validate_runtime_config()
+            .expect_err("duplicate previous roots must reject")
+            .to_string();
+    assert!(duplicate_previous.contains("must not repeat the current or another previous secret"));
+
+    let uppercase_duplicate = ROTATION_ROOTS[0].to_ascii_uppercase();
+    let duplicate_previous_case = explicit_dev_settings(
+        TEST_SIGNING_ROOT,
+        &[ROTATION_ROOTS[0], uppercase_duplicate.as_str()],
+    )
+    .validate_runtime_config()
+    .expect_err("case-insensitive duplicate previous roots must reject")
+    .to_string();
+    assert!(
+        duplicate_previous_case.contains("must not repeat the current or another previous secret")
+    );
+
+    explicit_dev_settings(TEST_SIGNING_ROOT, &ROTATION_ROOTS[..4])
+        .validate_runtime_config()
+        .expect("four distinct previous roots are supported");
+
+    let too_many = AuthSettings {
+        signing_keys: SigningKeyring::from_configured(
+            TEST_SIGNING_ROOT,
+            ROTATION_ROOTS
+                .iter()
+                .map(|root| (*root).to_string())
+                .collect(),
+        ),
+        ..explicit_dev_settings(TEST_SIGNING_ROOT, &[])
+    }
+    .validate_runtime_config()
+    .expect_err("unbounded previous roots must reject")
+    .to_string();
+    assert!(too_many.contains("VAULT_SESSION_SECRET_PREVIOUS may contain at most 4 secrets"));
+
+    let payload = Map::from_iter([
+        ("uid".to_string(), json!(42)),
+        ("exp".to_string(), json!(4_102_444_800_i64)),
+    ]);
+    let fourth = explicit_dev_settings(ROTATION_ROOTS[3], &[]);
+    let fifth = explicit_dev_settings(ROTATION_ROOTS[4], &[]);
+    let bounded = AuthSettings {
+        signing_keys: SigningKeyring::from_configured(
+            TEST_SIGNING_ROOT,
+            ROTATION_ROOTS
+                .iter()
+                .map(|root| (*root).to_string())
+                .collect(),
+        ),
+        ..explicit_dev_settings(TEST_SIGNING_ROOT, &[])
+    };
+    let fourth_token = sign_session_payload(&fourth, &payload).expect("fourth previous token");
+    let fifth_token = sign_session_payload(&fifth, &payload).expect("fifth previous token");
+    assert!(verify_session_payload(&bounded, &fourth_token).is_some());
+    assert!(verify_session_payload(&bounded, &fifth_token).is_none());
+}
+
+#[test]
+fn session_signing_key_rotation_verifies_previous_but_signs_only_with_current() {
+    let old = explicit_dev_settings(PREVIOUS_SIGNING_ROOT, &[]);
+    let rotated = explicit_dev_settings(TEST_SIGNING_ROOT, &[PREVIOUS_SIGNING_ROOT]);
+    let current_only = explicit_dev_settings(TEST_SIGNING_ROOT, &[]);
+    let mut payload = Map::new();
+    payload.insert("uid".to_string(), json!(42));
+    payload.insert("exp".to_string(), json!(4_102_444_800_i64));
+
+    let old_token = sign_session_payload(&old, &payload).expect("old session token");
+    assert!(verify_session_payload(&rotated, &old_token).is_some());
+    assert!(verify_session_payload(&current_only, &old_token).is_none());
+
+    let new_token = sign_session_payload(&rotated, &payload).expect("new session token");
+    assert_eq!(new_token.matches('.').count(), 1);
+    assert!(verify_session_payload(&current_only, &new_token).is_some());
+    assert!(verify_session_payload(&old, &new_token).is_none());
+    let debug_keyring = format!("{:?}", rotated.signing_keys);
+    assert!(!debug_keyring.contains(TEST_SIGNING_ROOT));
+    assert!(!debug_keyring.contains(PREVIOUS_SIGNING_ROOT));
+
+    let (body, _) = new_token.rsplit_once('.').expect("session token parts");
+    let mut legacy_mac =
+        Hmac::<Sha256>::new_from_slice(TEST_SIGNING_ROOT.as_bytes()).expect("legacy raw HMAC key");
+    legacy_mac.update(body.as_bytes());
+    let legacy_signature = URL_SAFE_NO_PAD.encode(legacy_mac.finalize().into_bytes());
+    let legacy_token = format!("{body}.{legacy_signature}");
+    assert!(verify_session_payload(&rotated, &legacy_token).is_none());
 }
 
 #[test]
@@ -726,7 +906,7 @@ fn trusted_proxy_set_matches_exact_cidrs_ipv6_and_mapped_ipv6() {
 #[test]
 fn runtime_validation_requires_valid_proxy_trust_for_header_auth() {
     let base = AuthSettings {
-        session_secret: "0123456789abcdef0123456789abcdef".to_string(),
+        signing_keys: signing_keys(TEST_SIGNING_ROOT, &[]),
         session_secret_source: SessionSecretSource::Explicit,
         ..AuthSettings::default()
     };
@@ -814,7 +994,7 @@ fn runtime_validation_rejects_invalid_auth_cookie_and_oidc_client_modes() {
         session_cookie_secure: "sometimes".to_string(),
         oidc_state_cookie_name: "vault;oidc".to_string(),
         oidc_client_auth: "implicit".to_string(),
-        session_secret: "configured-session-secret".to_string(),
+        signing_keys: signing_keys(TEST_SIGNING_ROOT, &[]),
         session_secret_source: SessionSecretSource::Explicit,
         ..AuthSettings::default()
     };
@@ -841,7 +1021,7 @@ fn runtime_validation_rejects_invalid_auth_cookie_and_oidc_client_modes() {
 fn runtime_validation_rejects_insecure_production_urls() {
     let settings = AuthSettings {
         public_url: "http://vault.example.com".to_string(),
-        session_secret: "configured-session-secret".to_string(),
+        signing_keys: signing_keys(TEST_SIGNING_ROOT, &[]),
         session_secret_source: SessionSecretSource::Explicit,
         ..AuthSettings::default()
     };
@@ -868,7 +1048,7 @@ fn runtime_validation_rejects_incomplete_or_insecure_oidc_config() {
         oidc_client_id: String::new(),
         oidc_client_secret: String::new(),
         oidc_redirect_uri: "http://vault.example.com/auth/callback".to_string(),
-        session_secret: "configured-session-secret".to_string(),
+        signing_keys: signing_keys(TEST_SIGNING_ROOT, &[]),
         session_secret_source: SessionSecretSource::Explicit,
         ..AuthSettings::default()
     };
@@ -902,7 +1082,7 @@ fn runtime_validation_allows_local_http_oidc_in_production() {
         oidc_client_id: "vault".to_string(),
         oidc_client_secret: "oidc-secret".to_string(),
         oidc_redirect_uri: "http://localhost:8000/auth/callback".to_string(),
-        session_secret: "configured-session-secret".to_string(),
+        signing_keys: signing_keys(TEST_SIGNING_ROOT, &[]),
         session_secret_source: SessionSecretSource::Explicit,
         ..AuthSettings::default()
     };

@@ -1425,7 +1425,7 @@ async fn api_create_upload_session(
         uploads::create_upload_session(
             &state.db,
             &state.config.transfers_path(),
-            &state.auth.session_secret,
+            &state.auth.signing_keys,
             UploadRuntimeSettings {
                 max_upload_bytes: state.config.max_upload_bytes,
                 transfer_chunk_bytes: state.config.transfer_chunk_bytes,
@@ -1449,7 +1449,7 @@ async fn api_get_upload_session(
         uploads::get_upload_session(
             &state.db,
             &state.config.transfers_path(),
-            &state.auth.session_secret,
+            &state.auth.signing_keys,
             &session_id,
             &user,
         )
@@ -1483,7 +1483,7 @@ async fn api_upload_session_part(
     .await;
     if let Some(token) = header_value_by_name(&headers, "x-upload-token") {
         let token_claims =
-            uploads::verify_upload_token_claims(&state.auth.session_secret, token, &session_id)?;
+            uploads::verify_upload_token_claims(&state.auth.signing_keys, token, &session_id)?;
         uploads::ingest_upload_part_with_token(&state.db, ingest, token_claims, stream).await?;
     } else {
         let user = current_user(&state, &headers).await?;
@@ -1558,7 +1558,7 @@ async fn api_abort_upload_session(
     let payload = uploads::abort_upload_session(
         &state.db,
         &state.config.transfers_path(),
-        &state.auth.session_secret,
+        &state.auth.signing_keys,
         &session_id,
         &user,
     )

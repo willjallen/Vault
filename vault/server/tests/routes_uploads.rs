@@ -5,14 +5,20 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use axum::body::{Body, Bytes, to_bytes};
 use axum::http::{Method, Request, StatusCode};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use futures_util::stream;
-use serde_json::{Value, json};
+use hmac::{Hmac, Mac};
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
 use tokio::sync::Notify;
 use tower::ServiceExt;
-use vault_server::auth::{AuthSettings, UserContext};
+use vault_server::auth::{
+    AuthMode, AuthSettings, SessionSecretSource, SigningKeyring, UserContext, sign_session_payload,
+    verify_session_payload,
+};
 use vault_server::blob_lifecycle::BlobLifecycleError;
 use vault_server::config::Config;
 use vault_server::db;
@@ -1340,7 +1346,7 @@ async fn concurrent_part_promotion_does_not_overwrite_existing_part() {
     let session = uploads::create_upload_session(
         &state.db,
         &transfers_path,
-        &state.auth.session_secret,
+        &state.auth.signing_keys,
         UploadRuntimeSettings {
             max_upload_bytes: state.config.max_upload_bytes,
             transfer_chunk_bytes: state.config.transfer_chunk_bytes,
@@ -1895,6 +1901,98 @@ async fn upload_part_accepts_signed_token_without_user_headers() {
     let rejected_json = response_json(rejected).await;
     assert_eq!(rejected_status, StatusCode::CONFLICT);
     assert_eq!(rejected_json["detail"], "Upload session is aborted");
+}
+
+#[tokio::test]
+async fn upload_tokens_use_domain_separation_and_bounded_key_rotation() {
+    const OLD_ROOT: &str = "7d92b4e10a6fc83531de709bca4825f06e13d97a58c02bf46a91e53c7bd80462";
+    const NEW_ROOT: &str = "a3f1c9e72b840d56ff196ab30ce2d785914b8c6230e7fa5d4921bc68e30fd754";
+
+    let (state, _temp_dir) = test_state().await;
+    grant_writer_root(&state.db).await;
+    let user = writer_context();
+    let transfers_path = state.config.transfers_path();
+    let old_keys = SigningKeyring::from_configured(OLD_ROOT, vec![]);
+    let rotated_keys = SigningKeyring::from_configured(NEW_ROOT, vec![OLD_ROOT.to_string()]);
+    let current_keys = SigningKeyring::from_configured(NEW_ROOT, vec![]);
+    let session = uploads::create_upload_session(
+        &state.db,
+        &transfers_path,
+        &old_keys,
+        UploadRuntimeSettings::default(),
+        CreateUploadRequest {
+            mode: "create".to_string(),
+            filename: "rotated-token.txt".to_string(),
+            size_bytes: 1,
+            mime_type: Some("text/plain".to_string()),
+            folder: String::new(),
+            document_id: None,
+            note: None,
+            rename_to_upload: false,
+            client_upload_parallelism: None,
+            resume_identity_sha256: None,
+        },
+        &user,
+        &ClientMeta {
+            ip: None,
+            user_agent: None,
+        },
+    )
+    .await
+    .expect("old-key upload session");
+    let old_token = session.upload_token.expect("old-key upload token");
+    assert_eq!(old_token.matches('.').count(), 1);
+    assert!(uploads::verify_upload_token_claims(&rotated_keys, &old_token, &session.id).is_ok());
+    assert!(uploads::verify_upload_token_claims(&current_keys, &old_token, &session.id).is_err());
+
+    let (old_body, _) = old_token.rsplit_once('.').expect("upload token parts");
+    let mut legacy_mac =
+        Hmac::<Sha256>::new_from_slice(OLD_ROOT.as_bytes()).expect("legacy raw HMAC key");
+    legacy_mac.update(old_body.as_bytes());
+    let legacy_signature = URL_SAFE_NO_PAD.encode(legacy_mac.finalize().into_bytes());
+    let legacy_token = format!("{old_body}.{legacy_signature}");
+    assert!(uploads::verify_upload_token_claims(&old_keys, &legacy_token, &session.id).is_err());
+
+    let refreshed = uploads::get_upload_session(
+        &state.db,
+        &transfers_path,
+        &rotated_keys,
+        &session.id,
+        &user,
+    )
+    .await
+    .expect("new-key upload token");
+    let new_token = refreshed.upload_token.expect("refreshed upload token");
+    assert!(uploads::verify_upload_token_claims(&current_keys, &new_token, &session.id).is_ok());
+    assert!(uploads::verify_upload_token_claims(&old_keys, &new_token, &session.id).is_err());
+
+    let auth = AuthSettings {
+        mode: AuthMode::Dev,
+        auth_mode_raw: "dev".to_string(),
+        dev_mode: true,
+        signing_keys: old_keys.clone(),
+        session_secret_source: SessionSecretSource::Explicit,
+        ..AuthSettings::default()
+    };
+    assert!(verify_session_payload(&auth, &old_token).is_none());
+
+    let mut upload_shaped_payload = Map::new();
+    upload_shaped_payload.insert("exp".to_string(), json!(4_102_444_800_i64));
+    upload_shaped_payload.insert("expires_at".to_string(), json!("2100-01-01T00:00:00Z"));
+    upload_shaped_payload.insert("owner".to_string(), json!(user.id));
+    upload_shaped_payload.insert("sid".to_string(), json!(session.id));
+    upload_shaped_payload.insert("mode".to_string(), json!("create"));
+    upload_shaped_payload.insert("name".to_string(), json!("rotated-token.txt"));
+    upload_shaped_payload.insert("size".to_string(), json!(1));
+    upload_shaped_payload.insert("chunk".to_string(), json!(1));
+    upload_shaped_payload.insert("parts".to_string(), json!(1));
+    upload_shaped_payload.insert("resume".to_string(), Value::Null);
+    upload_shaped_payload.insert("typ".to_string(), json!("upload-part"));
+    let wrong_domain_token =
+        sign_session_payload(&auth, &upload_shaped_payload).expect("session-domain token");
+    assert!(
+        uploads::verify_upload_token_claims(&old_keys, &wrong_domain_token, &session.id).is_err()
+    );
 }
 
 #[tokio::test]
@@ -2840,7 +2938,7 @@ async fn directly_uploaded_session_with_fixed_parts(
     let session = uploads::create_upload_session(
         &state.db,
         &transfers_path,
-        &state.auth.session_secret,
+        &state.auth.signing_keys,
         UploadRuntimeSettings {
             max_upload_bytes: state.config.max_upload_bytes,
             transfer_chunk_bytes: state.config.transfer_chunk_bytes,
@@ -3431,7 +3529,7 @@ async fn abort_wins_against_in_flight_completion_without_committing_metadata() {
     grant_writer_root(&state.db).await;
     let pool = state.db.clone();
     let transfers_path = state.config.transfers_path();
-    let token_secret = state.auth.session_secret.clone();
+    let signing_keys = state.auth.signing_keys.clone();
     let user = writer_context();
     let data = b"abcdefgh";
     let digest = sha256_hex(data);
@@ -3469,7 +3567,7 @@ async fn abort_wins_against_in_flight_completion_without_committing_metadata() {
 
     wait_for_storage_block(&waiting, &mut completion).await;
     let aborted =
-        uploads::abort_upload_session(&pool, &transfers_path, &token_secret, &session_id, &user)
+        uploads::abort_upload_session(&pool, &transfers_path, &signing_keys, &session_id, &user)
             .await
             .expect("abort should win while storage publication is blocked");
     assert_eq!(aborted.status, "aborted");

@@ -1,11 +1,13 @@
 use std::collections::{BTreeSet, HashSet};
 use std::env;
+use std::fmt;
 use std::net::IpAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::http::HeaderMap;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use ipnet::{IpNet, Ipv4Net};
 use serde::{Deserialize, Serialize};
@@ -19,6 +21,12 @@ use time::format_description::well_known::Rfc3339;
 type HmacSha256 = Hmac<Sha256>;
 
 const IDENTITY_UPSERT_RETRY_DELAYS_MS: [u64; 6] = [5, 10, 20, 40, 80, 160];
+const MAX_PREVIOUS_SESSION_SECRETS: usize = 4;
+const SESSION_SECRET_HEX_LENGTH: usize = 64;
+const MIN_REPEATED_PATTERN_BYTES: usize = 8;
+const SIGNING_HKDF_SALT: &[u8] = b"vault/signing-root/v1";
+const SESSION_HKDF_INFO: &[u8] = b"vault/session-hmac/v1";
+const UPLOAD_HKDF_INFO: &[u8] = b"vault/upload-hmac/v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthMode {
@@ -57,6 +65,195 @@ pub enum SessionSecretSource {
 pub enum SessionSecretRequirement {
     Optional,
     Required,
+}
+
+#[derive(Clone)]
+struct DerivedSigningKeys {
+    configured: String,
+    root: Option<[u8; 32]>,
+    session: [u8; 32],
+    upload: [u8; 32],
+}
+
+impl DerivedSigningKeys {
+    fn new(configured: String) -> Self {
+        let root = decode_session_secret(&configured);
+        let input = root
+            .as_ref()
+            .map_or_else(|| configured.as_bytes(), |root| root.as_slice());
+        let hkdf = Hkdf::<Sha256>::new(Some(SIGNING_HKDF_SALT), input);
+        let mut session = [0_u8; 32];
+        let mut upload = [0_u8; 32];
+        hkdf.expand(SESSION_HKDF_INFO, &mut session)
+            .expect("a 32-byte HKDF output is always valid");
+        hkdf.expand(UPLOAD_HKDF_INFO, &mut upload)
+            .expect("a 32-byte HKDF output is always valid");
+        Self {
+            configured,
+            root,
+            session,
+            upload,
+        }
+    }
+}
+
+/// Prederived, domain-separated keys for signed browser and upload tokens.
+#[derive(Clone)]
+pub struct SigningKeyring {
+    current: DerivedSigningKeys,
+    previous: Vec<DerivedSigningKeys>,
+    too_many_previous: bool,
+}
+
+impl SigningKeyring {
+    #[must_use]
+    pub fn from_configured(current: impl Into<String>, previous: Vec<String>) -> Self {
+        let too_many_previous = previous.len() > MAX_PREVIOUS_SESSION_SECRETS;
+        Self {
+            current: DerivedSigningKeys::new(current.into()),
+            previous: previous
+                .into_iter()
+                .take(MAX_PREVIOUS_SESSION_SECRETS)
+                .map(DerivedSigningKeys::new)
+                .collect(),
+            too_many_previous,
+        }
+    }
+
+    fn sign_session(&self, body: &[u8]) -> Option<Vec<u8>> {
+        hmac_signature(&self.current.session, body)
+    }
+
+    fn verify_session(&self, body: &[u8], signature: &[u8]) -> bool {
+        self.keys()
+            .any(|keys| hmac_signature_matches(&keys.session, body, signature))
+    }
+
+    pub(crate) fn sign_upload(&self, body: &[u8]) -> Option<Vec<u8>> {
+        hmac_signature(&self.current.upload, body)
+    }
+
+    pub(crate) fn verify_upload(&self, body: &[u8], signature: &[u8]) -> bool {
+        self.keys()
+            .any(|keys| hmac_signature_matches(&keys.upload, body, signature))
+    }
+
+    fn keys(&self) -> impl Iterator<Item = &DerivedSigningKeys> {
+        std::iter::once(&self.current).chain(self.previous.iter())
+    }
+
+    fn validate_explicit_roots(&self, errors: &mut Vec<String>) {
+        if !valid_session_secret(&self.current) {
+            errors.push(session_secret_validation_message("VAULT_SESSION_SECRET"));
+        }
+        self.validate_previous_roots(errors, self.current.root);
+    }
+
+    fn validate_previous_roots(&self, errors: &mut Vec<String>, current_root: Option<[u8; 32]>) {
+        if self.too_many_previous {
+            errors.push(format!(
+                "VAULT_SESSION_SECRET_PREVIOUS may contain at most {MAX_PREVIOUS_SESSION_SECRETS} secrets",
+            ));
+        }
+        for previous in &self.previous {
+            if !valid_session_secret(previous) {
+                errors.push(session_secret_validation_message(
+                    "VAULT_SESSION_SECRET_PREVIOUS",
+                ));
+                break;
+            }
+        }
+
+        let mut seen = current_root.into_iter().collect::<HashSet<_>>();
+        for previous in &self.previous {
+            let Some(root) = previous.root else {
+                continue;
+            };
+            if !seen.insert(root) {
+                errors.push(
+                    "VAULT_SESSION_SECRET_PREVIOUS must not repeat the current or another previous secret"
+                        .to_string(),
+                );
+                break;
+            }
+        }
+    }
+}
+
+impl fmt::Debug for SigningKeyring {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SigningKeyring")
+            .field("current", &"[REDACTED]")
+            .field("previous_count", &self.previous.len())
+            .field("too_many_previous", &self.too_many_previous)
+            .finish()
+    }
+}
+
+fn hmac_signature(key: &[u8; 32], body: &[u8]) -> Option<Vec<u8>> {
+    let mut mac = HmacSha256::new_from_slice(key).ok()?;
+    mac.update(body);
+    Some(mac.finalize().into_bytes().to_vec())
+}
+
+fn hmac_signature_matches(key: &[u8; 32], body: &[u8], signature: &[u8]) -> bool {
+    HmacSha256::new_from_slice(key).is_ok_and(|mut mac| {
+        mac.update(body);
+        mac.verify_slice(signature).is_ok()
+    })
+}
+
+fn decode_session_secret(value: &str) -> Option<[u8; 32]> {
+    if value.len() != SESSION_SECRET_HEX_LENGTH
+        || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    let mut decoded = [0_u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        decoded[index] = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
+    }
+    Some(decoded)
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn valid_session_secret(keys: &DerivedSigningKeys) -> bool {
+    keys.root.is_some_and(|root| !obviously_low_entropy(&root))
+}
+
+fn obviously_low_entropy(root: &[u8; 32]) -> bool {
+    let mut counts = [0_u8; 256];
+    for byte in root {
+        counts[usize::from(*byte)] = counts[usize::from(*byte)].saturating_add(1);
+    }
+    let distinct = counts.iter().filter(|count| **count > 0).count();
+    let highest_frequency = counts.iter().copied().max().unwrap_or_default();
+    if distinct < 16 || highest_frequency > 8 {
+        return true;
+    }
+    if (1..=root.len() - MIN_REPEATED_PATTERN_BYTES)
+        .any(|period| root[period..] == root[..root.len() - period])
+    {
+        return true;
+    }
+    let difference = root[1].wrapping_sub(root[0]);
+    root.windows(2)
+        .all(|pair| pair[1].wrapping_sub(pair[0]) == difference)
+}
+
+fn session_secret_validation_message(name: &str) -> String {
+    format!(
+        "{name} must be exactly 64 hexadecimal characters generated from 32 random bytes and must not be repeated or low-diversity",
+    )
 }
 
 #[derive(Debug, Clone, Default)]
@@ -171,7 +368,7 @@ pub struct AuthSettings {
     pub dev_auth_enabled: bool,
     pub base_domain: String,
     pub public_url: String,
-    pub session_secret: String,
+    pub signing_keys: SigningKeyring,
     pub session_secret_source: SessionSecretSource,
     pub session_secret_requirement: SessionSecretRequirement,
     pub session_cookie_name: String,
@@ -242,7 +439,7 @@ impl Default for AuthSettings {
             dev_auth_enabled: false,
             base_domain: "localhost".to_string(),
             public_url: String::new(),
-            session_secret: "dev-insecure-session-secret".to_string(),
+            signing_keys: SigningKeyring::from_configured(development_session_secret(), vec![]),
             session_secret_source: SessionSecretSource::Fallback,
             session_secret_requirement: SessionSecretRequirement::Optional,
             session_cookie_name: "vault_session".to_string(),
@@ -300,6 +497,7 @@ impl AuthSettings {
             .unwrap_or_else(|| default_user_email.clone());
         let mode = AuthMode::parse(&auth_mode);
         let (session_secret, session_secret_source) = session_secret_from_env();
+        let previous_session_secrets = previous_session_secrets_from_env();
         Self {
             mode,
             auth_mode_raw: auth_mode.trim().to_ascii_lowercase(),
@@ -307,7 +505,7 @@ impl AuthSettings {
             dev_auth_enabled,
             base_domain: env_string("BASE_DOMAIN", "localhost"),
             public_url: env_string("VAULT_PUBLIC_URL", ""),
-            session_secret,
+            signing_keys: SigningKeyring::from_configured(session_secret, previous_session_secrets),
             session_secret_source,
             session_secret_requirement: require_session_secret_from_env(),
             session_cookie_name: env_string("VAULT_SESSION_COOKIE_NAME", "vault_session"),
@@ -397,8 +595,19 @@ impl AuthSettings {
                 "VAULT_SESSION_SECRET is required when VAULT_REQUIRE_SESSION_SECRET=1".to_string(),
             );
         }
-        if !self.dev_mode && self.session_secret == development_session_secret() {
+        if !self.dev_mode && self.session_secret_source != SessionSecretSource::Explicit {
             errors.push("VAULT_SESSION_SECRET is required outside development mode".to_string());
+        }
+        if self.session_secret_source == SessionSecretSource::Explicit {
+            self.signing_keys.validate_explicit_roots(&mut errors);
+        } else {
+            if self.signing_keys.current.configured != development_session_secret() {
+                errors.push(
+                    "VAULT_SESSION_SECRET fallback is available only for the built-in development secret"
+                        .to_string(),
+                );
+            }
+            self.signing_keys.validate_previous_roots(&mut errors, None);
         }
         if let Some(error) = self
             .trusted_proxies
@@ -569,10 +778,11 @@ pub fn sign_session_payload(
     payload: &Map<String, Value>,
 ) -> Result<String, AuthError> {
     let body = URL_SAFE_NO_PAD.encode(serde_json::to_vec(payload)?);
-    let mut mac = HmacSha256::new_from_slice(settings.session_secret.as_bytes())
-        .map_err(|_| AuthError::IdentitySync)?;
-    mac.update(body.as_bytes());
-    let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+    let signature = settings
+        .signing_keys
+        .sign_session(body.as_bytes())
+        .map(|signature| URL_SAFE_NO_PAD.encode(signature))
+        .ok_or(AuthError::IdentitySync)?;
     Ok(format!("{body}.{signature}"))
 }
 
@@ -590,9 +800,12 @@ pub fn verify_session_payload(settings: &AuthSettings, value: &str) -> Option<Ma
         return None;
     }
     let signature_bytes = URL_SAFE_NO_PAD.decode(signature.as_bytes()).ok()?;
-    let mut mac = HmacSha256::new_from_slice(settings.session_secret.as_bytes()).ok()?;
-    mac.update(body.as_bytes());
-    mac.verify_slice(&signature_bytes).ok()?;
+    if !settings
+        .signing_keys
+        .verify_session(body.as_bytes(), &signature_bytes)
+    {
+        return None;
+    }
     let body_bytes = URL_SAFE_NO_PAD.decode(body.as_bytes()).ok()?;
     let Value::Object(payload) = serde_json::from_slice::<Value>(&body_bytes).ok()? else {
         return None;
@@ -1025,13 +1238,24 @@ fn session_secret_from_env() -> (String, SessionSecretSource) {
     if let Some(value) = session_secret {
         return (value, SessionSecretSource::Explicit);
     }
-    let oidc_secret = env::var("VAULT_OIDC_CLIENT_SECRET")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    (
-        oidc_secret.unwrap_or_else(development_session_secret),
-        SessionSecretSource::Fallback,
+    (development_session_secret(), SessionSecretSource::Fallback)
+}
+
+fn previous_session_secrets_from_env() -> Vec<String> {
+    env::var("VAULT_SESSION_SECRET_PREVIOUS").map_or_else(
+        |_| Vec::new(),
+        |value| {
+            let value = value.trim();
+            if value.is_empty() {
+                Vec::new()
+            } else {
+                value
+                    .split(',')
+                    .take(MAX_PREVIOUS_SESSION_SECRETS + 1)
+                    .map(|item| item.trim().to_string())
+                    .collect()
+            }
+        },
     )
 }
 

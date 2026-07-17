@@ -12,12 +12,17 @@ use serde_json::{Map, Value, json};
 use sqlx::Row;
 use tokio::net::TcpListener;
 use tower::ServiceExt;
-use vault_server::auth::{AuthMode, AuthSettings, sign_session_payload, verify_session_payload};
+use vault_server::auth::{
+    AuthMode, AuthSettings, SigningKeyring, sign_session_payload, verify_session_payload,
+};
 use vault_server::config::Config;
 use vault_server::db;
 use vault_server::http::{self, AppState};
 use vault_server::storage::LocalBlobStorage;
 
+const TEST_SIGNING_ROOT: &str = "a3f1c9e72b840d56ff196ab30ce2d785914b8c6230e7fa5d4921bc68e30fd754";
+const PREVIOUS_SIGNING_ROOT: &str =
+    "7d92b4e10a6fc83531de709bca4825f06e13d97a58c02bf46a91e53c7bd80462";
 const TEST_RSA_PRIVATE_KEY: &str = r"-----BEGIN RSA PRIVATE KEY-----
 MIIEowIBAAKCAQEAybIoSnqZmI2yqV/8RVupZccKfs4b/dTCqJ2rz6D3hPOiS/fY
 gMMVfLQ6YVpOeJUXoBkQGbGCX4A0T+hOR2xC1j9vDQ23GF4M7wQBeRKhBi+RzQXX
@@ -87,7 +92,7 @@ fn oidc_auth(endpoint: &str) -> AuthSettings {
         oidc_authorization_endpoint: endpoint.to_string(),
         oidc_client_id: "vault-client".to_string(),
         oidc_redirect_uri: "https://vault.example.com/auth/callback".to_string(),
-        session_secret: "test-session-secret".to_string(),
+        signing_keys: SigningKeyring::from_configured(TEST_SIGNING_ROOT, vec![]),
         ..AuthSettings::default()
     }
 }
@@ -105,7 +110,7 @@ fn oidc_provider_auth(issuer: &str) -> AuthSettings {
         oidc_client_id: "vault-client".to_string(),
         oidc_client_secret: "vault-secret".to_string(),
         oidc_redirect_uri: "https://vault.example.com/auth/callback".to_string(),
-        session_secret: "test-session-secret".to_string(),
+        signing_keys: SigningKeyring::from_configured(TEST_SIGNING_ROOT, vec![]),
         ..AuthSettings::default()
     }
 }
@@ -552,6 +557,21 @@ async fn oidc_login_redirects_to_provider_and_sets_signed_state_cookie() {
     assert_eq!(payload["state"], query["state"]);
     assert_eq!(payload["nonce"], query["nonce"]);
     assert_eq!(payload["rd"], "/Project");
+}
+
+#[test]
+fn oidc_state_cookie_accepts_a_bounded_previous_signing_root() {
+    let mut old_auth = oidc_auth("https://idp.example.com/auth");
+    old_auth.signing_keys = SigningKeyring::from_configured(PREVIOUS_SIGNING_ROOT, vec![]);
+    let state_cookie = signed_state_cookie(&old_auth, "state-123", "nonce-123", "/Project");
+
+    let mut rotated_auth = oidc_auth("https://idp.example.com/auth");
+    rotated_auth.signing_keys =
+        SigningKeyring::from_configured(TEST_SIGNING_ROOT, vec![PREVIOUS_SIGNING_ROOT.to_string()]);
+    assert!(verify_session_payload(&rotated_auth, &state_cookie).is_some());
+
+    let current_only = oidc_auth("https://idp.example.com/auth");
+    assert!(verify_session_payload(&current_only, &state_cookie).is_none());
 }
 
 #[tokio::test]

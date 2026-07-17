@@ -10,7 +10,6 @@ use axum::body::Bytes;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use futures_util::{Stream, StreamExt};
-use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -23,7 +22,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::auth::UserContext;
+use crate::auth::{SigningKeyring, UserContext};
 use crate::blob_lifecycle::{
     BlobLifecycleError, PendingBlobPublication, begin_blob_publication,
     collect_unreferenced_blobs_with_limit,
@@ -40,8 +39,6 @@ use crate::state_events::state_event_resources_json;
 use crate::storage::{
     BlobStorageBackend, BlobWriteKind, STORAGE_MULTIPART_MAX_PARTS, StorageError, StoredBlob,
 };
-
-type HmacSha256 = Hmac<Sha256>;
 
 const MAX_UPLOAD_BYTES: i64 = 5 * 1024 * 1024 * 1024;
 const TRANSFER_CHUNK_BYTES: i64 = 32 * 1024 * 1024;
@@ -604,7 +601,7 @@ impl Drop for UploadCompletionAttempt {
 pub async fn create_upload_session(
     pool: &SqlitePool,
     transfers_path: &Path,
-    token_secret: &str,
+    signing_keys: &SigningKeyring,
     settings: UploadRuntimeSettings,
     payload: CreateUploadRequest,
     user: &UserContext,
@@ -706,7 +703,7 @@ pub async fn create_upload_session(
     .bind(&expires_at)
     .execute(pool)
     .await?;
-    upload_session_payload(pool, transfers_path, token_secret, &session_id).await
+    upload_session_payload(pool, transfers_path, signing_keys, &session_id).await
 }
 
 async fn prepare_upload_target(
@@ -768,7 +765,7 @@ async fn prepare_checkin_upload_target(
 pub async fn get_upload_session(
     pool: &SqlitePool,
     transfers_path: &Path,
-    token_secret: &str,
+    signing_keys: &SigningKeyring,
     session_id: &str,
     user: &UserContext,
 ) -> Result<UploadSessionPayload, UploadError> {
@@ -779,7 +776,7 @@ pub async fn get_upload_session(
     if session.status == "active" {
         ensure_session_not_expired(pool, transfers_path, &session).await?;
     }
-    upload_session_payload(pool, transfers_path, token_secret, session_id).await
+    upload_session_payload(pool, transfers_path, signing_keys, session_id).await
 }
 
 pub async fn ingest_upload_part<S, E>(
@@ -1197,7 +1194,7 @@ async fn complete_upload_session_impl(
 pub async fn abort_upload_session(
     pool: &SqlitePool,
     transfers_path: &Path,
-    token_secret: &str,
+    signing_keys: &SigningKeyring,
     session_id: &str,
     user: &UserContext,
 ) -> Result<UploadSessionPayload, UploadError> {
@@ -1232,7 +1229,7 @@ pub async fn abort_upload_session(
     {
         clear_upload_session_files(transfers_path, session_id).await;
     }
-    upload_session_payload(pool, transfers_path, token_secret, session_id).await
+    upload_session_payload(pool, transfers_path, signing_keys, session_id).await
 }
 
 async fn complete_upload_session_inner(
@@ -2110,7 +2107,7 @@ fn write_chunked_part_blocking(
 async fn upload_session_payload(
     pool: &SqlitePool,
     transfers_path: &Path,
-    token_secret: &str,
+    signing_keys: &SigningKeyring,
     session_id: &str,
 ) -> Result<UploadSessionPayload, UploadError> {
     let session = fetch_upload_session(pool, session_id)
@@ -2150,7 +2147,7 @@ async fn upload_session_payload(
     } else {
         None
     };
-    let upload_token = upload_session_token(token_secret, &session)?;
+    let upload_token = upload_session_token(signing_keys, &session)?;
     Ok(UploadSessionPayload {
         id: session.id,
         mode: session.mode,
@@ -2803,15 +2800,15 @@ fn require_part_authorization(
 }
 
 pub fn verify_upload_token(
-    token_secret: &str,
+    signing_keys: &SigningKeyring,
     token: &str,
     session_id: &str,
 ) -> Result<String, UploadError> {
-    Ok(verify_upload_token_claims(token_secret, token, session_id)?.owner_id)
+    Ok(verify_upload_token_claims(signing_keys, token, session_id)?.owner_id)
 }
 
 pub fn verify_upload_token_claims(
-    token_secret: &str,
+    signing_keys: &SigningKeyring,
     token: &str,
     session_id: &str,
 ) -> Result<UploadPartTokenClaims, UploadError> {
@@ -2827,11 +2824,9 @@ pub fn verify_upload_token_claims(
     let signature_bytes = URL_SAFE_NO_PAD
         .decode(signature.as_bytes())
         .map_err(|_| UploadError::UploadTokenInvalid)?;
-    let mut mac = HmacSha256::new_from_slice(token_secret.as_bytes())
-        .map_err(|_| UploadError::UploadTokenInvalid)?;
-    mac.update(body.as_bytes());
-    mac.verify_slice(&signature_bytes)
-        .map_err(|_| UploadError::UploadTokenInvalid)?;
+    if !signing_keys.verify_upload(body.as_bytes(), &signature_bytes) {
+        return Err(UploadError::UploadTokenInvalid);
+    }
     let body_bytes = URL_SAFE_NO_PAD
         .decode(body.as_bytes())
         .map_err(|_| UploadError::UploadTokenInvalid)?;
@@ -2887,17 +2882,17 @@ pub fn verify_upload_token_claims(
 }
 
 fn upload_session_token(
-    token_secret: &str,
+    signing_keys: &SigningKeyring,
     session: &UploadSessionRow,
 ) -> Result<Option<String>, UploadError> {
     if !matches!(session.status.as_str(), "active" | "completing") {
         return Ok(None);
     }
-    Ok(Some(sign_upload_token(token_secret, session)?))
+    Ok(Some(sign_upload_token(signing_keys, session)?))
 }
 
 fn sign_upload_token(
-    token_secret: &str,
+    signing_keys: &SigningKeyring,
     session: &UploadSessionRow,
 ) -> Result<String, UploadError> {
     let expires_timestamp = OffsetDateTime::parse(&session.expires_at, &Rfc3339)?.unix_timestamp();
@@ -2915,10 +2910,10 @@ fn sign_upload_token(
         "typ": "upload-part",
     });
     let body = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload)?);
-    let mut mac = HmacSha256::new_from_slice(token_secret.as_bytes())
-        .map_err(|_| UploadError::UploadTokenInvalid)?;
-    mac.update(body.as_bytes());
-    let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+    let signature = signing_keys
+        .sign_upload(body.as_bytes())
+        .map(|signature| URL_SAFE_NO_PAD.encode(signature))
+        .ok_or(UploadError::UploadTokenInvalid)?;
     Ok(format!("{body}.{signature}"))
 }
 

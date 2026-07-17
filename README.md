@@ -6,7 +6,8 @@ The published image stores all local runtime state under `/data`. A standard dep
 
 ```sh
 cp .env.example .env
-# Set VAULT_SESSION_SECRET and, for header auth, FORWARDED_ALLOW_IPS before starting.
+# Set VAULT_SESSION_SECRET to the 64-hex output of `openssl rand -hex 32` and,
+# for header auth, set FORWARDED_ALLOW_IPS before starting.
 docker compose up -d
 ```
 
@@ -18,7 +19,9 @@ For local development with the built image, dev mode, and dev auth enabled:
 docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 ```
 
-Do not use the dev override for production. `VAULT_DEV_MODE=1` exposes admin-only debug tools and the app shows prominent development warnings. Production deployments should set a strong `VAULT_SESSION_SECRET` and either run behind a trusted header-auth proxy or configure `VAULT_AUTH_MODE=oidc` with the OIDC variables in `.env.example`.
+Do not use the dev override for production. `VAULT_DEV_MODE=1` exposes admin-only debug tools and the app shows prominent development warnings. Production deployments must set `VAULT_SESSION_SECRET` to exactly 32 random bytes encoded as 64 hexadecimal characters and either run behind a trusted header-auth proxy or configure `VAULT_AUTH_MODE=oidc` with the OIDC variables in `.env.example`. Arbitrary passwords and low-diversity values are rejected.
+
+To rotate the signing root without immediately invalidating sessions or resumable-upload tokens, generate a new `VAULT_SESSION_SECRET`, move the old value into the comma-separated `VAULT_SESSION_SECRET_PREVIOUS` list, and restart Vault. New tokens use only the new root; prior roots are accepted only for verification. Keep an old root for at least the greater of `VAULT_SESSION_MAX_AGE_SECONDS` and `VAULT_TRANSFER_SESSION_TTL_SECONDS`, then remove it. At most four prior roots are accepted. The first release with domain-separated signing keys intentionally does not accept tokens created by older raw-HMAC releases, so users must sign in again after that upgrade and active resumable uploads may need to fetch a fresh token through their authenticated session.
 
 Header authentication requires `FORWARDED_ALLOW_IPS` to contain the direct source IPs or CIDRs of the trusted reverse proxies, separated by commas. Vault matches the TCP peer that connected to it and never uses `X-Forwarded-For` to decide whether identity headers are trusted. Configure the address as seen inside the Vault container; a reverse proxy running on the Docker host commonly appears as the Docker bridge gateway rather than `127.0.0.1`. The proxy must remove or overwrite client-supplied `Remote-User`, `Remote-Name`, `Remote-Email`, `Remote-Groups`, and `X-Forwarded-*` headers. Changes to the trust list require a restart. Vault refuses to start in header mode when the trust list is missing or invalid.
 

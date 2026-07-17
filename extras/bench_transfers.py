@@ -30,6 +30,7 @@ DEFAULT_BODY_BLOCK_BYTES = 256 * 1024
 LOCAL_DIRECT_PROFILE = "local-direct"
 BENCHMARK_SERVER_ENV_KEYS = (
     "BASE_DOMAIN",
+    "FORWARDED_ALLOW_IPS",
     "VAULT_AUTH_MODE",
     "VAULT_DATA_DIR",
     "VAULT_DB_PATH",
@@ -44,6 +45,7 @@ BENCHMARK_SERVER_ENV_KEYS = (
     "VAULT_SECURITY_HEADERS_ENABLED",
     "VAULT_SESSION_COOKIE_SECURE",
     "VAULT_SESSION_SECRET",
+    "VAULT_SESSION_SECRET_PREVIOUS",
     "VAULT_STATIC_DIR",
     "VAULT_STORAGE_BACKEND",
     "VAULT_TRANSFER_CHUNK_BYTES",
@@ -484,6 +486,7 @@ def server_env(temp_dir: Path, chunk_mib: int | None, port: int) -> dict[str, st
     env.update(
         {
             "BASE_DOMAIN": "localhost",
+            "FORWARDED_ALLOW_IPS": "127.0.0.1,::1",
             "VAULT_HOST": "127.0.0.1",
             "VAULT_PORT": str(port),
             "VAULT_AUTH_MODE": "headers",
@@ -495,7 +498,11 @@ def server_env(temp_dir: Path, chunk_mib: int | None, port: int) -> dict[str, st
             "VAULT_TRANSFERS_PATH": str(temp_dir / "transfers"),
             "VAULT_STATIC_DIR": str(Path.cwd() / "vault" / "client"),
             "VAULT_STORAGE_BACKEND": "local",
-            "VAULT_SESSION_SECRET": "benchmark-session-secret",
+            "VAULT_SESSION_SECRET": (
+                "a3f1c9e72b840d56ff196ab30ce2d785"
+                "914b8c6230e7fa5d4921bc68e30fd754"
+            ),
+            "VAULT_SESSION_SECRET_PREVIOUS": "",
             "VAULT_SESSION_COOKIE_SECURE": "auto",
             "VAULT_MAX_UPLOAD_BYTES": str(5 * 1024 * MIB),
             "VAULT_TRANSFER_SESSION_TTL_SECONDS": "86400",
@@ -512,6 +519,9 @@ def container_server_env(chunk_mib: int | None) -> dict[str, str]:
     env = server_env(Path("/data"), chunk_mib, 8000)
     env.update(
         {
+            "FORWARDED_ALLOW_IPS": (
+                "127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+            ),
             "VAULT_HOST": "0.0.0.0",
             "VAULT_STATIC_DIR": "/app/vault/client",
             "VAULT_DOCKER_RUNTIME": "1",

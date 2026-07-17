@@ -300,6 +300,7 @@ fn production_compose_uses_latest_image_single_data_volume_and_hardened_defaults
     assert!(compose.contains("FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-}"));
     assert!(compose.contains("VAULT_REQUIRE_SESSION_SECRET: ${VAULT_REQUIRE_SESSION_SECRET:-}"));
     assert!(compose.contains("VAULT_SESSION_SECRET: ${VAULT_SESSION_SECRET:-}"));
+    assert!(compose.contains("VAULT_SESSION_SECRET_PREVIOUS: ${VAULT_SESSION_SECRET_PREVIOUS:-}"));
     assert!(
         compose.contains("VAULT_SESSION_COOKIE_NAME: ${VAULT_SESSION_COOKIE_NAME:-vault_session}")
     );
@@ -388,7 +389,8 @@ fn development_compose_is_the_only_compose_file_that_enables_dev_auth() {
             .contains("VAULT_TTL_SWEEP_INTERVAL_SECONDS: ${VAULT_TTL_SWEEP_INTERVAL_SECONDS:-60}")
     );
     assert!(dev_compose.contains("VAULT_DEV_AUTH: \"1\""));
-    assert!(dev_compose.contains("dev-insecure-session-secret-change-me"));
+    assert!(!dev_compose.contains("VAULT_SESSION_SECRET"));
+    assert!(!dev_compose.contains("dev-insecure-session-secret"));
     assert!(!dev_compose.contains("VAULT_VERSION"));
 }
 
@@ -400,6 +402,18 @@ fn generated_static_assets_are_ignored_build_output() {
     assert!(dockerignore.contains("vault/client/dist/"));
     assert!(dockerignore.contains("target/"));
     assert!(gitignore.contains("vault/client/dist/"));
+}
+
+#[test]
+fn canonical_transfer_harness_uses_valid_security_configuration() {
+    let harness = root_file("extras/bench_transfers.py");
+
+    assert!(harness.contains("\"FORWARDED_ALLOW_IPS\","));
+    assert!(harness.contains("\"FORWARDED_ALLOW_IPS\": \"127.0.0.1,::1\""));
+    assert!(harness.contains("10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"));
+    assert!(harness.contains("a3f1c9e72b840d56ff196ab30ce2d785"));
+    assert!(harness.contains("914b8c6230e7fa5d4921bc68e30fd754"));
+    assert!(!harness.contains("benchmark-session-secret"));
 }
 
 #[test]

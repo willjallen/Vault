@@ -7,7 +7,8 @@ use vault_server::folders::{
     folder_path_by_id, folder_path_from_cache, get_folder_by_path, get_folder_by_path_read,
     get_or_create_folder_path, get_or_create_folder_path_with_created, get_root_folder,
     normalize_folder, parse_public_folder_path, public_folder_path, require_folder_read_access,
-    require_folder_write_access, subtree_folder_ids_from_records, validate_permission_flags,
+    require_folder_write_access, resolve_visible_folder_by_id, resolve_visible_folder_by_path,
+    subtree_folder_ids_from_records, validate_permission_flags,
 };
 
 async fn test_pool() -> sqlx::SqlitePool {
@@ -237,6 +238,116 @@ async fn folder_path_helpers_tolerate_corrupt_parent_cycle() {
     assert!(!relative.is_empty());
     assert_eq!(subtree, expected);
     assert!(full_path.ends_with("/loop.txt") || full_path == "loop.txt");
+}
+
+#[tokio::test]
+async fn visible_folder_resolver_returns_only_viewable_canonical_paths() {
+    let pool = test_pool().await;
+    let root = get_root_folder(&pool, VAULT_ROOT_KEY).await.expect("root");
+    let viewers = create_group(&pool, "viewers").await;
+    add_folder_permission(&pool, root.id, viewers, true, false, false)
+        .await
+        .expect("root view access");
+    let visible = get_or_create_folder_path(&pool, Some("Project/Visible"))
+        .await
+        .expect("visible folder");
+
+    let resolved = resolve_visible_folder_by_id(&pool, visible.id, &user(&["viewers"], false))
+        .await
+        .expect("resolve visible folder")
+        .expect("viewable folder");
+
+    assert_eq!(resolved.id, visible.id);
+    assert_eq!(resolved.path, "Project/Visible");
+
+    let resolved_by_path =
+        resolve_visible_folder_by_path(&pool, " Project\\Visible/ ", &user(&["viewers"], false))
+            .await
+            .expect("resolve visible folder path")
+            .expect("viewable folder path");
+    assert_eq!(resolved_by_path, resolved);
+}
+
+#[tokio::test]
+async fn visible_folder_resolver_conceals_hidden_and_missing_folders() {
+    let pool = test_pool().await;
+    let root = get_root_folder(&pool, VAULT_ROOT_KEY).await.expect("root");
+    let viewers = create_group(&pool, "viewers").await;
+    add_folder_permission(&pool, root.id, viewers, true, false, false)
+        .await
+        .expect("root view access");
+    let hidden = get_or_create_folder_path(&pool, Some("Hidden"))
+        .await
+        .expect("hidden folder");
+    add_folder_permission(&pool, hidden.id, viewers, false, false, false)
+        .await
+        .expect("hide folder");
+
+    assert!(
+        resolve_visible_folder_by_id(&pool, hidden.id, &user(&["viewers"], false))
+            .await
+            .expect("resolve hidden folder")
+            .is_none()
+    );
+    assert!(
+        resolve_visible_folder_by_path(&pool, "Hidden", &user(&["viewers"], false))
+            .await
+            .expect("resolve hidden folder path")
+            .is_none()
+    );
+    assert!(
+        resolve_visible_folder_by_id(&pool, i64::MAX, &user(&["viewers"], false))
+            .await
+            .expect("resolve missing folder")
+            .is_none()
+    );
+    assert!(
+        resolve_visible_folder_by_path(&pool, "Missing", &user(&["viewers"], false))
+            .await
+            .expect("resolve missing folder path")
+            .is_none()
+    );
+    assert!(
+        resolve_visible_folder_by_id(&pool, i64::MAX, &user(&[], true))
+            .await
+            .expect("admin resolves missing folder")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn visible_folder_resolver_rejects_broken_ancestry_after_access_check() {
+    let pool = test_pool().await;
+    let viewers = create_group(&pool, "viewers").await;
+    let detached_id = sqlx::query(
+        "INSERT INTO folders (root_key, parent_id, name, is_root) VALUES ('vault', NULL, 'Detached', 0)",
+    )
+    .execute(&pool)
+    .await
+    .expect("detached folder")
+    .last_insert_rowid();
+    add_folder_permission(&pool, detached_id, viewers, true, false, false)
+        .await
+        .expect("detached view access");
+
+    assert!(
+        resolve_visible_folder_by_id(&pool, detached_id, &user(&["viewers"], false))
+            .await
+            .expect("resolve detached folder")
+            .is_none()
+    );
+    assert!(
+        resolve_visible_folder_by_id(&pool, detached_id, &user(&[], true))
+            .await
+            .expect("admin resolves detached folder")
+            .is_none()
+    );
+    assert!(
+        resolve_visible_folder_by_path(&pool, "Detached", &user(&[], true))
+            .await
+            .expect("admin resolves detached folder path")
+            .is_none()
+    );
 }
 
 #[tokio::test]

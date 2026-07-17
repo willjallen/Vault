@@ -35,6 +35,12 @@ pub struct FolderRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedVisibleFolder {
+    pub id: i64,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreatedFolders {
     pub folder: FolderRecord,
     pub created: Vec<FolderRecord>,
@@ -848,6 +854,62 @@ pub async fn folder_path_by_id(pool: &SqlitePool, folder_id: i64) -> Result<Stri
     folder_path_from_cache(folder, &cache)
 }
 
+/// Resolves an existing, viewable folder and its canonical public path from one
+/// database snapshot.
+///
+/// Missing folders, folders hidden from the user, and folders whose ancestry
+/// cannot produce a valid public path are intentionally indistinguishable.
+pub async fn resolve_visible_folder_by_id(
+    pool: &SqlitePool,
+    folder_id: i64,
+    user: &UserContext,
+) -> Result<Option<ResolvedVisibleFolder>, FolderError> {
+    let mut transaction = pool.begin().await?;
+    let target = find_folder_by_id_in_tx(&mut transaction, folder_id).await?;
+    let resolved = match target {
+        Some(target) => resolve_visible_folder_in_tx(&mut transaction, target, user).await?,
+        None => None,
+    };
+
+    transaction.commit().await?;
+    Ok(resolved)
+}
+
+/// Resolves a public folder path, effective view access, and its canonical path
+/// from one database snapshot.
+pub async fn resolve_visible_folder_by_path(
+    pool: &SqlitePool,
+    path: &str,
+    user: &UserContext,
+) -> Result<Option<ResolvedVisibleFolder>, FolderError> {
+    let mut transaction = pool.begin().await?;
+    let target = find_public_folder_by_path_in_tx(&mut transaction, path).await?;
+    let resolved = match target {
+        Some(target) => resolve_visible_folder_in_tx(&mut transaction, target, user).await?,
+        None => None,
+    };
+
+    transaction.commit().await?;
+    Ok(resolved)
+}
+
+async fn resolve_visible_folder_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    target: FolderRecord,
+    user: &UserContext,
+) -> Result<Option<ResolvedVisibleFolder>, FolderError> {
+    let access_level = folder_access_levels_in_tx(transaction, &[target.id], user)
+        .await?
+        .remove(&target.id)
+        .unwrap_or(0);
+    if access_level == 0 {
+        return Ok(None);
+    }
+    Ok(strict_public_folder_path_in_tx(transaction, target)
+        .await?
+        .map(|(id, path)| ResolvedVisibleFolder { id, path }))
+}
+
 pub fn build_folder_path_cache(
     folders: &[FolderRecord],
 ) -> Result<HashMap<i64, String>, FolderError> {
@@ -1090,6 +1152,59 @@ async fn fetch_folder_by_id_in_tx(
     )
 }
 
+async fn find_folder_by_id_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    id: i64,
+) -> Result<Option<FolderRecord>, FolderError> {
+    Ok(
+        sqlx::query_as::<_, FolderRecord>(&format!("{} WHERE id = ?", folder_select_sql()))
+            .bind(id)
+            .fetch_optional(&mut **transaction)
+            .await?,
+    )
+}
+
+async fn find_public_folder_by_path_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    path: &str,
+) -> Result<Option<FolderRecord>, FolderError> {
+    let parsed = parse_public_folder_path(Some(path))?;
+    if parsed.root_key == ARCHIVE_ROOT_KEY && !parsed.relative_path.is_empty() {
+        return Ok(None);
+    }
+    let Some(mut current) = sqlx::query_as::<_, FolderRecord>(&format!(
+        "{} WHERE root_key = ? AND is_root = 1 AND parent_id IS NULL AND name = ?",
+        folder_select_sql()
+    ))
+    .bind(&parsed.root_key)
+    .bind(root_name(&parsed.root_key)?)
+    .fetch_optional(&mut **transaction)
+    .await?
+    else {
+        return Ok(None);
+    };
+    if parsed.relative_path.is_empty() {
+        return Ok(Some(current));
+    }
+
+    for name in parsed.relative_path.split('/') {
+        let Some(child) = sqlx::query_as::<_, FolderRecord>(&format!(
+            "{} WHERE parent_id = ? AND name = ? AND root_key = ? AND is_root = 0",
+            folder_select_sql()
+        ))
+        .bind(current.id)
+        .bind(name)
+        .bind(&parsed.root_key)
+        .fetch_optional(&mut **transaction)
+        .await?
+        else {
+            return Ok(None);
+        };
+        current = child;
+    }
+    Ok(Some(current))
+}
+
 async fn find_child_folder(
     pool: &SqlitePool,
     parent_id: i64,
@@ -1249,6 +1364,55 @@ fn compute_folder_path(
     visiting.remove(&folder_id);
     cache.insert(folder_id, path.clone());
     Ok(path)
+}
+
+async fn strict_public_folder_path_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    target: FolderRecord,
+) -> Result<Option<(i64, String)>, FolderError> {
+    let target_id = target.id;
+    let target_root_key = target.root_key.clone();
+    let mut current = target;
+    let mut names = Vec::new();
+    let mut visited = HashSet::new();
+
+    loop {
+        if !visited.insert(current.id) || current.root_key != target_root_key {
+            return Ok(None);
+        }
+        if current.is_root {
+            if current.parent_id.is_some()
+                || root_name(&target_root_key).ok() != Some(current.name.as_str())
+                || target_root_key == ARCHIVE_ROOT_KEY && !names.is_empty()
+            {
+                return Ok(None);
+            }
+            names.reverse();
+            if target_root_key == VAULT_ROOT_KEY
+                && names.first().is_some_and(|name| name == ARCHIVE_ROOT)
+            {
+                return Ok(None);
+            }
+            return Ok(public_folder_path(&target_root_key, &names.join("/"))
+                .ok()
+                .map(|path| (target_id, path)));
+        }
+
+        let Some(normalized_name) = normalize_folder_item_name(&current.name).ok() else {
+            return Ok(None);
+        };
+        if normalized_name != current.name {
+            return Ok(None);
+        }
+        names.push(current.name);
+        let Some(parent_id) = current.parent_id else {
+            return Ok(None);
+        };
+        let Some(parent) = find_folder_by_id_in_tx(transaction, parent_id).await? else {
+            return Ok(None);
+        };
+        current = parent;
+    }
 }
 
 async fn record_folder_event_in_tx(
@@ -1679,7 +1843,7 @@ fn folder_access_levels_sql() -> &'static str {
 
 fn root_name(root_key: &str) -> Result<&'static str, FolderError> {
     match root_key {
-        VAULT_ROOT_KEY => Ok("Vault"),
+        VAULT_ROOT_KEY => Ok(""),
         ARCHIVE_ROOT_KEY => Ok("Archive"),
         _ => Err(FolderError::UnknownRootKey),
     }

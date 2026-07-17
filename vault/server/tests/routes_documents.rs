@@ -2247,6 +2247,110 @@ async fn lock_unlock_routes_return_item_level_failures() {
 }
 
 #[tokio::test]
+async fn lock_route_hides_inaccessible_folder_ids_without_blocking_authorized_items() {
+    let (state, _temp_dir) = test_state().await;
+    let writers = create_group(&state.db, "writers").await;
+    let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
+        .await
+        .expect("root");
+    add_folder_permission(&state.db, root.id, writers, true, true, true)
+        .await
+        .expect("writer root");
+    let project = get_or_create_folder_path(&state.db, Some("Project"))
+        .await
+        .expect("project");
+    let hidden = get_or_create_folder_path(&state.db, Some("Classified-Needle"))
+        .await
+        .expect("hidden folder");
+    add_folder_permission(&state.db, hidden.id, writers, false, false, false)
+        .await
+        .expect("hide folder");
+    let authorized_document = insert_versioned_document(&state.db, project.id).await;
+    let hidden_document =
+        insert_named_versioned_document(&state.db, hidden.id, "hidden-plan.txt", "hidden-version")
+            .await;
+    let missing_folder_id = hidden.id + 10_000;
+    let pool = state.db.clone();
+    let app = http::router(state);
+
+    let response = app
+        .oneshot(authed_json_post(
+            "/api/lock",
+            "writer",
+            "writers",
+            &json!({
+                "items": [
+                    {"type": "folder", "id": hidden.id},
+                    {"type": "folder", "id": missing_folder_id},
+                    {"type": "document", "id": authorized_document}
+                ]
+            }),
+        ))
+        .await
+        .expect("mixed lock response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload = response_json(response).await;
+
+    assert_eq!(
+        payload["ok"],
+        json!([{
+            "item": {"type": "document", "id": authorized_document},
+            "detail": "writer"
+        }]),
+    );
+    assert_eq!(
+        payload["failed"],
+        json!([
+            {
+                "item": {"type": "folder", "id": hidden.id},
+                "detail": "Folder not found"
+            },
+            {
+                "item": {"type": "folder", "id": missing_folder_id},
+                "detail": "Folder not found"
+            }
+        ]),
+    );
+    assert_eq!(payload["skipped"], json!([]));
+    assert!(
+        !serde_json::to_string(&payload)
+            .expect("response JSON")
+            .contains("Classified-Needle")
+    );
+
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM document_locks WHERE document_id = ? AND is_active = 1",
+        )
+        .bind(authorized_document)
+        .fetch_one(&pool)
+        .await
+        .expect("authorized lock count"),
+        1,
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM document_locks WHERE document_id = ? AND is_active = 1",
+        )
+        .bind(hidden_document)
+        .fetch_one(&pool)
+        .await
+        .expect("hidden lock count"),
+        0,
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM document_events WHERE document_id = ? AND event_type = 'lock'",
+        )
+        .bind(hidden_document)
+        .fetch_one(&pool)
+        .await
+        .expect("hidden lock event count"),
+        0,
+    );
+}
+
+#[tokio::test]
 async fn lock_route_prunes_child_documents_when_folder_is_selected() {
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;

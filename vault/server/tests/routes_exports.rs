@@ -1888,6 +1888,115 @@ fn le_u64(bytes: &[u8], offset: usize) -> u64 {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // One parameterized disclosure regression covers both routes.
+async fn folder_id_export_and_download_hide_inaccessible_folders_as_missing() {
+    for (endpoint, authorized_status) in [
+        ("/api/exports", StatusCode::OK),
+        ("/api/download", StatusCode::ACCEPTED),
+    ] {
+        let (state, _temp_dir) = test_state().await;
+        let readers = create_group(&state.db, "readers").await;
+        let confidential = create_group(&state.db, "confidential").await;
+        let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
+            .await
+            .expect("root");
+        add_folder_permission(&state.db, root.id, readers, true, true, false)
+            .await
+            .expect("reader root");
+        let secret = get_or_create_folder_path(&state.db, Some("Projects/Need-To-Know"))
+            .await
+            .expect("secret folder");
+        add_folder_permission(&state.db, secret.id, confidential, true, true, false)
+            .await
+            .expect("confidential folder");
+        insert_stored_document(
+            &state.db,
+            &state.storage,
+            secret.id,
+            "classified-plan.txt",
+            b"classified export bytes",
+        )
+        .await;
+        let missing_folder_id = i64::MAX;
+        let pool = state.db.clone();
+        let app = http::router(state);
+
+        let mut rejected = Vec::new();
+        for folder_id in [secret.id, missing_folder_id] {
+            let response = app
+                .clone()
+                .oneshot(authed_json_post(
+                    endpoint,
+                    "reader",
+                    "readers",
+                    &json!({"items": [{"type": "folder", "id": folder_id}]}),
+                ))
+                .await
+                .expect("folder selection response");
+            let status = response.status();
+            let body = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("folder selection body");
+            let payload: Value = serde_json::from_slice(&body).expect("folder selection json");
+
+            assert_eq!(status, StatusCode::NOT_FOUND, "{endpoint}: {payload}");
+            assert_eq!(payload, json!({"detail": "Folder not found"}), "{endpoint}");
+            for secret_value in [
+                b"Projects/Need-To-Know".as_slice(),
+                b"Need-To-Know".as_slice(),
+                b"classified-plan.txt".as_slice(),
+            ] {
+                assert!(
+                    !body_contains(&body, secret_value),
+                    "{endpoint} disclosed secret selection metadata: {payload}"
+                );
+            }
+            rejected.push((status, body));
+        }
+
+        assert_eq!(rejected[0], rejected[1], "{endpoint}");
+        let job_count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM export_jobs")
+            .fetch_one(&pool)
+            .await
+            .expect("export job count");
+        let artifact_count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM export_artifacts")
+            .fetch_one(&pool)
+            .await
+            .expect("export artifact count");
+        assert_eq!(job_count, 0, "{endpoint}");
+        assert_eq!(artifact_count, 0, "{endpoint}");
+
+        add_folder_permission(&pool, secret.id, readers, true, true, false)
+            .await
+            .expect("reader secret folder");
+        let authorized = app
+            .clone()
+            .oneshot(authed_json_post(
+                endpoint,
+                "reader",
+                "readers",
+                &json!({"items": [{"type": "folder", "id": secret.id}]}),
+            ))
+            .await
+            .expect("authorized folder selection response");
+        let status = authorized.status();
+        let payload = response_json(authorized).await;
+        assert_eq!(status, authorized_status, "{endpoint}: {payload}");
+        assert_eq!(payload["status"], "queued", "{endpoint}");
+        assert_eq!(payload["filename"], "Need-To-Know.zip", "{endpoint}");
+        let completed = wait_for_export_status(
+            app,
+            payload["id"].as_str().expect("authorized export id"),
+            "reader",
+            "readers",
+            "complete",
+        )
+        .await;
+        assert_eq!(completed["processed_items"], 1, "{endpoint}");
+    }
+}
+
+#[tokio::test]
 async fn export_job_creates_downloadable_zip_for_folder() {
     let (state, _temp_dir) = test_state().await;
     let readers = create_group(&state.db, "readers").await;

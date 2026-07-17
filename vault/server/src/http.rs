@@ -49,9 +49,9 @@ use crate::exports::{
 };
 use crate::folders::{
     CreatedFolderPayload, FolderError, FolderPermissionUpdate, FolderRetentionUpdate,
-    create_folder_path, folder_path_by_id, get_folder_by_path, get_or_create_folder_path_in_tx,
-    move_folder, rename_folder, update_folder_permissions, update_folder_properties,
-    update_folder_retention,
+    create_folder_path, get_or_create_folder_path_in_tx, move_folder, rename_folder,
+    resolve_visible_folder_by_id, resolve_visible_folder_by_path, update_folder_permissions,
+    update_folder_properties, update_folder_retention,
 };
 use crate::oidc::{self, CallbackRequest, OidcError};
 use crate::preferences::{PreferenceError, update_preferences_for_user};
@@ -1353,7 +1353,7 @@ async fn api_download_items(
     Json(payload): Json<ActionPayloadRequest>,
 ) -> Result<Response, ApiError> {
     let user = current_user(&state, &headers).await?;
-    let items = normalize_action_items(&state.db, &payload).await?;
+    let items = normalize_action_items(&state.db, &payload, &user).await?;
     if let [NormalizedActionItem::Document { id }] = items.as_slice() {
         let download = current_version_download(&state.db, *id, &user).await?;
         let response = version_download_response(&state, &download, &headers).await?;
@@ -1379,7 +1379,7 @@ async fn api_create_export_job(
     Json(payload): Json<ActionPayloadRequest>,
 ) -> Result<Json<exports::ExportJobPayload>, ApiError> {
     let user = current_user(&state, &headers).await?;
-    let items = normalize_action_items(&state.db, &payload).await?;
+    let items = normalize_action_items(&state.db, &payload, &user).await?;
     Ok(Json(
         exports::create_export_job_with_runtime(
             &state.db,
@@ -1721,7 +1721,7 @@ async fn api_lock_items(
     Json(payload): Json<ActionPayloadRequest>,
 ) -> Result<Json<BulkActionResponse>, ApiError> {
     let user = current_user(&state, &headers).await?;
-    let items = normalize_bulk_action_items(&state.db, &payload).await?;
+    let items = normalize_bulk_action_items(&state.db, &payload, &user).await?;
     let meta = client_meta(&headers);
     let mut response = BulkActionResponse::default();
     let mut changed = false;
@@ -1762,7 +1762,7 @@ async fn api_unlock_items(
     Json(payload): Json<ActionPayloadRequest>,
 ) -> Result<Json<BulkActionResponse>, ApiError> {
     let user = current_user(&state, &headers).await?;
-    let items = normalize_bulk_action_items(&state.db, &payload).await?;
+    let items = normalize_bulk_action_items(&state.db, &payload, &user).await?;
     let meta = client_meta(&headers);
     let mut response = BulkActionResponse::default();
     let mut changed = false;
@@ -1806,7 +1806,7 @@ async fn api_delete_forever(
     if archive_permanent_delete_admin_only(&state.db).await? && !user.is_admin {
         return Err(ApiError::AdminRequired);
     }
-    let items = normalize_bulk_action_items(&state.db, &payload).await?;
+    let items = normalize_bulk_action_items(&state.db, &payload, &user).await?;
     let mut response = BulkActionResponse::default();
     let mut changed = false;
     for item in items {
@@ -1858,7 +1858,7 @@ async fn api_move_items(
 ) -> Result<Json<BulkActionResponse>, ApiError> {
     let user = current_user(&state, &headers).await?;
     let destination = crate::folders::normalize_folder(payload.destination_folder.as_deref())?;
-    let items = normalize_bulk_action_items(&state.db, &payload).await?;
+    let items = normalize_bulk_action_items(&state.db, &payload, &user).await?;
     let meta = client_meta(&headers);
     let mut response = BulkActionResponse::default();
     let mut changed = false;
@@ -1905,7 +1905,7 @@ async fn api_archive_items(
     Json(payload): Json<ActionPayloadRequest>,
 ) -> Result<Json<BulkActionResponse>, ApiError> {
     let user = current_user(&state, &headers).await?;
-    let items = normalize_bulk_action_items(&state.db, &payload).await?;
+    let items = normalize_bulk_action_items(&state.db, &payload, &user).await?;
     let meta = client_meta(&headers);
     let mut response = BulkActionResponse::default();
     let mut changed = false;
@@ -1952,7 +1952,7 @@ async fn api_restore_items(
     Json(payload): Json<ActionPayloadRequest>,
 ) -> Result<Json<BulkActionResponse>, ApiError> {
     let user = current_user(&state, &headers).await?;
-    let items = normalize_bulk_action_items(&state.db, &payload).await?;
+    let items = normalize_bulk_action_items(&state.db, &payload, &user).await?;
     let meta = client_meta(&headers);
     let mut response = BulkActionResponse::default();
     let mut changed = false;
@@ -1993,7 +1993,7 @@ async fn api_rename_item(
     Json(payload): Json<ActionPayloadRequest>,
 ) -> Result<Json<BulkActionResponse>, ApiError> {
     let user = current_user(&state, &headers).await?;
-    let items = normalize_bulk_action_items(&state.db, &payload).await?;
+    let items = normalize_bulk_action_items(&state.db, &payload, &user).await?;
     if items.len() != 1 {
         return Err(ApiError::BadRequest("Rename exactly one item".to_string()));
     }
@@ -2058,22 +2058,25 @@ async fn api_rename_item(
 async fn normalize_action_items(
     pool: &DbPool,
     payload: &ActionPayloadRequest,
+    user: &UserContext,
 ) -> Result<Vec<NormalizedActionItem>, ApiError> {
-    normalize_action_items_with_options(pool, payload, false).await
+    normalize_action_items_with_options(pool, payload, user, false).await
 }
 
 async fn normalize_bulk_action_items(
     pool: &DbPool,
     payload: &ActionPayloadRequest,
+    user: &UserContext,
 ) -> Result<Vec<NormalizedActionItem>, ApiError> {
     // Mutating bulk endpoints mirror the Python action contract: a stale folder
     // path is an item-level failure, not a top-level 404 that aborts the whole batch.
-    normalize_action_items_with_options(pool, payload, true).await
+    normalize_action_items_with_options(pool, payload, user, true).await
 }
 
 async fn normalize_action_items_with_options(
     pool: &DbPool,
     payload: &ActionPayloadRequest,
+    user: &UserContext,
     allow_missing_folders: bool,
 ) -> Result<Vec<NormalizedActionItem>, ApiError> {
     if payload.items.is_empty() {
@@ -2097,7 +2100,7 @@ async fn normalize_action_items_with_options(
             }
             "folder" => {
                 let normalized_item =
-                    normalize_folder_action_item(pool, item, allow_missing_folders).await?;
+                    normalize_folder_action_item(pool, item, user, allow_missing_folders).await?;
                 if seen.insert(action_item_dedupe_key(&normalized_item)) {
                     normalized.push(normalized_item);
                 }
@@ -2157,6 +2160,7 @@ async fn prune_nested_action_items(
 async fn normalize_folder_action_item(
     pool: &DbPool,
     item: &ActionItemRequest,
+    user: &UserContext,
     allow_missing: bool,
 ) -> Result<NormalizedActionItem, ApiError> {
     if let Some(id) = item.id {
@@ -2165,12 +2169,7 @@ async fn normalize_folder_action_item(
                 "Folder id must be positive".to_string(),
             ));
         }
-        let exists = sqlx::query_scalar::<_, i64>("SELECT 1 FROM folders WHERE id = ?")
-            .bind(id)
-            .fetch_optional(pool)
-            .await?
-            .is_some();
-        if !exists {
+        let Some(folder) = resolve_visible_folder_by_id(pool, id, user).await? else {
             if allow_missing {
                 return Ok(NormalizedActionItem::MissingFolder {
                     id: Some(id),
@@ -2178,10 +2177,10 @@ async fn normalize_folder_action_item(
                 });
             }
             return Err(ApiError::NotFound("Folder not found".to_string()));
-        }
+        };
         return Ok(NormalizedActionItem::Folder {
-            id,
-            path: folder_path_by_id(pool, id).await?,
+            id: folder.id,
+            path: folder.path,
         });
     }
 
@@ -2189,7 +2188,8 @@ async fn normalize_folder_action_item(
     if path.is_empty() {
         return Err(ApiError::BadRequest("Folder path is required".to_string()));
     }
-    let Some(folder) = get_folder_by_path(pool, Some(&path)).await? else {
+    let visible_folder = resolve_visible_folder_by_path(pool, &path, user).await?;
+    let Some(folder) = visible_folder else {
         if allow_missing {
             return Ok(NormalizedActionItem::MissingFolder {
                 id: None,
@@ -2200,7 +2200,7 @@ async fn normalize_folder_action_item(
     };
     Ok(NormalizedActionItem::Folder {
         id: folder.id,
-        path: folder_path_by_id(pool, folder.id).await?,
+        path: folder.path,
     })
 }
 

@@ -151,6 +151,8 @@ fn export_runtime_settings(config: &Config) -> ExportRuntimeSettings {
     ExportRuntimeSettings {
         ttl_seconds: config.export_ttl_seconds,
         workers: config.export_workers,
+        max_active_jobs: config.export_max_active_jobs,
+        max_active_jobs_per_user: config.export_max_active_jobs_per_user,
         zip_options: ExportZipOptions {
             compression_threshold_bytes: config.export_zip_compression_threshold_bytes,
             compresslevel: u32::try_from(config.export_zip_compresslevel.clamp(1, 9)).unwrap_or(1),
@@ -3376,6 +3378,15 @@ impl IntoResponse for ApiError {
                 insert_header(response.headers_mut(), header::RETRY_AFTER, "1");
                 response
             }
+            Self::Export(
+                error @ (ExportError::UserActiveJobLimitExceeded
+                | ExportError::GlobalActiveJobLimitExceeded),
+            ) => {
+                let (status, detail) = export_error_response(error);
+                let mut response = (status, Json(ErrorPayload { detail })).into_response();
+                insert_header(response.headers_mut(), header::RETRY_AFTER, "1");
+                response
+            }
             error => {
                 let (status, detail) = api_error_status_detail(error);
                 (status, Json(ErrorPayload { detail })).into_response()
@@ -3979,6 +3990,12 @@ fn export_error_response(error: ExportError) -> (StatusCode, String) {
             (StatusCode::NOT_FOUND, error.to_string())
         }
         ExportError::ExportHasNoDownloadableFiles => (StatusCode::BAD_REQUEST, error.to_string()),
+        ExportError::UserActiveJobLimitExceeded => {
+            (StatusCode::TOO_MANY_REQUESTS, error.to_string())
+        }
+        ExportError::GlobalActiveJobLimitExceeded => {
+            (StatusCode::SERVICE_UNAVAILABLE, error.to_string())
+        }
         ExportError::InsufficientFolderAccess => (
             StatusCode::FORBIDDEN,
             "Insufficient folder access".to_string(),
@@ -3998,6 +4015,10 @@ fn export_error_response(error: ExportError) -> (StatusCode, String) {
         ExportError::StorageLocationConflict => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "Storage location points at another blob".to_string(),
+        ),
+        ExportError::UnsafeExportJobId => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Internal server error".to_string(),
         ),
         ExportError::ZipLimitExceeded => (
             StatusCode::BAD_REQUEST,

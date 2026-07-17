@@ -10,7 +10,7 @@ use axum::body::{Body, Bytes, to_bytes};
 use axum::http::{Method, Request, StatusCode};
 use crc::{CRC_32_ISO_HDLC, Crc};
 use flate2::read::DeflateDecoder;
-use futures_util::{Stream, StreamExt, stream};
+use futures_util::{Stream, StreamExt, future::join_all, stream};
 use serde_json::{Value, json};
 use std::io::Read;
 use time::OffsetDateTime;
@@ -21,7 +21,7 @@ use tower::ServiceExt;
 use vault_server::auth::{AuthSettings, UserContext};
 use vault_server::config::Config;
 use vault_server::db;
-use vault_server::exports::{self, ExportSelectionItem, ExportZipOptions};
+use vault_server::exports::{self, ExportSelectionItem};
 use vault_server::folders::{
     VAULT_ROOT_KEY, add_folder_permission, get_or_create_folder_path, get_root_folder,
 };
@@ -43,6 +43,25 @@ async fn test_state_with_export_settings(
     export_zip_compression_threshold_bytes: i64,
     export_zip_compresslevel: i64,
 ) -> (AppState, tempfile::TempDir) {
+    test_state_with_export_limits(
+        export_ttl_seconds,
+        export_workers,
+        export_zip_compression_threshold_bytes,
+        export_zip_compresslevel,
+        256,
+        16,
+    )
+    .await
+}
+
+async fn test_state_with_export_limits(
+    export_ttl_seconds: i64,
+    export_workers: i64,
+    export_zip_compression_threshold_bytes: i64,
+    export_zip_compresslevel: i64,
+    export_max_active_jobs: i64,
+    export_max_active_jobs_per_user: i64,
+) -> (AppState, tempfile::TempDir) {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let config = Config {
         host: "127.0.0.1".parse().expect("host"),
@@ -60,6 +79,8 @@ async fn test_state_with_export_settings(
         transfer_session_ttl_seconds: 86_400,
         export_ttl_seconds,
         export_workers,
+        export_max_active_jobs,
+        export_max_active_jobs_per_user,
         export_zip_compression_threshold_bytes,
         export_zip_compresslevel,
         ttl_sweep_interval_seconds: 60,
@@ -2077,6 +2098,7 @@ async fn export_job_prunes_child_documents_from_folder_selection() {
     let app = http::router(state);
 
     let response = app
+        .clone()
         .oneshot(authed_json_post(
             "/api/exports",
             "reader",
@@ -2824,6 +2846,507 @@ async fn export_job_reports_finalizing_while_artifact_is_promoted() {
 }
 
 #[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the admission contract and cleanup assertions share one blocked-worker scenario"
+)]
+async fn export_admission_bounds_active_jobs_globally_and_per_user() {
+    let (mut state, _temp_dir) =
+        test_state_with_export_limits(86_400, 1, 3 * 1024 * 1024 * 1024, 1, 2, 1).await;
+    let entered_put_file = Arc::new(Notify::new());
+    let release_put_file = Arc::new(Notify::new());
+    state.storage = Arc::new(BlockingPutFileStorage {
+        inner: LocalBlobStorage::new(state.config.objects_path(), &state.config.storage_prefix),
+        entered_put_file: entered_put_file.clone(),
+        release_put_file: release_put_file.clone(),
+    });
+    let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
+        .await
+        .expect("root");
+    let document_id = insert_stored_document(
+        &state.db,
+        &state.storage,
+        root.id,
+        "bounded-export.txt",
+        b"bounded export bytes",
+    )
+    .await;
+    let pool = state.db.clone();
+    let app = http::router(state);
+    let request_body = json!({"items": [{"type": "document", "id": document_id}]});
+
+    let first = app
+        .clone()
+        .oneshot(authed_json_post(
+            "/api/exports",
+            "first-user",
+            "vault-admin",
+            &request_body,
+        ))
+        .await
+        .expect("first export response");
+    assert_eq!(first.status(), StatusCode::OK);
+    let first_id = response_json(first).await["id"]
+        .as_str()
+        .expect("first job id")
+        .to_string();
+    timeout(Duration::from_secs(5), entered_put_file.notified())
+        .await
+        .expect("first export should occupy the worker");
+
+    let per_user_rejected = app
+        .clone()
+        .oneshot(authed_json_post(
+            "/api/exports",
+            "first-user",
+            "vault-admin",
+            &request_body,
+        ))
+        .await
+        .expect("per-user rejection");
+    assert_eq!(per_user_rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        per_user_rejected.headers().get("retry-after"),
+        Some(&"1".parse().expect("retry header"))
+    );
+
+    let second = app
+        .clone()
+        .oneshot(authed_json_post(
+            "/api/exports",
+            "second-user",
+            "vault-admin",
+            &request_body,
+        ))
+        .await
+        .expect("second export response");
+    assert_eq!(second.status(), StatusCode::OK);
+    let second_id = response_json(second).await["id"]
+        .as_str()
+        .expect("second job id")
+        .to_string();
+
+    let globally_rejected = app
+        .clone()
+        .oneshot(authed_json_post(
+            "/api/exports",
+            "third-user",
+            "vault-admin",
+            &request_body,
+        ))
+        .await
+        .expect("global rejection");
+    assert_eq!(globally_rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        globally_rejected.headers().get("retry-after"),
+        Some(&"1".parse().expect("retry header"))
+    );
+    let active_jobs: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM export_jobs WHERE status IN ('queued', 'running', 'finalizing')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("active export count");
+    assert_eq!(active_jobs, 2);
+    let active_statuses: Vec<String> = sqlx::query_scalar(
+        "SELECT status FROM export_jobs WHERE status IN ('queued', 'running', 'finalizing') ORDER BY status",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("active export statuses");
+    assert_eq!(active_statuses, vec!["finalizing", "queued"]);
+
+    let cancelled = app
+        .clone()
+        .oneshot(authed_delete(
+            &format!("/api/exports/{second_id}"),
+            "second-user",
+            "vault-admin",
+        ))
+        .await
+        .expect("cancel queued export");
+    assert_eq!(cancelled.status(), StatusCode::OK);
+    release_put_file.notify_one();
+    wait_for_export_status(app, &first_id, "first-user", "vault-admin", "complete").await;
+    let second_status: String = sqlx::query_scalar("SELECT status FROM export_jobs WHERE id = ?")
+        .bind(&second_id)
+        .fetch_one(&pool)
+        .await
+        .expect("cancelled second status");
+    let second_artifacts: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM export_artifacts WHERE job_id = ?")
+            .bind(&second_id)
+            .fetch_one(&pool)
+            .await
+            .expect("second artifact count");
+    assert_eq!(second_status, "cancelled");
+    assert_eq!(second_artifacts, 0);
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the concurrent admission race must inspect and clean every accepted response"
+)]
+async fn concurrent_export_admission_never_oversubscribes_the_global_cap() {
+    const SUBMISSIONS: usize = 16;
+    const GLOBAL_CAP: usize = 4;
+    let (mut state, _temp_dir) = test_state_with_export_limits(
+        86_400,
+        1,
+        3 * 1024 * 1024 * 1024,
+        1,
+        i64::try_from(GLOBAL_CAP).expect("global cap"),
+        1,
+    )
+    .await;
+    let entered_put_file = Arc::new(Notify::new());
+    let release_put_file = Arc::new(Notify::new());
+    state.storage = Arc::new(BlockingPutFileStorage {
+        inner: LocalBlobStorage::new(state.config.objects_path(), &state.config.storage_prefix),
+        entered_put_file: entered_put_file.clone(),
+        release_put_file: release_put_file.clone(),
+    });
+    let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
+        .await
+        .expect("root");
+    let document_id = insert_stored_document(
+        &state.db,
+        &state.storage,
+        root.id,
+        "concurrent-admission.txt",
+        b"concurrent admission bytes",
+    )
+    .await;
+    let pool = state.db.clone();
+    let transfers_path = state.config.transfers_path();
+    let app = http::router(state);
+
+    let responses = join_all((0..SUBMISSIONS).map(|index| {
+        let app = app.clone();
+        async move {
+            let user_id = format!("concurrent-user-{index:02}");
+            let response = app
+                .oneshot(authed_json_post(
+                    "/api/exports",
+                    &user_id,
+                    "vault-admin",
+                    &json!({"items": [{"type": "document", "id": document_id}]}),
+                ))
+                .await
+                .expect("concurrent export response");
+            (user_id, response)
+        }
+    }))
+    .await;
+    let mut accepted = Vec::new();
+    for (user_id, response) in responses {
+        if response.status() == StatusCode::OK {
+            let job_id = response_json(response).await["id"]
+                .as_str()
+                .expect("accepted job id")
+                .to_string();
+            accepted.push((user_id, job_id));
+        } else {
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                response
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|value| value.to_str().ok()),
+                Some("1")
+            );
+        }
+    }
+    assert_eq!(accepted.len(), GLOBAL_CAP);
+    let active_jobs: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM export_jobs WHERE status IN ('queued', 'running', 'finalizing')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("active export count");
+    assert_eq!(active_jobs, i64::try_from(GLOBAL_CAP).expect("global cap"));
+    timeout(Duration::from_secs(5), entered_put_file.notified())
+        .await
+        .expect("one accepted export should occupy the worker");
+
+    let accepted_ids = accepted
+        .iter()
+        .map(|(_, job_id)| job_id.clone())
+        .collect::<Vec<_>>();
+    for (user_id, job_id) in accepted {
+        let response = app
+            .clone()
+            .oneshot(authed_delete(
+                &format!("/api/exports/{job_id}"),
+                &user_id,
+                "vault-admin",
+            ))
+            .await
+            .expect("cancel accepted export");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    release_put_file.notify_one();
+    for job_id in &accepted_ids {
+        wait_for_path_missing(
+            &transfers_path
+                .join("exports")
+                .join(format!("{job_id}.zip.tmp")),
+        )
+        .await;
+    }
+    let artifact_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM export_artifacts")
+        .fetch_one(&pool)
+        .await
+        .expect("cancelled race artifacts");
+    assert_eq!(artifact_count, 0);
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "shutdown ordering, queue preservation, and publication cleanup form one scenario"
+)]
+async fn graceful_dispatcher_shutdown_drains_finalizing_work_and_exact_temp() {
+    let (mut state, _temp_dir) = test_state().await;
+    let entered_put_file = Arc::new(Notify::new());
+    let release_put_file = Arc::new(Notify::new());
+    state.storage = Arc::new(BlockingPutFileStorage {
+        inner: LocalBlobStorage::new(state.config.objects_path(), &state.config.storage_prefix),
+        entered_put_file: entered_put_file.clone(),
+        release_put_file: release_put_file.clone(),
+    });
+    let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
+        .await
+        .expect("root");
+    let document_id = insert_stored_document(
+        &state.db,
+        &state.storage,
+        root.id,
+        "shutdown-export.txt",
+        b"shutdown export bytes",
+    )
+    .await;
+    let pool = state.db.clone();
+    let transfers_path = state.config.transfers_path();
+    let execution = state.export_execution.clone();
+    let app = http::router(state);
+    let response = app
+        .clone()
+        .oneshot(authed_json_post(
+            "/api/exports",
+            "admin",
+            "vault-admin",
+            &json!({"items": [{"type": "document", "id": document_id}]}),
+        ))
+        .await
+        .expect("export response");
+    let job_id = response_json(response).await["id"]
+        .as_str()
+        .expect("job id")
+        .to_string();
+    timeout(Duration::from_secs(5), entered_put_file.notified())
+        .await
+        .expect("artifact promotion should begin");
+    let finalizing_status: String =
+        sqlx::query_scalar("SELECT status FROM export_jobs WHERE id = ?")
+            .bind(&job_id)
+            .fetch_one(&pool)
+            .await
+            .expect("finalizing status");
+    assert_eq!(finalizing_status, "finalizing");
+    let queued_response = app
+        .clone()
+        .oneshot(authed_json_post(
+            "/api/exports",
+            "queued-user",
+            "vault-admin",
+            &json!({"items": [{"type": "document", "id": document_id}]}),
+        ))
+        .await
+        .expect("queued export response");
+    let queued_job_id = response_json(queued_response).await["id"]
+        .as_str()
+        .expect("queued job id")
+        .to_string();
+
+    execution.request_dispatcher_shutdown();
+    sleep(Duration::from_millis(50)).await;
+    let still_queued: String = sqlx::query_scalar("SELECT status FROM export_jobs WHERE id = ?")
+        .bind(&queued_job_id)
+        .fetch_one(&pool)
+        .await
+        .expect("queued status immediately after shutdown request");
+    assert_eq!(still_queued, "queued");
+    let mut shutdown = tokio::spawn(async move { execution.shutdown_dispatcher().await });
+    assert!(
+        timeout(Duration::from_millis(100), &mut shutdown)
+            .await
+            .is_err(),
+        "graceful shutdown must not abandon an in-flight publication"
+    );
+    release_put_file.notify_one();
+    timeout(Duration::from_secs(5), &mut shutdown)
+        .await
+        .expect("dispatcher should drain after storage returns")
+        .expect("shutdown task");
+    wait_for_export_status_in_db(&pool, &job_id, "complete").await;
+    let queued_status: String = sqlx::query_scalar("SELECT status FROM export_jobs WHERE id = ?")
+        .bind(&queued_job_id)
+        .fetch_one(&pool)
+        .await
+        .expect("queued status");
+    assert_eq!(queued_status, "queued");
+
+    assert!(
+        tokio::fs::symlink_metadata(
+            transfers_path
+                .join("exports")
+                .join(format!("{job_id}.zip.tmp")),
+        )
+        .await
+        .is_err()
+    );
+    let pending_leases: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM blob_locations WHERE backend GLOB '_vault_pending:*'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("pending publication leases");
+    assert_eq!(pending_leases, 0);
+    let artifact_jobs: Vec<String> =
+        sqlx::query_scalar("SELECT job_id FROM export_artifacts ORDER BY job_id")
+            .fetch_all(&pool)
+            .await
+            .expect("artifact jobs");
+    assert_eq!(artifact_jobs, vec![job_id]);
+    assert!(
+        tokio::fs::symlink_metadata(
+            transfers_path
+                .join("exports")
+                .join(format!("{queued_job_id}.zip.tmp")),
+        )
+        .await
+        .is_err()
+    );
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the atomic-claim fixture and exactly-once assertions are intentionally colocated"
+)]
+async fn concurrent_dispatcher_workers_claim_each_queued_job_once() {
+    const JOBS: i64 = 12;
+    let (state, _temp_dir) =
+        test_state_with_export_settings(86_400, 4, 3 * 1024 * 1024 * 1024, 1).await;
+    let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
+        .await
+        .expect("root");
+    let document_id = insert_stored_document(
+        &state.db,
+        &state.storage,
+        root.id,
+        "atomic-claim.txt",
+        b"atomic claim bytes",
+    )
+    .await;
+    let user = UserContext {
+        id: "claim-user".to_string(),
+        vault_user_id: 0,
+        issuer: "test".to_string(),
+        subject: "claim-user".to_string(),
+        name: "Claim User".to_string(),
+        email: "claim@example.com".to_string(),
+        groups: Vec::new(),
+        is_admin: true,
+    };
+    let user_context = serde_json::to_string(&user).expect("user context");
+    let request_payload = serde_json::to_string(&json!({
+        "items": [{"type": "document", "id": document_id}]
+    }))
+    .expect("request payload");
+    let mut transaction = state.db.begin().await.expect("queue transaction");
+    for index in 0..JOBS {
+        sqlx::query(
+            r"
+            INSERT INTO export_jobs
+                (
+                    id,
+                    status,
+                    filename,
+                    total_items,
+                    total_bytes,
+                    created_by,
+                    created_by_name,
+                    user_context,
+                    request_payload,
+                    expires_at
+                )
+            VALUES (?, 'queued', 'claim.zip', 1, 18, ?, ?, ?, ?, '2999-01-01T00:00:00Z')
+            ",
+        )
+        .bind(format!("atomic-claim-{index:02}"))
+        .bind(&user.id)
+        .bind(&user.name)
+        .bind(&user_context)
+        .bind(&request_payload)
+        .execute(&mut *transaction)
+        .await
+        .expect("queued claim job");
+    }
+    transaction.commit().await.expect("commit claim jobs");
+    let transfers_path = state.config.transfers_path();
+    state
+        .export_execution
+        .start_dispatcher(&state.db, &state.storage, &transfers_path);
+
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let complete: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM export_jobs WHERE status = 'complete'")
+                    .fetch_one(&state.db)
+                    .await
+                    .expect("complete claim jobs");
+            if complete == JOBS {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("all claim jobs should complete");
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let events: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM document_events WHERE document_id = ? AND event_type = 'download'",
+            )
+            .bind(document_id)
+            .fetch_one(&state.db)
+            .await
+            .expect("claim download events");
+            if events == JOBS {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("each completed job should record one event");
+    let artifacts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM export_artifacts")
+        .fetch_one(&state.db)
+        .await
+        .expect("claim artifacts");
+    let failed: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM export_jobs WHERE status = 'failed'")
+            .fetch_one(&state.db)
+            .await
+            .expect("failed claim jobs");
+    assert_eq!(artifacts, JOBS);
+    assert_eq!(failed, 0);
+}
+
+#[tokio::test]
 async fn cancelled_export_cleans_object_promoted_before_artifact_metadata() {
     let (mut state, _temp_dir) = test_state().await;
     let stored_file = Arc::new(Notify::new());
@@ -3133,6 +3656,7 @@ async fn cancelled_export_during_streaming_entry_write_cleans_partial_zip() {
     let app = http::router(state);
 
     let response = app
+        .clone()
         .oneshot(authed_json_post(
             "/api/exports",
             "admin",
@@ -3319,6 +3843,7 @@ async fn large_stored_export_reports_byte_progress_before_entry_finishes() {
     let app = http::router(state);
 
     let response = app
+        .clone()
         .oneshot(authed_json_post(
             "/api/exports",
             "admin",
@@ -3333,9 +3858,19 @@ async fn large_stored_export_reports_byte_progress_before_entry_finishes() {
         .expect("job id")
         .to_string();
 
-    timeout(Duration::from_secs(5), entered_after_progress.notified())
+    if timeout(Duration::from_secs(5), entered_after_progress.notified())
         .await
-        .expect("export should report progress before finishing the large entry");
+        .is_err()
+    {
+        let stalled = sqlx::query_as::<_, (String, Option<String>, i64, i64)>(
+            "SELECT status, error, processed_bytes, total_bytes FROM export_jobs WHERE id = ?",
+        )
+        .bind(&job_id)
+        .fetch_one(&pool)
+        .await
+        .expect("stalled export status");
+        panic!("export should report progress before finishing the large entry: {stalled:?}");
+    }
     let progress = sqlx::query_as::<_, (String, i64, i64, i64)>(
         r"
         SELECT status, processed_items, processed_bytes, total_bytes
@@ -3649,13 +4184,15 @@ async fn export_runtime_settings_are_normalized_in_app_state() {
 
     assert_eq!(settings.ttl_seconds, 60);
     assert_eq!(settings.workers, 1);
+    assert_eq!(settings.max_active_jobs, 256);
+    assert_eq!(settings.max_active_jobs_per_user, 16);
     assert_eq!(settings.zip_options.compression_threshold_bytes, 0);
     assert_eq!(settings.zip_options.compresslevel, 9);
 }
 
 #[tokio::test]
 async fn export_zip_deflates_text_and_stores_precompressed_entries_when_threshold_allows() {
-    let (state, _temp_dir) = test_state().await;
+    let (state, _temp_dir) = test_state_with_export_settings(86_400, 1, 1, 1).await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
         .await
         .expect("root");
@@ -3690,7 +4227,7 @@ async fn export_zip_deflates_text_and_stores_precompressed_entries_when_threshol
         is_admin: true,
     };
 
-    let payload = exports::create_export_job_with_options(
+    let payload = exports::create_export_job_with_runtime(
         &state.db,
         &state.storage,
         &state.config.transfers_path(),
@@ -3699,10 +4236,7 @@ async fn export_zip_deflates_text_and_stores_precompressed_entries_when_threshol
             ExportSelectionItem::Document { id: png_id },
         ],
         &user,
-        ExportZipOptions {
-            compression_threshold_bytes: 1,
-            compresslevel: 1,
-        },
+        &state.export_execution,
     )
     .await
     .expect("export job");

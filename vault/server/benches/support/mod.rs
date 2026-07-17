@@ -17,7 +17,7 @@ use tower::ServiceExt;
 use vault_server::auth::{AuthSettings, UserContext, header_identity};
 use vault_server::config::Config;
 use vault_server::db;
-use vault_server::exports::{self, ExportSelectionItem, ExportZipOptions};
+use vault_server::exports::{self, ExportSelectionItem};
 use vault_server::folders::{
     VAULT_ROOT_KEY, add_folder_permission, get_or_create_folder_path, get_root_folder,
 };
@@ -200,7 +200,9 @@ impl LargeDownloadFixture {
 impl ExportScenario {
     pub async fn build() -> Self {
         let temp_dir = performance_temp_dir();
-        let config = test_config(&temp_dir);
+        let mut config = test_config(&temp_dir);
+        config.export_zip_compression_threshold_bytes = 1;
+        config.export_zip_compresslevel = 1;
         let db = db::connect(&config.db_path())
             .await
             .expect("export scenario database");
@@ -245,7 +247,7 @@ impl ExportScenario {
     }
 
     pub async fn export_and_wait(&self) {
-        let job = exports::create_export_job_with_options(
+        let job = exports::create_export_job_with_runtime(
             &self.state.db,
             &self.state.storage,
             &self.state.config.transfers_path(),
@@ -253,10 +255,7 @@ impl ExportScenario {
                 id: self.document_id,
             }],
             &self.user,
-            ExportZipOptions {
-                compression_threshold_bytes: 1,
-                compresslevel: 1,
-            },
+            &self.state.export_execution,
         )
         .await
         .expect("create forced-compression export benchmark job");
@@ -582,6 +581,8 @@ fn test_config(temp_dir: &TempDir) -> Config {
         transfer_session_ttl_seconds: 86_400,
         export_ttl_seconds: 86_400,
         export_workers: 1,
+        export_max_active_jobs: 256,
+        export_max_active_jobs_per_user: 16,
         export_zip_compression_threshold_bytes: 3 * 1024 * 1024 * 1024,
         export_zip_compresslevel: 1,
         ttl_sweep_interval_seconds: 60,

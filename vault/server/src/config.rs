@@ -4,6 +4,8 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
+const MAX_EXPORT_WORKERS: i64 = 64;
+
 #[derive(Debug, Clone, Parser)]
 #[command(author, version = crate::version::app_version(), about)]
 pub struct Config {
@@ -56,6 +58,16 @@ pub struct Config {
     #[arg(long, env = "VAULT_EXPORT_WORKERS", default_value_t = 1)]
     pub export_workers: i64,
 
+    #[arg(long, env = "VAULT_EXPORT_MAX_ACTIVE_JOBS", default_value_t = 256)]
+    pub export_max_active_jobs: i64,
+
+    #[arg(
+        long,
+        env = "VAULT_EXPORT_MAX_ACTIVE_JOBS_PER_USER",
+        default_value_t = 16
+    )]
+    pub export_max_active_jobs_per_user: i64,
+
     #[arg(
         long,
         env = "VAULT_EXPORT_ZIP_COMPRESSION_THRESHOLD_BYTES",
@@ -90,7 +102,13 @@ impl Config {
         self.transfer_chunk_bytes = self.transfer_chunk_bytes.max(1);
         self.transfer_session_ttl_seconds = self.transfer_session_ttl_seconds.max(60);
         self.export_ttl_seconds = self.export_ttl_seconds.max(60);
-        self.export_workers = self.export_workers.max(1);
+        self.export_max_active_jobs = self.export_max_active_jobs.max(1);
+        self.export_max_active_jobs_per_user = self
+            .export_max_active_jobs_per_user
+            .clamp(1, self.export_max_active_jobs);
+        self.export_workers = self
+            .export_workers
+            .clamp(1, self.export_max_active_jobs.min(MAX_EXPORT_WORKERS));
         self.export_zip_compression_threshold_bytes =
             self.export_zip_compression_threshold_bytes.max(0);
         self.export_zip_compresslevel = self.export_zip_compresslevel.clamp(1, 9);

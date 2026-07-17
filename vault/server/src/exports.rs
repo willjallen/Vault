@@ -1,7 +1,8 @@
 use std::collections::{HashSet, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration as StdDuration;
 
 use axum::body::Bytes;
@@ -18,7 +19,8 @@ use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, watch};
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::auth::UserContext;
@@ -39,6 +41,10 @@ use crate::storage::{
 
 const EXPORT_TTL_SECONDS: i64 = 86_400;
 const EXPORT_WORKERS: i64 = 1;
+const EXPORT_MAX_ACTIVE_JOBS: i64 = 256;
+const EXPORT_MAX_ACTIVE_JOBS_PER_USER: i64 = 16;
+const MAX_EXPORT_WORKERS: i64 = 64;
+const EXPORT_DISPATCH_POLL_INTERVAL: StdDuration = StdDuration::from_secs(15);
 const ZIP_DOS_DATE_1980_01_01: u16 = 33;
 const ZIP_VERSION_DEFLATE: u16 = 20;
 const ZIP_VERSION_ZIP64: u16 = 45;
@@ -124,6 +130,8 @@ impl ExportZipOptions {
 pub struct ExportRuntimeSettings {
     pub ttl_seconds: i64,
     pub workers: i64,
+    pub max_active_jobs: i64,
+    pub max_active_jobs_per_user: i64,
     pub zip_options: ExportZipOptions,
 }
 
@@ -132,6 +140,8 @@ impl Default for ExportRuntimeSettings {
         Self {
             ttl_seconds: EXPORT_TTL_SECONDS,
             workers: EXPORT_WORKERS,
+            max_active_jobs: EXPORT_MAX_ACTIVE_JOBS,
+            max_active_jobs_per_user: EXPORT_MAX_ACTIVE_JOBS_PER_USER,
             zip_options: ExportZipOptions::default(),
         }
     }
@@ -140,28 +150,57 @@ impl Default for ExportRuntimeSettings {
 impl ExportRuntimeSettings {
     #[must_use]
     pub fn normalized(self) -> Self {
+        let max_active_jobs = self.max_active_jobs.max(1);
         Self {
             ttl_seconds: self.ttl_seconds.max(60),
-            workers: self.workers.max(1),
+            workers: self
+                .workers
+                .clamp(1, max_active_jobs.min(MAX_EXPORT_WORKERS)),
+            max_active_jobs,
+            max_active_jobs_per_user: self.max_active_jobs_per_user.clamp(1, max_active_jobs),
             zip_options: self.zip_options.normalized(),
         }
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ExportExecutionContext {
     settings: ExportRuntimeSettings,
-    worker_slots: std::sync::Arc<Semaphore>,
+    poll_interval: StdDuration,
+    dispatcher: ExportDispatcher,
+}
+
+#[derive(Debug)]
+struct ExportDispatcher {
+    started: AtomicBool,
+    notify: Arc<Notify>,
+    shutdown: watch::Sender<bool>,
+    workers: StdMutex<Vec<JoinHandle<()>>>,
 }
 
 impl ExportExecutionContext {
     #[must_use]
     pub fn new(settings: ExportRuntimeSettings) -> Self {
+        Self::new_with_poll_interval(settings, EXPORT_DISPATCH_POLL_INTERVAL)
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn new_with_poll_interval(
+        settings: ExportRuntimeSettings,
+        poll_interval: StdDuration,
+    ) -> Self {
         let settings = settings.normalized();
-        let workers = usize::try_from(settings.workers).unwrap_or(usize::MAX);
+        let (shutdown, _) = watch::channel(false);
         Self {
             settings,
-            worker_slots: std::sync::Arc::new(Semaphore::new(workers)),
+            poll_interval: poll_interval.max(StdDuration::from_millis(1)),
+            dispatcher: ExportDispatcher {
+                started: AtomicBool::new(false),
+                notify: Arc::new(Notify::new()),
+                shutdown,
+                workers: StdMutex::new(Vec::new()),
+            },
         }
     }
 
@@ -170,25 +209,88 @@ impl ExportExecutionContext {
         &self.settings
     }
 
-    #[must_use]
-    fn job_runner(&self) -> ExportJobRunner {
-        ExportJobRunner {
-            zip_options: self.settings.zip_options,
-            worker_slots: Some(self.worker_slots.clone()),
+    pub fn start_dispatcher(
+        &self,
+        pool: &SqlitePool,
+        storage: &SharedBlobStorage,
+        transfers_path: &Path,
+    ) {
+        let mut workers = self
+            .dispatcher
+            .workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *self.dispatcher.shutdown.borrow() {
+            return;
+        }
+        if self
+            .dispatcher
+            .started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            self.notify_dispatcher();
+            return;
+        }
+        let worker_count = usize::try_from(self.settings.workers)
+            .expect("normalized export worker count must fit usize");
+        for worker_number in 0..worker_count {
+            workers.push(tokio::spawn(export_dispatcher_worker(
+                worker_number,
+                pool.clone(),
+                storage.clone(),
+                transfers_path.to_path_buf(),
+                self.settings.zip_options,
+                self.dispatcher.notify.clone(),
+                self.dispatcher.shutdown.subscribe(),
+            )));
+        }
+        workers.push(tokio::spawn(export_dispatcher_poller(
+            self.dispatcher.notify.clone(),
+            self.dispatcher.shutdown.subscribe(),
+            self.poll_interval,
+        )));
+        drop(workers);
+        self.notify_dispatcher();
+    }
+
+    pub fn notify_dispatcher(&self) {
+        self.dispatcher.notify.notify_one();
+    }
+
+    pub fn request_dispatcher_shutdown(&self) {
+        self.dispatcher.shutdown.send_replace(true);
+        self.dispatcher.notify.notify_waiters();
+    }
+
+    pub async fn shutdown_dispatcher(&self) {
+        self.request_dispatcher_shutdown();
+        let workers = {
+            let mut workers = self
+                .dispatcher
+                .workers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::take(&mut *workers)
+        };
+        for worker in workers {
+            if let Err(error) = worker.await {
+                tracing::warn!(?error, "export dispatcher worker did not shut down cleanly");
+            }
         }
     }
 }
 
-#[derive(Debug, Clone, Default)]
-struct ExportJobRunner {
-    zip_options: ExportZipOptions,
-    worker_slots: Option<std::sync::Arc<Semaphore>>,
+impl Drop for ExportExecutionContext {
+    fn drop(&mut self) {
+        self.request_dispatcher_shutdown();
+    }
 }
 
 #[derive(Debug, Clone)]
 struct ExportJobCreateOptions {
     settings: ExportRuntimeSettings,
-    runner: ExportJobRunner,
+    dispatcher_notify: Option<Arc<Notify>>,
     mode: ExportJobCreateMode,
 }
 
@@ -259,6 +361,12 @@ pub enum ExportError {
     ExportNotComplete,
     #[error("export was cancelled")]
     ExportCancelled,
+    #[error("export job identifier is unsafe")]
+    UnsafeExportJobId,
+    #[error("too many active exports for this user")]
+    UserActiveJobLimitExceeded,
+    #[error("export capacity is currently full")]
+    GlobalActiveJobLimitExceeded,
     #[error("export artifact has no storage location")]
     ArtifactMissingStorageLocation,
     #[error("blob content does not match metadata")]
@@ -320,6 +428,7 @@ struct ExportArtifactRow {
 
 #[derive(Debug, FromRow)]
 struct ExportWorkRow {
+    id: String,
     request_payload: String,
     user_context: String,
 }
@@ -493,24 +602,6 @@ pub fn streaming_zip_header_probe(
     })
 }
 
-pub async fn create_export_job(
-    pool: &SqlitePool,
-    storage: &SharedBlobStorage,
-    transfers_path: &Path,
-    items: &[ExportSelectionItem],
-    user: &UserContext,
-) -> Result<ExportJobPayload, ExportError> {
-    create_export_job_with_options(
-        pool,
-        storage,
-        transfers_path,
-        items,
-        user,
-        ExportZipOptions::default(),
-    )
-    .await
-}
-
 pub async fn create_export_job_with_runtime(
     pool: &SqlitePool,
     storage: &SharedBlobStorage,
@@ -519,6 +610,7 @@ pub async fn create_export_job_with_runtime(
     user: &UserContext,
     execution: &ExportExecutionContext,
 ) -> Result<ExportJobPayload, ExportError> {
+    execution.start_dispatcher(pool, storage, transfers_path);
     create_export_job_inner(
         pool,
         storage,
@@ -527,7 +619,7 @@ pub async fn create_export_job_with_runtime(
         user,
         ExportJobCreateOptions {
             settings: execution.settings().clone(),
-            runner: execution.job_runner(),
+            dispatcher_notify: Some(execution.dispatcher.notify.clone()),
             mode: ExportJobCreateMode::Export,
         },
     )
@@ -542,6 +634,7 @@ pub async fn create_download_job_with_runtime(
     user: &UserContext,
     execution: &ExportExecutionContext,
 ) -> Result<ExportJobPayload, ExportError> {
+    execution.start_dispatcher(pool, storage, transfers_path);
     create_export_job_inner(
         pool,
         storage,
@@ -550,37 +643,8 @@ pub async fn create_download_job_with_runtime(
         user,
         ExportJobCreateOptions {
             settings: execution.settings().clone(),
-            runner: execution.job_runner(),
+            dispatcher_notify: Some(execution.dispatcher.notify.clone()),
             mode: ExportJobCreateMode::Download,
-        },
-    )
-    .await
-}
-
-pub async fn create_export_job_with_options(
-    pool: &SqlitePool,
-    storage: &SharedBlobStorage,
-    transfers_path: &Path,
-    items: &[ExportSelectionItem],
-    user: &UserContext,
-    zip_options: ExportZipOptions,
-) -> Result<ExportJobPayload, ExportError> {
-    create_export_job_inner(
-        pool,
-        storage,
-        transfers_path,
-        items,
-        user,
-        ExportJobCreateOptions {
-            settings: ExportRuntimeSettings {
-                zip_options,
-                ..ExportRuntimeSettings::default()
-            },
-            runner: ExportJobRunner {
-                zip_options: zip_options.normalized(),
-                worker_slots: None,
-            },
-            mode: ExportJobCreateMode::Export,
         },
     )
     .await
@@ -588,13 +652,14 @@ pub async fn create_export_job_with_options(
 
 async fn create_export_job_inner(
     pool: &SqlitePool,
-    storage: &SharedBlobStorage,
-    transfers_path: &Path,
+    _storage: &SharedBlobStorage,
+    _transfers_path: &Path,
     items: &[ExportSelectionItem],
     user: &UserContext,
     options: ExportJobCreateOptions,
 ) -> Result<ExportJobPayload, ExportError> {
     let settings = options.settings.normalized();
+    check_export_admission(pool, &user.id, &settings).await?;
     let job_id = Uuid::new_v4().simple().to_string();
     let filename = export_filename_for_items(pool, items).await?;
     let (total_items, total_bytes) = match options.mode {
@@ -617,6 +682,28 @@ async fn create_export_job_inner(
     let request_payload = serde_json::to_string(&ExportRequestPayload {
         items: items.to_vec(),
     })?;
+    let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let (global_active_jobs, user_active_jobs) = sqlx::query_as::<_, (i64, i64)>(
+        r"
+        SELECT
+            COUNT(*),
+            COALESCE(SUM(CASE WHEN created_by = ? THEN 1 ELSE 0 END), 0)
+        FROM export_jobs
+        WHERE status IN ('queued', 'running', 'finalizing')
+          AND datetime(expires_at) > datetime('now')
+        ",
+    )
+    .bind(&user.id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    if user_active_jobs >= settings.max_active_jobs_per_user {
+        transaction.rollback().await?;
+        return Err(ExportError::UserActiveJobLimitExceeded);
+    }
+    if global_active_jobs >= settings.max_active_jobs {
+        transaction.rollback().await?;
+        return Err(ExportError::GlobalActiveJobLimitExceeded);
+    }
     sqlx::query(
         r"
         INSERT INTO export_jobs
@@ -645,18 +732,54 @@ async fn create_export_job_inner(
     .bind(serde_json::to_string(&transfer_user_payload(user))?)
     .bind(request_payload)
     .bind(&expires_at)
-    .execute(pool)
+    .execute(&mut *transaction)
     .await?;
+    transaction.commit().await?;
 
-    let payload = get_export_job(pool, &job_id, user).await?;
-    start_export_job(
-        pool.clone(),
-        storage.clone(),
-        transfers_path.to_path_buf(),
-        job_id,
-        options.runner,
-    );
+    let payload = ExportJobPayload {
+        id: job_id,
+        status: "queued".to_string(),
+        filename,
+        total_items,
+        processed_items: 0,
+        total_bytes,
+        processed_bytes: 0,
+        error: None,
+        expires_at,
+        download_url: None,
+        size_bytes: None,
+    };
+    if let Some(notify) = options.dispatcher_notify {
+        notify.notify_one();
+    }
     Ok(payload)
+}
+
+async fn check_export_admission(
+    pool: &SqlitePool,
+    user_id: &str,
+    settings: &ExportRuntimeSettings,
+) -> Result<(), ExportError> {
+    let (global_active_jobs, user_active_jobs) = sqlx::query_as::<_, (i64, i64)>(
+        r"
+        SELECT
+            COUNT(*),
+            COALESCE(SUM(CASE WHEN created_by = ? THEN 1 ELSE 0 END), 0)
+        FROM export_jobs
+        WHERE status IN ('queued', 'running', 'finalizing')
+          AND datetime(expires_at) > datetime('now')
+        ",
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
+    if user_active_jobs >= settings.max_active_jobs_per_user {
+        return Err(ExportError::UserActiveJobLimitExceeded);
+    }
+    if global_active_jobs >= settings.max_active_jobs {
+        return Err(ExportError::GlobalActiveJobLimitExceeded);
+    }
+    Ok(())
 }
 
 pub async fn get_export_job(
@@ -696,118 +819,106 @@ pub async fn cancel_export_job(
     get_export_job(pool, job_id, user).await
 }
 
-fn start_export_job(
+async fn export_dispatcher_worker(
+    worker_number: usize,
     pool: SqlitePool,
     storage: SharedBlobStorage,
     transfers_path: PathBuf,
-    job_id: String,
-    runner: ExportJobRunner,
-) {
-    tokio::spawn(async move {
-        // Export jobs are queued in SQLite, but ZIP generation is in-process. This semaphore
-        // preserves the deploy-time VAULT_EXPORT_WORKERS limit without adding an external queue.
-        let _worker_permit = match runner.worker_slots.clone() {
-            Some(slots) => Some(
-                slots
-                    .acquire_owned()
-                    .await
-                    .expect("export worker semaphore should not close"),
-            ),
-            None => None,
-        };
-        if let Err(error) = run_export_job(
-            &pool,
-            storage.as_ref(),
-            &transfers_path,
-            &job_id,
-            runner.zip_options,
-        )
-        .await
-        {
-            if matches!(error, ExportError::ExportCancelled) {
-                return;
-            }
-            let _ = mark_export_failed(&pool, &job_id, &error.to_string()).await;
-        }
-    });
-}
-
-pub async fn start_pending_export_jobs(
-    pool: &SqlitePool,
-    storage: &SharedBlobStorage,
-    transfers_path: &Path,
-    limit: i64,
-) -> Result<Vec<String>, ExportError> {
-    start_pending_export_jobs_with_options(
-        pool,
-        storage,
-        transfers_path,
-        limit,
-        ExportZipOptions::default(),
-    )
-    .await
-}
-
-pub async fn start_pending_export_jobs_with_runtime(
-    pool: &SqlitePool,
-    storage: &SharedBlobStorage,
-    transfers_path: &Path,
-    limit: i64,
-    execution: &ExportExecutionContext,
-) -> Result<Vec<String>, ExportError> {
-    start_pending_export_jobs_inner(pool, storage, transfers_path, limit, execution.job_runner())
-        .await
-}
-
-pub async fn start_pending_export_jobs_with_options(
-    pool: &SqlitePool,
-    storage: &SharedBlobStorage,
-    transfers_path: &Path,
-    limit: i64,
     zip_options: ExportZipOptions,
-) -> Result<Vec<String>, ExportError> {
-    start_pending_export_jobs_inner(
-        pool,
-        storage,
-        transfers_path,
-        limit,
-        ExportJobRunner {
-            zip_options: zip_options.normalized(),
-            worker_slots: None,
-        },
-    )
-    .await
+    notify: Arc<Notify>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        match claim_oldest_export_job(&pool).await {
+            Ok(Some(work)) => {
+                let job_id = work.id.clone();
+                notify.notify_one();
+                if !is_safe_export_job_id(&job_id) {
+                    if let Err(error) =
+                        mark_export_failed(&pool, &job_id, "export job identifier is unsafe").await
+                    {
+                        tracing::error!(
+                            ?error,
+                            %job_id,
+                            worker_number,
+                            "failed to quarantine an unsafe export job"
+                        );
+                    }
+                    continue;
+                }
+                let result = {
+                    let job = run_claimed_export_job(
+                        &pool,
+                        storage.as_ref(),
+                        &transfers_path,
+                        &work,
+                        zip_options,
+                    );
+                    tokio::pin!(job);
+                    tokio::select! {
+                        result = &mut job => result,
+                        _ = shutdown.changed() => job.await,
+                    }
+                };
+                if let Err(error) = result
+                    && !matches!(&error, ExportError::ExportCancelled)
+                    && let Err(mark_error) =
+                        mark_export_failed(&pool, &job_id, &error.to_string()).await
+                {
+                    tracing::error!(
+                        ?mark_error,
+                        %job_id,
+                        worker_number,
+                        "failed to record export worker failure"
+                    );
+                }
+            }
+            Ok(None) => {
+                tokio::select! {
+                    _ = shutdown.changed() => return,
+                    () = notify.notified() => {}
+                }
+            }
+            Err(error) => {
+                tracing::error!(
+                    ?error,
+                    worker_number,
+                    "export dispatcher could not claim queued work"
+                );
+                tokio::select! {
+                    _ = shutdown.changed() => return,
+                    () = notify.notified() => {}
+                }
+            }
+        }
+    }
 }
 
-async fn start_pending_export_jobs_inner(
-    pool: &SqlitePool,
-    storage: &SharedBlobStorage,
-    transfers_path: &Path,
-    limit: i64,
-    runner: ExportJobRunner,
-) -> Result<Vec<String>, ExportError> {
-    let job_ids = sqlx::query_scalar::<_, String>(
-        r"
-        SELECT id
-        FROM export_jobs
-        WHERE status = 'queued'
-        ORDER BY created_at
-        LIMIT ?
-        ",
-    )
-    .bind(limit.max(1))
-    .fetch_all(pool)
-    .await?;
-    for job_id in &job_ids {
-        start_export_job(
-            pool.clone(),
-            storage.clone(),
-            transfers_path.to_path_buf(),
-            job_id.clone(),
-            runner.clone(),
-        );
+async fn export_dispatcher_poller(
+    notify: Arc<Notify>,
+    mut shutdown: watch::Receiver<bool>,
+    poll_interval: StdDuration,
+) {
+    let mut interval = tokio::time::interval(poll_interval);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Submission notifies are the low-latency path. This fixed poller makes the durable SQLite
+    // queue level-triggered too, including jobs inserted while no request is running.
+    if *shutdown.borrow() {
+        return;
     }
-    Ok(job_ids)
+    interval.tick().await;
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        tokio::select! {
+            _ = shutdown.changed() => return,
+            _ = interval.tick() => notify.notify_one(),
+        }
+    }
 }
 
 pub async fn export_artifact_download(
@@ -884,15 +995,21 @@ pub async fn export_artifact_download(
     })
 }
 
-async fn complete_export_job(
+async fn run_claimed_export_job(
     pool: &SqlitePool,
     storage: &dyn BlobStorageBackend,
     transfers_path: &Path,
-    job_id: &str,
+    claimed: &ExportWorkRow,
     zip_options: ExportZipOptions,
 ) -> Result<(), ExportError> {
-    let Some(work) = claim_export_job(pool, job_id).await? else {
-        return Ok(());
+    let job_id = &claimed.id;
+    if !is_safe_export_job_id(job_id) {
+        return Err(ExportError::UnsafeExportJobId);
+    }
+    let request: ExportRequestPayload = serde_json::from_str(&claimed.request_payload)?;
+    let work = ExportWork {
+        items: request.items,
+        user: serde_json::from_str(&claimed.user_context)?,
     };
     let resolved = resolve_downloads(pool, &work.items, &work.user).await?;
     let downloads = resolved.downloads;
@@ -912,7 +1029,13 @@ async fn complete_export_job(
     {
         Ok(artifact) => artifact,
         Err(error) => {
-            let _ = fs::remove_file(export_temp_path(transfers_path, job_id)).await;
+            if let Err(cleanup_error) = remove_export_temp_file(transfers_path, job_id).await {
+                tracing::warn!(
+                    ?cleanup_error,
+                    %job_id,
+                    "failed to remove unsuccessful export scratch file"
+                );
+            }
             return Err(error);
         }
     };
@@ -937,21 +1060,13 @@ async fn complete_export_job(
         persist_export_artifact(pool, storage, job_id, &artifact).await
     }
     .await;
-    let _ = fs::remove_file(&artifact.path).await;
+    if let Err(error) = remove_export_temp_file(transfers_path, job_id).await {
+        tracing::warn!(?error, %job_id, "failed to remove export scratch file");
+    }
     if result.is_ok() {
         record_export_events(pool, &downloads, &work.user).await?;
     }
     result
-}
-
-async fn run_export_job(
-    pool: &SqlitePool,
-    storage: &dyn BlobStorageBackend,
-    transfers_path: &Path,
-    job_id: &str,
-    zip_options: ExportZipOptions,
-) -> Result<(), ExportError> {
-    complete_export_job(pool, storage, transfers_path, job_id, zip_options).await
 }
 
 async fn validate_download_queue_selection(
@@ -1074,11 +1189,8 @@ async fn document_ids_in_folder_subtree(
     Ok(builder.build_query_scalar::<i64>().fetch_all(pool).await?)
 }
 
-async fn claim_export_job(
-    pool: &SqlitePool,
-    job_id: &str,
-) -> Result<Option<ExportWork>, ExportError> {
-    let result = sqlx::query(
+async fn claim_oldest_export_job(pool: &SqlitePool) -> Result<Option<ExportWorkRow>, ExportError> {
+    let row = sqlx::query_as::<_, ExportWorkRow>(
         r"
         UPDATE export_jobs
         SET status = 'running',
@@ -1086,32 +1198,22 @@ async fn claim_export_job(
             processed_bytes = 0,
             error = NULL,
             updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?
+        WHERE id = (
+            SELECT id
+            FROM export_jobs
+            WHERE status = 'queued'
+              AND datetime(expires_at) > datetime('now')
+            ORDER BY datetime(created_at), rowid
+            LIMIT 1
+        )
           AND status = 'queued'
+          AND datetime(expires_at) > datetime('now')
+        RETURNING id, request_payload, user_context
         ",
     )
-    .bind(job_id)
-    .execute(pool)
+    .fetch_optional(pool)
     .await?;
-    if result.rows_affected() == 0 {
-        return Ok(None);
-    }
-    let row = sqlx::query_as::<_, ExportWorkRow>(
-        r"
-        SELECT request_payload, user_context
-        FROM export_jobs
-        WHERE id = ?
-        ",
-    )
-    .bind(job_id)
-    .fetch_one(pool)
-    .await?;
-    let request: ExportRequestPayload = serde_json::from_str(&row.request_payload)?;
-    let user: UserContext = serde_json::from_str(&row.user_context)?;
-    Ok(Some(ExportWork {
-        items: request.items,
-        user,
-    }))
+    Ok(row)
 }
 
 async fn update_export_totals(
@@ -1819,9 +1921,28 @@ async fn add_export_byte_progress(
 }
 
 fn export_temp_path(transfers_path: &Path, job_id: &str) -> PathBuf {
+    debug_assert!(is_safe_export_job_id(job_id));
     transfers_path
         .join("exports")
         .join(format!("{job_id}.zip.tmp"))
+}
+
+async fn remove_export_temp_file(transfers_path: &Path, job_id: &str) -> Result<(), ExportError> {
+    if !is_safe_export_job_id(job_id) {
+        return Err(ExportError::UnsafeExportJobId);
+    }
+    match fs::remove_file(export_temp_path(transfers_path, job_id)).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn is_safe_export_job_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || character == '-' || character == '_'
+        })
 }
 
 // Publication and artifact metadata must remain a single visibly ordered failure boundary.
@@ -1970,7 +2091,7 @@ async fn mark_export_failed(
             error = ?,
             updated_at = CURRENT_TIMESTAMP
         WHERE id = ?
-          AND status != 'cancelled'
+          AND status IN ('running', 'finalizing')
         ",
     )
     .bind(error)

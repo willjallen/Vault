@@ -29,6 +29,8 @@ async fn test_state() -> (AppState, tempfile::TempDir) {
         transfer_session_ttl_seconds: 86_400,
         export_ttl_seconds: 86_400,
         export_workers: 1,
+        export_max_active_jobs: 256,
+        export_max_active_jobs_per_user: 16,
         export_zip_compression_threshold_bytes: 3 * 1024 * 1024 * 1024,
         export_zip_compresslevel: 1,
         ttl_sweep_interval_seconds: 60,

@@ -4,7 +4,7 @@ use std::time::Duration;
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode};
 use serde_json::{Value, json};
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 use tower::ServiceExt;
 use vault_server::auth::{AuthMode, AuthSettings};
 use vault_server::config::Config;
@@ -38,6 +38,8 @@ async fn test_state(auth: AuthSettings) -> (AppState, tempfile::TempDir) {
         transfer_session_ttl_seconds: 86_400,
         export_ttl_seconds: 86_400,
         export_workers: 1,
+        export_max_active_jobs: 256,
+        export_max_active_jobs_per_user: 16,
         export_zip_compression_threshold_bytes: 3 * 1024 * 1024 * 1024,
         export_zip_compresslevel: 1,
         ttl_sweep_interval_seconds: 60,
@@ -615,6 +617,37 @@ async fn recovery_requeues_interrupted_exports_and_removes_partial_artifacts() {
 }
 
 #[tokio::test]
+async fn recovery_requiring_a_dispatcher_fails_before_mutating_state() {
+    let (state, _temp_dir) = test_state(AuthSettings::default()).await;
+    insert_export_job_with_expiration(&state.db, "untouched-export", "running", FUTURE_AT).await;
+    let transfers_path = state.config.transfers_path();
+    let export_dir = transfers_path.join("exports");
+    tokio::fs::create_dir_all(&export_dir)
+        .await
+        .expect("export dir");
+    let temp_path = export_dir.join("untouched-export.zip.tmp");
+    tokio::fs::write(&temp_path, b"partial")
+        .await
+        .expect("partial export");
+
+    let error = recover_interrupted_transfers(&state.db, &state.storage, &transfers_path, true)
+        .await
+        .expect_err("recovery without a persistent dispatcher must fail closed");
+    let status: String = sqlx::query_scalar("SELECT status FROM export_jobs WHERE id = ?")
+        .bind("untouched-export")
+        .fetch_one(&state.db)
+        .await
+        .expect("untouched status");
+
+    assert_eq!(
+        error.to_string(),
+        "export startup requires a persistent dispatcher runtime"
+    );
+    assert_eq!(status, "running");
+    assert!(temp_path.is_file());
+}
+
+#[tokio::test]
 async fn recovery_starts_pending_queued_exports() {
     let (state, _temp_dir) = test_state(AuthSettings::default()).await;
     let document_id =
@@ -666,9 +699,15 @@ async fn recovery_starts_pending_queued_exports() {
     .expect("queued export");
     let transfers_path = state.config.transfers_path();
 
-    let result = recover_interrupted_transfers(&state.db, &state.storage, &transfers_path, true)
-        .await
-        .expect("recover");
+    let result = vault_server::transfers::recover_interrupted_transfers_with_export_runtime(
+        &state.db,
+        &state.storage,
+        &transfers_path,
+        true,
+        &state.export_execution,
+    )
+    .await
+    .expect("recover");
     wait_for_export_status(&state.db, "startup-export", "complete").await;
     let artifact_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM export_artifacts WHERE job_id = ?")
@@ -677,8 +716,173 @@ async fn recovery_starts_pending_queued_exports() {
             .await
             .expect("artifact count");
 
-    assert_eq!(result.queued_exports, vec!["startup-export"]);
+    assert!(result.requeued_exports.is_empty());
     assert_eq!(artifact_count, 1);
+}
+
+#[tokio::test]
+async fn recovery_dispatcher_drains_beyond_the_legacy_startup_page() {
+    const QUEUED_JOBS: i64 = 1_001;
+    let (state, _temp_dir) = test_state(AuthSettings::default()).await;
+    let mut transaction = state.db.begin().await.expect("queue transaction");
+    for index in 0..QUEUED_JOBS {
+        sqlx::query(
+            r"
+            INSERT INTO export_jobs
+                (
+                    id,
+                    status,
+                    filename,
+                    total_items,
+                    total_bytes,
+                    created_by,
+                    created_by_name,
+                    user_context,
+                    request_payload,
+                    expires_at
+                )
+            VALUES (?, 'queued', 'poison.zip', 0, 0, 'admin', 'Admin', '{}', '{', ?)
+            ",
+        )
+        .bind(format!("queued-{index:04}"))
+        .bind(FUTURE_AT)
+        .execute(&mut *transaction)
+        .await
+        .expect("queued export");
+    }
+    transaction.commit().await.expect("commit queued exports");
+    let transfers_path = state.config.transfers_path();
+
+    vault_server::transfers::recover_interrupted_transfers_with_export_runtime(
+        &state.db,
+        &state.storage,
+        &transfers_path,
+        true,
+        &state.export_execution,
+    )
+    .await
+    .expect("recover");
+    timeout(Duration::from_secs(20), async {
+        loop {
+            let queued: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM export_jobs WHERE status IN ('queued', 'running')",
+            )
+            .fetch_one(&state.db)
+            .await
+            .expect("remaining queued exports");
+            if queued == 0 {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("dispatcher should drain every queued row");
+    let failed: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM export_jobs WHERE status = 'failed'")
+            .fetch_one(&state.db)
+            .await
+            .expect("failed export count");
+    assert_eq!(failed, QUEUED_JOBS);
+}
+
+#[tokio::test]
+async fn idle_dispatcher_polls_for_db_only_queued_jobs() {
+    let (state, _temp_dir) = test_state(AuthSettings::default()).await;
+    let transfers_path = state.config.transfers_path();
+    let execution = vault_server::exports::ExportExecutionContext::new_with_poll_interval(
+        state.export_execution.settings().clone(),
+        Duration::from_millis(50),
+    );
+    execution.start_dispatcher(&state.db, &state.storage, &transfers_path);
+    // Let the startup notification drain so this insertion has no in-process wake-up paired
+    // with it; the fixed periodic poller must discover the durable row.
+    sleep(Duration::from_millis(100)).await;
+    sqlx::query(
+        r"
+        INSERT INTO export_jobs
+            (
+                id,
+                status,
+                filename,
+                total_items,
+                total_bytes,
+                created_by,
+                created_by_name,
+                user_context,
+                request_payload,
+                expires_at
+            )
+        VALUES ('db-only-export', 'queued', 'poison.zip', 0, 0, 'admin', 'Admin', '{}', '{', ?)
+        ",
+    )
+    .bind(FUTURE_AT)
+    .execute(&state.db)
+    .await
+    .expect("DB-only queued export");
+
+    timeout(Duration::from_secs(3), async {
+        loop {
+            let status: String =
+                sqlx::query_scalar("SELECT status FROM export_jobs WHERE id = 'db-only-export'")
+                    .fetch_one(&state.db)
+                    .await
+                    .expect("DB-only export status");
+            if status == "failed" {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("periodic dispatcher poll should claim DB-only work");
+}
+
+#[tokio::test]
+async fn shutdown_requested_before_start_never_claims_queued_work() {
+    let (state, _temp_dir) = test_state(AuthSettings::default()).await;
+    sqlx::query(
+        r"
+        INSERT INTO export_jobs
+            (
+                id,
+                status,
+                filename,
+                total_items,
+                total_bytes,
+                created_by,
+                created_by_name,
+                user_context,
+                request_payload,
+                expires_at
+            )
+        VALUES ('shutdown-before-start', 'queued', 'poison.zip', 0, 0, 'admin', 'Admin', '{}', '{', ?)
+        ",
+    )
+    .bind(FUTURE_AT)
+    .execute(&state.db)
+    .await
+    .expect("queued export");
+    state.export_execution.request_dispatcher_shutdown();
+    state.export_execution.start_dispatcher(
+        &state.db,
+        &state.storage,
+        &state.config.transfers_path(),
+    );
+    timeout(
+        Duration::from_millis(100),
+        state.export_execution.shutdown_dispatcher(),
+    )
+    .await
+    .expect("shutdown without spawned handles should return promptly");
+    sleep(Duration::from_millis(100)).await;
+
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM export_jobs WHERE id = 'shutdown-before-start'")
+            .fetch_one(&state.db)
+            .await
+            .expect("queued status");
+    assert_eq!(status, "queued");
 }
 
 #[tokio::test]

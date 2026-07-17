@@ -34,6 +34,8 @@ fn rust_config_uses_single_data_dir_defaults() {
     assert_eq!(config.transfer_session_ttl_seconds, 86_400);
     assert_eq!(config.export_ttl_seconds, 86_400);
     assert_eq!(config.export_workers, 1);
+    assert_eq!(config.export_max_active_jobs, 256);
+    assert_eq!(config.export_max_active_jobs_per_user, 16);
     assert_eq!(
         config.export_zip_compression_threshold_bytes,
         3 * 1024 * 1024 * 1024
@@ -84,6 +86,10 @@ fn explicit_runtime_paths_and_site_name_override_data_dir() {
         "120",
         "--export-workers",
         "3",
+        "--export-max-active-jobs",
+        "12",
+        "--export-max-active-jobs-per-user",
+        "4",
         "--export-zip-compression-threshold-bytes",
         "456",
         "--export-zip-compresslevel",
@@ -111,6 +117,8 @@ fn explicit_runtime_paths_and_site_name_override_data_dir() {
     assert_eq!(config.transfer_session_ttl_seconds, 90);
     assert_eq!(config.export_ttl_seconds, 120);
     assert_eq!(config.export_workers, 3);
+    assert_eq!(config.export_max_active_jobs, 12);
+    assert_eq!(config.export_max_active_jobs_per_user, 4);
     assert_eq!(config.export_zip_compression_threshold_bytes, 456);
     assert_eq!(config.export_zip_compresslevel, 7);
     assert_eq!(config.ttl_sweep_interval_seconds, 45);
@@ -131,7 +139,11 @@ fn runtime_numeric_values_normalize_to_python_compatible_bounds() {
         "--export-ttl-seconds",
         "1",
         "--export-workers",
-        "0",
+        "999",
+        "--export-max-active-jobs",
+        "3",
+        "--export-max-active-jobs-per-user",
+        "99",
         "--export-zip-compression-threshold-bytes=-10",
         "--export-zip-compresslevel",
         "99",
@@ -148,12 +160,30 @@ fn runtime_numeric_values_normalize_to_python_compatible_bounds() {
     assert_eq!(config.transfer_chunk_bytes, 1);
     assert_eq!(config.transfer_session_ttl_seconds, 60);
     assert_eq!(config.export_ttl_seconds, 60);
-    assert_eq!(config.export_workers, 1);
+    assert_eq!(config.export_workers, 3);
+    assert_eq!(config.export_max_active_jobs, 3);
+    assert_eq!(config.export_max_active_jobs_per_user, 3);
     assert_eq!(config.export_zip_compression_threshold_bytes, 0);
     assert_eq!(config.export_zip_compresslevel, 9);
     assert_eq!(config.ttl_sweep_interval_seconds, 10);
     assert_eq!(config.gzip_minimum_size, 0);
     assert_eq!(config.gzip_compresslevel, 9);
+}
+
+#[test]
+fn export_worker_count_has_an_absolute_task_bound() {
+    let config = Config::try_parse_from([
+        "vault-server",
+        "--export-workers",
+        "9223372036854775807",
+        "--export-max-active-jobs",
+        "9223372036854775807",
+    ])
+    .expect("config")
+    .normalized();
+
+    assert_eq!(config.export_workers, 64);
+    assert_eq!(config.export_max_active_jobs, i64::MAX);
 }
 
 #[test]
@@ -287,6 +317,10 @@ fn production_compose_uses_latest_image_single_data_volume_and_hardened_defaults
     assert!(compose.contains("VAULT_TRANSFERS_PATH: ${VAULT_TRANSFERS_PATH:-/data/transfers}"));
     assert!(compose.contains("VAULT_EXPORT_TTL_SECONDS: ${VAULT_EXPORT_TTL_SECONDS:-86400}"));
     assert!(compose.contains("VAULT_EXPORT_WORKERS: ${VAULT_EXPORT_WORKERS:-1}"));
+    assert!(compose.contains("VAULT_EXPORT_MAX_ACTIVE_JOBS: ${VAULT_EXPORT_MAX_ACTIVE_JOBS:-256}"));
+    assert!(compose.contains(
+        "VAULT_EXPORT_MAX_ACTIVE_JOBS_PER_USER: ${VAULT_EXPORT_MAX_ACTIVE_JOBS_PER_USER:-16}"
+    ));
     assert!(
         compose.contains(
             "VAULT_EXPORT_ZIP_COMPRESSION_THRESHOLD_BYTES: ${VAULT_EXPORT_ZIP_COMPRESSION_THRESHOLD_BYTES:-3221225472}",

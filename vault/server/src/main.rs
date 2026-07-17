@@ -1,7 +1,9 @@
+use std::future::IntoFuture;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use tokio::net::TcpListener;
+use tokio::sync::oneshot;
 use tracing_subscriber::EnvFilter;
 use vault_server::assets;
 use vault_server::auth::AuthSettings;
@@ -14,6 +16,8 @@ use vault_server::storage::{configured_blob_storage, sweep_legacy_s3_stage_files
 use vault_server::transfers;
 
 use vault_server::db;
+
+const SERVER_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -30,6 +34,7 @@ async fn main() -> anyhow::Result<()> {
     let bind_addr = config.bind_addr();
     tokio::fs::create_dir_all(&transfers_path).await?;
     assets::validate_static_assets(&config.static_dir).await?;
+    let listener = TcpListener::bind(bind_addr).await?;
     let state = AppState::new(config, auth, db, storage);
     let document_sweep = documents::sweep_expired_documents(&state.db, 250).await?;
     transfers::cleanup_upload_session_resources(
@@ -60,12 +65,72 @@ async fn main() -> anyhow::Result<()> {
     sweep_local_multipart_parts(&state).await;
     spawn_ttl_sweeper(state.clone(), transfers_path.clone());
 
+    let export_execution = state.export_execution.clone();
     let app = http::router(state);
 
-    let listener = TcpListener::bind(bind_addr).await?;
     tracing::info!(%bind_addr, "vault rust server listening");
-    axum::serve(listener, app).await?;
+    let (http_shutdown_tx, http_shutdown_rx) = oneshot::channel();
+    let (shutdown_observed_tx, shutdown_observed_rx) = oneshot::channel();
+    let signal_execution = export_execution.clone();
+    let signal_task = tokio::spawn(async move {
+        wait_for_shutdown_signal().await;
+        signal_execution.request_dispatcher_shutdown();
+        let _ = http_shutdown_tx.send(());
+        let _ = shutdown_observed_tx.send(());
+    });
+    let server_result = {
+        let server = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = http_shutdown_rx.await;
+            })
+            .into_future();
+        tokio::pin!(server);
+        tokio::select! {
+            result = &mut server => {
+                signal_task.abort();
+                export_execution.request_dispatcher_shutdown();
+                result
+            }
+            _ = shutdown_observed_rx => {
+                if let Ok(result) =
+                    tokio::time::timeout(SERVER_DRAIN_TIMEOUT, &mut server).await
+                {
+                    result
+                } else {
+                    tracing::warn!(
+                        timeout_seconds = SERVER_DRAIN_TIMEOUT.as_secs(),
+                        "HTTP connections did not drain before the shutdown deadline"
+                    );
+                    Ok(())
+                }
+            }
+        }
+    };
+    export_execution.shutdown_dispatcher().await;
+    server_result?;
     Ok(())
+}
+
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("install SIGTERM handler");
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                if let Err(error) = result {
+                    tracing::error!(?error, "failed to listen for Ctrl-C");
+                }
+            }
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    if let Err(error) = tokio::signal::ctrl_c().await {
+        tracing::error!(?error, "failed to listen for Ctrl-C");
+    }
+    tracing::info!("shutdown requested; draining active export workers");
 }
 
 fn spawn_ttl_sweeper(state: AppState, transfers_path: PathBuf) {

@@ -12,14 +12,14 @@ use tokio::fs;
 use tokio::sync::Mutex;
 
 use crate::blob_lifecycle::collect_unreferenced_blobs_with_limit;
-use crate::exports::{self, ExportError, ExportExecutionContext};
+use crate::exports::{ExportError, ExportExecutionContext};
 use crate::storage::{
     S3_UPLOAD_STAGE_FILENAME, SharedBlobStorage, StorageError, remove_s3_upload_stage_file,
 };
 use crate::uploads::{UploadHashCoordinator, clear_upload_session_files};
 
 const DEFAULT_SWEEP_LIMIT: i64 = 250;
-const DEFAULT_STARTUP_EXPORT_LIMIT: i64 = 1000;
+const DEFAULT_RECOVERY_BLOB_GC_LIMIT: i64 = 1000;
 const MAX_UPLOAD_PART_METADATA_BYTES: u64 = 4096;
 const ORPHAN_UPLOAD_MINIMUM_AGE: Duration = Duration::from_mins(5);
 
@@ -49,7 +49,6 @@ pub struct TransferRecoveryResult {
     pub failed_uploads: Vec<String>,
     pub deleted_upload_temps: Vec<String>,
     pub requeued_exports: Vec<String>,
-    pub queued_exports: Vec<String>,
     pub deleted_export_temps: Vec<String>,
     pub deleted_export_objects: Vec<String>,
 }
@@ -66,6 +65,8 @@ pub enum TransferMaintenanceError {
     Export(#[from] ExportError),
     #[error(transparent)]
     TimeFormat(#[from] time::error::Format),
+    #[error("export startup requires a persistent dispatcher runtime")]
+    ExportDispatcherRequired,
 }
 
 #[derive(Debug, FromRow)]
@@ -346,6 +347,9 @@ async fn recover_interrupted_transfers_inner(
     enqueue_exports: bool,
     export_execution: Option<&ExportExecutionContext>,
 ) -> Result<TransferRecoveryResult, TransferMaintenanceError> {
+    if enqueue_exports && export_execution.is_none() {
+        return Err(TransferMaintenanceError::ExportDispatcherRequired);
+    }
     let now = OffsetDateTime::now_utc().format(&Rfc3339)?;
     let uploads = interrupted_uploads(pool, &now).await?;
     let exports = interrupted_exports(pool, &now).await?;
@@ -422,7 +426,7 @@ async fn recover_interrupted_transfers_inner(
     match collect_unreferenced_blobs_with_limit(
         pool,
         storage.as_ref(),
-        DEFAULT_STARTUP_EXPORT_LIMIT,
+        DEFAULT_RECOVERY_BLOB_GC_LIMIT,
     )
     .await
     {
@@ -432,8 +436,7 @@ async fn recover_interrupted_transfers_inner(
         Err(error) => tracing::warn!(?error, "recovery object garbage collection failed"),
     }
     if enqueue_exports {
-        result.queued_exports =
-            enqueue_pending_exports(pool, storage, transfers_path, export_execution).await?;
+        start_export_dispatcher(pool, storage, transfers_path, export_execution)?;
     }
     Ok(result)
 }
@@ -479,30 +482,16 @@ async fn clear_interrupted_upload_stages(
     deleted
 }
 
-async fn enqueue_pending_exports(
+fn start_export_dispatcher(
     pool: &SqlitePool,
     storage: &SharedBlobStorage,
     transfers_path: &Path,
     export_execution: Option<&ExportExecutionContext>,
-) -> Result<Vec<String>, TransferMaintenanceError> {
-    if let Some(execution) = export_execution {
-        Ok(exports::start_pending_export_jobs_with_runtime(
-            pool,
-            storage,
-            transfers_path,
-            DEFAULT_STARTUP_EXPORT_LIMIT,
-            execution,
-        )
-        .await?)
-    } else {
-        Ok(exports::start_pending_export_jobs(
-            pool,
-            storage,
-            transfers_path,
-            DEFAULT_STARTUP_EXPORT_LIMIT,
-        )
-        .await?)
-    }
+) -> Result<(), TransferMaintenanceError> {
+    let execution = export_execution.ok_or(TransferMaintenanceError::ExportDispatcherRequired)?;
+    execution.start_dispatcher(pool, storage, transfers_path);
+    execution.notify_dispatcher();
+    Ok(())
 }
 
 async fn expired_uploads(

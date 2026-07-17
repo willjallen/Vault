@@ -520,6 +520,114 @@ struct BlockAfterProgressRangeStorage {
     release_range: Arc<Notify>,
 }
 
+#[derive(Debug)]
+struct PanicExportStorage {
+    inner: LocalBlobStorage,
+    panic_object_key: String,
+    panic_count: Arc<AtomicUsize>,
+    entered_panic: Arc<Notify>,
+    release_panic: Arc<Notify>,
+}
+
+#[async_trait]
+impl BlobStorageBackend for PanicExportStorage {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn bucket(&self) -> &str {
+        self.inner.bucket()
+    }
+
+    async fn ensure(&self) -> Result<(), StorageError> {
+        self.inner.ensure().await
+    }
+
+    fn planned_object_key(
+        &self,
+        hash_algo: &str,
+        digest: &str,
+        write_kind: BlobWriteKind,
+    ) -> Result<String, StorageError> {
+        self.inner.planned_object_key(hash_algo, digest, write_kind)
+    }
+
+    async fn put_bytes(&self, data: &[u8]) -> Result<StoredBlob, StorageError> {
+        self.inner.put_bytes(data).await
+    }
+
+    async fn put_file(
+        &self,
+        source_path: &Path,
+        digest: &str,
+        size_bytes: u64,
+    ) -> Result<StoredBlob, StorageError> {
+        self.inner.put_file(source_path, digest, size_bytes).await
+    }
+
+    async fn put_part_files(
+        &self,
+        part_paths: &[PathBuf],
+        expected_digest: Option<&str>,
+    ) -> Result<StoredBlob, StorageError> {
+        self.inner.put_part_files(part_paths, expected_digest).await
+    }
+
+    async fn read_bytes(&self, object_key: &str) -> Result<Vec<u8>, StorageError> {
+        self.inner.read_bytes(object_key).await
+    }
+
+    async fn read_range(
+        &self,
+        object_key: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<u8>, StorageError> {
+        self.inner.read_range(object_key, start, end).await
+    }
+
+    async fn stream_range(
+        &self,
+        object_key: &str,
+        range: BlobReadRange,
+    ) -> Result<BlobByteStream, StorageError> {
+        self.inner.stream_range(object_key, range).await
+    }
+
+    async fn list_object_keys(&self) -> Result<Vec<String>, StorageError> {
+        self.inner.list_object_keys().await
+    }
+
+    async fn delete_object(&self, object_key: &str) -> Result<(), StorageError> {
+        self.inner.delete_object(object_key).await
+    }
+
+    async fn stream_location_range(
+        &self,
+        backend: &str,
+        bucket: &str,
+        object_key: &str,
+        range: BlobReadRange,
+    ) -> Result<BlobByteStream, StorageError> {
+        if object_key != self.panic_object_key {
+            return self
+                .inner
+                .stream_location_range(backend, bucket, object_key, range)
+                .await;
+        }
+        self.require_location(backend, bucket)?;
+        self.entered_panic.notify_one();
+        self.release_panic.notified().await;
+        let panic_count = self.panic_count.clone();
+        Ok(Box::pin(stream::poll_fn(
+            move |_context| -> Poll<Option<Result<Bytes, StorageError>>> {
+                panic_count.fetch_add(1, Ordering::SeqCst);
+                panic!("injected export source panic");
+            },
+        )))
+    }
+}
+
 #[async_trait]
 impl BlobStorageBackend for BlockAfterProgressRangeStorage {
     fn name(&self) -> &str {
@@ -1462,6 +1570,24 @@ async fn wait_for_export_status(
         sleep(Duration::from_millis(20)).await;
     }
     panic!("export {job_id} did not reach {expected}");
+}
+
+async fn create_admin_document_export(app: &axum::Router, document_id: i64) -> String {
+    let response = app
+        .clone()
+        .oneshot(authed_json_post(
+            "/api/exports",
+            "admin",
+            "vault-admin",
+            &json!({"items": [{"type": "document", "id": document_id}]}),
+        ))
+        .await
+        .expect("document export response");
+    assert_eq!(response.status(), StatusCode::OK);
+    response_json(response).await["id"]
+        .as_str()
+        .expect("document export job id")
+        .to_string()
 }
 
 async fn wait_for_export_status_in_db(pool: &sqlx::SqlitePool, job_id: &str, expected: &str) {
@@ -2432,6 +2558,190 @@ async fn api_download_multi_selection_returns_accepted_export_job() {
             .expect("download url")
             .starts_with("/api/exports/")
     );
+}
+
+#[tokio::test]
+async fn bulk_export_with_an_empty_file_completes_and_reports_activity_timestamps() {
+    let (state, _temp_dir) = test_state().await;
+    let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
+        .await
+        .expect("root");
+    let small_bytes = vec![b'x'; 518];
+    let small = insert_stored_document(
+        &state.db,
+        &state.storage,
+        root.id,
+        "a-small.txt",
+        &small_bytes,
+    )
+    .await;
+    let empty =
+        insert_stored_document(&state.db, &state.storage, root.id, "b-empty.txt", b"").await;
+    let app = http::router(state);
+
+    let response = app
+        .clone()
+        .oneshot(authed_json_post(
+            "/api/exports",
+            "admin",
+            "vault-admin",
+            &json!({
+                "items": [
+                    {"type": "document", "id": small},
+                    {"type": "document", "id": empty}
+                ]
+            }),
+        ))
+        .await
+        .expect("export response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let queued = response_json(response).await;
+    let created_at =
+        OffsetDateTime::parse(queued["created_at"].as_str().expect("created_at"), &Rfc3339)
+            .expect("RFC3339 created_at");
+    let queued_updated_at =
+        OffsetDateTime::parse(queued["updated_at"].as_str().expect("updated_at"), &Rfc3339)
+            .expect("RFC3339 updated_at");
+    assert!(queued_updated_at >= created_at);
+
+    let completed = wait_for_export_status(
+        app.clone(),
+        queued["id"].as_str().expect("id"),
+        "admin",
+        "vault-admin",
+        "complete",
+    )
+    .await;
+    let completed_updated_at = OffsetDateTime::parse(
+        completed["updated_at"]
+            .as_str()
+            .expect("completed updated_at"),
+        &Rfc3339,
+    )
+    .expect("RFC3339 completed updated_at");
+    assert_eq!(completed["created_at"], queued["created_at"]);
+    assert!(completed_updated_at >= queued_updated_at);
+    assert_eq!(completed["total_items"], 2);
+    assert_eq!(completed["processed_items"], 2);
+    assert_eq!(completed["total_bytes"], 518);
+    assert_eq!(completed["processed_bytes"], 518);
+
+    let download = app
+        .oneshot(authed_get(
+            completed["download_url"].as_str().expect("download url"),
+            "admin",
+            "vault-admin",
+        ))
+        .await
+        .expect("download response");
+    assert_eq!(download.status(), StatusCode::OK);
+    let zip = to_bytes(download.into_body(), usize::MAX)
+        .await
+        .expect("zip body");
+    let entries = local_zip_entries(&zip);
+    let small_entry = entries
+        .iter()
+        .find(|entry| entry.name == "a-small.txt")
+        .expect("small entry");
+    let empty_entry = entries
+        .iter()
+        .find(|entry| entry.name == "b-empty.txt")
+        .expect("empty entry");
+    assert_eq!(entries.len(), 2);
+    assert_eq!(zip_entry_payload(small_entry), small_bytes);
+    assert!(zip_entry_payload(empty_entry).is_empty());
+}
+
+#[tokio::test]
+async fn export_dispatcher_contains_job_panic_and_serves_the_next_job() {
+    let (mut state, _temp_dir) = test_state().await;
+    let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
+        .await
+        .expect("root");
+    let panicking_document = insert_stored_document(
+        &state.db,
+        &state.storage,
+        root.id,
+        "a-panics.txt",
+        b"panic source",
+    )
+    .await;
+    let healthy_document = insert_stored_document(
+        &state.db,
+        &state.storage,
+        root.id,
+        "b-healthy.txt",
+        b"healthy source",
+    )
+    .await;
+    let panic_object_key = sqlx::query_scalar::<_, String>(
+        r"
+        SELECT l.object_key
+        FROM document_versions v
+        JOIN blob_locations l ON l.blob_id = v.blob_id
+        WHERE v.document_id = ?
+        ",
+    )
+    .bind(panicking_document)
+    .fetch_one(&state.db)
+    .await
+    .expect("panic source object key");
+    let panic_count = Arc::new(AtomicUsize::new(0));
+    let entered_panic = Arc::new(Notify::new());
+    let release_panic = Arc::new(Notify::new());
+    state.storage = Arc::new(PanicExportStorage {
+        inner: LocalBlobStorage::new(state.config.objects_path(), &state.config.storage_prefix),
+        panic_object_key,
+        panic_count: panic_count.clone(),
+        entered_panic: entered_panic.clone(),
+        release_panic: release_panic.clone(),
+    });
+    let pool = state.db.clone();
+    let transfers_path = state.config.transfers_path();
+    let app = http::router(state);
+
+    let failed_job_id = create_admin_document_export(&app, panicking_document).await;
+    timeout(Duration::from_secs(5), entered_panic.notified())
+        .await
+        .expect("panicking export should enter its poisoned source");
+
+    let healthy_job_id = create_admin_document_export(&app, healthy_document).await;
+    let healthy_queued: String = sqlx::query_scalar("SELECT status FROM export_jobs WHERE id = ?")
+        .bind(&healthy_job_id)
+        .fetch_one(&pool)
+        .await
+        .expect("healthy queued status");
+    assert_eq!(healthy_queued, "queued");
+
+    release_panic.notify_one();
+    let failed = wait_for_export_status(
+        app.clone(),
+        &failed_job_id,
+        "admin",
+        "vault-admin",
+        "failed",
+    )
+    .await;
+    assert_eq!(failed["error"], "Export failed unexpectedly. Please retry.");
+    assert_eq!(panic_count.load(Ordering::SeqCst), 1);
+    wait_for_path_missing(
+        &transfers_path
+            .join("exports")
+            .join(format!("{failed_job_id}.zip.tmp")),
+    )
+    .await;
+    let failed_artifacts: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM export_artifacts WHERE job_id = ?")
+            .bind(&failed_job_id)
+            .fetch_one(&pool)
+            .await
+            .expect("failed artifact count");
+    assert_eq!(failed_artifacts, 0);
+
+    let healthy =
+        wait_for_export_status(app, &healthy_job_id, "admin", "vault-admin", "complete").await;
+    assert!(healthy["download_url"].as_str().is_some());
+    assert_eq!(panic_count.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

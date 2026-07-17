@@ -40,6 +40,9 @@ export function transferTitle(transfer) {
   if (transfer.kind === "upload" && transfer.resumedBytes > 0) {
     return "Resuming upload";
   }
+  if (transfer.kind === "download" && transfer.serverStatus === "queued") {
+    return "Waiting to prepare download";
+  }
   if (transfer.kind === "download" && transfer.stage === "preparing") {
     return "Preparing download";
   }
@@ -64,6 +67,21 @@ export function transferStageLabel(transfer) {
   }
   if (transfer.kind === "upload" && transfer.stage === "resuming") {
     return "Previous upload found";
+  }
+  if (transfer.kind === "download" && transfer.serverStatus === "queued") {
+    return "Export queued";
+  }
+  if (
+    transfer.kind === "download" &&
+    transfer.serverStatus === "running" &&
+    Number.isFinite(transfer.totalItems) &&
+    transfer.totalItems > 0
+  ) {
+    const processedItems = Number.isFinite(transfer.processedItems)
+      ? Math.max(0, transfer.processedItems)
+      : 0;
+    const itemNumber = Math.min(transfer.totalItems, processedItems + 1);
+    return `Packaging item ${itemNumber} of ${transfer.totalItems}`;
   }
   if (transfer.kind === "download" && transfer.stage === "preparing") {
     return "Server export";
@@ -116,6 +134,65 @@ function uploadResumeSuffix(transfer) {
   return "";
 }
 
+function noProgressMeta(transfer) {
+  const seconds = Math.floor(Number(transfer.noProgressSeconds));
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    return "";
+  }
+  return transfer.serverStatus === "queued"
+    ? `Waiting for worker for ${seconds}s`
+    : `No progress reported for ${seconds}s`;
+}
+
+function hasKnownTotal(transfer) {
+  if (transfer.total === null || transfer.total === undefined) {
+    return false;
+  }
+  const total = Number(transfer.total);
+  return Number.isFinite(total) && total >= 0;
+}
+
+function serverFinalizingMeta(transfer) {
+  const noProgress = noProgressMeta(transfer);
+  const pieces = noProgress ? [noProgress] : [];
+  pieces.push(
+    hasKnownTotal(transfer)
+      ? `${formatBytes(transfer.total, { emptyForZero: false })} packaged`
+      : "Finalizing"
+  );
+  return pieces.join(" - ");
+}
+
+function activeTransferMeta(transfer) {
+  const noProgress = noProgressMeta(transfer);
+  const pieces = noProgress ? [noProgress] : [];
+  if (transfer.percent !== null && transfer.percent !== undefined) {
+    pieces.push(formatPercent(transfer.percent));
+  }
+  if (hasKnownTotal(transfer)) {
+    pieces.push(
+      `${formatBytes(transfer.loaded || 0, { emptyForZero: false })} of ${formatBytes(
+        transfer.total,
+        { emptyForZero: false }
+      )}`
+    );
+  } else if (transfer.loaded) {
+    pieces.push(formatBytes(transfer.loaded));
+  }
+  if (!noProgress && transfer.bytesPerSecond > 0) {
+    pieces.push(`${formatBytes(transfer.bytesPerSecond, { emptyForZero: false })}/s`);
+  }
+  const resumeSuffix = uploadResumeSuffix(transfer);
+  if (resumeSuffix) {
+    pieces.push(resumeSuffix);
+  }
+  const eta = noProgress ? "" : formatEta(transfer.etaSeconds);
+  if (eta) {
+    pieces.push(eta);
+  }
+  return pieces.join(" - ") || "Starting";
+}
+
 export function transferMeta(transfer) {
   if (transfer.status === "browser-managed") {
     return "Your browser controls the download location and progress";
@@ -136,34 +213,14 @@ export function transferMeta(transfer) {
     return transfer.total ? `${formatBytes(transfer.total)} received` : "Finalizing";
   }
   if (transfer.kind === "download" && transfer.stage === "server-finalizing") {
-    return transfer.total ? `${formatBytes(transfer.total)} packaged` : "Finalizing";
+    return serverFinalizingMeta(transfer);
   }
   const resumeMeta = uploadResumeMeta(transfer);
   if (resumeMeta) {
     return resumeMeta;
   }
 
-  const pieces = [];
-  if (transfer.percent !== null && transfer.percent !== undefined) {
-    pieces.push(formatPercent(transfer.percent));
-  }
-  if (transfer.loaded && transfer.total) {
-    pieces.push(`${formatBytes(transfer.loaded)} of ${formatBytes(transfer.total)}`);
-  } else if (transfer.loaded) {
-    pieces.push(formatBytes(transfer.loaded));
-  }
-  if (transfer.bytesPerSecond > 0) {
-    pieces.push(`${formatBytes(transfer.bytesPerSecond, { emptyForZero: false })}/s`);
-  }
-  const resumeSuffix = uploadResumeSuffix(transfer);
-  if (resumeSuffix) {
-    pieces.push(resumeSuffix);
-  }
-  const eta = formatEta(transfer.etaSeconds);
-  if (eta) {
-    pieces.push(eta);
-  }
-  return pieces.join(" - ") || "Starting";
+  return activeTransferMeta(transfer);
 }
 
 function TransferIcon({ kind }) {

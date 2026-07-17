@@ -210,6 +210,33 @@ async fn range_reader_reads_exact_slice() {
 }
 
 #[tokio::test]
+async fn ranked_zero_length_stream_can_be_polled_after_its_probe() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let storage = test_storage(temp_dir.path());
+    let blob = storage.put_bytes(b"").await.expect("empty object");
+    let locations = [BlobLocation {
+        backend: blob.backend,
+        bucket: blob.bucket,
+        object_key: blob.object_key,
+    }];
+
+    let mut stream = open_ranked_location_stream(
+        &storage,
+        &locations,
+        BlobReadRange {
+            expected_size: 0,
+            offset: 0,
+            length: 0,
+        },
+    )
+    .await
+    .expect("ranked empty stream");
+
+    assert!(stream.next().await.is_none());
+    assert!(stream.next().await.is_none());
+}
+
+#[tokio::test]
 async fn range_stream_rejects_object_size_drift_before_returning_headers() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let storage = test_storage(temp_dir.path());

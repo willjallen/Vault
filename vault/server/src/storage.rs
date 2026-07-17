@@ -364,7 +364,13 @@ pub async fn open_ranked_location_stream(
             }
         };
         match source.next().await {
-            None if range.length == 0 => return Ok(source),
+            // Probing consumes the terminal item from a zero-length backend stream. Returning
+            // that already-terminated stream is unsafe because not every `Stream` is fused; in
+            // particular, `Unfold` panics when polled again after yielding `None`. Hand callers a
+            // canonical fused empty stream after the successful probe instead.
+            None if range.length == 0 => {
+                return Ok(Box::pin(stream::empty::<Result<Bytes, StorageError>>()));
+            }
             Some(Ok(first))
                 if range.length > 0
                     && !first.is_empty()

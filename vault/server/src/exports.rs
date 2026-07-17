@@ -329,6 +329,8 @@ pub struct ExportJobPayload {
     pub processed_items: i64,
     pub total_bytes: i64,
     pub processed_bytes: i64,
+    pub created_at: String,
+    pub updated_at: String,
     pub error: Option<String>,
     pub expires_at: String,
     pub download_url: Option<String>,
@@ -407,6 +409,8 @@ struct ExportJobRow {
     processed_items: i64,
     total_bytes: i64,
     processed_bytes: i64,
+    created_at: String,
+    updated_at: String,
     created_by: String,
     error: Option<String>,
     expires_at: String,
@@ -735,6 +739,8 @@ async fn create_export_job_inner(
     .bind(&expires_at)
     .execute(&mut *transaction)
     .await?;
+    let (created_at, updated_at) =
+        export_job_activity_timestamps(&mut transaction, &job_id).await?;
     transaction.commit().await?;
 
     let payload = ExportJobPayload {
@@ -745,6 +751,8 @@ async fn create_export_job_inner(
         processed_items: 0,
         total_bytes,
         processed_bytes: 0,
+        created_at,
+        updated_at,
         error: None,
         expires_at,
         download_url: None,
@@ -754,6 +762,24 @@ async fn create_export_job_inner(
         notify.notify_one();
     }
     Ok(payload)
+}
+
+async fn export_job_activity_timestamps(
+    transaction: &mut Transaction<'_, Sqlite>,
+    job_id: &str,
+) -> Result<(String, String), ExportError> {
+    Ok(sqlx::query_as(
+        r"
+        SELECT
+            strftime('%Y-%m-%dT%H:%M:%SZ', created_at),
+            strftime('%Y-%m-%dT%H:%M:%SZ', updated_at)
+        FROM export_jobs
+        WHERE id = ?
+        ",
+    )
+    .bind(job_id)
+    .fetch_one(&mut **transaction)
+    .await?)
 }
 
 async fn check_export_admission(
@@ -850,32 +876,33 @@ async fn export_dispatcher_worker(
                     }
                     continue;
                 }
-                let result = {
-                    let job = run_claimed_export_job(
-                        &pool,
-                        storage.as_ref(),
-                        &transfers_path,
+                let job_pool = pool.clone();
+                let job_storage = storage.clone();
+                let job_transfers_path = transfers_path.clone();
+                let mut job = tokio::spawn(async move {
+                    run_claimed_export_job(
+                        &job_pool,
+                        job_storage.as_ref(),
+                        &job_transfers_path,
                         &work,
                         zip_options,
-                    );
-                    tokio::pin!(job);
+                    )
+                    .await
+                });
+                let task_result = {
                     tokio::select! {
                         result = &mut job => result,
                         _ = shutdown.changed() => job.await,
                     }
                 };
-                if let Err(error) = result
-                    && !matches!(&error, ExportError::ExportCancelled)
-                    && let Err(mark_error) =
-                        mark_export_failed(&pool, &job_id, &error.to_string()).await
-                {
-                    tracing::error!(
-                        ?mark_error,
-                        %job_id,
-                        worker_number,
-                        "failed to record export worker failure"
-                    );
-                }
+                handle_export_job_task_result(
+                    &pool,
+                    &transfers_path,
+                    &job_id,
+                    worker_number,
+                    task_result,
+                )
+                .await;
             }
             Ok(None) => {
                 tokio::select! {
@@ -893,6 +920,56 @@ async fn export_dispatcher_worker(
                     _ = shutdown.changed() => return,
                     () = notify.notified() => {}
                 }
+            }
+        }
+    }
+}
+
+async fn handle_export_job_task_result(
+    pool: &SqlitePool,
+    transfers_path: &Path,
+    job_id: &str,
+    worker_number: usize,
+    task_result: Result<Result<(), ExportError>, tokio::task::JoinError>,
+) {
+    match task_result {
+        Ok(Ok(()) | Err(ExportError::ExportCancelled)) => {}
+        Ok(Err(error)) => {
+            if let Err(mark_error) = mark_export_failed(pool, job_id, &error.to_string()).await {
+                tracing::error!(
+                    ?mark_error,
+                    %job_id,
+                    worker_number,
+                    "failed to record export worker failure"
+                );
+            }
+        }
+        Err(task_error) => {
+            let failure = "Export failed unexpectedly. Please retry.";
+            tracing::error!(
+                ?task_error,
+                %job_id,
+                worker_number,
+                "export job task failed unexpectedly"
+            );
+            if let Err(mark_error) = mark_export_failed(pool, job_id, failure).await {
+                tracing::error!(
+                    ?mark_error,
+                    %job_id,
+                    worker_number,
+                    "failed to record unexpected export worker failure"
+                );
+            }
+            // This exact path is always safe to remove after the job task has unwound. If a
+            // backend panics later during artifact publication, its transactional pending-blob
+            // lease remains protected and is reclaimed by the existing stale-publication sweep.
+            if let Err(cleanup_error) = remove_export_temp_file(transfers_path, job_id).await {
+                tracing::warn!(
+                    ?cleanup_error,
+                    %job_id,
+                    worker_number,
+                    "failed to remove export scratch file after worker failure"
+                );
             }
         }
     }
@@ -2137,6 +2214,8 @@ async fn export_job_row(
             j.processed_items,
             j.total_bytes,
             j.processed_bytes,
+            strftime('%Y-%m-%dT%H:%M:%SZ', j.created_at) AS created_at,
+            strftime('%Y-%m-%dT%H:%M:%SZ', j.updated_at) AS updated_at,
             j.created_by,
             j.error,
             j.expires_at,
@@ -2163,6 +2242,8 @@ fn export_job_payload(row: ExportJobRow) -> ExportJobPayload {
         processed_items: row.processed_items,
         total_bytes: row.total_bytes,
         processed_bytes: row.processed_bytes,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
         error: row.error,
         expires_at: row.expires_at,
         download_url: has_artifact.then(|| format!("/api/exports/{}/download", row.id)),

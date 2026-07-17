@@ -4,6 +4,7 @@ Unreleased
 
 feat: Permanently delete empty writable unarchived leaf folders while preserving archive actions for nonempty folders.
 fix: Upload all files from picker and drag-and-drop selections to the chosen folder or share with bounded concurrency.
+fix: Complete bulk exports containing empty files, isolate worker failures, and show queue, item, activity, and finalization progress.
 fix: Make resumable uploads content-bound and restart-safe, guard terminal transfer states, isolate failures, and clean abandoned staging.
 fix: Serialize archive, permanent-delete, and retention workflows with atomic audit and state-event bookkeeping.
 fix: Make local blob publication power-loss durable and reconciliation race-safe, fail over between copies, and reclaim orphaned storage.

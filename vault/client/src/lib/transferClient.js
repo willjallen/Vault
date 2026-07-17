@@ -30,6 +30,7 @@ import {
   validateInMemoryCompletionManifest,
   waitForUploadSessionTransition as pollUploadSessionTransition,
 } from "./uploadStatusPolicy.js";
+import { createExportProgressTracker, trackExportJobProgress } from "./exportStatusPolicy.js";
 const EXPORT_POLL_MS = 900;
 const PROGRESS_TICK_MS = 80;
 const SERVER_PROGRESS_RATE_MIN_BYTES = 1024 * 1024;
@@ -71,7 +72,8 @@ async function errorFromResponse(response, fallback) {
 function progressFromValues(loaded, total, startedAt, options = {}) {
   const elapsedSeconds = Math.max((performance.now() - startedAt) / 1000, 0.01);
   const suppressRate =
-    options.stage === "preparing" && loaded > 0 && loaded < SERVER_PROGRESS_RATE_MIN_BYTES;
+    options.noProgressSeconds > 0 ||
+    (options.stage === "preparing" && loaded > 0 && loaded < SERVER_PROGRESS_RATE_MIN_BYTES);
   const bytesPerSecond = suppressRate ? 0 : loaded / elapsedSeconds;
   const finalizing = options.stage === "finalizing" || options.stage === "server-finalizing";
   const etaSeconds =
@@ -80,13 +82,19 @@ function progressFromValues(loaded, total, startedAt, options = {}) {
       : null;
   return {
     bytesPerSecond: finalizing ? 0 : bytesPerSecond,
+    createdAt: options.createdAt || null,
     etaSeconds,
     lengthComputable: Boolean(total),
     loaded,
+    noProgressSeconds: options.noProgressSeconds || 0,
     percent: total ? Math.min(100, Math.max(0, (loaded / total) * 100)) : null,
+    processedItems: options.processedItems ?? null,
     resumedBytes: options.resumedBytes || null,
+    serverStatus: options.serverStatus || null,
     stage: options.stage || "transfer",
     total,
+    totalItems: options.totalItems ?? null,
+    updatedAt: options.updatedAt || null,
   };
 }
 
@@ -918,21 +926,27 @@ export async function exportAndDownload({
       "Could not start export"
     );
     const exportStartedAt = performance.now();
+    const progressTracker = createExportProgressTracker(exportStartedAt);
     let current = job;
     while (!["complete", "failed", "cancelled"].includes(current.status)) {
       throwIfAborted(signal);
+      const serverProgress = trackExportJobProgress(current, progressTracker);
       onProgress(
-        progressFromValues(
-          current.processed_bytes || 0,
-          current.total_bytes || null,
-          exportStartedAt,
-          {
-            stage: current.status === "finalizing" ? "server-finalizing" : "preparing",
-          }
-        )
+        progressFromValues(serverProgress.loaded, serverProgress.total, exportStartedAt, {
+          ...serverProgress,
+          stage:
+            current.status === "queued"
+              ? "queued"
+              : current.status === "finalizing"
+                ? "server-finalizing"
+                : "preparing",
+        })
       );
       await waitFor(EXPORT_POLL_MS, signal);
       current = await requestJson(`/api/exports/${job.id}`, { signal }, "Could not refresh export");
+    }
+    if (current.status === "cancelled") {
+      throw new TransferCancelledError("Export cancelled");
     }
     if (current.status !== "complete" || !current.download_url) {
       throw new Error(current.error || `Export ${current.status}`);

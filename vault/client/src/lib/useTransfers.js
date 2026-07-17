@@ -10,7 +10,7 @@ import { confirmNativeDownload } from "./downloadGuidance.js";
 const { useCallback, useEffect, useRef, useState } = React;
 
 const COMPLETE_HOLD_MS = 1400;
-const ERROR_HOLD_MS = 2600;
+const ERROR_HOLD_MS = 10_000;
 const EXIT_MS = 260;
 
 export function useTransfers({
@@ -75,14 +75,17 @@ export function useTransfers({
         ...current,
         {
           bytesPerSecond: 0,
+          createdAt: null,
           etaSeconds: null,
           id,
           kind,
           loaded: 0,
           name: displayName,
+          noProgressSeconds: 0,
           percent: size ? 0 : null,
           phase: "entering",
           size: size || null,
+          serverStatus: null,
           stage: kind === "upload" ? "uploading" : "starting",
           status: "active",
           total: size || null,
@@ -112,12 +115,18 @@ export function useTransfers({
     (id, progress) => {
       updateTransfer(id, {
         bytesPerSecond: progress.bytesPerSecond,
+        createdAt: progress.createdAt || null,
         etaSeconds: progress.etaSeconds,
         loaded: progress.loaded,
+        noProgressSeconds: progress.noProgressSeconds || 0,
         percent: progress.percent,
+        processedItems: progress.processedItems ?? null,
         resumedBytes: progress.resumedBytes || null,
+        serverStatus: progress.serverStatus || null,
         stage: progress.stage || "transfer",
         total: progress.total,
+        totalItems: progress.totalItems ?? null,
+        updatedAt: progress.updatedAt || null,
       });
     },
     [updateTransfer]

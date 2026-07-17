@@ -331,3 +331,142 @@ test("completed exports are handed directly to the browser", async () => {
   ]);
   assert.equal(result.browserManaged, true);
 });
+
+test("exports report queued, running, and finalizing server progress", async () => {
+  const downloads = installBrowser();
+  const originalSetTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = (callback) => {
+    queueMicrotask(callback);
+    return 1;
+  };
+  const progress = [];
+  const statuses = [
+    {
+      created_at: "2026-07-17T10:00:00Z",
+      id: "export-progress",
+      processed_bytes: 256,
+      processed_items: 0,
+      status: "running",
+      total_bytes: 1024,
+      total_items: 2,
+      updated_at: "2026-07-17T10:00:01Z",
+    },
+    {
+      created_at: "2026-07-17T10:00:00Z",
+      id: "export-progress",
+      processed_bytes: 1024,
+      processed_items: 2,
+      status: "finalizing",
+      total_bytes: 1024,
+      total_items: 2,
+      updated_at: "2026-07-17T10:00:02Z",
+    },
+    {
+      download_url: "/api/exports/export-progress/download",
+      filename: "vault-download.zip",
+      id: "export-progress",
+      processed_bytes: 1024,
+      processed_items: 2,
+      size_bytes: 512,
+      status: "complete",
+      total_bytes: 1024,
+      total_items: 2,
+    },
+  ];
+  try {
+    globalThis.fetch = async (url, options = {}) => {
+      if (url === "/api/exports" && options.method === "POST") {
+        return {
+          json: async () => ({
+            created_at: "2026-07-17T10:00:00Z",
+            id: "export-progress",
+            processed_bytes: 0,
+            processed_items: 0,
+            status: "queued",
+            total_bytes: 1024,
+            total_items: 2,
+            updated_at: "2026-07-17T10:00:00Z",
+          }),
+          ok: true,
+          status: 200,
+        };
+      }
+      assert.equal(url, "/api/exports/export-progress");
+      assert.equal(options.method, undefined);
+      const status = statuses.shift();
+      assert.ok(status);
+      return { json: async () => status, ok: true, status: 200 };
+    };
+
+    const result = await exportAndDownload({
+      onProgress: (nextProgress) => progress.push(nextProgress),
+      payload: { items: [{ id: 1, type: "folder" }] },
+      signal: new AbortController().signal,
+    });
+
+    const queued = progress.find((nextProgress) => nextProgress.serverStatus === "queued");
+    const running = progress.find((nextProgress) => nextProgress.serverStatus === "running");
+    const finalizing = progress.find((nextProgress) => nextProgress.serverStatus === "finalizing");
+    assert.equal(queued.stage, "queued");
+    assert.equal(queued.loaded, 0);
+    assert.equal(queued.total, 1024);
+    assert.equal(queued.totalItems, 2);
+    assert.equal(running.stage, "preparing");
+    assert.equal(running.loaded, 256);
+    assert.equal(running.processedItems, 0);
+    assert.equal(finalizing.stage, "server-finalizing");
+    assert.equal(finalizing.processedItems, 2);
+    assert.equal(progress.at(-1).stage, "browser-handoff");
+    assert.equal(result.browserManaged, true);
+    assert.equal(statuses.length, 0);
+    assert.equal(
+      downloads.at(-1).href,
+      "https://vault.example/api/exports/export-progress/download"
+    );
+  } finally {
+    globalThis.setTimeout = originalSetTimeout;
+  }
+});
+
+test("server-cancelled exports map to transfer cancellation", async () => {
+  installBrowser();
+  const originalSetTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = (callback) => {
+    queueMicrotask(callback);
+    return 1;
+  };
+  const requests = [];
+  try {
+    globalThis.fetch = async (url, options = {}) => {
+      requests.push({ method: options.method || "GET", url });
+      if (url === "/api/exports" && options.method === "POST") {
+        return {
+          json: async () => ({ id: "export-cancelled", status: "queued" }),
+          ok: true,
+          status: 200,
+        };
+      }
+      return {
+        json: async () => ({ id: "export-cancelled", status: "cancelled" }),
+        ok: true,
+        status: 200,
+      };
+    };
+
+    await assert.rejects(
+      exportAndDownload({
+        onProgress: () => {},
+        payload: { items: [{ id: 1, type: "folder" }] },
+        signal: new AbortController().signal,
+      }),
+      (error) => error instanceof TransferCancelledError
+    );
+    assert.deepEqual(requests, [
+      { method: "POST", url: "/api/exports" },
+      { method: "GET", url: "/api/exports/export-cancelled" },
+      { method: "DELETE", url: "/api/exports/export-cancelled" },
+    ]);
+  } finally {
+    globalThis.setTimeout = originalSetTimeout;
+  }
+});

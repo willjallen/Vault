@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 use vault_server::auth::AuthSettings;
@@ -6,8 +7,11 @@ use vault_server::config::Config;
 use vault_server::db;
 use vault_server::folders::{VAULT_ROOT_KEY, get_root_folder};
 use vault_server::http::AppState;
-use vault_server::reconciliation::storage_reconciliation_report;
-use vault_server::storage::LocalBlobStorage;
+use vault_server::reconciliation::{
+    storage_reconciliation_report, storage_reconciliation_report_with_multipart_part_age,
+    sweep_unreferenced_multipart_parts_with_options,
+};
+use vault_server::storage::{LocalBlobStorage, StoredBlob};
 
 async fn test_state() -> (AppState, tempfile::TempDir) {
     let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -131,7 +135,53 @@ async fn insert_stored_document(
 }
 
 fn local_storage(state: &AppState) -> LocalBlobStorage {
-    LocalBlobStorage::new(state.config.objects_path(), &state.config.storage_prefix)
+    state.local_storage_maintenance.clone()
+}
+
+async fn insert_referenced_multipart_blob(state: &AppState, stored: &StoredBlob, name: &str) {
+    let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
+        .await
+        .expect("root");
+    let blob_id = sqlx::query("INSERT INTO blobs (hash_algo, hash, size_bytes) VALUES (?, ?, ?)")
+        .bind(&stored.hash_algo)
+        .bind(&stored.digest)
+        .bind(i64::try_from(stored.size_bytes).expect("blob size"))
+        .execute(&state.db)
+        .await
+        .expect("multipart blob")
+        .last_insert_rowid();
+    sqlx::query(
+        "INSERT INTO blob_locations (blob_id, backend, bucket, object_key) VALUES (?, 'local', '', ?)",
+    )
+    .bind(blob_id)
+    .bind(&stored.object_key)
+    .execute(&state.db)
+    .await
+    .expect("multipart location");
+    let document_id = sqlx::query(
+        "INSERT INTO documents (folder_id, name, created_by, latest_modified_by) VALUES (?, ?, 'admin', 'admin')",
+    )
+    .bind(root.id)
+    .bind(name)
+    .execute(&state.db)
+    .await
+    .expect("multipart document")
+    .last_insert_rowid();
+    sqlx::query(
+        r"
+        INSERT INTO document_versions
+            (id, document_id, blob_id, version_number, committed_by, message, original_filename, created_via)
+        VALUES
+            (?, ?, ?, 1, 'admin', 'multipart', ?, 'upload')
+        ",
+    )
+    .bind(format!("multipart-version-{document_id}"))
+    .bind(document_id)
+    .bind(blob_id)
+    .bind(name)
+    .execute(&state.db)
+    .await
+    .expect("multipart version");
 }
 
 async fn reconciliation_report(
@@ -311,4 +361,193 @@ async fn apply_preserves_remote_orphan_metadata_without_local_delete_support() {
             "objects/sha256/remote-only".to_string(),
         ),
     );
+}
+
+#[tokio::test]
+async fn reconciliation_removes_only_aged_parts_outside_the_current_layout() {
+    let (state, _temp_dir) = test_state().await;
+    let storage = local_storage(&state);
+    let source_dir = state.config.data_dir.join("multipart-sources");
+    tokio::fs::create_dir_all(&source_dir)
+        .await
+        .expect("source directory");
+    let old_first = source_dir.join("old-first.part");
+    let old_second = source_dir.join("old-second.part");
+    let new_first = source_dir.join("new-first.part");
+    let new_second = source_dir.join("new-second.part");
+    for (path, bytes) in [
+        (&old_first, b"abc".as_slice()),
+        (&old_second, b"defgh".as_slice()),
+        (&new_first, b"abcd".as_slice()),
+        (&new_second, b"efgh".as_slice()),
+    ] {
+        tokio::fs::write(path, bytes).await.expect("source part");
+    }
+    let digest = sha256_hex(b"abcdefgh");
+    let old = storage
+        .put_part_files(&[old_first, old_second], Some(&digest))
+        .await
+        .expect("old layout");
+    let old_manifest = storage
+        .read_multipart_manifest(&old.object_key)
+        .await
+        .expect("old manifest");
+    tokio::fs::remove_file(storage.root().join(&old.object_key))
+        .await
+        .expect("remove old manifest");
+    let current = storage
+        .put_part_files(&[new_first, new_second], Some(&digest))
+        .await
+        .expect("current layout");
+    let current_manifest = storage
+        .read_multipart_manifest(&current.object_key)
+        .await
+        .expect("current manifest");
+    insert_referenced_multipart_blob(&state, &current, "multipart.bin").await;
+
+    let mut dry_run = storage_reconciliation_report_with_multipart_part_age(
+        &state.db,
+        &storage,
+        false,
+        Duration::ZERO,
+    )
+    .await
+    .expect("dry-run reconciliation");
+    let mut applied = storage_reconciliation_report_with_multipart_part_age(
+        &state.db,
+        &storage,
+        true,
+        Duration::ZERO,
+    )
+    .await
+    .expect("apply reconciliation");
+    let mut old_keys = old_manifest
+        .parts
+        .iter()
+        .map(|part| part.object_key.clone())
+        .collect::<Vec<_>>();
+    old_keys.sort();
+    dry_run.unreferenced_multipart_part_keys.sort();
+    applied.deleted_multipart_part_keys.sort();
+
+    assert_eq!(dry_run.unreferenced_multipart_part_keys, old_keys);
+    assert_eq!(applied.deleted_multipart_part_keys, old_keys);
+    assert!(old_manifest.parts.iter().all(|part| !part.path.exists()));
+    assert!(
+        current_manifest
+            .parts
+            .iter()
+            .all(|part| part.path.is_file())
+    );
+    assert_eq!(
+        storage
+            .read_bytes(&current.object_key)
+            .await
+            .expect("current layout remains readable"),
+        b"abcdefgh"
+    );
+}
+
+#[tokio::test]
+async fn multipart_part_sweep_respects_age_and_pending_publications() {
+    let (state, _temp_dir) = test_state().await;
+    let storage = local_storage(&state);
+    let source = state.config.data_dir.join("orphan-source.part");
+    tokio::fs::write(&source, b"orphan bytes")
+        .await
+        .expect("orphan source");
+    let digest = sha256_hex(b"orphan bytes");
+    let stored = storage
+        .put_part_files(&[source], Some(&digest))
+        .await
+        .expect("multipart object");
+    let manifest = storage
+        .read_multipart_manifest(&stored.object_key)
+        .await
+        .expect("manifest");
+    tokio::fs::remove_file(storage.root().join(&stored.object_key))
+        .await
+        .expect("remove manifest");
+    let blob_id =
+        sqlx::query("INSERT INTO blobs (hash_algo, hash, size_bytes) VALUES ('sha256', ?, ?)")
+            .bind(&digest)
+            .bind(i64::try_from(stored.size_bytes).expect("size"))
+            .execute(&state.db)
+            .await
+            .expect("pending blob")
+            .last_insert_rowid();
+    sqlx::query(
+        "INSERT INTO blob_locations (blob_id, backend, bucket, object_key) VALUES (?, '_vault_pending:test:local', '', ?)",
+    )
+    .bind(blob_id)
+    .bind(&stored.object_key)
+    .execute(&state.db)
+    .await
+    .expect("pending location");
+
+    let young = sweep_unreferenced_multipart_parts_with_options(
+        &state.db,
+        &storage,
+        Duration::from_hours(1),
+        1024,
+    )
+    .await
+    .expect("young sweep");
+    let pending =
+        sweep_unreferenced_multipart_parts_with_options(&state.db, &storage, Duration::ZERO, 1024)
+            .await
+            .expect("pending sweep");
+    assert!(young.deleted_multipart_part_keys.is_empty());
+    assert!(pending.deleted_multipart_part_keys.is_empty());
+    assert!(manifest.parts[0].path.is_file());
+
+    sqlx::query("DELETE FROM blob_locations WHERE blob_id = ?")
+        .bind(blob_id)
+        .execute(&state.db)
+        .await
+        .expect("remove pending lease");
+    sqlx::query("DELETE FROM blobs WHERE id = ?")
+        .bind(blob_id)
+        .execute(&state.db)
+        .await
+        .expect("remove pending blob");
+    let deleted =
+        sweep_unreferenced_multipart_parts_with_options(&state.db, &storage, Duration::ZERO, 1024)
+            .await
+            .expect("unleased sweep");
+    assert_eq!(
+        deleted.deleted_multipart_part_keys,
+        vec![manifest.parts[0].object_key.clone()]
+    );
+    assert!(!manifest.parts[0].path.exists());
+}
+
+#[tokio::test]
+async fn multipart_part_sweep_preserves_referenced_parts_when_the_manifest_is_missing() {
+    let (state, _temp_dir) = test_state().await;
+    let storage = local_storage(&state);
+    let source = state.config.data_dir.join("referenced-source.part");
+    tokio::fs::write(&source, b"referenced bytes")
+        .await
+        .expect("referenced source");
+    let stored = storage
+        .put_part_files(&[source], Some(&sha256_hex(b"referenced bytes")))
+        .await
+        .expect("referenced multipart object");
+    let manifest = storage
+        .read_multipart_manifest(&stored.object_key)
+        .await
+        .expect("referenced manifest");
+    insert_referenced_multipart_blob(&state, &stored, "referenced.bin").await;
+    tokio::fs::remove_file(storage.root().join(&stored.object_key))
+        .await
+        .expect("remove referenced manifest");
+
+    let swept =
+        sweep_unreferenced_multipart_parts_with_options(&state.db, &storage, Duration::ZERO, 1024)
+            .await
+            .expect("referenced missing-manifest sweep");
+
+    assert!(swept.deleted_multipart_part_keys.is_empty());
+    assert!(manifest.parts[0].path.is_file());
 }

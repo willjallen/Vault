@@ -8,6 +8,7 @@ use vault_server::auth::AuthSettings;
 use vault_server::config::Config;
 use vault_server::documents;
 use vault_server::http::{self, AppState};
+use vault_server::reconciliation;
 use vault_server::state_events::notify_state_event_committed;
 use vault_server::storage::configured_blob_storage;
 use vault_server::transfers;
@@ -55,6 +56,7 @@ async fn main() -> anyhow::Result<()> {
         &state.export_execution,
     )
     .await?;
+    sweep_local_multipart_parts(&state).await;
     spawn_ttl_sweeper(state.clone(), transfers_path.clone());
 
     let app = http::router(state);
@@ -96,8 +98,28 @@ fn spawn_ttl_sweeper(state: AppState, transfers_path: PathBuf) {
             {
                 tracing::error!(%error, "transfer TTL sweep failed");
             }
+            sweep_local_multipart_parts(&state).await;
         }
     });
+}
+
+async fn sweep_local_multipart_parts(state: &AppState) {
+    if !state
+        .config
+        .storage_backend
+        .trim()
+        .eq_ignore_ascii_case("local")
+    {
+        return;
+    }
+    if let Err(error) = reconciliation::sweep_unreferenced_multipart_parts(
+        &state.db,
+        &state.local_storage_maintenance,
+    )
+    .await
+    {
+        tracing::warn!(?error, "multipart part garbage collection failed");
+    }
 }
 
 fn init_tracing() {

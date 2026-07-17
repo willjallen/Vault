@@ -98,6 +98,7 @@ pub struct AppState {
     pub auth: Arc<AuthSettings>,
     pub db: DbPool,
     pub storage: SharedBlobStorage,
+    pub local_storage_maintenance: LocalBlobStorage,
     pub export_execution: Arc<ExportExecutionContext>,
     pub upload_hash_coordinator: uploads::UploadHashCoordinator,
     pub transfer_maintenance: transfers::TransferMaintenanceCoordinator,
@@ -129,11 +130,14 @@ impl AppState {
         let export_execution = Arc::new(ExportExecutionContext::new(export_runtime_settings(
             &config,
         )));
+        let local_storage_maintenance =
+            LocalBlobStorage::new(config.objects_path(), &config.storage_prefix);
         Self {
             config: Arc::new(config),
             auth: Arc::new(auth),
             db,
             storage,
+            local_storage_maintenance,
             export_execution,
             upload_hash_coordinator: uploads::UploadHashCoordinator::new(),
             transfer_maintenance: transfers::TransferMaintenanceCoordinator::default(),
@@ -920,17 +924,36 @@ async fn api_admin_debug_sweep_ttl(
     if documents.has_state_changes() {
         notify_state_event_committed();
     }
+    let transfer_result = transfers::sweep_expired_transfers(
+        &state.db,
+        &state.storage,
+        &transfers_path,
+        &state.upload_hash_coordinator,
+        &state.transfer_maintenance,
+    )
+    .await?;
+    let multipart_parts = if state
+        .config
+        .storage_backend
+        .trim()
+        .eq_ignore_ascii_case("local")
+    {
+        Some(
+            reconciliation::sweep_unreferenced_multipart_parts(
+                &state.db,
+                &state.local_storage_maintenance,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
     Ok(Json(debug_action_result(json!({
         "action": "sweep-ttl",
         "result": {
             "documents": documents,
-            "transfers": transfers::sweep_expired_transfers(
-                &state.db,
-                &state.storage,
-                &transfers_path,
-                &state.upload_hash_coordinator,
-                &state.transfer_maintenance,
-            ).await?,
+            "transfers": transfer_result,
+            "multipart_parts": multipart_parts,
         },
     }))))
 }
@@ -940,11 +963,13 @@ async fn api_admin_debug_storage_report(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     let _user = require_dev_admin(&state, &headers).await?;
-    let local_storage =
-        LocalBlobStorage::new(state.config.objects_path(), &state.config.storage_prefix);
     Ok(Json(debug_action_result(json!({
         "action": "storage-report",
-        "report": reconciliation::storage_reconciliation_report(&state.db, &local_storage, false).await?,
+        "report": reconciliation::storage_reconciliation_report(
+            &state.db,
+            &state.local_storage_maintenance,
+            false,
+        ).await?,
     }))))
 }
 

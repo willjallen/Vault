@@ -2,7 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex as StdMutex, Weak};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
+use std::time::{Duration as StdDuration, SystemTime};
 
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
@@ -18,7 +19,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tokio::sync::{OwnedRwLockReadGuard, RwLock};
+use tokio::sync::{Mutex, OwnedRwLockReadGuard, RwLock};
 use uuid::Uuid;
 
 use crate::config::Config;
@@ -86,6 +87,13 @@ pub struct LocalMultipartManifest {
     pub digest: String,
     pub size_bytes: u64,
     pub parts: Vec<LocalMultipartPart>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalMultipartPartObject {
+    pub object_key: String,
+    pub path: PathBuf,
+    pub modified_at: Option<SystemTime>,
 }
 
 #[derive(Debug, Error)]
@@ -236,6 +244,7 @@ pub struct LocalBlobStorage {
     root: Arc<PathBuf>,
     prefix: Arc<str>,
     lifecycle_locks: Arc<ObjectLifecycleLocks>,
+    multipart_inventory: Arc<Mutex<MultipartInventoryCursor>>,
 }
 
 #[derive(Debug, Clone)]
@@ -280,6 +289,13 @@ enum MultipartManifestState {
     Replace,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PartPublication {
+    Existing,
+    Created,
+    Replaced,
+}
+
 #[derive(Debug, Default)]
 struct ObjectLifecycleLocks {
     entries: StdMutex<HashMap<String, Weak<RwLock<()>>>>,
@@ -301,6 +317,23 @@ impl ObjectLifecycleLocks {
     }
 }
 
+fn shared_local_lifecycle_locks(root: &Path) -> Arc<ObjectLifecycleLocks> {
+    static REGISTRY: OnceLock<StdMutex<HashMap<PathBuf, Weak<ObjectLifecycleLocks>>>> =
+        OnceLock::new();
+    let root_key = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
+    let registry = REGISTRY.get_or_init(|| StdMutex::new(HashMap::new()));
+    let mut entries = registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    entries.retain(|_, locks| locks.strong_count() > 0);
+    if let Some(locks) = entries.get(&root_key).and_then(Weak::upgrade) {
+        return locks;
+    }
+    let locks = Arc::new(ObjectLifecycleLocks::default());
+    entries.insert(root_key, Arc::downgrade(&locks));
+    locks
+}
+
 struct LocalMultipartReadState {
     parts: Vec<LocalMultipartPart>,
     part_index: usize,
@@ -309,6 +342,16 @@ struct LocalMultipartReadState {
     source: Option<fs::File>,
     remaining: u64,
     _read_guard: OwnedRwLockReadGuard<()>,
+}
+
+#[derive(Debug, Default)]
+struct MultipartInventoryCursor {
+    frames: Vec<MultipartInventoryFrame>,
+}
+
+#[derive(Debug)]
+struct MultipartInventoryFrame {
+    entries: std::fs::ReadDir,
 }
 
 struct S3ReadState {
@@ -321,10 +364,12 @@ struct S3ReadState {
 impl LocalBlobStorage {
     #[must_use]
     pub fn new(root: impl Into<PathBuf>, prefix: impl AsRef<str>) -> Self {
+        let root = root.into();
         Self {
-            root: Arc::new(root.into()),
+            lifecycle_locks: shared_local_lifecycle_locks(&root),
+            multipart_inventory: Arc::new(Mutex::new(MultipartInventoryCursor::default())),
+            root: Arc::new(root),
             prefix: Arc::from(normalize_storage_prefix(prefix.as_ref())),
-            lifecycle_locks: Arc::new(ObjectLifecycleLocks::default()),
         }
     }
 
@@ -580,6 +625,148 @@ impl LocalBlobStorage {
         Ok(keys)
     }
 
+    pub async fn scan_multipart_part_objects(
+        &self,
+        work_limit: usize,
+    ) -> Result<(Vec<LocalMultipartPartObject>, bool), StorageError> {
+        self.ensure().await?;
+        let multipart_root = if self.prefix.is_empty() {
+            self.root().join("multipart")
+        } else {
+            self.root().join(self.prefix.as_ref()).join("multipart")
+        };
+        if !directory_without_symlink_ancestors(self.root(), &multipart_root).await? {
+            self.multipart_inventory.lock().await.frames.clear();
+            return Ok((Vec::new(), true));
+        }
+        let mut cursor = self.multipart_inventory.lock().await;
+        if cursor.frames.is_empty() {
+            cursor.frames.push(MultipartInventoryFrame {
+                entries: std::fs::read_dir(&multipart_root)?,
+            });
+        }
+        let mut parts = Vec::new();
+        let mut work = 0_usize;
+        while work < work_limit.max(1) {
+            let Some(frame) = cursor.frames.last_mut() else {
+                break;
+            };
+            let entry = match frame.entries.next() {
+                Some(Ok(entry)) => entry,
+                Some(Err(error)) => {
+                    cursor.frames.clear();
+                    return Err(error.into());
+                }
+                None => {
+                    cursor.frames.pop();
+                    continue;
+                }
+            };
+            work += 1;
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            if file_type.is_dir() {
+                if multipart_inventory_directory_allowed(&multipart_root, &path) {
+                    cursor.frames.push(MultipartInventoryFrame {
+                        entries: std::fs::read_dir(&path)?,
+                    });
+                }
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            let Ok(relative) = path.strip_prefix(&multipart_root) else {
+                continue;
+            };
+            let relative = relative.to_string_lossy().replace('\\', "/");
+            let object_key = prefixed_key(&self.prefix, &format!("multipart/{relative}"));
+            if multipart_manifest_key_for_part(&self.prefix, &object_key).is_none() {
+                continue;
+            }
+            let metadata = entry.metadata()?;
+            parts.push(LocalMultipartPartObject {
+                object_key,
+                path,
+                modified_at: metadata.modified().ok(),
+            });
+        }
+        let scan_complete = cursor.frames.is_empty();
+        Ok((parts, scan_complete))
+    }
+
+    pub async fn multipart_manifest_part_keys(
+        &self,
+        manifest_key: &str,
+    ) -> Result<Vec<String>, StorageError> {
+        Ok(self
+            .read_multipart_manifest_structure(manifest_key)
+            .await?
+            .parts
+            .into_iter()
+            .map(|part| part.object_key)
+            .collect())
+    }
+
+    #[must_use]
+    pub fn multipart_manifest_key_for_part_object(&self, object_key: &str) -> Option<String> {
+        multipart_manifest_key_for_part(&self.prefix, object_key)
+    }
+
+    pub async fn delete_unreferenced_multipart_part(
+        &self,
+        object_key: &str,
+        minimum_age: StdDuration,
+        protect_indeterminate_manifest: bool,
+    ) -> Result<bool, StorageError> {
+        let manifest_key = multipart_manifest_key_for_part(&self.prefix, object_key)
+            .ok_or(StorageError::InvalidObjectKey)?;
+        let Ok(_delete_guard) = self
+            .lifecycle_locks
+            .for_object(&manifest_key)
+            .try_write_owned()
+        else {
+            return Ok(false);
+        };
+        match self.multipart_manifest_part_keys(&manifest_key).await {
+            Ok(parts) if parts.iter().any(|part| part == object_key) => return Ok(false),
+            Ok(_) => {}
+            Err(
+                StorageError::NotFound
+                | StorageError::InvalidMultipartManifest
+                | StorageError::UnreadableMultipartManifest,
+            ) if !protect_indeterminate_manifest => {}
+            Err(
+                StorageError::NotFound
+                | StorageError::InvalidMultipartManifest
+                | StorageError::UnreadableMultipartManifest,
+            ) => return Ok(false),
+            Err(error) => return Err(error),
+        }
+        let path = self.object_path(object_key)?;
+        if !regular_file_without_symlink_ancestors(self.root(), &path).await? {
+            return Ok(false);
+        }
+        let metadata = match fs::symlink_metadata(&path).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        let old_enough = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+            .is_some_and(|age| age >= minimum_age);
+        if !old_enough {
+            return Ok(false);
+        }
+        remove_file_if_present(&path).await?;
+        Ok(true)
+    }
+
     pub async fn delete_object(&self, object_key: &str) -> Result<(), StorageError> {
         let _delete_guard = self
             .lifecycle_locks
@@ -617,12 +804,18 @@ impl LocalBlobStorage {
     ) -> Result<Option<Vec<PathBuf>>, StorageError> {
         let payload = match self.read_manifest_payload(object_key).await {
             Ok(payload) => payload,
-            Err(StorageError::NotFound) => return Ok(None),
+            Err(
+                StorageError::NotFound
+                | StorageError::InvalidMultipartManifest
+                | StorageError::UnreadableMultipartManifest,
+            ) => return Ok(None),
             Err(error) => return Err(error),
         };
-        Ok(Some(
-            self.validated_manifest_part_paths(object_key, &payload)?,
-        ))
+        match self.validated_manifest_part_paths(object_key, &payload) {
+            Ok(paths) => Ok(Some(paths)),
+            Err(StorageError::InvalidMultipartManifest) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     pub async fn read_multipart_manifest(
@@ -682,6 +875,7 @@ impl LocalBlobStorage {
             || !is_canonical_sha256_digest(&payload.digest)
             || self.multipart_manifest_key_for_hash(&payload.hash_algo, &payload.digest)
                 != object_key
+            || payload.parts.len() > STORAGE_MULTIPART_MAX_PARTS
             || (payload.size_bytes == 0 && !payload.parts.is_empty())
             || (payload.size_bytes > 0 && payload.parts.is_empty())
         {
@@ -777,6 +971,23 @@ impl LocalBlobStorage {
         }
         self.ensure().await?;
         let manifest_key = self.multipart_manifest_key_for_hash("sha256", digest);
+        let _write_guard = self
+            .lifecycle_locks
+            .for_object(&manifest_key)
+            .write_owned()
+            .await;
+        let previous_part_paths = self
+            .read_multipart_manifest_structure(&manifest_key)
+            .await
+            .ok()
+            .map(|manifest| {
+                manifest
+                    .parts
+                    .into_iter()
+                    .map(|part| part.path)
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
         let manifest_state = self
             .verified_multipart_manifest_state(&manifest_key, digest)
             .await?;
@@ -784,34 +995,53 @@ impl LocalBlobStorage {
             return Ok(stored_blob(digest.to_string(), size_bytes, manifest_key));
         }
 
-        let (size_bytes, part_entries) = self
-            .publish_multipart_part_entries(part_paths, digest)
-            .await?;
+        let mut publication_rollback_paths = Vec::new();
+        let publication = async {
+            let (size_bytes, part_entries) = self
+                .publish_multipart_part_entries(part_paths, digest, &mut publication_rollback_paths)
+                .await?;
 
-        if matches!(manifest_state, MultipartManifestState::Replace) {
-            self.write_multipart_manifest(
-                &manifest_key,
-                digest,
+            let prospective_manifest = LocalMultipartManifest {
+                hash_algo: "sha256".to_string(),
+                digest: digest.to_string(),
                 size_bytes,
-                part_entries.clone(),
-                true,
-            )
-            .await?;
-        } else {
-            self.publish_multipart_manifest(
-                &manifest_key,
-                digest,
-                size_bytes,
-                part_entries.clone(),
-            )
-            .await?;
+                parts: part_entries
+                    .iter()
+                    .map(|part| {
+                        Ok(LocalMultipartPart {
+                            object_key: part.object_key.clone(),
+                            path: self.object_path(&part.object_key)?,
+                            size_bytes: part.size_bytes,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, StorageError>>()?,
+            };
+            verify_multipart_manifest_digest(&prospective_manifest).await?;
+            self.write_multipart_manifest(&manifest_key, digest, size_bytes, part_entries, true)
+                .await?;
+            Ok::<_, StorageError>(size_bytes)
         }
-        let manifest = self
-            .read_and_verify_multipart_manifest(&manifest_key, digest)
-            .await?;
-        if manifest.size_bytes != size_bytes {
-            return Err(StorageError::ContentMismatch);
-        }
+        .await;
+        let size_bytes = match publication {
+            Ok(publication) => publication,
+            Err(error) => {
+                if let Err(cleanup_error) = self
+                    .rollback_multipart_parts(
+                        &manifest_key,
+                        &publication_rollback_paths,
+                        &previous_part_paths,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        ?cleanup_error,
+                        manifest_key,
+                        "failed to roll back multipart publication"
+                    );
+                }
+                return Err(error);
+            }
+        };
         Ok(stored_blob(digest.to_string(), size_bytes, manifest_key))
     }
 
@@ -819,6 +1049,7 @@ impl LocalBlobStorage {
         &self,
         part_paths: &[PathBuf],
         digest: &str,
+        publication_rollback_paths: &mut Vec<PathBuf>,
     ) -> Result<(u64, Vec<ManifestPartPayload>), StorageError> {
         let mut part_sizes = Vec::with_capacity(part_paths.len());
         let mut size_bytes = 0_u64;
@@ -862,41 +1093,36 @@ impl LocalBlobStorage {
         }
         for (part_path, part) in part_paths.iter().zip(&part_entries) {
             let target_path = self.object_path(&part.object_key)?;
-            publish_part_file(part_path, &target_path, part.size_bytes).await?;
+            publish_part_file(
+                part_path,
+                &target_path,
+                part.size_bytes,
+                publication_rollback_paths,
+            )
+            .await?;
         }
         Ok((size_bytes, part_entries))
     }
 
-    async fn publish_multipart_manifest(
+    async fn rollback_multipart_parts(
         &self,
         manifest_key: &str,
-        digest: &str,
-        size_bytes: u64,
-        part_entries: Vec<ManifestPartPayload>,
+        publication_rollback_paths: &[PathBuf],
+        previous_part_paths: &HashSet<PathBuf>,
     ) -> Result<(), StorageError> {
-        if self
-            .write_multipart_manifest(
-                manifest_key,
-                digest,
-                size_bytes,
-                part_entries.clone(),
-                false,
-            )
-            .await?
-        {
-            return Ok(());
+        let mut protected = previous_part_paths.clone();
+        if let Ok(manifest) = self.read_multipart_manifest_structure(manifest_key).await {
+            protected.extend(manifest.parts.into_iter().map(|part| part.path));
         }
-        match self
-            .verified_multipart_manifest_state(manifest_key, digest)
-            .await?
-        {
-            MultipartManifestState::Existing(_) => Ok(()),
-            MultipartManifestState::Missing | MultipartManifestState::Replace => {
-                self.write_multipart_manifest(manifest_key, digest, size_bytes, part_entries, true)
-                    .await?;
-                Ok(())
+        let mut first_error = None;
+        for path in publication_rollback_paths {
+            if !protected.contains(path)
+                && let Err(error) = remove_file_if_present(path).await
+            {
+                first_error.get_or_insert(error);
             }
         }
+        first_error.map_or(Ok(()), Err)
     }
 
     async fn write_multipart_manifest(
@@ -1768,6 +1994,46 @@ pub fn is_multipart_part_key(object_key: &str) -> bool {
     format!("/{cleaned}").contains("/multipart/") && cleaned.contains("/parts/")
 }
 
+fn multipart_manifest_key_for_part(prefix: &str, object_key: &str) -> Option<String> {
+    let cleaned = object_key.trim().trim_start_matches('/').replace('\\', "/");
+    if cleaned != object_key {
+        return None;
+    }
+    let normalized_prefix = normalize_storage_prefix(prefix);
+    let relative = if normalized_prefix.is_empty() {
+        cleaned.as_str()
+    } else {
+        cleaned.strip_prefix(&format!("{normalized_prefix}/"))?
+    };
+    let components = relative.split('/').collect::<Vec<_>>();
+    let canonical_part_name = |value: &str| {
+        let stem = value.strip_suffix(".part")?;
+        (stem.len() == 8
+            && stem.bytes().all(|byte| byte.is_ascii_digit())
+            && stem
+                .parse::<usize>()
+                .is_ok_and(|part| (1..=STORAGE_MULTIPART_MAX_PARTS).contains(&part)))
+        .then_some(())
+    };
+    let legacy = components.len() == 5 && canonical_part_name(components[4]).is_some();
+    let layout = components.len() == 6
+        && is_canonical_sha256_digest(components[4])
+        && canonical_part_name(components[5]).is_some();
+    if (!legacy && !layout)
+        || components[0] != "multipart"
+        || components[1] != "sha256"
+        || !is_canonical_sha256_digest(components[2])
+        || components[3] != "parts"
+    {
+        return None;
+    }
+    Some(multipart_manifest_key_for_hash(
+        &normalized_prefix,
+        "sha256",
+        components[2],
+    ))
+}
+
 fn prefixed_key(prefix: &str, key: &str) -> String {
     let normalized = normalize_storage_prefix(prefix);
     if normalized.is_empty() {
@@ -1889,7 +2155,8 @@ async fn publish_part_file(
     source_path: &Path,
     target_path: &Path,
     size_bytes: u64,
-) -> Result<(), StorageError> {
+    publication_rollback_paths: &mut Vec<PathBuf>,
+) -> Result<PartPublication, StorageError> {
     let source_size = fs::metadata(source_path).await?.len();
     if source_size != size_bytes {
         return Err(StorageError::SourceSizeChanged);
@@ -1898,25 +2165,43 @@ async fn publish_part_file(
         fs::create_dir_all(parent).await?;
     }
     if file_matches_source(target_path, source_path, size_bytes).await? {
-        return Ok(());
+        return Ok(PartPublication::Existing);
     }
     if fs::hard_link(source_path, target_path).await.is_ok() {
-        return Ok(());
+        publication_rollback_paths.push(target_path.to_path_buf());
+        return Ok(PartPublication::Created);
     }
     if file_matches_source(target_path, source_path, size_bytes).await? {
-        return Ok(());
+        return Ok(PartPublication::Existing);
     }
 
     let temp_path = temp_sibling_path(target_path)?;
     let copy_result = async {
         let mut source = fs::File::open(source_path).await?;
         let mut target = fs::File::create_new(&temp_path).await?;
+        publication_rollback_paths.push(temp_path.clone());
         let copied = tokio::io::copy(&mut source, &mut target).await?;
         target.flush().await?;
         if copied != size_bytes {
             return Err(StorageError::SourceSizeChanged);
         }
-        rename_or_replace(&temp_path, target_path).await
+        match fs::hard_link(&temp_path, target_path).await {
+            Ok(()) => {
+                publication_rollback_paths.push(target_path.to_path_buf());
+                remove_file_if_present(&temp_path).await?;
+                Ok(PartPublication::Created)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if file_matches_source(target_path, source_path, size_bytes).await? {
+                    remove_file_if_present(&temp_path).await?;
+                    Ok(PartPublication::Existing)
+                } else {
+                    rename_or_replace(&temp_path, target_path).await?;
+                    Ok(PartPublication::Replaced)
+                }
+            }
+            Err(error) => Err(error.into()),
+        }
     }
     .await;
     if copy_result.is_err() {
@@ -2096,15 +2381,22 @@ fn collect_object_keys(
     path: &Path,
     keys: &mut Vec<String>,
 ) -> Result<(), StorageError> {
+    let path_metadata = std::fs::symlink_metadata(path)?;
+    if path_metadata.file_type().is_symlink() || !path_metadata.is_dir() {
+        return Ok(());
+    }
     for entry_result in std::fs::read_dir(path)? {
         let entry = entry_result?;
         let entry_path = entry.path();
-        let metadata = entry.metadata()?;
-        if metadata.is_dir() {
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
             collect_object_keys(root, &entry_path, keys)?;
             continue;
         }
-        if !metadata.is_file() {
+        if !file_type.is_file() {
             continue;
         }
         let Some(file_name) = entry_path.file_name().and_then(OsStr::to_str) else {
@@ -2123,4 +2415,82 @@ fn collect_object_keys(
         keys.push(key);
     }
     Ok(())
+}
+
+async fn regular_file_without_symlink_ancestors(
+    root: &Path,
+    path: &Path,
+) -> Result<bool, StorageError> {
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| StorageError::InvalidObjectKey)?;
+    let root_metadata = fs::symlink_metadata(root).await?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Ok(false);
+    }
+    let components = relative.components().collect::<Vec<_>>();
+    let mut current = root.to_path_buf();
+    for (index, component) in components.iter().enumerate() {
+        current.push(component);
+        let metadata = match fs::symlink_metadata(&current).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.file_type().is_symlink() {
+            return Ok(false);
+        }
+        let is_last = index + 1 == components.len();
+        if (is_last && !metadata.is_file()) || (!is_last && !metadata.is_dir()) {
+            return Ok(false);
+        }
+    }
+    Ok(!components.is_empty())
+}
+
+async fn directory_without_symlink_ancestors(
+    root: &Path,
+    path: &Path,
+) -> Result<bool, StorageError> {
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| StorageError::InvalidObjectKey)?;
+    let root_metadata = fs::symlink_metadata(root).await?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Ok(false);
+    }
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        current.push(component);
+        let metadata = match fs::symlink_metadata(&current).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn multipart_inventory_directory_allowed(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    let components = relative
+        .components()
+        .map(|component| component.as_os_str().to_str())
+        .collect::<Option<Vec<_>>>();
+    let Some(components) = components else {
+        return false;
+    };
+    match components.as_slice() {
+        ["sha256"] => true,
+        ["sha256", digest] | ["sha256", digest, "parts"] => is_canonical_sha256_digest(digest),
+        ["sha256", digest, "parts", layout] => {
+            is_canonical_sha256_digest(digest) && is_canonical_sha256_digest(layout)
+        }
+        _ => false,
+    }
 }

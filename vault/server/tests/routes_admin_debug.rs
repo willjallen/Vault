@@ -284,6 +284,7 @@ async fn dev_debug_seed_emit_report_sweep_and_reset_work() {
     assert_eq!(swept["action"], "sweep-ttl");
     assert!(swept["result"]["documents"]["archived"].is_array());
     assert!(swept["result"]["transfers"]["expired_uploads"].is_array());
+    assert!(swept["result"]["multipart_parts"]["deleted_multipart_part_keys"].is_array());
 
     let reset = app
         .clone()

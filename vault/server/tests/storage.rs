@@ -25,6 +25,39 @@ fn sha256_hex(data: &[u8]) -> String {
     output
 }
 
+async fn multipart_sources(root: &std::path::Path) -> (Vec<PathBuf>, String) {
+    tokio::fs::create_dir_all(root)
+        .await
+        .expect("source directory");
+    let first = root.join("first.part");
+    let second = root.join("second.part");
+    tokio::fs::write(&first, b"abc").await.expect("first part");
+    tokio::fs::write(&second, b"def")
+        .await
+        .expect("second part");
+    (vec![first, second], sha256_hex(b"abcdef"))
+}
+
+async fn deterministic_multipart_part_keys(
+    root: &std::path::Path,
+    sources: &[PathBuf],
+    digest: &str,
+) -> Vec<String> {
+    let probe = test_storage(root);
+    let stored = probe
+        .put_part_files(sources, Some(digest))
+        .await
+        .expect("probe multipart object");
+    probe
+        .read_multipart_manifest(&stored.object_key)
+        .await
+        .expect("probe manifest")
+        .parts
+        .into_iter()
+        .map(|part| part.object_key)
+        .collect()
+}
+
 #[tokio::test]
 async fn put_bytes_is_content_addressed_and_deduped() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -242,6 +275,103 @@ async fn verified_part_files_promote_to_manifest_without_listing_parts() {
 }
 
 #[tokio::test]
+async fn multipart_publication_rolls_back_parts_created_before_a_later_conflict() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let (sources, digest) = multipart_sources(&temp_dir.path().join("sources")).await;
+    let part_keys =
+        deterministic_multipart_part_keys(&temp_dir.path().join("probe"), &sources, &digest).await;
+    let storage = test_storage(&temp_dir.path().join("target"));
+    let first_target = storage.root().join(&part_keys[0]);
+    let second_target = storage.root().join(&part_keys[1]);
+    tokio::fs::create_dir_all(&second_target)
+        .await
+        .expect("conflicting second target");
+
+    let error = storage
+        .put_part_files(&sources, Some(&digest))
+        .await
+        .expect_err("second part conflict");
+
+    assert!(matches!(error, StorageError::ContentMismatch));
+    assert!(!first_target.exists());
+    assert!(second_target.is_dir());
+    assert!(
+        !storage
+            .root()
+            .join(multipart_manifest_key_for_hash(
+                "objects", "sha256", &digest
+            ))
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn multipart_rollback_preserves_existing_and_replaced_part_targets() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let (sources, digest) = multipart_sources(&temp_dir.path().join("sources")).await;
+    let part_keys =
+        deterministic_multipart_part_keys(&temp_dir.path().join("probe"), &sources, &digest).await;
+
+    for (case, initial) in [
+        ("existing", b"abc".as_slice()),
+        ("replaced", b"xxx".as_slice()),
+    ] {
+        let storage = test_storage(&temp_dir.path().join(case));
+        let first_target = storage.root().join(&part_keys[0]);
+        let second_target = storage.root().join(&part_keys[1]);
+        tokio::fs::create_dir_all(first_target.parent().expect("part parent"))
+            .await
+            .expect("part parent");
+        tokio::fs::write(&first_target, initial)
+            .await
+            .expect("initial first target");
+        tokio::fs::create_dir_all(&second_target)
+            .await
+            .expect("conflicting second target");
+
+        storage
+            .put_part_files(&sources, Some(&digest))
+            .await
+            .expect_err("second part conflict");
+
+        assert_eq!(
+            tokio::fs::read(&first_target)
+                .await
+                .expect("first target survives"),
+            b"abc",
+            "{case} target"
+        );
+    }
+}
+
+#[tokio::test]
+async fn multipart_manifest_publication_failure_rolls_back_all_created_parts() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let (sources, digest) = multipart_sources(&temp_dir.path().join("sources")).await;
+    let part_keys =
+        deterministic_multipart_part_keys(&temp_dir.path().join("probe"), &sources, &digest).await;
+    let storage = test_storage(&temp_dir.path().join("target"));
+    let manifest_path = storage.root().join(multipart_manifest_key_for_hash(
+        "objects", "sha256", &digest,
+    ));
+    tokio::fs::create_dir_all(&manifest_path)
+        .await
+        .expect("conflicting manifest directory");
+
+    storage
+        .put_part_files(&sources, Some(&digest))
+        .await
+        .expect_err("manifest publication conflict");
+
+    assert!(manifest_path.is_dir());
+    assert!(
+        part_keys
+            .iter()
+            .all(|part_key| !storage.root().join(part_key).exists())
+    );
+}
+
+#[tokio::test]
 #[allow(clippy::too_many_lines)] // One ordered concurrency scenario must retain both live streams.
 async fn multipart_stream_lease_blocks_only_its_own_object_deletion() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -419,16 +549,16 @@ async fn multipart_delete_rejects_manifest_that_points_at_another_blobs_parts() 
             },
         )
         .await;
-    let error = storage
+    storage
         .delete_object(&first.object_key)
         .await
-        .expect_err("cross-object part reference must be rejected");
+        .expect("invalid manifest is removed without following its part reference");
 
     assert!(matches!(
         read_result,
         Err(StorageError::InvalidMultipartManifest)
     ));
-    assert!(matches!(error, StorageError::InvalidMultipartManifest));
+    assert!(!first_manifest_path.exists());
     assert!(protected_part.path.is_file());
     assert_eq!(
         storage
@@ -594,5 +724,114 @@ async fn unverified_part_files_are_assembled_into_content_addressed_blob() {
     assert_eq!(
         storage.list_object_keys().await.expect("keys"),
         [blob.object_key],
+    );
+}
+
+#[tokio::test]
+async fn multipart_inventory_preserves_legacy_storage_prefix_spelling() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let (sources, digest) = multipart_sources(&temp_dir.path().join("sources")).await;
+    let root = temp_dir.path().join("store");
+    let legacy_prefix = " /team//./objects\\archive/ ";
+    let storage = LocalBlobStorage::new(&root, legacy_prefix);
+
+    let stored = storage
+        .put_part_files(&sources, Some(&digest))
+        .await
+        .expect("multipart object");
+    let mut expected_part_keys = storage
+        .read_multipart_manifest(&stored.object_key)
+        .await
+        .expect("multipart manifest")
+        .parts
+        .into_iter()
+        .map(|part| part.object_key)
+        .collect::<Vec<_>>();
+    let restarted_storage = LocalBlobStorage::new(&root, legacy_prefix);
+    let (parts, scan_complete) = restarted_storage
+        .scan_multipart_part_objects(1_024)
+        .await
+        .expect("multipart inventory");
+    let mut actual_part_keys = parts
+        .into_iter()
+        .map(|part| part.object_key)
+        .collect::<Vec<_>>();
+    expected_part_keys.sort();
+    actual_part_keys.sort();
+
+    assert_eq!(restarted_storage.prefix(), "team//./objects/archive");
+    assert!(scan_complete);
+    assert_eq!(actual_part_keys, expected_part_keys);
+    assert_eq!(
+        restarted_storage
+            .read_bytes(&stored.object_key)
+            .await
+            .expect("legacy-prefixed object remains readable"),
+        b"abcdef",
+    );
+}
+
+#[tokio::test]
+async fn multipart_inventory_is_bounded_strict_and_symlink_safe() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let storage = test_storage(&temp_dir.path().join("store"));
+    let digest = sha256_hex(b"inventory");
+    let layout = sha256_hex(b"layout");
+    let parts_root = storage
+        .root()
+        .join("objects/multipart/sha256")
+        .join(&digest)
+        .join("parts");
+    let legacy = parts_root.join("00000001.part");
+    let layout_part = parts_root.join(&layout).join("00000002.part");
+    tokio::fs::create_dir_all(layout_part.parent().expect("layout parent"))
+        .await
+        .expect("multipart directories");
+    tokio::fs::write(&legacy, b"a").await.expect("legacy part");
+    tokio::fs::write(&layout_part, b"b")
+        .await
+        .expect("layout part");
+    for invalid in ["00000000.part", "00000003.part.extra", "éééé.part"] {
+        tokio::fs::write(parts_root.join(invalid), b"unsafe")
+            .await
+            .expect("invalid inventory entry");
+    }
+
+    #[cfg(unix)]
+    let outside = {
+        let outside = temp_dir.path().join("outside");
+        tokio::fs::create_dir_all(&outside)
+            .await
+            .expect("outside directory");
+        tokio::fs::write(outside.join("00000003.part"), b"sentinel")
+            .await
+            .expect("outside sentinel");
+        std::os::unix::fs::symlink(&outside, parts_root.join(sha256_hex(b"symlink-layout")))
+            .expect("layout symlink");
+        outside
+    };
+
+    let mut inventoried = Vec::new();
+    for _ in 0..32 {
+        let (batch, complete) = storage
+            .scan_multipart_part_objects(1)
+            .await
+            .expect("bounded inventory");
+        assert!(batch.len() <= 1);
+        inventoried.extend(batch.into_iter().map(|part| part.path));
+        if complete {
+            break;
+        }
+    }
+    inventoried.sort();
+    let mut expected = vec![legacy, layout_part];
+    expected.sort();
+    assert_eq!(inventoried, expected);
+    #[cfg(unix)]
+    assert_eq!(
+        tokio::fs::read(outside.join("00000003.part"))
+            .await
+            .expect("outside sentinel survives"),
+        b"sentinel"
     );
 }

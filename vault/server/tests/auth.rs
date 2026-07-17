@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::time::Duration;
 
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use base64::Engine;
@@ -53,6 +54,22 @@ async fn test_pool() -> sqlx::SqlitePool {
     // integration tests use one short-lived SQLite database per test.
     let _ = Box::leak(Box::new(temp_dir));
     pool
+}
+
+async fn hold_sqlite_writer(pool: &sqlx::SqlitePool) -> sqlx::pool::PoolConnection<sqlx::Sqlite> {
+    let mut connection = pool.acquire().await.expect("writer connection");
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *connection)
+        .await
+        .expect("hold SQLite writer");
+    connection
+}
+
+async fn release_sqlite_writer(mut connection: sqlx::pool::PoolConnection<sqlx::Sqlite>) {
+    sqlx::query("ROLLBACK")
+        .execute(&mut *connection)
+        .await
+        .expect("release SQLite writer");
 }
 
 fn headers(values: &[(&str, &str)]) -> HeaderMap {
@@ -135,6 +152,95 @@ async fn header_identity_is_stripped_and_groups_are_synced() {
 }
 
 #[tokio::test]
+async fn unchanged_header_identity_does_not_wait_for_sqlite_writer() {
+    let pool = test_pool().await;
+    let settings = AuthSettings::default();
+    let request_headers = headers(&[
+        ("Remote-User", "reader"),
+        ("Remote-Name", "Read Only"),
+        ("Remote-Email", "reader@example.com"),
+        ("Remote-Groups", "artists,writers"),
+    ]);
+    header_identity(&settings, &pool, &request_headers)
+        .await
+        .expect("initial identity sync");
+    let last_seen_before: String = sqlx::query_scalar(
+        "SELECT last_seen_at FROM vault_users WHERE issuer = 'headers' AND subject = 'reader'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("initial last seen");
+
+    let writer = hold_sqlite_writer(&pool).await;
+    let authentication = tokio::time::timeout(
+        Duration::from_secs(2),
+        header_identity(&settings, &pool, &request_headers),
+    )
+    .await;
+    release_sqlite_writer(writer).await;
+
+    let user = authentication
+        .expect("unchanged header identity must not wait for the SQLite writer")
+        .expect("unchanged header identity");
+    assert_eq!(user.groups, ["artists", "writers"]);
+    let last_seen_after: String = sqlx::query_scalar(
+        "SELECT last_seen_at FROM vault_users WHERE issuer = 'headers' AND subject = 'reader'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("unchanged last seen");
+    assert_eq!(last_seen_after, last_seen_before);
+}
+
+#[tokio::test]
+async fn unchanged_header_claims_repair_a_missing_root_permission_row() {
+    let pool = test_pool().await;
+    let settings = AuthSettings::default();
+    let request_headers = headers(&[
+        ("Remote-User", "repair"),
+        ("Remote-Name", "Repair User"),
+        ("Remote-Email", "repair@example.com"),
+        ("Remote-Groups", "artists"),
+    ]);
+    header_identity(&settings, &pool, &request_headers)
+        .await
+        .expect("initial identity sync");
+    sqlx::query(
+        r"
+        DELETE FROM folder_permissions
+        WHERE id = (
+            SELECT folder_permissions.id
+            FROM folder_permissions
+            JOIN vault_groups ON vault_groups.id = folder_permissions.group_id
+            WHERE vault_groups.name = 'artists'
+            ORDER BY folder_permissions.id
+            LIMIT 1
+        )
+        ",
+    )
+    .execute(&pool)
+    .await
+    .expect("remove one root permission");
+    assert_eq!(
+        folder_permission_count_for_group(&pool, "artists")
+            .await
+            .expect("incomplete permissions"),
+        1,
+    );
+
+    header_identity(&settings, &pool, &request_headers)
+        .await
+        .expect("repair root permission");
+
+    assert_eq!(
+        folder_permission_count_for_group(&pool, "artists")
+            .await
+            .expect("repaired permissions"),
+        2,
+    );
+}
+
+#[tokio::test]
 async fn missing_header_email_stays_null_and_cannot_match_a_bootstrap_admin_email() {
     let pool = test_pool().await;
     let settings = AuthSettings {
@@ -199,6 +305,72 @@ async fn missing_header_email_clears_a_legacy_synthetic_bootstrap_email() {
             .await
             .expect("cleared email");
     assert_eq!(stored_email, None);
+}
+
+#[tokio::test]
+async fn missing_header_email_blocks_to_revoke_then_stable_none_is_read_only() {
+    let pool = test_pool().await;
+    let settings = AuthSettings {
+        bootstrap_admin_emails: ["owner@example.com".to_string()].into_iter().collect(),
+        ..AuthSettings::default()
+    };
+    let email_headers = headers(&[
+        ("Remote-User", "owner"),
+        ("Remote-Name", "Owner"),
+        ("Remote-Email", "owner@example.com"),
+        ("Remote-Groups", "artists"),
+    ]);
+    let missing_email_headers = headers(&[
+        ("Remote-User", "owner"),
+        ("Remote-Name", "Owner"),
+        ("Remote-Groups", "artists"),
+    ]);
+    let initial = header_identity(&settings, &pool, &email_headers)
+        .await
+        .expect("initial email identity");
+    assert!(initial.is_admin);
+
+    let writer = hold_sqlite_writer(&pool).await;
+    let transition_pool = pool.clone();
+    let transition_settings = settings.clone();
+    let transition_headers = missing_email_headers.clone();
+    let mut transition = tokio::spawn(async move {
+        header_identity(&transition_settings, &transition_pool, &transition_headers).await
+    });
+    let blocked = tokio::time::timeout(Duration::from_millis(200), &mut transition).await;
+    release_sqlite_writer(writer).await;
+    assert!(
+        blocked.is_err(),
+        "Some-to-None email transition must wait for a durable write"
+    );
+
+    let transitioned = tokio::time::timeout(Duration::from_secs(2), transition)
+        .await
+        .expect("email transition after writer release")
+        .expect("email transition task")
+        .expect("email transition identity");
+    assert_eq!(transitioned.email, "");
+    assert!(!transitioned.is_admin);
+    let stored_email: Option<String> = sqlx::query_scalar(
+        "SELECT email FROM vault_users WHERE issuer = 'headers' AND subject = 'owner'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("cleared authoritative email");
+    assert_eq!(stored_email, None);
+
+    let writer = hold_sqlite_writer(&pool).await;
+    let stable = tokio::time::timeout(
+        Duration::from_secs(2),
+        header_identity(&settings, &pool, &missing_email_headers),
+    )
+    .await;
+    release_sqlite_writer(writer).await;
+    let stable = stable
+        .expect("stable missing email must not wait for the SQLite writer")
+        .expect("stable missing email identity");
+    assert_eq!(stable.email, "");
+    assert!(!stable.is_admin);
 }
 
 #[tokio::test]
@@ -397,6 +569,12 @@ async fn oidc_relogin_without_a_verified_email_preserves_the_existing_profile_em
     )
     .await
     .expect("initial identity");
+    sqlx::query(
+        "UPDATE vault_users SET last_login_at = '2000-01-01T00:00:00Z' WHERE subject = 'subject'",
+    )
+    .execute(&pool)
+    .await
+    .expect("old login timestamp");
 
     let user = oidc_identity(
         &settings,
@@ -410,6 +588,12 @@ async fn oidc_relogin_without_a_verified_email_preserves_the_existing_profile_em
     .expect("relogin identity");
 
     assert_eq!(user.email, "verified@example.com");
+    let last_login_at: String =
+        sqlx::query_scalar("SELECT last_login_at FROM vault_users WHERE subject = 'subject'")
+            .fetch_one(&pool)
+            .await
+            .expect("OIDC login timestamp");
+    assert_ne!(last_login_at, "2000-01-01T00:00:00Z");
 }
 
 #[tokio::test]
@@ -553,6 +737,16 @@ async fn dev_auth_syncs_configured_groups_on_local_domain() {
     assert_eq!(user.name, "Dev User");
     assert_eq!(user.groups, ["vault-admin", "vault-users"]);
     assert!(user.is_admin);
+
+    let writer = hold_sqlite_writer(&pool).await;
+    let repeated =
+        tokio::time::timeout(Duration::from_secs(2), dev_identity(&settings, &pool)).await;
+    release_sqlite_writer(writer).await;
+    let repeated = repeated
+        .expect("unchanged development identity must not wait for the SQLite writer")
+        .expect("development identity check")
+        .expect("development user");
+    assert_eq!(repeated.groups, ["vault-admin", "vault-users"]);
 }
 
 #[tokio::test]
@@ -652,6 +846,66 @@ async fn session_identity_resolves_active_user() {
             is_admin: false,
         },
     );
+}
+
+#[tokio::test]
+async fn stale_session_refreshes_once_then_fresh_session_is_read_only() {
+    let pool = test_pool().await;
+    let settings = AuthSettings::default();
+    let stale_last_seen = "2000-01-01T00:00:00Z";
+    let user_id = sqlx::query(
+        r"
+        INSERT INTO vault_users
+            (issuer, subject, email, name, is_admin, is_active, preferences, last_seen_at)
+        VALUES
+            ('issuer', 'returning', 'returning@example.com', 'Returning', 0, 1, '{}', ?)
+        ",
+    )
+    .bind(stale_last_seen)
+    .execute(&pool)
+    .await
+    .expect("insert stale session user")
+    .last_insert_rowid();
+    let cookie = sign_session_payload(
+        &settings,
+        &Map::from_iter([
+            ("uid".to_string(), json!(user_id)),
+            ("exp".to_string(), json!(4_102_444_800_i64)),
+        ]),
+    )
+    .expect("session");
+    let cookie_header = format!("{}={cookie}", settings.session_cookie_name);
+
+    session_identity(&settings, &pool, Some(&cookie_header))
+        .await
+        .expect("stale session refresh")
+        .expect("active session");
+    let refreshed_last_seen: String =
+        sqlx::query_scalar("SELECT last_seen_at FROM vault_users WHERE id = ?")
+            .bind(user_id)
+            .fetch_one(&pool)
+            .await
+            .expect("refreshed last seen");
+    assert_ne!(refreshed_last_seen, stale_last_seen);
+
+    let writer = hold_sqlite_writer(&pool).await;
+    let authentication = tokio::time::timeout(
+        Duration::from_secs(2),
+        session_identity(&settings, &pool, Some(&cookie_header)),
+    )
+    .await;
+    release_sqlite_writer(writer).await;
+    authentication
+        .expect("fresh signed session must not wait for the SQLite writer")
+        .expect("fresh session lookup")
+        .expect("fresh active session");
+    let unchanged_last_seen: String =
+        sqlx::query_scalar("SELECT last_seen_at FROM vault_users WHERE id = ?")
+            .bind(user_id)
+            .fetch_one(&pool)
+            .await
+            .expect("unchanged last seen");
+    assert_eq!(unchanged_last_seen, refreshed_last_seen);
 }
 
 #[tokio::test]

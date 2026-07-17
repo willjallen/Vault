@@ -21,6 +21,7 @@ use time::format_description::well_known::Rfc3339;
 type HmacSha256 = Hmac<Sha256>;
 
 const IDENTITY_UPSERT_RETRY_DELAYS_MS: [u64; 6] = [5, 10, 20, 40, 80, 160];
+const LAST_SEEN_REFRESH_INTERVAL_SECONDS: i64 = 5 * 60;
 const MAX_PREVIOUS_SESSION_SECRETS: usize = 4;
 const SESSION_SECRET_HEX_LENGTH: usize = 64;
 const MIN_REPEATED_PATTERN_BYTES: usize = 8;
@@ -668,6 +669,94 @@ struct VaultUserRecord {
     is_active: i64,
 }
 
+#[derive(Debug, FromRow)]
+struct IdentitySnapshotRow {
+    id: i64,
+    issuer: String,
+    subject: String,
+    email: Option<String>,
+    name: String,
+    is_admin: i64,
+    is_active: i64,
+    last_seen_is_fresh: i64,
+    group_name: Option<String>,
+    root_permissions_complete: i64,
+}
+
+#[derive(Debug)]
+struct IdentitySnapshot {
+    user: VaultUserRecord,
+    groups: Vec<String>,
+    last_seen_is_fresh: bool,
+    root_permissions_complete: bool,
+}
+
+impl IdentitySnapshot {
+    fn from_rows(rows: Vec<IdentitySnapshotRow>) -> Option<Self> {
+        let mut rows = rows.into_iter();
+        let first = rows.next()?;
+        let mut groups = first.group_name.into_iter().collect::<Vec<_>>();
+        let mut root_permissions_complete = first.root_permissions_complete != 0;
+        for row in rows {
+            groups.extend(row.group_name);
+            root_permissions_complete &= row.root_permissions_complete != 0;
+        }
+        Some(Self {
+            user: VaultUserRecord {
+                id: first.id,
+                issuer: first.issuer,
+                subject: first.subject,
+                email: first.email,
+                name: first.name,
+                is_admin: first.is_admin,
+                is_active: first.is_active,
+            },
+            groups,
+            last_seen_is_fresh: first.last_seen_is_fresh != 0,
+            root_permissions_complete,
+        })
+    }
+
+    fn matches_authoritative_claims(
+        &self,
+        email: Option<&str>,
+        name: &str,
+        groups: &BTreeSet<String>,
+    ) -> bool {
+        self.user.email.as_deref() == email
+            && self.user.name == name
+            && self.groups.iter().eq(groups.iter())
+            && self.root_permissions_complete
+    }
+
+    fn into_context(self, settings: &AuthSettings) -> UserContext {
+        let is_admin = effective_admin_from_parts(
+            settings,
+            self.user.is_admin != 0,
+            &self.user.issuer,
+            &self.user.subject,
+            self.user.email.as_deref(),
+            &self.groups,
+        );
+        UserContext {
+            id: self.user.id.to_string(),
+            vault_user_id: self.user.id,
+            issuer: self.user.issuer,
+            subject: self.user.subject,
+            name: self.user.name,
+            email: self.user.email.unwrap_or_default(),
+            groups: self.groups,
+            is_admin,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentitySyncMode {
+    Authoritative,
+    OidcLogin,
+}
+
 pub async fn header_identity(
     settings: &AuthSettings,
     pool: &SqlitePool,
@@ -690,17 +779,16 @@ pub async fn header_identity(
         }
     };
 
-    let user = upsert_vault_user(
+    authoritative_identity(
+        settings,
         pool,
         &settings.header_auth_issuer,
         &remote_user,
         email.as_deref(),
-        Some(&remote_name),
-        Some(&groups),
-        false,
+        &remote_name,
+        &groups,
     )
-    .await?;
-    context_for_user(settings, pool, &user).await
+    .await
 }
 
 pub async fn dev_identity(
@@ -711,17 +799,58 @@ pub async fn dev_identity(
         return Ok(None);
     }
 
-    let user = upsert_vault_user(
+    Ok(Some(
+        authoritative_identity(
+            settings,
+            pool,
+            &settings.dev_auth_issuer,
+            &settings.dev_user,
+            Some(&settings.dev_email),
+            &settings.dev_name,
+            &settings.dev_groups,
+        )
+        .await?,
+    ))
+}
+
+async fn authoritative_identity(
+    settings: &AuthSettings,
+    pool: &SqlitePool,
+    issuer: &str,
+    subject: &str,
+    email: Option<&str>,
+    name: &str,
+    groups: &BTreeSet<String>,
+) -> Result<UserContext, AuthError> {
+    if issuer.trim().is_empty() || subject.trim().is_empty() {
+        return Err(AuthError::MissingSubject);
+    }
+
+    let cutoff = last_seen_cutoff()?;
+    if let Some(snapshot) = fetch_identity_snapshot(pool, issuer, subject, &cutoff).await? {
+        if snapshot.user.is_active == 0 {
+            return Err(AuthError::UserDisabled);
+        }
+        if snapshot.matches_authoritative_claims(email, name, groups) && snapshot.last_seen_is_fresh
+        {
+            return Ok(snapshot.into_context(settings));
+        }
+    }
+
+    let snapshot = upsert_vault_user(
         pool,
-        &settings.dev_auth_issuer,
-        &settings.dev_user,
-        Some(&settings.dev_email),
-        Some(&settings.dev_name),
-        Some(&settings.dev_groups),
-        false,
+        issuer,
+        subject,
+        email,
+        Some(name),
+        groups,
+        IdentitySyncMode::Authoritative,
     )
     .await?;
-    Ok(Some(context_for_user(settings, pool, &user).await?))
+    if snapshot.user.is_active == 0 {
+        return Err(AuthError::UserDisabled);
+    }
+    Ok(snapshot.into_context(settings))
 }
 
 pub async fn session_identity(
@@ -738,18 +867,20 @@ pub async fn session_identity(
     let Some(user_id) = payload.get("uid").and_then(value_as_i64) else {
         return Ok(None);
     };
-    let Some(user) = fetch_user_by_id(pool, user_id).await? else {
+    let cutoff = last_seen_cutoff()?;
+    let Some(snapshot) = fetch_identity_snapshot_by_id(pool, user_id, &cutoff).await? else {
         return Ok(None);
     };
-    if user.is_active == 0 {
+    if snapshot.user.is_active == 0 {
         return Ok(None);
     }
-    sqlx::query("UPDATE vault_users SET last_seen_at = ? WHERE id = ?")
-        .bind(now_string()?)
-        .bind(user.id)
-        .execute(pool)
-        .await?;
-    context_for_user(settings, pool, &user).await.map(Some)
+    if snapshot.last_seen_is_fresh {
+        return Ok(Some(snapshot.into_context(settings)));
+    }
+    let snapshot = refresh_last_seen_by_id(pool, user_id).await?;
+    Ok(snapshot
+        .filter(|snapshot| snapshot.user.is_active != 0)
+        .map(|snapshot| snapshot.into_context(settings)))
 }
 
 pub async fn oidc_identity(
@@ -760,17 +891,20 @@ pub async fn oidc_identity(
     name: Option<&str>,
     groups: &BTreeSet<String>,
 ) -> Result<UserContext, AuthError> {
-    let user = upsert_vault_user(
+    let snapshot = upsert_vault_user(
         pool,
         &settings.oidc_issuer,
         subject,
         email,
         name,
-        Some(groups),
-        true,
+        groups,
+        IdentitySyncMode::OidcLogin,
     )
     .await?;
-    context_for_user(settings, pool, &user).await
+    if snapshot.user.is_active == 0 {
+        return Err(AuthError::UserDisabled);
+    }
+    Ok(snapshot.into_context(settings))
 }
 
 pub fn sign_session_payload(
@@ -824,9 +958,9 @@ async fn upsert_vault_user(
     subject: &str,
     email: Option<&str>,
     name: Option<&str>,
-    groups: Option<&BTreeSet<String>>,
-    mark_login: bool,
-) -> Result<VaultUserRecord, AuthError> {
+    groups: &BTreeSet<String>,
+    mode: IdentitySyncMode,
+) -> Result<IdentitySnapshot, AuthError> {
     if issuer.trim().is_empty() || subject.trim().is_empty() {
         return Err(AuthError::MissingSubject);
     }
@@ -835,8 +969,8 @@ async fn upsert_vault_user(
         .map(Some)
         .chain(std::iter::once(None))
     {
-        match upsert_vault_user_once(pool, issuer, subject, email, name, groups, mark_login).await {
-            Ok(user) => return Ok(user),
+        match upsert_vault_user_once(pool, issuer, subject, email, name, groups, mode).await {
+            Ok(snapshot) => return Ok(snapshot),
             Err(error) if retry_delay_ms.is_some() && retryable_identity_upsert_error(&error) => {
                 if let Some(delay_ms) = retry_delay_ms {
                     tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
@@ -854,50 +988,62 @@ async fn upsert_vault_user_once(
     subject: &str,
     email: Option<&str>,
     name: Option<&str>,
-    groups: Option<&BTreeSet<String>>,
-    mark_login: bool,
-) -> Result<VaultUserRecord, AuthError> {
+    groups: &BTreeSet<String>,
+    mode: IdentitySyncMode,
+) -> Result<IdentitySnapshot, AuthError> {
     // Identity sync is a short canonical write that can be hit by many fresh
     // sessions at once. BEGIN IMMEDIATE makes SQLite queue writers up front
     // instead of failing later during deferred read-to-write promotion.
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-    let existing = fetch_user_by_identity(&mut tx, issuer, subject).await?;
     let display_name = display_name(name, email, subject);
-    let now = now_string()?;
+    let (now, cutoff) = last_seen_write_times()?;
+    let existing = fetch_identity_snapshot_tx(&mut tx, issuer, subject, &cutoff).await?;
 
-    let user = if let Some(user) = existing {
-        if user.is_active == 0 {
+    let user_id = if let Some(snapshot) = existing {
+        if snapshot.user.is_active == 0 {
             return Err(AuthError::UserDisabled);
         }
-        if mark_login {
-            sqlx::query(
-                "UPDATE vault_users SET email = COALESCE(?, email), name = ?, last_seen_at = ?, last_login_at = ? WHERE id = ?",
-            )
-            .bind(email)
-            .bind(&display_name)
-            .bind(&now)
-            .bind(&now)
-            .bind(user.id)
-            .execute(&mut *tx)
-            .await?;
-        } else {
-            // Header identity claims are authoritative. In particular, an absent
-            // email must clear an old value so it cannot retain bootstrap-admin
-            // privileges. OIDC logins intentionally preserve a verified email
-            // when a later response omits that optional claim.
-            sqlx::query(
-                "UPDATE vault_users SET email = ?, name = ?, last_seen_at = ? WHERE id = ?",
-            )
-            .bind(email)
-            .bind(&display_name)
-            .bind(&now)
-            .bind(user.id)
-            .execute(&mut *tx)
-            .await?;
+        match mode {
+            IdentitySyncMode::OidcLogin => {
+                // A real OIDC callback is a login even when its profile claims
+                // are unchanged. Missing verified email remains preserve-only.
+                sqlx::query(
+                    "UPDATE vault_users SET email = COALESCE(?, email), name = ?, last_seen_at = ?, last_login_at = ? WHERE id = ?",
+                )
+                .bind(email)
+                .bind(&display_name)
+                .bind(&now)
+                .bind(&now)
+                .bind(snapshot.user.id)
+                .execute(&mut *tx)
+                .await?;
+            }
+            IdentitySyncMode::Authoritative => {
+                // Header and development identity claims are authoritative. In
+                // particular, None must clear an old email before bootstrap-admin
+                // authorization is calculated.
+                if snapshot.user.email.as_deref() != email || snapshot.user.name != display_name {
+                    sqlx::query("UPDATE vault_users SET email = ?, name = ? WHERE id = ?")
+                        .bind(email)
+                        .bind(&display_name)
+                        .bind(snapshot.user.id)
+                        .execute(&mut *tx)
+                        .await?;
+                }
+                if !snapshot.last_seen_is_fresh {
+                    sqlx::query("UPDATE vault_users SET last_seen_at = ? WHERE id = ?")
+                        .bind(&now)
+                        .bind(snapshot.user.id)
+                        .execute(&mut *tx)
+                        .await?;
+                }
+            }
         }
-        fetch_user_by_id_tx(&mut tx, user.id)
-            .await?
-            .ok_or(AuthError::IdentitySync)?
+
+        if !snapshot.groups.iter().eq(groups.iter()) || !snapshot.root_permissions_complete {
+            sync_vault_groups(&mut tx, snapshot.user.id, groups).await?;
+        }
+        snapshot.user.id
     } else {
         let result = sqlx::query(
             r"
@@ -911,22 +1057,24 @@ async fn upsert_vault_user_once(
         .bind(subject)
         .bind(email)
         .bind(&display_name)
-        .bind(if mark_login { Some(now.as_str()) } else { None })
+        .bind(if mode == IdentitySyncMode::OidcLogin {
+            Some(now.as_str())
+        } else {
+            None
+        })
         .bind(&now)
         .execute(&mut *tx)
         .await?;
-        fetch_user_by_id_tx(&mut tx, result.last_insert_rowid())
-            .await?
-            .ok_or(AuthError::IdentitySync)?
+        let user_id = result.last_insert_rowid();
+        sync_vault_groups(&mut tx, user_id, groups).await?;
+        user_id
     };
 
-    if let Some(groups) = groups {
-        sync_vault_groups(&mut tx, user.id, groups).await?;
-    }
-    tx.commit().await?;
-    fetch_user_by_id(pool, user.id)
+    let snapshot = fetch_identity_snapshot_by_id_tx(&mut tx, user_id, &cutoff)
         .await?
-        .ok_or(AuthError::IdentitySync)
+        .ok_or(AuthError::IdentitySync)?;
+    tx.commit().await?;
+    Ok(snapshot)
 }
 
 fn retryable_identity_upsert_error(error: &AuthError) -> bool {
@@ -1035,45 +1183,139 @@ async fn ensure_group_root_permissions(
     Ok(())
 }
 
-async fn context_for_user(
-    settings: &AuthSettings,
+const IDENTITY_SNAPSHOT_BY_IDENTITY_SQL: &str = r"
+    SELECT
+        vault_users.id,
+        vault_users.issuer,
+        vault_users.subject,
+        vault_users.email,
+        vault_users.name,
+        vault_users.is_admin,
+        vault_users.is_active,
+        COALESCE(julianday(vault_users.last_seen_at) >= julianday(?), 0)
+            AS last_seen_is_fresh,
+        vault_groups.name AS group_name,
+        CASE
+            WHEN vault_groups.id IS NULL THEN 1
+            ELSE NOT EXISTS (
+                SELECT 1
+                FROM folders AS root
+                WHERE root.is_root = 1
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM folder_permissions
+                      WHERE folder_permissions.folder_id = root.id
+                        AND folder_permissions.group_id = vault_groups.id
+                  )
+            )
+        END AS root_permissions_complete
+    FROM vault_users
+    LEFT JOIN vault_group_memberships
+        ON vault_group_memberships.user_id = vault_users.id
+    LEFT JOIN vault_groups
+        ON vault_groups.id = vault_group_memberships.group_id
+    WHERE vault_users.issuer = ? AND vault_users.subject = ?
+    ORDER BY vault_groups.name
+";
+
+const IDENTITY_SNAPSHOT_BY_ID_SQL: &str = r"
+    SELECT
+        vault_users.id,
+        vault_users.issuer,
+        vault_users.subject,
+        vault_users.email,
+        vault_users.name,
+        vault_users.is_admin,
+        vault_users.is_active,
+        COALESCE(julianday(vault_users.last_seen_at) >= julianday(?), 0)
+            AS last_seen_is_fresh,
+        vault_groups.name AS group_name,
+        1 AS root_permissions_complete
+    FROM vault_users
+    LEFT JOIN vault_group_memberships
+        ON vault_group_memberships.user_id = vault_users.id
+    LEFT JOIN vault_groups
+        ON vault_groups.id = vault_group_memberships.group_id
+    WHERE vault_users.id = ?
+    ORDER BY vault_groups.name
+";
+
+async fn fetch_identity_snapshot(
     pool: &SqlitePool,
-    user: &VaultUserRecord,
-) -> Result<UserContext, AuthError> {
-    let groups = group_names_for_user(pool, user.id).await?;
-    let is_admin = effective_admin_from_parts(
-        settings,
-        user.is_admin != 0,
-        &user.issuer,
-        &user.subject,
-        user.email.as_deref(),
-        &groups,
-    );
-    Ok(UserContext {
-        id: user.id.to_string(),
-        vault_user_id: user.id,
-        issuer: user.issuer.clone(),
-        subject: user.subject.clone(),
-        name: user.name.clone(),
-        email: user.email.clone().unwrap_or_default(),
-        groups,
-        is_admin,
-    })
+    issuer: &str,
+    subject: &str,
+    cutoff: &str,
+) -> Result<Option<IdentitySnapshot>, AuthError> {
+    let rows = sqlx::query_as::<_, IdentitySnapshotRow>(IDENTITY_SNAPSHOT_BY_IDENTITY_SQL)
+        .bind(cutoff)
+        .bind(issuer)
+        .bind(subject)
+        .fetch_all(pool)
+        .await?;
+    Ok(IdentitySnapshot::from_rows(rows))
 }
 
-async fn group_names_for_user(pool: &SqlitePool, user_id: i64) -> Result<Vec<String>, AuthError> {
-    Ok(sqlx::query_scalar(
-        r"
-        SELECT vault_groups.name
-        FROM vault_groups
-        JOIN vault_group_memberships ON vault_group_memberships.group_id = vault_groups.id
-        WHERE vault_group_memberships.user_id = ?
-        ORDER BY vault_groups.name
-        ",
-    )
-    .bind(user_id)
-    .fetch_all(pool)
-    .await?)
+async fn fetch_identity_snapshot_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    issuer: &str,
+    subject: &str,
+    cutoff: &str,
+) -> Result<Option<IdentitySnapshot>, AuthError> {
+    let rows = sqlx::query_as::<_, IdentitySnapshotRow>(IDENTITY_SNAPSHOT_BY_IDENTITY_SQL)
+        .bind(cutoff)
+        .bind(issuer)
+        .bind(subject)
+        .fetch_all(&mut **tx)
+        .await?;
+    Ok(IdentitySnapshot::from_rows(rows))
+}
+
+async fn fetch_identity_snapshot_by_id(
+    pool: &SqlitePool,
+    user_id: i64,
+    cutoff: &str,
+) -> Result<Option<IdentitySnapshot>, AuthError> {
+    let rows = sqlx::query_as::<_, IdentitySnapshotRow>(IDENTITY_SNAPSHOT_BY_ID_SQL)
+        .bind(cutoff)
+        .bind(user_id)
+        .fetch_all(pool)
+        .await?;
+    Ok(IdentitySnapshot::from_rows(rows))
+}
+
+async fn fetch_identity_snapshot_by_id_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    user_id: i64,
+    cutoff: &str,
+) -> Result<Option<IdentitySnapshot>, AuthError> {
+    let rows = sqlx::query_as::<_, IdentitySnapshotRow>(IDENTITY_SNAPSHOT_BY_ID_SQL)
+        .bind(cutoff)
+        .bind(user_id)
+        .fetch_all(&mut **tx)
+        .await?;
+    Ok(IdentitySnapshot::from_rows(rows))
+}
+
+async fn refresh_last_seen_by_id(
+    pool: &SqlitePool,
+    user_id: i64,
+) -> Result<Option<IdentitySnapshot>, AuthError> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let (now, cutoff) = last_seen_write_times()?;
+    let mut snapshot = fetch_identity_snapshot_by_id_tx(&mut tx, user_id, &cutoff).await?;
+    if snapshot
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.user.is_active != 0 && !snapshot.last_seen_is_fresh)
+    {
+        sqlx::query("UPDATE vault_users SET last_seen_at = ? WHERE id = ? AND is_active = 1")
+            .bind(now)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        snapshot = fetch_identity_snapshot_by_id_tx(&mut tx, user_id, &cutoff).await?;
+    }
+    tx.commit().await?;
+    Ok(snapshot)
 }
 
 #[must_use]
@@ -1104,48 +1346,6 @@ pub fn effective_admin_from_parts(
                 .admin_groups
                 .contains(&group.trim().to_ascii_lowercase())
         })
-}
-
-async fn fetch_user_by_identity(
-    tx: &mut Transaction<'_, Sqlite>,
-    issuer: &str,
-    subject: &str,
-) -> Result<Option<VaultUserRecord>, AuthError> {
-    Ok(sqlx::query_as::<_, VaultUserRecord>(
-        r"
-        SELECT id, issuer, subject, email, name, is_admin, is_active
-        FROM vault_users
-        WHERE issuer = ? AND subject = ?
-        ",
-    )
-    .bind(issuer)
-    .bind(subject)
-    .fetch_optional(&mut **tx)
-    .await?)
-}
-
-async fn fetch_user_by_id_tx(
-    tx: &mut Transaction<'_, Sqlite>,
-    id: i64,
-) -> Result<Option<VaultUserRecord>, AuthError> {
-    Ok(sqlx::query_as::<_, VaultUserRecord>(
-        "SELECT id, issuer, subject, email, name, is_admin, is_active FROM vault_users WHERE id = ?",
-    )
-    .bind(id)
-    .fetch_optional(&mut **tx)
-    .await?)
-}
-
-async fn fetch_user_by_id(
-    pool: &SqlitePool,
-    id: i64,
-) -> Result<Option<VaultUserRecord>, AuthError> {
-    Ok(sqlx::query_as::<_, VaultUserRecord>(
-        "SELECT id, issuer, subject, email, name, is_admin, is_active FROM vault_users WHERE id = ?",
-    )
-    .bind(id)
-    .fetch_optional(pool)
-    .await?)
 }
 
 fn clean_header(value: Option<&axum::http::HeaderValue>) -> String {
@@ -1461,8 +1661,17 @@ fn unix_timestamp_now() -> f64 {
         .map_or(0.0, |duration| duration.as_secs_f64())
 }
 
-fn now_string() -> Result<String, time::error::Format> {
-    OffsetDateTime::now_utc().format(&Rfc3339)
+fn last_seen_cutoff() -> Result<String, time::error::Format> {
+    (OffsetDateTime::now_utc() - time::Duration::seconds(LAST_SEEN_REFRESH_INTERVAL_SECONDS))
+        .format(&Rfc3339)
+}
+
+fn last_seen_write_times() -> Result<(String, String), time::error::Format> {
+    let now = OffsetDateTime::now_utc();
+    Ok((
+        now.format(&Rfc3339)?,
+        (now - time::Duration::seconds(LAST_SEEN_REFRESH_INTERVAL_SECONDS)).format(&Rfc3339)?,
+    ))
 }
 
 pub async fn folder_permission_count_for_group(

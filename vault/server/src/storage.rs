@@ -26,8 +26,11 @@ use crate::config::Config;
 
 pub const DEFAULT_STORAGE_PREFIX: &str = "objects";
 pub const LOCAL_MULTIPART_FORMAT: &str = "vault.local.multipart.v1";
+pub const S3_UPLOAD_STAGE_FILENAME: &str = ".vault-s3-upload.stage";
 pub const STORAGE_CHUNK_SIZE: usize = 1024 * 1024;
 const MAX_LOCAL_MULTIPART_MANIFEST_BYTES: u64 = 512 * 1024;
+const LEGACY_S3_STAGE_PREFIX: &str = "vault-s3-upload-";
+const LEGACY_S3_STAGE_SUFFIX: &str = ".tmp";
 pub const STORAGE_MULTIPART_MAX_PARTS: usize = 1024;
 
 pub type SharedBlobStorage = Arc<dyn BlobStorageBackend>;
@@ -167,6 +170,15 @@ pub trait BlobStorageBackend: std::fmt::Debug + Send + Sync {
         part_paths: &[PathBuf],
         expected_digest: Option<&str>,
     ) -> Result<StoredBlob, StorageError>;
+
+    async fn put_part_files_in_staging(
+        &self,
+        part_paths: &[PathBuf],
+        expected_digest: Option<&str>,
+        _staging_dir: &Path,
+    ) -> Result<StoredBlob, StorageError> {
+        self.put_part_files(part_paths, expected_digest).await
+    }
 
     async fn read_bytes(&self, object_key: &str) -> Result<Vec<u8>, StorageError>;
 
@@ -359,6 +371,66 @@ struct S3ReadState {
     pending: Option<Bytes>,
     remaining: u64,
     _read_guard: OwnedRwLockReadGuard<()>,
+}
+
+#[derive(Debug)]
+struct OwnedStageFile {
+    path: PathBuf,
+    writer: Option<fs::File>,
+    armed: bool,
+}
+
+impl OwnedStageFile {
+    fn new(path: PathBuf, writer: fs::File) -> Self {
+        Self {
+            path,
+            writer: Some(writer),
+            armed: true,
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn writer(&mut self) -> Result<&mut fs::File, StorageError> {
+        self.writer.as_mut().ok_or(StorageError::InvalidStoragePath)
+    }
+
+    fn close_writer(&mut self) {
+        drop(self.writer.take());
+    }
+
+    async fn cleanup(mut self) {
+        self.close_writer();
+        match fs::remove_file(&self.path).await {
+            Ok(()) => self.armed = false,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => self.armed = false,
+            Err(error) => tracing::warn!(
+                ?error,
+                path = %self.path.display(),
+                "could not remove S3 upload stage file asynchronously"
+            ),
+        }
+    }
+}
+
+impl Drop for OwnedStageFile {
+    fn drop(&mut self) {
+        self.close_writer();
+        if !self.armed {
+            return;
+        }
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(
+                ?error,
+                path = %self.path.display(),
+                "could not remove S3 upload stage file"
+            ),
+        }
+    }
 }
 
 impl LocalBlobStorage {
@@ -1686,20 +1758,8 @@ impl BlobStorageBackend for S3CompatibleBlobStorage {
         if hashed_size != size_bytes || source_digest != normalized_digest {
             return Err(StorageError::ChecksumMismatch);
         }
-        let object_key = self.object_key_for_hash("sha256", &normalized_digest);
-        self.client
-            .put_object()
-            .bucket(self.bucket())
-            .key(&object_key)
-            .body(
-                ByteStream::from_path(source_path)
-                    .await
-                    .map_err(remote_storage_error)?,
-            )
-            .send()
+        self.put_preverified_file(source_path, &normalized_digest, size_bytes)
             .await
-            .map_err(remote_storage_error)?;
-        Ok(self.stored_blob(normalized_digest, size_bytes, object_key))
     }
 
     async fn put_part_files(
@@ -1707,18 +1767,26 @@ impl BlobStorageBackend for S3CompatibleBlobStorage {
         part_paths: &[PathBuf],
         expected_digest: Option<&str>,
     ) -> Result<StoredBlob, StorageError> {
-        let (temp_path, actual_digest, size_bytes) = stage_part_files(part_paths).await?;
-        let result = async {
-            if expected_digest
-                .is_some_and(|expected| actual_digest != expected.to_ascii_lowercase())
-            {
+        if part_paths.is_empty() {
+            let digest = sha256_hex(&[]);
+            if expected_digest.is_some_and(|expected| digest != expected.to_ascii_lowercase()) {
                 return Err(StorageError::ChecksumMismatch);
             }
-            self.put_file(&temp_path, &actual_digest, size_bytes).await
+            return self.put_bytes(&[]).await;
         }
-        .await;
-        let _ = fs::remove_file(&temp_path).await;
-        result
+        let staging_dir = common_part_parent(part_paths)?;
+        self.put_staged_part_files(part_paths, expected_digest, &staging_dir)
+            .await
+    }
+
+    async fn put_part_files_in_staging(
+        &self,
+        part_paths: &[PathBuf],
+        expected_digest: Option<&str>,
+        staging_dir: &Path,
+    ) -> Result<StoredBlob, StorageError> {
+        self.put_staged_part_files(part_paths, expected_digest, staging_dir)
+            .await
     }
 
     async fn read_bytes(&self, object_key: &str) -> Result<Vec<u8>, StorageError> {
@@ -1897,6 +1965,52 @@ impl S3CompatibleBlobStorage {
             bucket: self.bucket().to_string(),
             object_key,
         }
+    }
+
+    async fn put_preverified_file(
+        &self,
+        source_path: &Path,
+        digest: &str,
+        size_bytes: u64,
+    ) -> Result<StoredBlob, StorageError> {
+        let source_metadata = fs::metadata(source_path).await?;
+        if !source_metadata.is_file() || source_metadata.len() != size_bytes {
+            return Err(StorageError::SourceSizeChanged);
+        }
+        let object_key = self.object_key_for_hash("sha256", digest);
+        self.client
+            .put_object()
+            .bucket(self.bucket())
+            .key(&object_key)
+            .body(
+                ByteStream::from_path(source_path)
+                    .await
+                    .map_err(remote_storage_error)?,
+            )
+            .send()
+            .await
+            .map_err(remote_storage_error)?;
+        Ok(self.stored_blob(digest.to_string(), size_bytes, object_key))
+    }
+
+    async fn put_staged_part_files(
+        &self,
+        part_paths: &[PathBuf],
+        expected_digest: Option<&str>,
+        staging_dir: &Path,
+    ) -> Result<StoredBlob, StorageError> {
+        let (stage, actual_digest, size_bytes) =
+            stage_part_files_in(part_paths, staging_dir).await?;
+        let result = if expected_digest
+            .is_some_and(|expected| actual_digest != expected.to_ascii_lowercase())
+        {
+            Err(StorageError::ChecksumMismatch)
+        } else {
+            self.put_preverified_file(stage.path(), &actual_digest, size_bytes)
+                .await
+        };
+        stage.cleanup().await;
+        result
     }
 }
 
@@ -2282,10 +2396,167 @@ async fn sync_directory(_path: &Path) -> Result<(), StorageError> {
     Ok(())
 }
 
-async fn stage_part_files(part_paths: &[PathBuf]) -> Result<(PathBuf, String, u64), StorageError> {
-    let temp_path =
-        std::env::temp_dir().join(format!("vault-s3-upload-{}.tmp", Uuid::new_v4().simple()));
-    let mut output = fs::File::create_new(&temp_path).await?;
+fn common_part_parent(part_paths: &[PathBuf]) -> Result<PathBuf, StorageError> {
+    let parent = part_paths
+        .first()
+        .and_then(|path| path.parent())
+        .ok_or(StorageError::InvalidStoragePath)?;
+    if part_paths.iter().any(|path| path.parent() != Some(parent)) {
+        return Err(StorageError::InvalidStoragePath);
+    }
+    Ok(parent.to_path_buf())
+}
+
+pub async fn remove_s3_upload_stage_file(staging_dir: &Path) -> Result<bool, StorageError> {
+    let directory_metadata = fs::symlink_metadata(staging_dir).await?;
+    if directory_metadata.file_type().is_symlink() || !directory_metadata.is_dir() {
+        return Err(StorageError::InvalidStoragePath);
+    }
+    let stage_path = staging_dir.join(S3_UPLOAD_STAGE_FILENAME);
+    let stage_metadata = match fs::symlink_metadata(&stage_path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if stage_metadata.file_type().is_symlink() || !stage_metadata.is_file() {
+        return Err(StorageError::InvalidStoragePath);
+    }
+    fs::remove_file(stage_path).await?;
+    Ok(true)
+}
+
+pub async fn sweep_legacy_s3_stage_files(
+    temp_dir: &Path,
+    minimum_age: StdDuration,
+    work_batch_size: usize,
+) -> Result<Vec<String>, StorageError> {
+    if !temp_dir.is_absolute() || work_batch_size == 0 {
+        return if work_batch_size == 0 {
+            Ok(Vec::new())
+        } else {
+            Err(StorageError::InvalidStoragePath)
+        };
+    }
+    let supplied_metadata = fs::symlink_metadata(temp_dir).await?;
+    if supplied_metadata.file_type().is_symlink() || !supplied_metadata.is_dir() {
+        return Err(StorageError::InvalidStoragePath);
+    }
+    let temp_dir = fs::canonicalize(temp_dir).await?;
+    if temp_dir.parent().is_none() {
+        return Err(StorageError::InvalidStoragePath);
+    }
+    let directory_metadata = fs::symlink_metadata(&temp_dir).await?;
+    if directory_metadata.file_type().is_symlink() || !directory_metadata.is_dir() {
+        return Err(StorageError::InvalidStoragePath);
+    }
+    let mut entries = fs::read_dir(&temp_dir).await?;
+    let now = SystemTime::now();
+    let mut batch_work = 0_usize;
+    let mut deleted = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        if deleted.len() == work_batch_size {
+            break;
+        }
+        batch_work += 1;
+        if batch_work == work_batch_size {
+            batch_work = 0;
+            tokio::task::yield_now().await;
+        }
+        let Some(file_name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
+            continue;
+        };
+        if !is_legacy_s3_stage_filename(&file_name) || !entry.file_type().await?.is_file() {
+            continue;
+        }
+        let path = temp_dir.join(&file_name);
+        if entry.path() != path {
+            continue;
+        }
+        let metadata = match fs::symlink_metadata(&path).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata
+                .modified()
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+                .is_none_or(|age| age < minimum_age)
+        {
+            continue;
+        }
+        let current_directory = fs::symlink_metadata(&temp_dir).await?;
+        if current_directory.file_type().is_symlink() || !current_directory.is_dir() {
+            return Err(StorageError::InvalidStoragePath);
+        }
+        let current_metadata = match fs::symlink_metadata(&path).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if !same_file_snapshot(&metadata, &current_metadata)
+            || current_metadata
+                .modified()
+                .ok()
+                .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+                .is_none_or(|age| age < minimum_age)
+        {
+            continue;
+        }
+        match fs::remove_file(&path).await {
+            Ok(()) => deleted.push(file_name),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(deleted)
+}
+
+fn same_file_snapshot(first: &std::fs::Metadata, current: &std::fs::Metadata) -> bool {
+    if current.file_type().is_symlink()
+        || !current.is_file()
+        || first.len() != current.len()
+        || first.modified().ok() != current.modified().ok()
+    {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        first.dev() == current.dev() && first.ino() == current.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn is_legacy_s3_stage_filename(file_name: &str) -> bool {
+    file_name
+        .strip_prefix(LEGACY_S3_STAGE_PREFIX)
+        .and_then(|name| name.strip_suffix(LEGACY_S3_STAGE_SUFFIX))
+        .is_some_and(|uuid| {
+            uuid.len() == 32
+                && uuid
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+}
+
+async fn stage_part_files_in(
+    part_paths: &[PathBuf],
+    staging_dir: &Path,
+) -> Result<(OwnedStageFile, String, u64), StorageError> {
+    let directory_metadata = fs::symlink_metadata(staging_dir).await?;
+    if directory_metadata.file_type().is_symlink() || !directory_metadata.is_dir() {
+        return Err(StorageError::InvalidStoragePath);
+    }
+    remove_s3_upload_stage_file(staging_dir).await?;
+    let stage_path = staging_dir.join(S3_UPLOAD_STAGE_FILENAME);
+    let output = fs::File::create_new(&stage_path).await?;
+    let mut stage = OwnedStageFile::new(stage_path, output);
     let mut hasher = Sha256::new();
     let mut size_bytes = 0_u64;
     let write_result = async {
@@ -2301,18 +2572,16 @@ async fn stage_part_files(part_paths: &[PathBuf]) -> Result<(PathBuf, String, u6
                 size_bytes = size_bytes
                     .checked_add(u64::try_from(read).map_err(|_| StorageError::InvalidRange)?)
                     .ok_or(StorageError::InvalidRange)?;
-                tokio::io::AsyncWriteExt::write_all(&mut output, &buffer[..read]).await?;
+                tokio::io::AsyncWriteExt::write_all(stage.writer()?, &buffer[..read]).await?;
             }
         }
-        tokio::io::AsyncWriteExt::flush(&mut output).await?;
+        tokio::io::AsyncWriteExt::flush(stage.writer()?).await?;
         Ok::<(), StorageError>(())
     }
     .await;
-    if write_result.is_err() {
-        let _ = fs::remove_file(&temp_path).await;
-    }
+    stage.close_writer();
     write_result?;
-    Ok((temp_path, lower_hex(&hasher.finalize()), size_bytes))
+    Ok((stage, lower_hex(&hasher.finalize()), size_bytes))
 }
 
 fn env_trimmed_from<F>(env_var: &F, name: &str) -> String

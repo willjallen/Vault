@@ -298,6 +298,7 @@ struct CompletedParts {
     digest: String,
     size_bytes: i64,
     paths: Vec<PathBuf>,
+    staging_dir: PathBuf,
 }
 
 #[derive(Debug, Default)]
@@ -428,6 +429,7 @@ impl UploadHashCoordinator {
             digest,
             size_bytes,
             paths,
+            staging_dir: upload_session_dir(transfers_path, &session.id)?,
         })
     }
 
@@ -1223,7 +1225,11 @@ async fn complete_upload_session_inner(
     )
     .await?;
     let stored = match publication
-        .run_storage(storage.put_part_files(&parts.paths, Some(&parts.digest)))
+        .run_storage(storage.put_part_files_in_staging(
+            &parts.paths,
+            Some(&parts.digest),
+            &parts.staging_dir,
+        ))
         .await
     {
         Ok(stored) => stored,
@@ -1668,6 +1674,7 @@ async fn completed_parts(
         digest,
         size_bytes,
         paths,
+        staging_dir: upload_session_dir(transfers_path, &session.id)?,
     })
 }
 

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use axum::Router;
 use axum::body::{Body, Bytes, to_bytes};
@@ -11,15 +12,23 @@ use axum::routing::{delete, get, head, put};
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
+use tokio::time::timeout;
 use vault_server::blob_lifecycle::{begin_blob_publication, collect_unreferenced_blobs};
 use vault_server::db;
 use vault_server::storage::{
-    BlobReadRange, BlobStorageBackend, BlobWriteKind, S3CompatibleBlobStorage, S3StorageSettings,
-    STORAGE_CHUNK_SIZE, StorageError,
+    BlobReadRange, BlobStorageBackend, BlobWriteKind, S3_UPLOAD_STAGE_FILENAME,
+    S3CompatibleBlobStorage, S3StorageSettings, STORAGE_CHUNK_SIZE, StorageError,
+    remove_s3_upload_stage_file, sweep_legacy_s3_stage_files,
 };
 
 type ObjectMap = Arc<Mutex<HashMap<String, Vec<u8>>>>;
+
+#[derive(Clone, Default)]
+struct BlockedPutState {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
 
 #[tokio::test]
 async fn s3_compatible_storage_puts_reads_ranges_and_deletes_objects() {
@@ -318,7 +327,7 @@ async fn s3_compatible_storage_promotes_part_files_as_content_addressed_object()
     let digest = sha256_hex(combined);
 
     let stored = storage
-        .put_part_files(&[first, second], Some(&digest))
+        .put_part_files_in_staging(&[first, second], Some(&digest), temp_dir.path())
         .await
         .expect("put part files");
 
@@ -327,6 +336,7 @@ async fn s3_compatible_storage_promotes_part_files_as_content_addressed_object()
     assert_eq!(stored.digest, digest);
     assert_eq!(stored.size_bytes, combined.len() as u64);
     assert_eq!(stored.object_key, format!("tenant-a/sha256/{digest}"));
+    assert!(!temp_dir.path().join(S3_UPLOAD_STAGE_FILENAME).exists());
     assert_eq!(
         storage
             .read_bytes(&stored.object_key)
@@ -360,17 +370,210 @@ async fn s3_compatible_storage_rejects_part_file_checksum_mismatch_without_uploa
     let wrong_digest = sha256_hex(b"different bytes");
 
     let error = storage
-        .put_part_files(&[part], Some(&wrong_digest))
+        .put_part_files_in_staging(&[part], Some(&wrong_digest), temp_dir.path())
         .await
         .expect_err("checksum mismatch");
 
     assert!(matches!(error, StorageError::ChecksumMismatch));
+    assert!(!temp_dir.path().join(S3_UPLOAD_STAGE_FILENAME).exists());
     assert!(matches!(
         storage
             .read_bytes(&format!("objects/sha256/{actual_digest}"))
             .await,
         Err(StorageError::NotFound),
     ));
+}
+
+#[tokio::test]
+async fn s3_staged_part_upload_supports_empty_objects() {
+    let endpoint_url = start_s3_mock().await;
+    let storage = S3CompatibleBlobStorage::from_settings(S3StorageSettings {
+        name: "s3".to_string(),
+        bucket: "vault-parts".to_string(),
+        region: "us-east-1".to_string(),
+        endpoint_url: Some(endpoint_url),
+        access_key_id: Some("test-access".to_string()),
+        secret_access_key: Some("test-secret".to_string()),
+        session_token: None,
+        prefix: "objects".to_string(),
+    })
+    .await
+    .expect("s3 storage");
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let digest = sha256_hex(&[]);
+
+    let stored = storage
+        .put_part_files_in_staging(&[], Some(&digest), temp_dir.path())
+        .await
+        .expect("empty staged upload");
+
+    assert_eq!(stored.digest, digest);
+    assert_eq!(stored.size_bytes, 0);
+    assert_eq!(
+        storage
+            .read_bytes(&stored.object_key)
+            .await
+            .expect("empty object"),
+        b"",
+    );
+    assert!(!temp_dir.path().join(S3_UPLOAD_STAGE_FILENAME).exists());
+}
+
+#[tokio::test]
+async fn s3_part_staging_is_session_local_and_cancel_safe() {
+    let (endpoint_url, blocked_put) = start_blocked_s3_put_mock().await;
+    let storage = S3CompatibleBlobStorage::from_settings(S3StorageSettings {
+        name: "s3".to_string(),
+        bucket: "vault-parts".to_string(),
+        region: "us-east-1".to_string(),
+        endpoint_url: Some(endpoint_url),
+        access_key_id: Some("test-access".to_string()),
+        secret_access_key: Some("test-secret".to_string()),
+        session_token: None,
+        prefix: "objects".to_string(),
+    })
+    .await
+    .expect("s3 storage");
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let session_dir = temp_dir.path().join("transfers/uploads/session");
+    tokio::fs::create_dir_all(&session_dir)
+        .await
+        .expect("session dir");
+    let first = session_dir.join("00000001.part");
+    let second = session_dir.join("00000002.part");
+    tokio::fs::write(&first, b"hello ")
+        .await
+        .expect("first part");
+    tokio::fs::write(&second, b"world")
+        .await
+        .expect("second part");
+    let digest = sha256_hex(b"hello world");
+    let task_session_dir = session_dir.clone();
+    let upload = tokio::spawn(async move {
+        storage
+            .put_part_files_in_staging(&[first, second], Some(&digest), &task_session_dir)
+            .await
+    });
+
+    timeout(Duration::from_secs(5), blocked_put.entered.notified())
+        .await
+        .expect("S3 PUT started");
+    let stage_path = session_dir.join(S3_UPLOAD_STAGE_FILENAME);
+    assert_eq!(
+        tokio::fs::read(&stage_path).await.expect("stage bytes"),
+        b"hello world",
+    );
+
+    upload.abort();
+    let error = upload.await.expect_err("cancelled upload task");
+    assert!(error.is_cancelled());
+    assert!(!stage_path.exists());
+    blocked_put.release.notify_waiters();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn s3_stage_cleanup_refuses_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let session_dir = temp_dir.path().join("session");
+    tokio::fs::create_dir_all(&session_dir)
+        .await
+        .expect("session dir");
+    let outside = temp_dir.path().join("outside");
+    tokio::fs::write(&outside, b"outside")
+        .await
+        .expect("outside file");
+    let stage_path = session_dir.join(S3_UPLOAD_STAGE_FILENAME);
+    symlink(&outside, &stage_path).expect("stage symlink");
+
+    let error = remove_s3_upload_stage_file(&session_dir)
+        .await
+        .expect_err("symlink must be refused");
+
+    assert!(matches!(error, StorageError::InvalidStoragePath));
+    assert!(
+        tokio::fs::symlink_metadata(&stage_path)
+            .await
+            .expect("stage metadata")
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        tokio::fs::read(&outside).await.expect("outside bytes"),
+        b"outside",
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn legacy_s3_stage_sweep_is_aged_bounded_and_symlink_safe() {
+    use std::os::unix::fs::symlink;
+
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let legacy_name = |digit: char| format!("vault-s3-upload-{}.tmp", digit.to_string().repeat(32));
+    let old_name = legacy_name('0');
+    let fresh_name = legacy_name('1');
+    let symlink_name = legacy_name('2');
+    let directory_name = legacy_name('3');
+    let near_miss_name = format!("vault-s3-upload-{}.tmp", "A".repeat(32));
+    let old_path = temp_dir.path().join(&old_name);
+    tokio::fs::write(&old_path, b"old stage")
+        .await
+        .expect("old stage");
+    tokio::fs::write(temp_dir.path().join(&fresh_name), b"fresh stage")
+        .await
+        .expect("fresh stage");
+    tokio::fs::create_dir(temp_dir.path().join(&directory_name))
+        .await
+        .expect("lookalike directory");
+    tokio::fs::write(temp_dir.path().join(&near_miss_name), b"near miss")
+        .await
+        .expect("near-miss stage");
+    let outside = temp_dir.path().join("outside");
+    tokio::fs::write(&outside, b"outside")
+        .await
+        .expect("outside file");
+    symlink(&outside, temp_dir.path().join(&symlink_name)).expect("legacy stage symlink");
+    std::fs::File::open(&old_path)
+        .expect("old stage handle")
+        .set_times(
+            std::fs::FileTimes::new().set_modified(SystemTime::now() - Duration::from_hours(2)),
+        )
+        .expect("old stage mtime");
+
+    assert!(
+        sweep_legacy_s3_stage_files(temp_dir.path(), Duration::ZERO, 0)
+            .await
+            .expect("zero-work sweep")
+            .is_empty()
+    );
+    assert!(old_path.is_file());
+    assert!(matches!(
+        sweep_legacy_s3_stage_files(std::path::Path::new("/."), Duration::ZERO, 1,).await,
+        Err(StorageError::InvalidStoragePath)
+    ));
+
+    let deleted = sweep_legacy_s3_stage_files(temp_dir.path(), Duration::from_hours(1), 128)
+        .await
+        .expect("legacy stage sweep");
+
+    assert_eq!(deleted, vec![old_name]);
+    assert!(temp_dir.path().join(fresh_name).is_file());
+    assert!(temp_dir.path().join(directory_name).is_dir());
+    assert!(temp_dir.path().join(near_miss_name).is_file());
+    assert!(
+        tokio::fs::symlink_metadata(temp_dir.path().join(symlink_name))
+            .await
+            .expect("legacy symlink metadata")
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        tokio::fs::read(outside).await.expect("outside bytes"),
+        b"outside"
+    );
 }
 
 #[tokio::test]
@@ -459,6 +662,25 @@ async fn start_s3_mock_with_objects() -> (String, ObjectMap) {
         axum::serve(listener, app).await.expect("s3 mock");
     });
     (endpoint_url(addr), objects)
+}
+
+async fn start_blocked_s3_put_mock() -> (String, BlockedPutState) {
+    let state = BlockedPutState::default();
+    let app = Router::new()
+        .route("/{bucket}/{*key}", put(mock_blocked_put))
+        .with_state(state.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let addr = listener.local_addr().expect("listener address");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("blocked S3 mock");
+    });
+    (endpoint_url(addr), state)
+}
+
+async fn mock_blocked_put(State(state): State<BlockedPutState>, _body: Body) -> StatusCode {
+    state.entered.notify_one();
+    state.release.notified().await;
+    StatusCode::OK
 }
 
 fn endpoint_url(addr: SocketAddr) -> String {

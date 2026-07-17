@@ -13,7 +13,9 @@ use tokio::sync::Mutex;
 
 use crate::blob_lifecycle::collect_unreferenced_blobs_with_limit;
 use crate::exports::{self, ExportError, ExportExecutionContext};
-use crate::storage::{SharedBlobStorage, StorageError};
+use crate::storage::{
+    S3_UPLOAD_STAGE_FILENAME, SharedBlobStorage, StorageError, remove_s3_upload_stage_file,
+};
 use crate::uploads::{UploadHashCoordinator, clear_upload_session_files};
 
 const DEFAULT_SWEEP_LIMIT: i64 = 250;
@@ -45,6 +47,7 @@ pub struct TransferSweepResult {
 pub struct TransferRecoveryResult {
     pub resumed_uploads: Vec<String>,
     pub failed_uploads: Vec<String>,
+    pub deleted_upload_temps: Vec<String>,
     pub requeued_exports: Vec<String>,
     pub queued_exports: Vec<String>,
     pub deleted_export_temps: Vec<String>,
@@ -347,6 +350,7 @@ async fn recover_interrupted_transfers_inner(
     let uploads = interrupted_uploads(pool, &now).await?;
     let exports = interrupted_exports(pool, &now).await?;
     let mut result = TransferRecoveryResult::default();
+    result.deleted_upload_temps = clear_interrupted_upload_stages(&uploads, transfers_path).await;
 
     let mut transaction = pool.begin().await?;
     for upload in &uploads {
@@ -432,6 +436,47 @@ async fn recover_interrupted_transfers_inner(
             enqueue_pending_exports(pool, storage, transfers_path, export_execution).await?;
     }
     Ok(result)
+}
+
+async fn clear_interrupted_upload_stages(
+    uploads: &[InterruptedUploadRow],
+    transfers_path: &Path,
+) -> Vec<String> {
+    let mut deleted = Vec::new();
+    let upload_root = match validated_upload_root(transfers_path).await {
+        Ok(Some(upload_root)) => upload_root,
+        Ok(None) => return deleted,
+        Err(error) => {
+            tracing::warn!(?error, "could not validate interrupted upload staging root");
+            return deleted;
+        }
+    };
+    for upload in uploads {
+        if !is_safe_transfer_id(&upload.id) {
+            continue;
+        }
+        if validated_upload_root(transfers_path)
+            .await
+            .ok()
+            .flatten()
+            .as_ref()
+            != Some(&upload_root)
+        {
+            break;
+        }
+        let session_dir = upload_root.join(&upload.id);
+        match remove_s3_upload_stage_file(&session_dir).await {
+            Ok(true) => deleted.push(format!("{}/{}", upload.id, S3_UPLOAD_STAGE_FILENAME)),
+            Ok(false) => {}
+            Err(StorageError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(
+                ?error,
+                session_id = %upload.id,
+                "could not remove interrupted S3 upload stage file"
+            ),
+        }
+    }
+    deleted
 }
 
 async fn enqueue_pending_exports(

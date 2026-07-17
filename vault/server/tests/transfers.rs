@@ -11,7 +11,7 @@ use vault_server::config::Config;
 use vault_server::db;
 use vault_server::folders::{VAULT_ROOT_KEY, get_root_folder};
 use vault_server::http::{self, AppState};
-use vault_server::storage::{LocalBlobStorage, StoredBlob};
+use vault_server::storage::{LocalBlobStorage, S3_UPLOAD_STAGE_FILENAME, StoredBlob};
 use vault_server::transfers::{
     TransferSweepResult, cleanup_upload_session_resources, recover_interrupted_transfers,
     sweep_expired_transfers, sweep_orphaned_upload_directories,
@@ -410,10 +410,22 @@ async fn recovery_resumes_recoverable_completing_uploads_and_fails_missing_parts
     tokio::fs::create_dir_all(&missing_dir)
         .await
         .expect("missing dir");
-
-    let result = recover_interrupted_transfers(&state.db, &state.storage, &transfers_path, false)
+    let recoverable_stage = transfers_path
+        .join("uploads/recoverable-upload")
+        .join(S3_UPLOAD_STAGE_FILENAME);
+    let missing_stage = missing_dir.join(S3_UPLOAD_STAGE_FILENAME);
+    tokio::fs::write(&recoverable_stage, b"partial remote stage")
         .await
-        .expect("recover");
+        .expect("recoverable stage");
+    tokio::fs::write(&missing_stage, b"partial remote stage")
+        .await
+        .expect("missing stage");
+
+    let mut result =
+        recover_interrupted_transfers(&state.db, &state.storage, &transfers_path, false)
+            .await
+            .expect("recover");
+    result.deleted_upload_temps.sort();
     let recoverable: (String, i64, i64, Option<String>) = sqlx::query_as(
         r"
         SELECT status, verification_total_bytes, verification_processed_bytes, error
@@ -437,6 +449,13 @@ async fn recovery_resumes_recoverable_completing_uploads_and_fails_missing_parts
 
     assert_eq!(result.resumed_uploads, vec!["recoverable-upload"]);
     assert_eq!(result.failed_uploads, vec!["missing-upload"]);
+    assert_eq!(
+        result.deleted_upload_temps,
+        vec![
+            format!("missing-upload/{S3_UPLOAD_STAGE_FILENAME}"),
+            format!("recoverable-upload/{S3_UPLOAD_STAGE_FILENAME}"),
+        ]
+    );
     assert_eq!(recoverable, ("active".to_string(), 0, 0, None));
     assert_eq!(
         missing,
@@ -458,6 +477,8 @@ async fn recovery_resumes_recoverable_completing_uploads_and_fails_missing_parts
         tokio::fs::metadata(missing_dir).await.is_ok(),
         "failed recovery must preserve staging until normal expiry"
     );
+    assert!(!recoverable_stage.exists());
+    assert!(!missing_stage.exists());
 }
 
 #[tokio::test]

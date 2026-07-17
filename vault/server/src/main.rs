@@ -10,7 +10,7 @@ use vault_server::documents;
 use vault_server::http::{self, AppState};
 use vault_server::reconciliation;
 use vault_server::state_events::notify_state_event_committed;
-use vault_server::storage::configured_blob_storage;
+use vault_server::storage::{configured_blob_storage, sweep_legacy_s3_stage_files};
 use vault_server::transfers;
 
 use vault_server::db;
@@ -25,6 +25,7 @@ async fn main() -> anyhow::Result<()> {
     let db = db::connect(&config.db_path()).await?;
     let storage = configured_blob_storage(&config).await?;
     storage.ensure().await?;
+    spawn_legacy_s3_stage_sweep(&config);
     let transfers_path = config.transfers_path();
     let bind_addr = config.bind_addr();
     tokio::fs::create_dir_all(&transfers_path).await?;
@@ -120,6 +121,31 @@ async fn sweep_local_multipart_parts(state: &AppState) {
     {
         tracing::warn!(?error, "multipart part garbage collection failed");
     }
+}
+
+fn spawn_legacy_s3_stage_sweep(config: &Config) {
+    if !matches!(
+        config.storage_backend.trim().to_ascii_lowercase().as_str(),
+        "s3" | "r2"
+    ) {
+        return;
+    }
+    let minimum_age = Duration::from_secs(
+        u64::try_from(config.transfer_session_ttl_seconds)
+            .unwrap_or_default()
+            .max(7 * 24 * 60 * 60),
+    );
+    let temp_dir = std::env::temp_dir();
+    tokio::spawn(async move {
+        match sweep_legacy_s3_stage_files(&temp_dir, minimum_age, 4_096).await {
+            Ok(deleted) if !deleted.is_empty() => tracing::info!(
+                count = deleted.len(),
+                "removed aged legacy S3 upload stage files"
+            ),
+            Ok(_) => {}
+            Err(error) => tracing::warn!(?error, "legacy S3 upload stage cleanup failed"),
+        }
+    });
 }
 
 fn init_tracing() {

@@ -2,14 +2,17 @@ import * as browserDownload from "./browserDownload.js";
 import {
   sha256Blob,
   uploadContentFingerprint,
+  uploadFilePartManifestSha256,
   uploadPartManifestSha256,
   uploadResumeIdentitySha256,
 } from "./fileIntegrity.js";
 import {
-  acquireUploadPartSlot,
-  shouldRetryUploadPart,
+  createUploadCancellation,
+  currentUploadLoadedBytes,
+  reportUploadProgress,
+  runUploadWorkers,
+  uploadPart,
   uploadParallelismForLatency,
-  uploadPartTimeoutMs,
 } from "./uploadPartPolicy.js";
 import {
   committedUploadBytes,
@@ -18,7 +21,6 @@ import {
   storedUploadSessionId,
   uploadSessionKey,
 } from "./uploadSessionStore.js";
-const UPLOAD_RETRY_LIMIT = 3;
 const EXPORT_POLL_MS = 900;
 const PROGRESS_TICK_MS = 80;
 const VERIFICATION_POLL_MS = 240;
@@ -103,9 +105,13 @@ function waitFor(delay, signal) {
     }, delay);
     function onAbort() {
       clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
       reject(new TransferCancelledError());
     }
     signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) {
+      onAbort();
+    }
   });
 }
 
@@ -155,8 +161,11 @@ async function requestJson(url, options = {}, fallback = "Request failed") {
 async function existingUploadSession(sessionId, signal) {
   try {
     return await requestJson(`/api/uploads/${sessionId}`, { signal }, "Upload session not found");
-  } catch {
-    return null;
+  } catch (error) {
+    if ([404, 410].includes(error?.status)) {
+      return null;
+    }
+    throw error;
   }
 }
 
@@ -194,119 +203,6 @@ async function createUploadSession({
   );
 }
 
-function uploadPartRequest({ session, partNumber, chunk, offset, onProgress, sha256, signal }) {
-  throwIfAborted(signal);
-  return new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    let settled = false;
-
-    function cleanup() {
-      signal?.removeEventListener("abort", abortRequest);
-    }
-
-    function settle(callback, value) {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      cleanup();
-      callback(value);
-    }
-
-    function abortRequest() {
-      xhr.abort();
-    }
-
-    xhr.upload.onprogress = (progressEvent) => {
-      if (!onProgress) {
-        return;
-      }
-      const loaded = Number.isFinite(progressEvent.loaded) ? progressEvent.loaded : 0;
-      onProgress(Math.min(chunk.size, Math.max(0, loaded)));
-    };
-    xhr.onload = () => {
-      if (xhr.status >= 200 && xhr.status < 300) {
-        onProgress?.(chunk.size);
-        settle(resolve, parseJson(xhr.responseText));
-        return;
-      }
-      settle(reject, errorFromText(xhr.responseText, xhr.status, "Upload part failed"));
-    };
-    xhr.onerror = () => {
-      const error = new Error("Network error during upload");
-      error.networkError = true;
-      settle(reject, error);
-    };
-    xhr.onabort = () => {
-      settle(reject, new TransferCancelledError());
-    };
-    xhr.ontimeout = () => {
-      const error = new Error("Upload part timed out");
-      error.networkError = true;
-      settle(reject, error);
-    };
-
-    signal?.addEventListener("abort", abortRequest, { once: true });
-    xhr.open("PUT", `/api/uploads/${session.id}/parts/${partNumber}`);
-    xhr.timeout = uploadPartTimeoutMs(chunk.size);
-    xhr.withCredentials = true;
-    xhr.setRequestHeader("Content-Type", "application/octet-stream");
-    xhr.setRequestHeader("X-Upload-Offset", String(offset));
-    xhr.setRequestHeader("X-Upload-Size", String(chunk.size));
-    xhr.setRequestHeader("X-Upload-Sha256", sha256);
-    if (session.upload_token) {
-      xhr.setRequestHeader("X-Upload-Token", session.upload_token);
-    }
-    xhr.send(chunk);
-  });
-}
-
-async function uploadPart({
-  session,
-  partNumber,
-  chunk,
-  offset,
-  onAttemptStart,
-  onProgress,
-  sha256,
-  signal,
-}) {
-  for (let attempt = 1; attempt <= UPLOAD_RETRY_LIMIT; attempt += 1) {
-    throwIfAborted(signal);
-    onAttemptStart?.();
-    try {
-      const releaseSlot = await acquireUploadPartSlot(signal);
-      try {
-        return await uploadPartRequest({
-          chunk,
-          offset,
-          onProgress,
-          partNumber,
-          session,
-          sha256,
-          signal,
-        });
-      } finally {
-        releaseSlot();
-      }
-    } catch (error) {
-      if (!shouldRetryUploadPart(error) || attempt >= UPLOAD_RETRY_LIMIT) {
-        throw error;
-      }
-      await waitFor(attempt * 700, signal);
-    }
-  }
-  throw new Error("Upload part failed");
-}
-
-function currentUploadLoadedBytes({ activeParts, completedBytes, fileSize }) {
-  const activeBytes = [...activeParts.values()].reduce(
-    (total, part) => total + Math.min(part.size, Math.max(0, part.loaded || 0)),
-    0
-  );
-  return Math.min(fileSize, Math.max(completedBytes, completedBytes + activeBytes));
-}
-
 async function completeUploadSession(session, { partManifestSha256, sha256 = null }, signal) {
   return requestJson(
     `/api/uploads/${session.id}/complete`,
@@ -332,12 +228,23 @@ async function pollUploadVerification({ sessionId, signal, onProgress, isDone })
     if (isDone()) {
       break;
     }
-    const current = await existingUploadSession(sessionId, signal);
+    let current;
+    try {
+      current = await existingUploadSession(sessionId, signal);
+    } catch (error) {
+      if (isAbortError(error)) {
+        throw error;
+      }
+      // Verification progress is advisory. A status refresh failure must not
+      // turn an otherwise successful completion into a reported failure.
+      return;
+    }
     const verification = current?.verification;
     if (!verification) {
       continue;
     }
-    onProgress(
+    reportUploadProgress(
+      onProgress,
       progressFromValues(
         verification.processed_bytes || 0,
         verification.total_bytes || null,
@@ -350,9 +257,18 @@ async function pollUploadVerification({ sessionId, signal, onProgress, isDone })
 
 async function abortUploadSession(sessionId) {
   try {
-    await requestJson(`/api/uploads/${sessionId}`, { method: "DELETE" }, "Could not cancel upload");
-  } catch {
+    const session = await requestJson(
+      `/api/uploads/${sessionId}`,
+      { method: "DELETE" },
+      "Could not cancel upload"
+    );
+    return { missing: false, session };
+  } catch (error) {
+    if ([404, 410].includes(error?.status)) {
+      return { missing: true, session: null };
+    }
     // Cancellation cleanup is best-effort after the client has already aborted in-flight work.
+    return { missing: false, session: null };
   }
 }
 
@@ -384,16 +300,13 @@ function normalizedUploadFilename(filename) {
     .trim();
 }
 
-function uploadSessionMatchesFile(session, file, resumeIdentitySha256) {
+function uploadSessionLayoutMatchesFile(session, file, resumeIdentitySha256) {
   const chunkSize = Number(session?.chunk_size);
   const partCount = Number(session?.part_count);
   const sizeBytes = Number(session?.size_bytes);
   if (
     typeof session?.id !== "string" ||
     !session.id ||
-    session.status !== "active" ||
-    typeof session.upload_token !== "string" ||
-    !session.upload_token ||
     !Number.isSafeInteger(chunkSize) ||
     chunkSize <= 0 ||
     !Number.isSafeInteger(partCount) ||
@@ -410,8 +323,71 @@ function uploadSessionMatchesFile(session, file, resumeIdentitySha256) {
   );
 }
 
+function activeUploadSessionMatchesFile(session, file, resumeIdentitySha256) {
+  return (
+    session?.status === "active" &&
+    typeof session.upload_token === "string" &&
+    Boolean(session.upload_token) &&
+    uploadSessionLayoutMatchesFile(session, file, resumeIdentitySha256)
+  );
+}
+
+function completedUploadSessionResult(session, file, resumeIdentitySha256) {
+  if (!uploadSessionLayoutMatchesFile(session, file, resumeIdentitySha256)) {
+    throw new Error("Completed upload session layout does not match the selected file.");
+  }
+  const result = session?.result;
+  if (
+    session.status !== "complete" ||
+    !Number.isSafeInteger(result?.id) ||
+    result.id <= 0 ||
+    typeof result.version !== "string" ||
+    !result.version ||
+    typeof result.path !== "string" ||
+    !result.path
+  ) {
+    throw new Error("Completed upload session is missing its result.");
+  }
+  return result;
+}
+
+function completedUploadSessionManifest(session) {
+  const manifest = session?.part_manifest_sha256;
+  if (typeof manifest !== "string" || !/^[a-f0-9]{64}$/.test(manifest)) {
+    throw new Error("Completed upload session is missing its integrity manifest.");
+  }
+  return manifest;
+}
+
+function validateInMemoryCompletionManifest(session, partManifestSha256) {
+  if (completedUploadSessionManifest(session) !== partManifestSha256) {
+    throw new Error("Completed upload session integrity manifest does not match this upload.");
+  }
+}
+
+async function validateStoredCompletionManifest(file, session, signal) {
+  const expected = completedUploadSessionManifest(session);
+  const actual = await uploadFilePartManifestSha256(
+    file,
+    { chunkSize: session.chunk_size, partCount: session.part_count },
+    signal
+  );
+  if (actual !== expected) {
+    throw new Error("Selected file does not match the completed upload session.");
+  }
+}
+
+async function waitForUploadSessionTransition(session, signal) {
+  let current = session;
+  while (current?.status === "completing") {
+    await waitFor(VERIFICATION_POLL_MS, signal);
+    current = await existingUploadSession(current.id, signal);
+  }
+  return current;
+}
+
 async function verifiedCommittedPartDigests(file, session, resumeIdentitySha256, signal) {
-  if (!uploadSessionMatchesFile(session, file, resumeIdentitySha256)) {
+  if (!activeUploadSessionMatchesFile(session, file, resumeIdentitySha256)) {
     return null;
   }
   const verified = new Map();
@@ -459,9 +435,24 @@ async function resolveUploadSession({
   const storedSessionId = storedUploadSessionId(key);
   if (storedSessionId) {
     session = await existingUploadSession(storedSessionId, signal);
-    if (!session || session.status !== "active") {
+    if (
+      ["complete", "completing"].includes(session?.status) &&
+      !uploadSessionLayoutMatchesFile(session, file, resumeIdentitySha256)
+    ) {
+      throw new Error("Stored upload session layout does not match the selected file.");
+    }
+    session = await waitForUploadSessionTransition(session, signal);
+    if (session?.status === "complete") {
+      const completedResult = completedUploadSessionResult(session, file, resumeIdentitySha256);
+      await validateStoredCompletionManifest(file, session, signal);
+      forgetUploadSession(key);
+      return { completedResult, partDigests, resumedSession, session };
+    }
+    if (!session || ["aborted", "expired", "failed"].includes(session.status)) {
       forgetUploadSession(key);
       session = null;
+    } else if (session.status !== "active") {
+      throw new Error(`Upload session has unsupported status ${session.status}.`);
     } else if (committedUploadBytes(session) <= 0) {
       await abortUploadSessionStrict(session.id, signal);
       forgetUploadSession(key);
@@ -487,7 +478,7 @@ async function resolveUploadSession({
       }
     }
   }
-  if (!session || session.status !== "active") {
+  if (!session) {
     session = await createUploadSession({
       documentId,
       file,
@@ -499,7 +490,7 @@ async function resolveUploadSession({
       uploadParallelism,
       signal,
     });
-    if (!uploadSessionMatchesFile(session, file, resumeIdentitySha256)) {
+    if (!activeUploadSessionMatchesFile(session, file, resumeIdentitySha256)) {
       const createdSessionId = typeof session?.id === "string" && session.id ? session.id : null;
       if (createdSessionId) {
         await abortUploadSessionStrict(createdSessionId, signal);
@@ -512,6 +503,36 @@ async function resolveUploadSession({
   return { partDigests, resumedSession, session };
 }
 
+async function reconcileAmbiguousUploadCompletion({
+  error,
+  file,
+  resumeIdentitySha256,
+  partManifestSha256,
+  session,
+  signal,
+}) {
+  try {
+    let current = await existingUploadSession(session.id, signal);
+    if (
+      current?.status === "completing" &&
+      !uploadSessionLayoutMatchesFile(current, file, resumeIdentitySha256)
+    ) {
+      throw error;
+    }
+    current = await waitForUploadSessionTransition(current, signal);
+    if (current?.status === "complete") {
+      validateInMemoryCompletionManifest(current, partManifestSha256);
+      return completedUploadSessionResult(current, file, resumeIdentitySha256);
+    }
+  } catch (recoveryError) {
+    if (isAbortError(recoveryError)) {
+      throw recoveryError;
+    }
+    throw error;
+  }
+  throw error;
+}
+
 export async function uploadFileResumable({
   file,
   folder = "",
@@ -522,10 +543,54 @@ export async function uploadFileResumable({
   onProgress,
   signal,
 }) {
+  const cancellation = createUploadCancellation(signal);
+  const uploadSignal = cancellation.signal;
   let key = null;
+  let partManifestSha256 = null;
   let session = null;
+  let resumeIdentitySha256 = null;
+
+  async function handleFailure(error) {
+    if (cancellation.callerCancelled()) {
+      const cancellationSessionId = session?.id || (key ? storedUploadSessionId(key) : null);
+      const cleanupResult = cancellationSessionId
+        ? await abortUploadSession(cancellationSessionId)
+        : { missing: false, session: null };
+      if (cleanupResult.session?.status === "complete") {
+        if (!resumeIdentitySha256 || !partManifestSha256) {
+          throw new TransferCancelledError();
+        }
+        validateInMemoryCompletionManifest(cleanupResult.session, partManifestSha256);
+        const result = completedUploadSessionResult(
+          cleanupResult.session,
+          file,
+          resumeIdentitySha256
+        );
+        forgetUploadSession(key);
+        return { body: result, size: file.size, status: 200 };
+      }
+      if (
+        cleanupResult.missing ||
+        ["aborted", "expired", "failed"].includes(cleanupResult.session?.status)
+      ) {
+        forgetUploadSession(key);
+      }
+      throw new TransferCancelledError();
+    }
+    if (isAbortError(error)) {
+      const unexpectedAbort = new Error("Upload stopped before all parts completed.");
+      unexpectedAbort.cause = error;
+      throw unexpectedAbort;
+    }
+    if (error?.detail === "Upload part manifest mismatch" && session?.id) {
+      await abortUploadSessionStrict(session.id, uploadSignal);
+      forgetUploadSession(key);
+    }
+    throw error;
+  }
+
   try {
-    const contentFingerprint = await uploadContentFingerprint(file, signal);
+    const contentFingerprint = await uploadContentFingerprint(file, uploadSignal);
     key = uploadSessionKey({
       contentFingerprint,
       documentId,
@@ -535,11 +600,11 @@ export async function uploadFileResumable({
       note,
       renameToUpload,
     });
-    const resumeIdentitySha256 = await uploadResumeIdentitySha256(key, signal);
+    resumeIdentitySha256 = await uploadResumeIdentitySha256(key, uploadSignal);
     // Upload session sizing is path-sensitive. Low-latency clients should not
     // pay for high request fanout, but stream-limited clients need enough active
     // PUTs to fill their uplink. The server uses this hint to choose chunk size.
-    const uploadParallelism = await resolveUploadParallelism(signal);
+    const uploadParallelism = await resolveUploadParallelism(uploadSignal);
     const resolved = await resolveUploadSession({
       documentId,
       file,
@@ -549,10 +614,13 @@ export async function uploadFileResumable({
       note,
       renameToUpload,
       resumeIdentitySha256,
-      signal,
+      signal: uploadSignal,
       uploadParallelism,
     });
     session = resolved.session;
+    if (resolved.completedResult) {
+      return { body: resolved.completedResult, size: file.size, status: 200 };
+    }
     const { partDigests, resumedSession } = resolved;
 
     const startedAt = performance.now();
@@ -573,7 +641,8 @@ export async function uploadFileResumable({
         return;
       }
       lastProgressEmittedAt = now;
-      onProgress(
+      reportUploadProgress(
+        onProgress,
         progressFromValues(
           currentUploadLoadedBytes({
             activeParts,
@@ -605,7 +674,8 @@ export async function uploadFileResumable({
 
     emitUploadProgress({ force: true });
     if (resumedBytes > 0) {
-      onProgress(
+      reportUploadProgress(
+        onProgress,
         progressFromValues(completedBytes, file.size, startedAt, {
           resumedBytes,
           stage: "resuming",
@@ -616,7 +686,7 @@ export async function uploadFileResumable({
     let nextPartNumber = 1;
     async function uploadWorker() {
       while (nextPartNumber <= session.part_count) {
-        throwIfAborted(signal);
+        throwIfAborted(uploadSignal);
         const partNumber = nextPartNumber;
         nextPartNumber += 1;
         const offset = (partNumber - 1) * session.chunk_size;
@@ -626,7 +696,7 @@ export async function uploadFileResumable({
         if (existing) {
           continue;
         }
-        const sha256 = await sha256Blob(chunk, signal);
+        const sha256 = await sha256Blob(chunk, uploadSignal);
         activeParts.set(partNumber, { loaded: 0, size: chunk.size });
         emitUploadProgress({ force: true });
         try {
@@ -638,7 +708,7 @@ export async function uploadFileResumable({
             partNumber,
             session,
             sha256,
-            signal,
+            signal: uploadSignal,
           });
         } finally {
           activeParts.delete(partNumber);
@@ -648,58 +718,72 @@ export async function uploadFileResumable({
         emitUploadProgress({ force: true });
       }
     }
-    await Promise.all(
-      Array.from({ length: Math.min(uploadParallelism, session.part_count) }, () => uploadWorker())
+    await runUploadWorkers(
+      Math.min(uploadParallelism, session.part_count),
+      uploadWorker,
+      cancellation.abortSiblings
     );
 
-    const partManifestSha256 = await uploadPartManifestSha256(
+    partManifestSha256 = await uploadPartManifestSha256(
       {
         chunkSize: session.chunk_size,
         fileSize: file.size,
         partCount: session.part_count,
         partDigests,
       },
-      signal
+      uploadSignal
     );
 
     const verificationStartedAt = performance.now();
-    onProgress(progressFromValues(0, file.size, verificationStartedAt, { stage: "verifying" }));
+    reportUploadProgress(
+      onProgress,
+      progressFromValues(0, file.size, verificationStartedAt, { stage: "verifying" })
+    );
     let verificationDone = false;
+    const verificationController = new AbortController();
+    const abortVerification = () => verificationController.abort();
+    if (uploadSignal.aborted) {
+      abortVerification();
+    } else {
+      uploadSignal.addEventListener("abort", abortVerification, { once: true });
+    }
     const verificationPoll = pollUploadVerification({
       isDone: () => verificationDone,
       onProgress,
       sessionId: session.id,
-      signal,
-    }).catch((error) => {
-      if (!isAbortError(error)) {
-        throw error;
-      }
-    });
+      signal: verificationController.signal,
+    }).catch(() => {});
     let result;
     try {
-      result = await completeUploadSession(session, { partManifestSha256 }, signal);
+      result = await completeUploadSession(session, { partManifestSha256 }, uploadSignal);
+    } catch (error) {
+      if (isAbortError(error)) {
+        throw error;
+      }
+      result = await reconcileAmbiguousUploadCompletion({
+        error,
+        file,
+        partManifestSha256,
+        resumeIdentitySha256,
+        session,
+        signal: uploadSignal,
+      });
     } finally {
       verificationDone = true;
+      verificationController.abort();
+      uploadSignal.removeEventListener("abort", abortVerification);
       await verificationPoll;
     }
     forgetUploadSession(key);
-    onProgress(
+    reportUploadProgress(
+      onProgress,
       progressFromValues(file.size, file.size, verificationStartedAt, { stage: "verifying" })
     );
     return { body: result, size: file.size, status: 200 };
   } catch (error) {
-    if (isAbortError(error)) {
-      if (session?.id) {
-        await abortUploadSession(session.id);
-      }
-      forgetUploadSession(key);
-      throw new TransferCancelledError();
-    }
-    if (error?.detail === "Upload part manifest mismatch" && session?.id) {
-      await abortUploadSessionStrict(session.id, signal);
-      forgetUploadSession(key);
-    }
-    throw error;
+    return await handleFailure(error);
+  } finally {
+    cancellation.dispose();
   }
 }
 

@@ -154,4 +154,22 @@ export async function uploadPartManifestSha256(
   return sha256Bytes(new TextEncoder().encode(`${lines.join("\n")}\n`), signal);
 }
 
+export async function uploadFilePartManifestSha256(file, { chunkSize, partCount }, signal) {
+  const partDigests = new Map();
+  for (let partNumber = 1; partNumber <= partCount; partNumber += 1) {
+    throwIfAborted(signal);
+    const offset = (partNumber - 1) * chunkSize;
+    const size = Math.max(0, Math.min(chunkSize, file.size - offset));
+    const chunk = file.slice(offset, offset + size);
+    partDigests.set(partNumber, {
+      sha256: await sha256Blob(chunk, signal),
+      size,
+    });
+  }
+  return uploadPartManifestSha256(
+    { chunkSize, fileSize: file.size, partCount, partDigests },
+    signal
+  );
+}
+
 export { UPLOAD_FINGERPRINT_SAMPLE_BYTES, UPLOAD_FINGERPRINT_SCHEME };

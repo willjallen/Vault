@@ -55,6 +55,7 @@ const SMALL_PART_MEMORY_BUFFER_BYTES: i64 = 8 * 1024 * 1024;
 const VERIFICATION_PROGRESS_UPDATE_BYTES: i64 = 32 * 1024 * 1024;
 const MAX_UPLOAD_PART_METADATA_BYTES: u64 = 4096;
 const UPLOAD_RESUME_IDENTITY_CONTEXT_KEY: &str = "_upload_resume_identity_sha256";
+const UPLOAD_PART_MANIFEST_CONTEXT_KEY: &str = "_upload_part_manifest_sha256";
 // Preverification is an optimization. Stop caching new sessions at this bound;
 // completion can use a request-owned state and hash the immutable parts without
 // evicting an active state or retaining it for the process lifetime.
@@ -135,6 +136,7 @@ pub struct UploadSessionPayload {
     pub expires_at: Option<String>,
     pub result: Option<UploadResultPayload>,
     pub resume_identity_sha256: Option<String>,
+    pub part_manifest_sha256: Option<String>,
     pub upload_token: Option<String>,
 }
 
@@ -266,6 +268,7 @@ struct UploadSessionRow {
     result_version_id: Option<String>,
     result_path: Option<String>,
     resume_identity_sha256: Option<String>,
+    part_manifest_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -294,6 +297,7 @@ struct ActiveUploadLockRow {
 #[derive(Debug)]
 struct CompletedParts {
     digest: String,
+    part_manifest_sha256: String,
     size_bytes: i64,
     paths: Vec<PathBuf>,
     staging_dir: PathBuf,
@@ -415,7 +419,7 @@ impl UploadHashCoordinator {
             .digest
             .clone()
             .ok_or(UploadError::UploadSessionMissingParts)?;
-        validate_completed_integrity(
+        let part_manifest_sha256 = validate_completed_integrity(
             session,
             &digest,
             &inner.part_digests,
@@ -425,6 +429,7 @@ impl UploadHashCoordinator {
         drop(inner);
         Ok(CompletedParts {
             digest,
+            part_manifest_sha256,
             size_bytes,
             paths,
             staging_dir: upload_session_dir(transfers_path, &session.id)?,
@@ -1356,7 +1361,8 @@ async fn complete_upload_session_after_store(
             updated_at = ?,
             result_document_id = ?,
             result_version_id = ?,
-            result_path = ?
+            result_path = ?,
+            user_context = json_set(user_context, '$.' || ?, ?)
         WHERE id = ?
           AND status = 'completing'
         ",
@@ -1368,6 +1374,8 @@ async fn complete_upload_session_after_store(
     .bind(result.id)
     .bind(&result.version)
     .bind(&result.path)
+    .bind(UPLOAD_PART_MANIFEST_CONTEXT_KEY)
+    .bind(&parts.part_manifest_sha256)
     .bind(&session.id)
     .execute(&mut *transaction)
     .await?;
@@ -1689,7 +1697,7 @@ async fn completed_parts(
 ) -> Result<CompletedParts, UploadError> {
     let (size_bytes, paths) = completed_part_paths(transfers_path, session).await?;
     let (digest, part_digests) = hash_completed_part_paths(pool, session, &paths).await?;
-    validate_completed_integrity(
+    let part_manifest_sha256 = validate_completed_integrity(
         session,
         &digest,
         &part_digests,
@@ -1698,6 +1706,7 @@ async fn completed_parts(
     )?;
     Ok(CompletedParts {
         digest,
+        part_manifest_sha256,
         size_bytes,
         paths,
         staging_dir: upload_session_dir(transfers_path, &session.id)?,
@@ -1749,17 +1758,17 @@ fn validate_completed_integrity(
     part_digests: &[String],
     expected_sha256: Option<&str>,
     expected_part_manifest_sha256: Option<&str>,
-) -> Result<(), UploadError> {
+) -> Result<String, UploadError> {
     if expected_sha256.is_some_and(|expected| digest != expected) {
         return Err(UploadError::UploadChecksumMismatch);
     }
-    if let Some(expected) = expected_part_manifest_sha256 {
-        let actual = part_manifest_sha256(session, part_digests)?;
-        if actual != expected {
-            return Err(UploadError::UploadPartManifestMismatch);
-        }
+    let actual_part_manifest_sha256 = part_manifest_sha256(session, part_digests)?;
+    if let Some(expected) = expected_part_manifest_sha256
+        && actual_part_manifest_sha256 != expected
+    {
+        return Err(UploadError::UploadPartManifestMismatch);
     }
-    Ok(())
+    Ok(actual_part_manifest_sha256)
 }
 
 fn part_manifest_sha256(
@@ -2147,6 +2156,11 @@ async fn upload_session_payload(
     } else {
         None
     };
+    let part_manifest_sha256 = if session.status == "complete" {
+        session.part_manifest_sha256.clone()
+    } else {
+        None
+    };
     let upload_token = upload_session_token(signing_keys, &session)?;
     Ok(UploadSessionPayload {
         id: session.id,
@@ -2162,6 +2176,7 @@ async fn upload_session_payload(
         expires_at: Some(session.expires_at.clone()),
         result,
         resume_identity_sha256: session.resume_identity_sha256.clone(),
+        part_manifest_sha256,
         upload_token,
     })
 }
@@ -2196,11 +2211,14 @@ async fn fetch_upload_session(
             result_version_id,
             result_path,
             json_extract(user_context, '$._upload_resume_identity_sha256')
-                AS resume_identity_sha256
+                AS resume_identity_sha256,
+            json_extract(user_context, '$.' || ?)
+                AS part_manifest_sha256
         FROM upload_sessions
         WHERE id = ?
         ",
     )
+    .bind(UPLOAD_PART_MANIFEST_CONTEXT_KEY)
     .bind(session_id)
     .fetch_optional(pool)
     .await?)

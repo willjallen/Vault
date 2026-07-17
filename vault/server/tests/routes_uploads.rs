@@ -623,6 +623,66 @@ async fn complete_upload_with_manifest_and_assert_download(
     assert_eq!(response_bytes(downloaded).await, data);
 }
 
+async fn assert_completed_manifest_is_durable(
+    app: axum::Router,
+    pool: &sqlx::SqlitePool,
+    session_dir: &Path,
+    session_id: &str,
+    manifest: &str,
+) {
+    let completed = app
+        .clone()
+        .oneshot(authed_json_request(
+            Method::POST,
+            &format!("/api/uploads/{session_id}/complete"),
+            &json!({"part_manifest_sha256": manifest}),
+        ))
+        .await
+        .expect("manifest completion retry");
+    assert_eq!(completed.status(), StatusCode::OK);
+    assert!(
+        !session_dir.exists(),
+        "successful completion must remove upload staging"
+    );
+
+    let persisted_manifest: Option<String> = sqlx::query_scalar(
+        "SELECT json_extract(user_context, '$._upload_part_manifest_sha256') FROM upload_sessions WHERE id = ?",
+    )
+    .bind(session_id)
+    .fetch_one(pool)
+    .await
+    .expect("persisted upload part manifest");
+    assert_eq!(persisted_manifest.as_deref(), Some(manifest));
+
+    for _ in 0..2 {
+        let resumed = app
+            .clone()
+            .oneshot(authed_request(
+                Method::GET,
+                &format!("/api/uploads/{session_id}"),
+                Body::empty(),
+            ))
+            .await
+            .expect("completed upload status");
+        let resumed = response_json(resumed).await;
+        assert_eq!(resumed["status"], "complete");
+        assert_eq!(resumed["part_manifest_sha256"], manifest);
+        assert_eq!(resumed["uploaded_parts"], json!([]));
+    }
+
+    let delete_complete = app
+        .oneshot(authed_request(
+            Method::DELETE,
+            &format!("/api/uploads/{session_id}"),
+            Body::empty(),
+        ))
+        .await
+        .expect("delete completed upload status");
+    let delete_complete = response_json(delete_complete).await;
+    assert_eq!(delete_complete["status"], "complete");
+    assert_eq!(delete_complete["part_manifest_sha256"], manifest);
+}
+
 #[tokio::test]
 async fn upload_size_limit_rejects_before_metadata_or_blob_write() {
     let (state, temp_dir) = test_state_with_upload_settings(5, 32 * 1024 * 1024, 86_400).await;
@@ -3206,6 +3266,7 @@ async fn part_manifest_mismatch_preserves_parts_and_allows_retry() {
     );
     let session_id =
         uploaded_session_with_fixed_parts(app.clone(), "retry-manifest.txt", data, 4).await;
+    let session_dir = transfers_path.join("uploads").join(&session_id);
     let mismatched = app
         .clone()
         .oneshot(authed_json_request(
@@ -3238,15 +3299,21 @@ async fn part_manifest_mismatch_preserves_parts_and_allows_retry() {
         .expect("document count");
     assert_eq!(document_count, 0);
 
-    let completed = app
-        .oneshot(authed_json_request(
-            Method::POST,
-            &format!("/api/uploads/{session_id}/complete"),
-            &json!({"part_manifest_sha256": correct_manifest}),
+    let active = app
+        .clone()
+        .oneshot(authed_request(
+            Method::GET,
+            &format!("/api/uploads/{session_id}"),
+            Body::empty(),
         ))
         .await
-        .expect("manifest completion retry");
-    assert_eq!(completed.status(), StatusCode::OK);
+        .expect("active upload status after manifest mismatch");
+    let active = response_json(active).await;
+    assert_eq!(active["status"], "active");
+    assert!(active["part_manifest_sha256"].is_null());
+
+    assert_completed_manifest_is_durable(app, &pool, &session_dir, &session_id, &correct_manifest)
+        .await;
 }
 
 #[tokio::test]

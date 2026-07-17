@@ -70,7 +70,9 @@ const boundsBundle = await build({
 const boundsModuleUrl = `data:text/javascript;base64,${Buffer.from(
   boundsBundle.outputFiles.at(0).text
 ).toString("base64")}`;
-const { BoundedPrefetchScheduler, ContentsPageCache } = await import(boundsModuleUrl);
+const { BoundedPrefetchScheduler, ContentsPageCache, contentsScopeAffectedByUpload } = await import(
+  boundsModuleUrl
+);
 
 function deferred() {
   let resolve;
@@ -177,6 +179,107 @@ test("contents cache is a bounded LRU and evicts derived folder data with its pa
   assert.equal(protectedCache.has("incoming"), true);
 });
 
+test("deleting a folder evicts all of only that folder's base and search pages", () => {
+  const targetFolder = "Shared/Target";
+  const otherFolder = "Shared/Other";
+  const targetBase = {
+    documents: [],
+    folder: targetFolder,
+    folders: [{ id: 101, path: `${targetFolder}/Child` }],
+    next_cursor: null,
+    q: "",
+    recursive: false,
+  };
+  const otherBase = {
+    documents: [],
+    folder: otherFolder,
+    folders: [{ id: 202, path: `${otherFolder}/Child` }],
+    next_cursor: null,
+    q: "",
+    recursive: false,
+  };
+  const cache = new ContentsPageCache(10, [
+    ["target-base", targetBase],
+    ["target-search", { ...targetBase, q: "needle" }],
+    ["target-recursive", { ...targetBase, recursive: true }],
+    ["other-base", otherBase],
+    ["other-search", { ...otherBase, q: "needle" }],
+  ]);
+
+  assert.deepEqual(cache.folderData().children[targetFolder], [`${targetFolder}/Child`]);
+  assert.equal(cache.deleteFolder(targetFolder), true);
+
+  assert.equal(cache.has("target-base"), false);
+  assert.equal(cache.has("target-search"), false);
+  assert.equal(cache.has("target-recursive"), false);
+  assert.equal(cache.has("other-base"), true);
+  assert.equal(cache.has("other-search"), true);
+  assert.equal(cache.size, 2);
+  const folderData = cache.folderData();
+  assert.equal(folderData.children[targetFolder], undefined);
+  assert.equal(folderData.metadata[`${targetFolder}/Child`], undefined);
+  assert.deepEqual(folderData.children[otherFolder], [`${otherFolder}/Child`]);
+  assert.equal(folderData.metadata[`${otherFolder}/Child`].id, 202);
+  assert.equal(cache.deleteFolder(targetFolder), false);
+});
+
+test("upload invalidation evicts exact scopes and recursive ancestors only", () => {
+  const uploadFolder = "Shared/Target";
+  const page = (folder, { id, q = "", recursive = false } = {}) => ({
+    documents: [],
+    folder,
+    folders: [{ id, path: `${folder ? `${folder}/` : ""}Child-${id}` }],
+    next_cursor: null,
+    q,
+    recursive,
+  });
+  const cache = new ContentsPageCache(20, [
+    ["target-base", page(uploadFolder, { id: 1 })],
+    ["target-search", page(uploadFolder, { id: 2, q: "needle" })],
+    ["ancestor-recursive", page("Shared", { id: 3, q: "needle", recursive: true })],
+    ["root-recursive", page("", { id: 4, q: "needle", recursive: true })],
+    ["ancestor-base", page("Shared", { id: 5 })],
+    ["root-base", page("", { id: 6 })],
+    ["descendant", page("Shared/Target/Child", { id: 7 })],
+    ["prefix-only", page("Share", { id: 8, recursive: true })],
+    ["unrelated", page("Other", { id: 9, recursive: true })],
+  ]);
+
+  assert.equal(cache.deleteUploadAffected(uploadFolder), true);
+
+  for (const key of ["target-base", "target-search", "ancestor-recursive", "root-recursive"]) {
+    assert.equal(cache.has(key), false, `${key} should be invalidated`);
+  }
+  for (const key of ["ancestor-base", "root-base", "descendant", "prefix-only", "unrelated"]) {
+    assert.equal(cache.has(key), true, `${key} should be retained`);
+  }
+  const folderData = cache.folderData();
+  assert.equal(folderData.children[uploadFolder], undefined);
+  assert.deepEqual(folderData.children.Shared, ["Shared/Child-5"]);
+  assert.deepEqual(folderData.children["Shared/Target/Child"], ["Shared/Target/Child/Child-7"]);
+});
+
+test("upload scope matching honors root and folder-segment boundaries", () => {
+  const cases = [
+    { expected: true, recursive: false, scope: "Shared/Target", upload: "Shared/Target" },
+    { expected: true, recursive: true, scope: "Shared", upload: "Shared/Target" },
+    { expected: true, recursive: true, scope: "", upload: "Shared/Target" },
+    { expected: true, recursive: false, scope: "", upload: "" },
+    { expected: false, recursive: false, scope: "Shared", upload: "Shared/Target" },
+    { expected: false, recursive: true, scope: "Share", upload: "Shared/Target" },
+    { expected: false, recursive: true, scope: "Shared/Target/Child", upload: "Shared/Target" },
+    { expected: false, recursive: true, scope: "Other", upload: "Shared/Target" },
+  ];
+
+  for (const { expected, recursive, scope, upload } of cases) {
+    assert.equal(
+      contentsScopeAffectedByUpload(scope, recursive, upload),
+      expected,
+      JSON.stringify({ recursive, scope, upload })
+    );
+  }
+});
+
 test("prefetch scheduler bounds work, deduplicates, prioritizes, and aborts on clear", async () => {
   const scheduler = new BoundedPrefetchScheduler({ concurrency: 3, maxQueued: 32 });
   const runs = [];
@@ -247,6 +350,54 @@ test("prefetch completion from an old generation cannot remove a replacement tas
   await flushMicrotasks();
   assert.equal(scheduler.activeCount, 0);
   assert.equal(scheduler.has("same-key"), false);
+});
+
+test("targeted prefetch cancellation aborts active and queued work without losing replacement", async () => {
+  const scheduler = new BoundedPrefetchScheduler({ concurrency: 1, maxQueued: 4 });
+  const runs = [];
+  scheduler.setRunner(
+    (payload, signal) =>
+      new Promise((resolve) => {
+        runs.push({ payload, resolve, signal });
+      })
+  );
+
+  assert.equal(scheduler.enqueue("same-key", { task: "active-old" }), true);
+  assert.equal(scheduler.enqueue("queued-key", { task: "queued-cancelled" }), true);
+  await flushMicrotasks();
+  assert.equal(runs.length, 1);
+  const queuedSignal = scheduler.tasks.get("queued-key").controller.signal;
+
+  assert.equal(scheduler.cancel("queued-key"), true);
+  assert.equal(queuedSignal.aborted, true);
+  assert.equal(scheduler.queuedCount, 0);
+  assert.equal(scheduler.has("queued-key"), false);
+  assert.equal(scheduler.cancel("missing-key"), false);
+
+  assert.equal(scheduler.cancel("same-key"), true);
+  assert.equal(runs[0].signal.aborted, true);
+  assert.equal(scheduler.has("same-key"), false);
+  assert.equal(scheduler.enqueue("same-key", { task: "active-replacement" }), true);
+  assert.equal(scheduler.has("same-key"), true);
+  assert.equal(scheduler.queuedCount, 1);
+
+  runs[0].resolve();
+  await flushMicrotasks();
+  await flushMicrotasks();
+  assert.equal(runs.length, 2);
+  assert.deepEqual(runs[1].payload, { task: "active-replacement" });
+  assert.equal(runs[1].signal.aborted, false);
+  assert.equal(scheduler.has("same-key"), true);
+
+  runs[1].resolve();
+  await flushMicrotasks();
+  await flushMicrotasks();
+  assert.equal(scheduler.activeCount, 0);
+  assert.equal(scheduler.has("same-key"), false);
+  assert.equal(
+    runs.some((run) => run.payload.task === "queued-cancelled"),
+    false
+  );
 });
 
 test("contents pages merge by stable ID and replace duplicate metadata", () => {
@@ -640,6 +791,131 @@ test("invalidating contents clears the cursor and a first page replaces cached r
     ["document-2"]
   );
   assert.equal(resources.contentsHasMore, false);
+});
+
+test("refresh after upload refreshes the active recursive ancestor scope", async () => {
+  resetHooks();
+  const requests = [];
+  const errors = [];
+  const initial = {
+    contents: {
+      documents: [],
+      folder: "Shared",
+      folders: [],
+      next_cursor: null,
+      q: "",
+      recursive: false,
+    },
+    my_edits: { documents: [] },
+    sidebar: { folder_children: {} },
+  };
+  const props = {
+    apiFetch: async (url, options = {}) => {
+      requests.push({ options, url });
+      if (url.startsWith("/api/folders/contents?")) {
+        const requestUrl = new URL(url, "https://vault.invalid");
+        return {
+          json: async () => ({
+            documents: [],
+            folder: requestUrl.searchParams.get("folder"),
+            folders: [],
+            next_cursor: null,
+            q: requestUrl.searchParams.get("q"),
+            recursive: requestUrl.searchParams.get("recursive") === "true",
+          }),
+          ok: true,
+          status: 200,
+        };
+      }
+      if (url === "/api/my-edits") {
+        return { json: async () => ({ documents: [] }), ok: true };
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    },
+    folder: "Shared",
+    initial,
+    setError: (message) => errors.push(message),
+  };
+
+  let resources = renderResources(props);
+  resources.setRecursiveSearch(true);
+  resources = renderResources(props);
+  await resources.refreshAfterUpload("Shared/Target");
+
+  const contentsRequests = requests.filter(({ url }) => url.startsWith("/api/folders/contents?"));
+  assert.equal(contentsRequests.length, 1);
+  const requestUrl = new URL(contentsRequests[0].url, "https://vault.invalid");
+  assert.equal(requestUrl.searchParams.get("folder"), "Shared");
+  assert.equal(requestUrl.searchParams.get("q"), "");
+  assert.equal(requestUrl.searchParams.get("recursive"), "true");
+  assert.equal(contentsRequests[0].options.signal.aborted, false);
+  assert.equal(requests.filter(({ url }) => url === "/api/my-edits").length, 1);
+  assert.deepEqual(errors, []);
+});
+
+test("unrelated upload invalidation preserves foreground work and evicts affected cache", async () => {
+  resetHooks();
+  const targetFolder = "Shared/Target";
+  const requests = [];
+  const errors = [];
+  const initial = {
+    contents: {
+      documents: [{ id: "cached-target", name: "cached.txt" }],
+      folder: targetFolder,
+      folders: [],
+      next_cursor: null,
+      q: "",
+      recursive: false,
+    },
+    my_edits: { documents: [] },
+    sidebar: { folder_children: {} },
+  };
+  const props = {
+    apiFetch: (url, options = {}) => {
+      const request = { options, url };
+      requests.push(request);
+      return new Promise((_resolve, reject) => {
+        options.signal.addEventListener(
+          "abort",
+          () => {
+            const error = new Error("aborted");
+            error.name = "AbortError";
+            reject(error);
+          },
+          { once: true }
+        );
+      });
+    },
+    initial,
+    setError: (message) => errors.push(message),
+  };
+
+  renderResources({ ...props, folder: targetFolder });
+  let resources = renderResources({ ...props, folder: "Unrelated" });
+  commitEffect(0);
+  assert.equal(requests.length, 1);
+  assert.equal(
+    new URL(requests[0].url, "https://vault.invalid").searchParams.get("folder"),
+    "Unrelated"
+  );
+  assert.equal(requests[0].options.signal.aborted, false);
+
+  await resources.refreshAfterUpload(targetFolder);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].options.signal.aborted, false);
+
+  resources = renderResources({ ...props, folder: targetFolder });
+  commitEffect(0);
+  assert.equal(requests[0].options.signal.aborted, true);
+  assert.equal(requests.length, 2);
+  assert.equal(
+    new URL(requests[1].url, "https://vault.invalid").searchParams.get("folder"),
+    targetFolder
+  );
+  cleanupEffect(0);
+  await flushMicrotasks();
+  assert.equal(requests[1].options.signal.aborted, true);
+  assert.deepEqual(errors, []);
 });
 
 test("search waits 250ms, captures exact parameters, and aborts superseded work", async () => {

@@ -33,6 +33,16 @@ export function dragCanUseVaultDropZones(dragEvent) {
   return dragHasFiles(dragEvent) || dragHasVaultItems(dragEvent);
 }
 
+export function vaultDropEffect(dragEvent, targetKind) {
+  if (!targetKind) {
+    return "none";
+  }
+  if (dragHasFiles(dragEvent) || targetKind === "favorites") {
+    return "copy";
+  }
+  return targetKind === "folder" ? "move" : "none";
+}
+
 export function selectionItemsFromDrag(dragEvent) {
   const rawSelection = dragEvent.dataTransfer.getData("application/x-vault-selection");
   if (!rawSelection) {

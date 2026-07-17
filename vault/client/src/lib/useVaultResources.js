@@ -6,6 +6,7 @@ import {
   PREFETCH_PRIORITY_SIDEBAR,
   PREFETCH_PRIORITY_VISIBLE,
   SEARCH_DEBOUNCE_MS,
+  contentsScopeAffectedByUpload,
 } from "./vaultResourceBounds.js";
 
 const { useCallback, useEffect, useMemo, useRef, useState } = React;
@@ -751,6 +752,23 @@ export function useVaultResources({
     ]
   );
 
+  const refreshAfterUpload = useCallback(
+    async (nextFolder) => {
+      const targetFolder = nextFolder || "";
+      if (
+        contentsScopeAffectedByUpload(folderRef.current, recursiveSearchRef.current, targetFolder)
+      ) {
+        await refresh(folderRef.current, { invalidateContents: true });
+        return;
+      }
+      prefetchScheduler.cancel(contentsKey(targetFolder, "", false));
+      if (contentsCache.deleteUploadAffected(targetFolder)) {
+        setContentsFolderData(contentsCache.folderData());
+      }
+    },
+    [contentsCache, prefetchScheduler, refresh]
+  );
+
   const updateDocumentInViews = useCallback(
     (docId, updater) => {
       const updateList = (items = []) =>
@@ -951,6 +969,7 @@ export function useVaultResources({
     myEdits,
     recursiveSearch,
     refresh,
+    refreshAfterUpload,
     searchQuery,
     selectedDoc,
     setRecursiveSearch,

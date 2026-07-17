@@ -5,6 +5,7 @@ import {
   dragCanUseVaultDropZones,
   dragHasFavoriteItems,
   favoriteItemsFromDrag,
+  vaultDropEffect,
 } from "../lib/dragPayloads.js";
 
 const h = React.createElement;
@@ -181,7 +182,7 @@ export function FinderShell({
     evt.preventDefault();
     evt.stopPropagation();
     const target = resolveDropTarget(evt);
-    evt.dataTransfer.dropEffect = target?.kind === "favorites" ? "copy" : target ? "move" : "none";
+    evt.dataTransfer.dropEffect = vaultDropEffect(evt, target?.kind);
     scheduleDragUi({
       active: true,
       favoriteDrop: dragHasFavoriteItems(evt),

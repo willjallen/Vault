@@ -41,6 +41,10 @@ function selectionHasFolders(items) {
   return items.some((item) => item.type === "folder");
 }
 
+function filesFromDrop(dropEvent) {
+  return Array.from(dropEvent.dataTransfer?.files || []);
+}
+
 function handleSelectionDrop({
   target,
   targetFolder,
@@ -166,7 +170,7 @@ function handleFileDrop({
   setUploadHover,
   handleUpload,
 }) {
-  const file = dropEvent.dataTransfer.files[0];
+  const files = filesFromDrop(dropEvent);
   dropEvent.preventDefault();
   if (isPreview) {
     setDropHint(targetFolder);
@@ -175,7 +179,7 @@ function handleFileDrop({
   }
   setDropHint(null);
   setUploadHover(false);
-  handleUpload(file, targetFolder || "");
+  return handleUpload(files, targetFolder || "");
 }
 
 function handleDocDrop({
@@ -282,7 +286,7 @@ export function createDropHandlers({
       dropEvent.dataTransfer.files &&
       dropEvent.dataTransfer.files.length > 0;
     if (hasFiles) {
-      handleFileDrop({
+      return handleFileDrop({
         targetFolder,
         dropEvent,
         isPreview,
@@ -290,7 +294,6 @@ export function createDropHandlers({
         setUploadHover,
         handleUpload,
       });
-      return;
     }
     const doc = getDocFromDrag(dropEvent, docs);
     if (!doc) {
@@ -345,12 +348,11 @@ export function createDropHandlers({
       });
       return;
     }
-    const hasFiles = canvasEvent.dataTransfer.files && canvasEvent.dataTransfer.files.length > 0;
-    if (hasFiles) {
+    const files = filesFromDrop(canvasEvent);
+    if (files.length) {
       setDropHint(null);
       setUploadHover(false);
-      handleUpload(canvasEvent.dataTransfer.files[0]);
-      return;
+      return handleUpload(files, target);
     }
     const doc = getDocFromDrag(canvasEvent, docs);
     if (!doc) {

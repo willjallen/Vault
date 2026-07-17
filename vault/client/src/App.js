@@ -38,6 +38,7 @@ import {
   useShareLinkResolution,
 } from "./lib/shareLinks.js";
 import { useAuthFetch } from "./lib/useAuthFetch.js";
+import { UploadFileScheduler, uploadFileBatch } from "./lib/uploadActions.js";
 import { useFolderNavigation } from "./lib/useFolderNavigation.js";
 import { useFavoritePreferenceActions } from "./lib/useFavoritePreferenceActions.js";
 import { useMoveDialog } from "./lib/useMoveDialog.js";
@@ -88,6 +89,7 @@ export function App({ initial }) {
   const confirmResolver = useRef(null);
   const shareCodeRef = useRef(initialShareCode);
   const historyModeRef = useRef("replace");
+  const [uploadFileScheduler] = useState(() => new UploadFileScheduler());
   const closeContextMenu = useCallback(() => setContextMenu(null), []);
   const { dismissNotice, notice, showError: setError, showNotice } = useNotifications();
 
@@ -239,6 +241,7 @@ export function App({ initial }) {
     loadMoreContents,
     recursiveSearch,
     refresh,
+    refreshAfterUpload,
     searchQuery,
     selectedDoc,
     setRecursiveSearch,
@@ -528,25 +531,20 @@ export function App({ initial }) {
     }
   }
 
-  async function handleUpload(file, targetFolder = folder) {
-    if (!file) {
-      return;
-    }
-    setError("");
+  async function handleUpload(files, targetFolder = folder) {
     try {
-      const result = await uploadWithProgress({
-        file,
-        folder: targetFolder || "",
-        mode: "create",
-        name: file.name,
-        size: file.size,
+      return await uploadFileBatch({
+        blocked: shareResolving,
+        files,
+        refresh: refreshAfterUpload,
+        scheduler: uploadFileScheduler,
+        setError,
+        targetFolder,
+        uploadWithProgress,
       });
-      if (result.cancelled) {
-        return;
-      }
-      await refresh(targetFolder || "", { invalidateContents: true });
     } catch (err) {
       setError(err.message || "Upload failed. Please try again.");
+      return null;
     } finally {
       setUploadHover(false);
       if (uploadInput.current) {
@@ -949,7 +947,8 @@ export function App({ initial }) {
       type: "file",
       ref: uploadInput,
       className: "hidden-input",
-      onChange: (e) => handleUpload(e.target.files[0]),
+      multiple: true,
+      onChange: (e) => handleUpload(e.target.files),
     }),
     h("input", {
       type: "file",

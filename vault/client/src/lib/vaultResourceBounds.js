@@ -31,6 +31,12 @@ function metadataFromContents(contents) {
   );
 }
 
+export function contentsScopeAffectedByUpload(scopeFolder, recursive, uploadFolder) {
+  const scope = scopeFolder || "";
+  const target = uploadFolder || "";
+  return scope === target || (Boolean(recursive) && (!scope || target.startsWith(`${scope}/`)));
+}
+
 export class ContentsPageCache {
   constructor(limit = CONTENTS_CACHE_LIMIT, initialEntries = []) {
     this.limit = Math.max(1, limit);
@@ -44,6 +50,29 @@ export class ContentsPageCache {
 
   clear() {
     this.pages.clear();
+  }
+
+  deleteFolder(folder) {
+    const targetFolder = folder || "";
+    let deleted = false;
+    this.pages.forEach((page, key) => {
+      if ((page.folder || "") === targetFolder) {
+        this.pages.delete(key);
+        deleted = true;
+      }
+    });
+    return deleted;
+  }
+
+  deleteUploadAffected(folder) {
+    let deleted = false;
+    this.pages.forEach((page, key) => {
+      if (contentsScopeAffectedByUpload(page.folder, page.recursive, folder)) {
+        this.pages.delete(key);
+        deleted = true;
+      }
+    });
+    return deleted;
   }
 
   get(key) {
@@ -136,6 +165,19 @@ export class BoundedPrefetchScheduler {
       }
     });
     this.tasks.clear();
+  }
+
+  cancel(key) {
+    const entry = this.tasks.get(key);
+    if (!entry) {
+      return false;
+    }
+    entry.controller.abort();
+    this.tasks.delete(key);
+    if (entry.state === "queued") {
+      this.queue = this.queue.filter((candidate) => candidate !== entry);
+    }
+    return true;
   }
 
   has(key) {

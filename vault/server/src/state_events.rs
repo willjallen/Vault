@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::sync::OnceLock;
 
 use serde::Serialize;
-use sqlx::{FromRow, SqlitePool};
+use sqlx::{FromRow, Sqlite, SqlitePool, Transaction};
 use thiserror::Error;
 use tokio::sync::broadcast;
 
@@ -84,6 +84,28 @@ pub async fn record_state_event(
     .bind(event_type)
     .bind(resources_json)
     .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn record_state_event_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    event_type: &str,
+    resources: &[&str],
+) -> Result<(), sqlx::Error> {
+    let resources_json = state_event_resources_json(resources);
+    if resources_json == "[]" {
+        return Ok(());
+    }
+    sqlx::query(
+        r"
+        INSERT INTO state_events (event_type, resources)
+        VALUES (?, ?)
+        ",
+    )
+    .bind(event_type)
+    .bind(resources_json)
+    .execute(&mut **transaction)
     .await?;
     Ok(())
 }

@@ -13,7 +13,7 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use sqlx::{FromRow, QueryBuilder, Sqlite, SqlitePool};
+use sqlx::{FromRow, QueryBuilder, Sqlite, SqlitePool, Transaction};
 use thiserror::Error;
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
@@ -34,6 +34,7 @@ use crate::folders::{
     FolderError, all_folders, folder_path_by_id, require_folder_read_access,
     subtree_folder_ids_from_records,
 };
+use crate::state_events::{notify_state_event_committed, record_state_event_in_tx};
 use crate::storage::{
     BlobByteStream, BlobLocation, BlobReadRange, BlobStorageBackend, BlobWriteKind,
     STORAGE_CHUNK_SIZE, SharedBlobStorage, StorageError, open_ranked_location_stream,
@@ -1057,14 +1058,11 @@ async fn run_claimed_export_job(
             return Err(ExportError::ExportCancelled);
         }
         ensure_export_not_cancelled(pool, job_id).await?;
-        persist_export_artifact(pool, storage, job_id, &artifact).await
+        persist_export_artifact(pool, storage, job_id, &artifact, &downloads, &work.user).await
     }
     .await;
     if let Err(error) = remove_export_temp_file(transfers_path, job_id).await {
         tracing::warn!(?error, %job_id, "failed to remove export scratch file");
-    }
-    if result.is_ok() {
-        record_export_events(pool, &downloads, &work.user).await?;
     }
     result
 }
@@ -1952,6 +1950,8 @@ async fn persist_export_artifact(
     storage: &dyn BlobStorageBackend,
     job_id: &str,
     artifact: &ExportZipArtifact,
+    downloads: &[VersionDownload],
+    user: &UserContext,
 ) -> Result<(), ExportError> {
     ensure_export_not_cancelled(pool, job_id).await?;
     let publication = begin_blob_publication(
@@ -1986,15 +1986,10 @@ async fn persist_export_artifact(
             .await?;
         let job = sqlx::query_as::<_, (String, String)>(
             r"
-            UPDATE export_jobs
-            SET status = 'complete',
-                processed_items = total_items,
-                processed_bytes = total_bytes,
-                completed_at = CURRENT_TIMESTAMP,
-                updated_at = CURRENT_TIMESTAMP
+            SELECT filename, expires_at
+            FROM export_jobs
             WHERE id = ?
               AND status = 'finalizing'
-            RETURNING filename, expires_at
             ",
         )
         .bind(job_id)
@@ -2029,7 +2024,31 @@ async fn persist_export_artifact(
         .bind(&expires_at)
         .execute(&mut *transaction)
         .await?;
+        record_export_events_in_tx(&mut transaction, downloads, user).await?;
+        if !downloads.is_empty() {
+            record_state_event_in_tx(&mut transaction, "document.download", &["document_detail"])
+                .await?;
+        }
         publication.finish_metadata_in_tx(&mut transaction).await?;
+        let completed = sqlx::query(
+            r"
+            UPDATE export_jobs
+            SET status = 'complete',
+                processed_items = total_items,
+                processed_bytes = total_bytes,
+                completed_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+              AND status = 'finalizing'
+            ",
+        )
+        .bind(job_id)
+        .execute(&mut *transaction)
+        .await?;
+        if completed.rows_affected() != 1 {
+            transaction.rollback().await?;
+            return Err(ExportError::ExportCancelled);
+        }
         transaction.commit().await?;
         Ok(())
     }
@@ -2052,11 +2071,14 @@ async fn persist_export_artifact(
         }
         return Err(error);
     }
+    if !downloads.is_empty() {
+        notify_state_event_committed();
+    }
     Ok(())
 }
 
-async fn record_export_events(
-    pool: &SqlitePool,
+async fn record_export_events_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
     downloads: &[VersionDownload],
     user: &UserContext,
 ) -> Result<(), ExportError> {
@@ -2073,7 +2095,7 @@ async fn record_export_events(
         .bind(&user.id)
         .bind(&user.name)
         .bind(format!("Exported {}", download.document_path))
-        .execute(pool)
+        .execute(&mut **transaction)
         .await?;
     }
     Ok(())

@@ -3,6 +3,7 @@ use sqlx::SqlitePool;
 use thiserror::Error;
 
 use crate::auth::UserContext;
+use crate::state_events::record_state_event_in_tx;
 
 const SIDEBAR_SECTION_KEYS: [&str; 4] = ["folders", "favorites", "editing", "archive"];
 const MIN_SIDEBAR_SECTION_SIZE: i64 = 32;
@@ -72,6 +73,9 @@ pub async fn update_preferences_for_user(
         .bind(user.vault_user_id)
         .execute(&mut *transaction)
         .await?;
+    if changed {
+        record_state_event_in_tx(&mut transaction, "preferences.update", &["preferences"]).await?;
+    }
     transaction.commit().await?;
     Ok((merged, changed))
 }

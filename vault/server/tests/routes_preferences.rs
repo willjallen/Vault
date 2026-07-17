@@ -403,6 +403,64 @@ async fn preferences_patch_allows_missing_preferences_as_noop() {
     assert_eq!(json["preferences"]["themePreference"], "light");
 }
 
+#[tokio::test]
+async fn preference_update_rolls_back_when_outbox_insert_fails() {
+    let (state, _temp_dir) = test_state().await;
+    let pool = state.db.clone();
+    let app = http::router(state);
+    let seeded = app
+        .clone()
+        .oneshot(authed_get("/api/preferences", "artist", "artists"))
+        .await
+        .expect("seed user");
+    assert_eq!(seeded.status(), StatusCode::OK);
+    let before: String = sqlx::query_scalar(
+        "SELECT preferences FROM vault_users WHERE issuer = 'headers' AND subject = 'artist'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("preferences before failure");
+    sqlx::query(
+        r"
+        CREATE TRIGGER reject_preference_outbox
+        BEFORE INSERT ON state_events
+        WHEN NEW.event_type = 'preferences.update'
+        BEGIN
+            SELECT RAISE(ABORT, 'forced preference event failure');
+        END
+        ",
+    )
+    .execute(&pool)
+    .await
+    .expect("install preference-event trigger");
+
+    let response = app
+        .oneshot(authed_patch(
+            "/api/preferences",
+            "artist",
+            "artists",
+            &json!({"preferences": {"themePreference": "dark"}}),
+        ))
+        .await
+        .expect("preference response");
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let after: String = sqlx::query_scalar(
+        "SELECT preferences FROM vault_users WHERE issuer = 'headers' AND subject = 'artist'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("preferences after failure");
+    let event_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM state_events WHERE event_type = 'preferences.update'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("preference event count");
+    assert_eq!(after, before);
+    assert_eq!(event_count, 0);
+}
+
 fn assert_favorites_after_rename(
     preferences_json: &Value,
     art_id: i64,

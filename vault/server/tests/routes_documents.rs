@@ -3889,6 +3889,103 @@ async fn archive_restore_document_round_trip_preserves_metadata_and_events() {
 }
 
 #[tokio::test]
+async fn bulk_move_reports_prior_success_when_second_outbox_write_fails() {
+    let (state, _temp_dir) = test_state().await;
+    let writers = create_group(&state.db, "writers").await;
+    let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
+        .await
+        .expect("vault root");
+    add_folder_permission(&state.db, root.id, writers, true, true, true)
+        .await
+        .expect("writer root");
+    let source = get_or_create_folder_path(&state.db, Some("Source"))
+        .await
+        .expect("source");
+    let folder = get_or_create_folder_path(&state.db, Some("Folder To Move"))
+        .await
+        .expect("folder to move");
+    let destination = get_or_create_folder_path(&state.db, Some("Destination"))
+        .await
+        .expect("destination");
+    let document_id =
+        insert_named_versioned_document(&state.db, source.id, "first.txt", "atomic-batch").await;
+    sqlx::query(
+        r"
+        CREATE TRIGGER reject_second_batch_move_event
+        BEFORE INSERT ON state_events
+        WHEN NEW.event_type = 'batch.move'
+         AND (SELECT COUNT(*) FROM state_events WHERE event_type = 'batch.move') >= 1
+        BEGIN
+            SELECT RAISE(ABORT, 'forced second batch event failure');
+        END
+        ",
+    )
+    .execute(&state.db)
+    .await
+    .expect("install second-event trigger");
+    let pool = state.db.clone();
+    let app = http::router(state);
+
+    let response = app
+        .oneshot(authed_json_post(
+            "/api/move",
+            "writer",
+            "writers",
+            &json!({
+                "items": [
+                    {"type": "document", "id": document_id},
+                    {"type": "folder", "id": folder.id}
+                ],
+                "destination_folder": "Destination"
+            }),
+        ))
+        .await
+        .expect("move response");
+    let status = response.status();
+    let payload = response_json(response).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["ok"].as_array().expect("ok results").len(), 1);
+    assert_eq!(payload["ok"][0]["item"]["id"], document_id);
+    assert_eq!(
+        payload["failed"].as_array().expect("failed results").len(),
+        1
+    );
+    assert_eq!(payload["failed"][0]["item"]["id"], folder.id);
+    assert_eq!(
+        payload["failed"][0]["detail"],
+        "Action could not be completed"
+    );
+
+    let document_folder: i64 = sqlx::query_scalar("SELECT folder_id FROM documents WHERE id = ?")
+        .bind(document_id)
+        .fetch_one(&pool)
+        .await
+        .expect("document folder");
+    let folder_parent: i64 = sqlx::query_scalar("SELECT parent_id FROM folders WHERE id = ?")
+        .bind(folder.id)
+        .fetch_one(&pool)
+        .await
+        .expect("folder parent");
+    let move_states: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM state_events WHERE event_type = 'batch.move'")
+            .fetch_one(&pool)
+            .await
+            .expect("move state count");
+    let folder_events: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM folder_events WHERE folder_id = ?")
+            .bind(folder.id)
+            .fetch_one(&pool)
+            .await
+            .expect("folder event count");
+
+    assert_eq!(document_folder, destination.id);
+    assert_eq!(folder_parent, root.id);
+    assert_eq!(move_states, 1);
+    assert_eq!(folder_events, 0);
+}
+
+#[tokio::test]
 async fn archived_document_hidden_when_source_acl_snapshot_denies_access() {
     let (state, _temp_dir) = test_state().await;
     let outsiders = create_group(&state.db, "outsiders").await;

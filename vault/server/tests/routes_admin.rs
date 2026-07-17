@@ -788,3 +788,55 @@ async fn admin_group_routes_validate_errors_and_last_admin_guards() {
         "Group is used by folder permissions",
     );
 }
+
+#[tokio::test]
+async fn admin_mutation_rolls_back_when_outbox_insert_fails() {
+    let (state, _temp_dir) = test_state().await;
+    let pool = state.db.clone();
+    let app = http::router(state);
+    let seeded = app
+        .clone()
+        .oneshot(authed_get("/api/settings", "admin", "vault-admin"))
+        .await
+        .expect("seed admin");
+    assert_eq!(seeded.status(), StatusCode::OK);
+    sqlx::query(
+        r"
+        CREATE TRIGGER reject_admin_group_outbox
+        BEFORE INSERT ON state_events
+        WHEN NEW.event_type = 'admin.group.created'
+        BEGIN
+            SELECT RAISE(ABORT, 'forced admin event failure');
+        END
+        ",
+    )
+    .execute(&pool)
+    .await
+    .expect("install admin-event trigger");
+
+    let response = app
+        .oneshot(authed_json(
+            Method::POST,
+            "/api/admin/groups",
+            "admin",
+            "vault-admin",
+            &json!({"name": "Must Roll Back"}),
+        ))
+        .await
+        .expect("create group response");
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let group_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM vault_groups WHERE name = 'Must Roll Back'")
+            .fetch_one(&pool)
+            .await
+            .expect("group count");
+    let event_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM state_events WHERE event_type = 'admin.group.created'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("admin event count");
+    assert_eq!(group_count, 0);
+    assert_eq!(event_count, 0);
+}

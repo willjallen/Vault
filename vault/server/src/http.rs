@@ -42,9 +42,8 @@ use crate::documents::{
     ClientMeta, DocumentError, VersionDownload, archive_document, archive_folder,
     checkout_version_download, current_version_download, delete_document_forever,
     document_access_level, document_folder_path, lock_document, move_document,
-    record_checkout_event_and_lock, record_document_batch_state, record_document_deleted_state,
-    record_download_event, rename_document, restore_document, sweep_expired_documents,
-    try_fetch_document_by_id, unlock_document, version_download_by_id,
+    record_checkout_event_and_lock, record_download_event, rename_document, restore_document,
+    sweep_expired_documents, try_fetch_document_by_id, unlock_document, version_download_by_id,
 };
 use crate::exports::{
     self, ExportError, ExportExecutionContext, ExportRuntimeSettings, ExportSelectionItem,
@@ -52,7 +51,7 @@ use crate::exports::{
 };
 use crate::folders::{
     CreatedFolderPayload, FolderError, FolderPermissionUpdate, FolderRetentionUpdate,
-    create_folder_path, folder_path_by_id, get_folder_by_path, get_or_create_folder_path,
+    create_folder_path, folder_path_by_id, get_folder_by_path, get_or_create_folder_path_in_tx,
     move_folder, rename_folder, update_folder_permissions, update_folder_properties,
     update_folder_retention,
 };
@@ -66,7 +65,7 @@ use crate::site_settings::{
 };
 use crate::state_events::{
     StateEventError, StateEventRecord, latest_state_event_id, notify_state_event_committed,
-    record_state_event, state_events_after, subscribe_state_events,
+    record_state_event, record_state_event_in_tx, state_events_after, subscribe_state_events,
 };
 use crate::storage::{
     BlobByteStream, BlobReadRange, BlobWriteKind, LocalBlobStorage, STORAGE_CHUNK_SIZE,
@@ -980,7 +979,6 @@ async fn api_admin_debug_seed(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     let user = require_dev_admin(&state, &headers).await?;
-    let folder = get_or_create_folder_path(&state.db, Some("Debug Samples")).await?;
     let name = format!("debug-sample-{}.txt", Uuid::new_v4().simple());
     let content = format!("Debug sample created by Rust Vault as {}\n", user.name);
     let content_digest = sha256_hex(content.as_bytes());
@@ -1009,8 +1007,7 @@ async fn api_admin_debug_seed(
             return Err(error.into());
         }
     };
-    let document_result =
-        create_debug_document(&state, folder.id, &name, &stored, &user, &publication).await;
+    let document_result = create_debug_document(&state, &name, &stored, &user, &publication).await;
     let document_id = match document_result {
         Ok(document_id) => document_id,
         Err(error) => {
@@ -1027,7 +1024,6 @@ async fn api_admin_debug_seed(
             return Err(error);
         }
     };
-    record_state_event(&state.db, "folder.debug.seeded", &["contents", "sidebar"]).await?;
     notify_state_event_committed();
     Ok(Json(debug_action_result(json!({
         "action": "seed",
@@ -1177,7 +1173,6 @@ async fn api_update_preferences(
     let user = current_user(&state, &headers).await?;
     let (_, changed) = update_preferences_for_user(&state.db, &user, &payload.preferences).await?;
     if changed {
-        record_state_event(&state.db, "preferences.update", &["preferences"]).await?;
         notify_state_event_committed();
     }
     Ok(Json(PreferencesResponse {
@@ -1711,7 +1706,6 @@ async fn api_lock_items(
         }
     }
     if changed {
-        record_document_batch_state(&state.db, "lock").await?;
         notify_state_event_committed();
     }
     Ok(Json(response))
@@ -1753,7 +1747,6 @@ async fn api_unlock_items(
         }
     }
     if changed {
-        record_document_batch_state(&state.db, "unlock").await?;
         notify_state_event_committed();
     }
     Ok(Json(response))
@@ -1803,7 +1796,6 @@ async fn api_delete_forever(
         }
     }
     if changed {
-        record_document_deleted_state(&state.db).await?;
         notify_state_event_committed();
         if let Err(error) =
             collect_unreferenced_blobs_with_limit(&state.db, state.storage.as_ref(), 250).await
@@ -1857,7 +1849,6 @@ async fn api_move_items(
         }
     }
     if changed {
-        record_document_batch_state(&state.db, "move").await?;
         notify_state_event_committed();
     }
     Ok(Json(response))
@@ -1905,7 +1896,6 @@ async fn api_archive_items(
         }
     }
     if changed {
-        record_document_batch_state(&state.db, "archive").await?;
         notify_state_event_committed();
     }
     Ok(Json(response))
@@ -1947,7 +1937,6 @@ async fn api_restore_items(
         }
     }
     if changed {
-        record_document_batch_state(&state.db, "restore").await?;
         notify_state_event_committed();
     }
     Ok(Json(response))
@@ -1986,7 +1975,6 @@ async fn api_rename_item(
             {
                 Ok(detail) => {
                     response.ok.push(action_result(&item, Some(detail)));
-                    record_document_batch_state(&state.db, "rename").await?;
                     notify_state_event_committed();
                 }
                 Err(error) => {
@@ -2007,7 +1995,6 @@ async fn api_rename_item(
             {
                 Ok(result) => {
                     response.ok.push(action_result(&item, Some(result.path)));
-                    record_document_batch_state(&state.db, "rename").await?;
                     notify_state_event_committed();
                 }
                 Err(error) => {
@@ -2287,6 +2274,14 @@ fn document_action_error_detail(error: DocumentError) -> Result<String, ApiError
         DocumentError::Folder(FolderError::ArchiveDoesNotContainFolders) => {
             Ok("Archive does not contain folders".to_string())
         }
+        DocumentError::Database(error) => {
+            tracing::error!(?error, "bulk document action database failure");
+            Ok("Action could not be completed".to_string())
+        }
+        DocumentError::Folder(FolderError::Database(error)) => {
+            tracing::error!(?error, "bulk document action folder database failure");
+            Ok("Action could not be completed".to_string())
+        }
         error => Err(ApiError::Document(error)),
     }
 }
@@ -2314,6 +2309,10 @@ fn folder_action_error_detail(error: FolderError) -> Result<String, ApiError> {
         }
         FolderError::InsufficientFolderAccess => Ok("Insufficient folder access".to_string()),
         FolderError::FolderNotFound => Ok("Folder not found".to_string()),
+        FolderError::Database(error) => {
+            tracing::error!(?error, "bulk folder action database failure");
+            Ok("Action could not be completed".to_string())
+        }
         error => Err(ApiError::Folder(error)),
     }
 }
@@ -3100,7 +3099,6 @@ fn debug_allowed_resources(resources: &[String]) -> Vec<String> {
 
 async fn create_debug_document(
     state: &AppState,
-    folder_id: i64,
     name: &str,
     stored: &StoredBlob,
     user: &UserContext,
@@ -3110,9 +3108,16 @@ async fn create_debug_document(
     let blob_id = publication
         .prepare_metadata_in_tx(&mut transaction, stored)
         .await?;
-    let document_id = insert_debug_document_row(&mut transaction, folder_id, name, user).await?;
+    let folder = get_or_create_folder_path_in_tx(&mut transaction, "Debug Samples").await?;
+    let document_id = insert_debug_document_row(&mut transaction, folder.id, name, user).await?;
     insert_debug_document_version_and_event(&mut transaction, document_id, blob_id, name, user)
         .await?;
+    record_state_event_in_tx(
+        &mut transaction,
+        "folder.debug.seeded",
+        &["contents", "sidebar"],
+    )
+    .await?;
     publication.finish_metadata_in_tx(&mut transaction).await?;
     transaction.commit().await?;
     Ok(document_id)

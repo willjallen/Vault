@@ -2,14 +2,14 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::{FromRow, SqlitePool};
+use sqlx::{FromRow, Sqlite, SqlitePool, Transaction};
 use thiserror::Error;
 use time::format_description::well_known::Rfc3339;
 use time::{OffsetDateTime, PrimitiveDateTime, UtcOffset};
 
 use crate::auth::{AuthSettings, effective_admin_from_parts};
 use crate::site_settings::{SiteSettingsError, site_settings_for_db};
-use crate::state_events::state_event_resources_json;
+use crate::state_events::record_state_event_in_tx;
 
 #[derive(Debug, Error)]
 pub enum AdminError {
@@ -217,6 +217,7 @@ pub async fn update_user(
     if payload.is_admin == Some(false) || payload.is_active == Some(false) {
         ensure_not_last_active_admin(pool, auth, &target).await?;
     }
+    let mut transaction = pool.begin().await?;
     sqlx::query(
         r"
         UPDATE vault_users
@@ -229,9 +230,10 @@ pub async fn update_user(
     .bind(payload.is_admin)
     .bind(payload.is_active)
     .bind(user_id)
-    .execute(pool)
+    .execute(&mut *transaction)
     .await?;
-    record_admin_change(pool, "admin.user.updated", &["admin"]).await?;
+    record_admin_change(&mut transaction, "admin.user.updated", &["admin"]).await?;
+    transaction.commit().await?;
     Ok(())
 }
 
@@ -243,14 +245,16 @@ pub async fn create_group(
     if find_group_by_normalized_name(pool, &name).await?.is_some() {
         return Err(AdminError::GroupAlreadyExists);
     }
+    let mut transaction = pool.begin().await?;
     sqlx::query("INSERT INTO vault_groups (name, description) VALUES (?, ?)")
         .bind(name)
         .bind(normalize_optional_description(
             request.description.as_deref(),
         ))
-        .execute(pool)
+        .execute(&mut *transaction)
         .await?;
-    record_admin_change(pool, "admin.group.created", &["admin"]).await?;
+    record_admin_change(&mut transaction, "admin.group.created", &["admin"]).await?;
+    transaction.commit().await?;
     Ok(())
 }
 
@@ -278,15 +282,17 @@ pub async fn update_group(
         },
     )
     .await?;
+    let mut transaction = pool.begin().await?;
     sqlx::query("UPDATE vault_groups SET name = ?, description = ? WHERE id = ?")
         .bind(name)
         .bind(normalize_optional_description(
             request.description.as_deref(),
         ))
         .bind(group_id)
-        .execute(pool)
+        .execute(&mut *transaction)
         .await?;
-    record_admin_change(pool, "admin.group.updated", &["admin"]).await?;
+    record_admin_change(&mut transaction, "admin.group.updated", &["admin"]).await?;
+    transaction.commit().await?;
     Ok(())
 }
 
@@ -309,11 +315,13 @@ pub async fn delete_group(
     }
     ensure_active_admin_after_group_change(pool, auth, GroupAdminChange::Delete { group_id })
         .await?;
+    let mut transaction = pool.begin().await?;
     sqlx::query("DELETE FROM vault_groups WHERE id = ?")
         .bind(group_id)
-        .execute(pool)
+        .execute(&mut *transaction)
         .await?;
-    record_admin_change(pool, "admin.group.deleted", &["admin"]).await?;
+    record_admin_change(&mut transaction, "admin.group.deleted", &["admin"]).await?;
+    transaction.commit().await?;
     Ok(())
 }
 
@@ -327,6 +335,7 @@ pub async fn add_group_member(
     {
         return Err(AdminError::GroupOrUserNotFound);
     }
+    let mut transaction = pool.begin().await?;
     sqlx::query(
         r"
         INSERT OR IGNORE INTO vault_group_memberships (user_id, group_id)
@@ -335,9 +344,10 @@ pub async fn add_group_member(
     )
     .bind(request.user_id)
     .bind(group_id)
-    .execute(pool)
+    .execute(&mut *transaction)
     .await?;
-    record_admin_change(pool, "admin.group.member.added", &["admin"]).await?;
+    record_admin_change(&mut transaction, "admin.group.member.added", &["admin"]).await?;
+    transaction.commit().await?;
     Ok(())
 }
 
@@ -368,12 +378,14 @@ pub async fn remove_group_member(
         GroupAdminChange::RemoveMembership { group_id, user_id },
     )
     .await?;
+    let mut transaction = pool.begin().await?;
     sqlx::query("DELETE FROM vault_group_memberships WHERE group_id = ? AND user_id = ?")
         .bind(group_id)
         .bind(user_id)
-        .execute(pool)
+        .execute(&mut *transaction)
         .await?;
-    record_admin_change(pool, "admin.group.member.removed", &["admin"]).await?;
+    record_admin_change(&mut transaction, "admin.group.member.removed", &["admin"]).await?;
+    transaction.commit().await?;
     Ok(())
 }
 
@@ -669,20 +681,11 @@ async fn all_memberships(pool: &SqlitePool) -> Result<Vec<MembershipRow>, AdminE
 }
 
 async fn record_admin_change(
-    pool: &SqlitePool,
+    transaction: &mut Transaction<'_, Sqlite>,
     event_type: &str,
     resources: &[&str],
 ) -> Result<(), AdminError> {
-    sqlx::query(
-        r"
-        INSERT INTO state_events (event_type, resources)
-        VALUES (?, ?)
-        ",
-    )
-    .bind(event_type)
-    .bind(state_event_resources_json(resources))
-    .execute(pool)
-    .await?;
+    record_state_event_in_tx(transaction, event_type, resources).await?;
     Ok(())
 }
 

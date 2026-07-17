@@ -6,7 +6,7 @@ use sqlx::{FromRow, QueryBuilder, Sqlite, SqlitePool, Transaction};
 use thiserror::Error;
 
 use crate::auth::UserContext;
-use crate::state_events::state_event_resources_json;
+use crate::state_events::{record_state_event_in_tx, state_event_resources_json};
 
 pub const ARCHIVE_ROOT: &str = "Archive";
 pub const VAULT_ROOT_KEY: &str = "vault";
@@ -782,6 +782,19 @@ async fn move_or_rename_folder(
         format!("Moved from {source_path} to {target_path}")
     };
     record_folder_event_in_tx(&mut transaction, source.id, user, event_type, &message).await?;
+    let batch_event_type = if name.is_some() { "rename" } else { "move" };
+    record_state_event_in_tx(
+        &mut transaction,
+        &format!("batch.{batch_event_type}"),
+        &[
+            "contents",
+            "document_detail",
+            "my_edits",
+            "preferences",
+            "sidebar",
+        ],
+    )
+    .await?;
     transaction.commit().await?;
     Ok(RenameFolderResult { path: target_path })
 }

@@ -408,3 +408,64 @@ async fn dev_database_reset_cleans_tracked_upload_resources() {
     assert!(!upload_dir.exists());
     assert!(coordinator.preverified_bytes(upload_id).await.is_none());
 }
+
+#[tokio::test]
+async fn debug_seed_rolls_back_all_metadata_when_outbox_insert_fails() {
+    let (state, _temp_dir) = test_state(dev_auth()).await;
+    let db = state.db.clone();
+    let storage = state.storage.clone();
+    sqlx::query(
+        r"
+        CREATE TRIGGER reject_debug_seed_outbox
+        BEFORE INSERT ON state_events
+        WHEN NEW.event_type = 'folder.debug.seeded'
+        BEGIN
+            SELECT RAISE(ABORT, 'forced debug seed event failure');
+        END
+        ",
+    )
+    .execute(&db)
+    .await
+    .expect("install debug-seed trigger");
+
+    let response = http::router(state)
+        .oneshot(dev_post("/api/admin/debug/seed"))
+        .await
+        .expect("debug seed response");
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let folder_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM folders WHERE name = 'Debug Samples'")
+            .fetch_one(&db)
+            .await
+            .expect("debug folder count");
+    let document_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM documents")
+        .fetch_one(&db)
+        .await
+        .expect("document count");
+    let version_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM document_versions")
+        .fetch_one(&db)
+        .await
+        .expect("version count");
+    let blob_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM blobs")
+        .fetch_one(&db)
+        .await
+        .expect("blob count");
+    let location_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM blob_locations")
+        .fetch_one(&db)
+        .await
+        .expect("location count");
+    let event_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM state_events")
+        .fetch_one(&db)
+        .await
+        .expect("state event count");
+    let object_keys = storage.list_object_keys().await.expect("object keys");
+
+    assert_eq!(folder_count, 0);
+    assert_eq!(document_count, 0);
+    assert_eq!(version_count, 0);
+    assert_eq!(blob_count, 0);
+    assert_eq!(location_count, 0);
+    assert_eq!(event_count, 0);
+    assert!(object_keys.is_empty());
+}

@@ -14,7 +14,7 @@ use crate::folders::{
     parse_public_folder_path, require_write_for_folder_path, require_write_for_folder_path_in_tx,
     subtree_folder_ids_from_records,
 };
-use crate::state_events::state_event_resources_json;
+use crate::state_events::{record_state_event_in_tx, state_event_resources_json};
 use crate::storage::BlobLocation;
 
 #[derive(Debug, Clone, PartialEq, Eq, FromRow)]
@@ -280,6 +280,7 @@ pub async fn lock_document(
     let path = document_path_in_tx(&mut transaction, &document).await?;
     if let Some(lock) = active_lock_in_tx(&mut transaction, document.id).await? {
         ensure_lock_owner_or_admin(&lock, user)?;
+        record_document_batch_state_in_tx(&mut transaction, "lock").await?;
         transaction.commit().await?;
         return Ok(DocumentLockResult {
             detail: lock.locked_by_name.unwrap_or(lock.locked_by),
@@ -309,6 +310,7 @@ pub async fn lock_document(
         meta,
     )
     .await?;
+    record_document_batch_state_in_tx(&mut transaction, "lock").await?;
     transaction.commit().await?;
     Ok(DocumentLockResult {
         detail: user.name.clone(),
@@ -348,6 +350,7 @@ pub async fn unlock_document(
         meta,
     )
     .await?;
+    record_document_batch_state_in_tx(&mut transaction, "unlock").await?;
     transaction.commit().await?;
     Ok(DocumentLockResult {
         detail: "Unlocked".to_string(),
@@ -395,6 +398,7 @@ pub async fn delete_document_forever(
     if deleted.rows_affected() != 1 {
         return Err(DocumentError::DocumentStateChanged);
     }
+    record_document_deleted_state_in_tx(&mut transaction).await?;
     transaction.commit().await?;
     Ok(PermanentDeleteResult {
         path,
@@ -775,6 +779,7 @@ pub async fn archive_document(
         },
     )
     .await?;
+    record_document_batch_state_in_tx(&mut transaction, "archive").await?;
     transaction.commit().await?;
     Ok(join_path(&[ARCHIVE_ROOT, &document.name]))
 }
@@ -852,6 +857,7 @@ pub async fn restore_document(
         meta,
     )
     .await?;
+    record_document_batch_state_in_tx(&mut transaction, "restore").await?;
     transaction.commit().await?;
     Ok(join_path(&[&target_folder_path, &target_name]))
 }
@@ -941,6 +947,7 @@ pub async fn archive_folder(
     }
     ensure_folders_have_no_documents_in_tx(&mut transaction, &source_ids).await?;
     delete_folder_subtree_in_tx(&mut transaction, source.id).await?;
+    record_document_batch_state_in_tx(&mut transaction, "archive").await?;
     transaction.commit().await?;
     Ok(ARCHIVE_ROOT.to_string())
 }
@@ -1083,38 +1090,10 @@ async fn move_or_rename_document(
         meta,
     )
     .await?;
+    let batch_event_type = if name.is_some() { "rename" } else { "move" };
+    record_document_batch_state_in_tx(&mut transaction, batch_event_type).await?;
     transaction.commit().await?;
     Ok(target_path)
-}
-
-pub async fn record_document_batch_state(
-    pool: &SqlitePool,
-    event_type: &str,
-) -> Result<(), DocumentError> {
-    sqlx::query(
-        r"
-        INSERT INTO state_events (event_type, resources)
-        VALUES (?, ?)
-        ",
-    )
-    .bind(format!("batch.{event_type}"))
-    .bind(batch_state_resources_json())
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-pub async fn record_document_deleted_state(pool: &SqlitePool) -> Result<(), DocumentError> {
-    sqlx::query(
-        r"
-        INSERT INTO state_events (event_type, resources)
-        VALUES ('document.deleted', ?)
-        ",
-    )
-    .bind(batch_state_resources_json())
-    .execute(pool)
-    .await?;
-    Ok(())
 }
 
 pub async fn document_folder_path(
@@ -1969,14 +1948,34 @@ async fn record_document_state_in_tx(
     Ok(())
 }
 
-fn batch_state_resources_json() -> String {
-    state_event_resources_json(&[
+async fn record_document_batch_state_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    event_type: &str,
+) -> Result<(), DocumentError> {
+    record_state_event_in_tx(
+        transaction,
+        &format!("batch.{event_type}"),
+        batch_state_resources(),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn record_document_deleted_state_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+) -> Result<(), DocumentError> {
+    record_state_event_in_tx(transaction, "document.deleted", batch_state_resources()).await?;
+    Ok(())
+}
+
+fn batch_state_resources() -> &'static [&'static str] {
+    &[
         "contents",
         "document_detail",
         "my_edits",
         "preferences",
         "sidebar",
-    ])
+    ]
 }
 
 #[must_use]

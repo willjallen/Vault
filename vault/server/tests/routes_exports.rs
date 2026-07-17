@@ -1476,7 +1476,17 @@ async fn wait_for_export_status_in_db(pool: &sqlx::SqlitePool, job_id: &str, exp
         }
         sleep(Duration::from_millis(20)).await;
     }
-    panic!("export {job_id} did not reach {expected}");
+    let terminal = sqlx::query_as::<_, (String, Option<String>)>(
+        "SELECT status, error FROM export_jobs WHERE id = ?",
+    )
+    .bind(job_id)
+    .fetch_one(pool)
+    .await
+    .expect("export terminal diagnostic");
+    panic!(
+        "export {job_id} did not reach {expected}; current status is {} and error is {:?}",
+        terminal.0, terminal.1
+    );
 }
 
 async fn wait_for_cancelled_export_cleanup(
@@ -1670,6 +1680,23 @@ async fn wait_for_export_event_count(pool: &sqlx::SqlitePool, expected: i64) {
         .await
         .expect("export events");
         if count == expected {
+            let outbox = sqlx::query_as::<_, (String, String)>(
+                r"
+                SELECT event_type, resources
+                FROM state_events
+                WHERE event_type = 'document.download'
+                ",
+            )
+            .fetch_all(pool)
+            .await
+            .expect("export outbox events");
+            assert_eq!(
+                outbox,
+                vec![(
+                    "document.download".to_string(),
+                    "[\"document_detail\"]".to_string(),
+                )],
+            );
             return;
         }
         sleep(Duration::from_millis(20)).await;
@@ -3509,6 +3536,143 @@ async fn export_artifact_failure_rolls_back_blob_and_location_metadata() {
     keys.sort();
     assert_eq!(artifact_count, 0);
     assert_eq!(orphan_blob_count, 0);
+    assert_eq!(keys, expected_keys);
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // One transaction-fault test keeps all rollback surfaces together.
+async fn export_completion_rolls_back_when_a_later_audit_insert_fails() {
+    let (state, _temp_dir) = test_state().await;
+    let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
+        .await
+        .expect("root");
+    let first = insert_stored_document(
+        &state.db,
+        &state.storage,
+        root.id,
+        "first-audit.txt",
+        b"first audit bytes",
+    )
+    .await;
+    let second = insert_stored_document(
+        &state.db,
+        &state.storage,
+        root.id,
+        "second-audit.txt",
+        b"second audit bytes",
+    )
+    .await;
+    let mut expected_keys = state
+        .storage
+        .list_object_keys()
+        .await
+        .expect("source object keys");
+    expected_keys.sort();
+    let pool = state.db.clone();
+    let storage = state.storage.clone();
+    let transfers_path = state.config.transfers_path();
+    sqlx::query(
+        r"
+        CREATE TRIGGER reject_second_export_audit
+        BEFORE INSERT ON document_events
+        WHEN NEW.event_type = 'download'
+         AND NEW.message LIKE 'Exported %'
+         AND (
+             SELECT COUNT(*)
+             FROM document_events
+             WHERE event_type = 'download' AND message LIKE 'Exported %'
+         ) >= 1
+        BEGIN
+            SELECT RAISE(ABORT, 'forced second export audit failure');
+        END
+        ",
+    )
+    .execute(&pool)
+    .await
+    .expect("install export-audit trigger");
+    let app = http::router(state);
+
+    let response = app
+        .clone()
+        .oneshot(authed_json_post(
+            "/api/exports",
+            "admin",
+            "vault-admin",
+            &json!({
+                "items": [
+                    {"type": "document", "id": first},
+                    {"type": "document", "id": second}
+                ]
+            }),
+        ))
+        .await
+        .expect("export response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload = response_json(response).await;
+    let job_id = payload["id"].as_str().expect("job id").to_string();
+
+    wait_for_export_status_in_db(&pool, &job_id, "failed").await;
+    wait_for_path_missing(
+        &transfers_path
+            .join("exports")
+            .join(format!("{job_id}.zip.tmp")),
+    )
+    .await;
+    let terminal = sqlx::query_as::<_, (String, Option<String>)>(
+        "SELECT status, completed_at FROM export_jobs WHERE id = ?",
+    )
+    .bind(&job_id)
+    .fetch_one(&pool)
+    .await
+    .expect("job terminal state");
+    let artifact_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM export_artifacts WHERE job_id = ?")
+            .bind(&job_id)
+            .fetch_one(&pool)
+            .await
+            .expect("artifact count");
+    let audit_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM document_events WHERE event_type = 'download' AND message LIKE 'Exported %'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("export audit count");
+    let outbox_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM state_events WHERE event_type = 'document.download'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("download outbox count");
+    let orphan_blob_count: i64 = sqlx::query_scalar(
+        r"
+        SELECT COUNT(*)
+        FROM blobs b
+        WHERE NOT EXISTS (SELECT 1 FROM document_versions v WHERE v.blob_id = b.id)
+          AND NOT EXISTS (SELECT 1 FROM export_artifacts a WHERE a.blob_id = b.id)
+        ",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("orphan blob count");
+    let orphan_location_count: i64 = sqlx::query_scalar(
+        r"
+        SELECT COUNT(*)
+        FROM blob_locations l
+        WHERE NOT EXISTS (SELECT 1 FROM blobs b WHERE b.id = l.blob_id)
+        ",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("orphan location count");
+    let mut keys = storage.list_object_keys().await.expect("object keys");
+    keys.sort();
+
+    assert_eq!(terminal, ("failed".to_string(), None));
+    assert_eq!(artifact_count, 0);
+    assert_eq!(audit_count, 0);
+    assert_eq!(outbox_count, 0);
+    assert_eq!(orphan_blob_count, 0);
+    assert_eq!(orphan_location_count, 0);
     assert_eq!(keys, expected_keys);
 }
 

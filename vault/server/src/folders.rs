@@ -52,6 +52,12 @@ pub struct CreatedFolderPayload {
     pub id: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeletedFolderPayload {
+    pub folder: String,
+    pub id: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FolderPermissionUpdate {
     pub group_id: i64,
@@ -86,6 +92,12 @@ pub enum FolderError {
     InvalidFolderName,
     #[error("cannot move a root folder")]
     CannotMoveRootFolder,
+    #[error("cannot delete a root folder")]
+    CannotDeleteRootFolder,
+    #[error("folder is not empty")]
+    FolderNotEmpty,
+    #[error("folder path changed")]
+    FolderPathChanged,
     #[error("cannot move a folder into itself")]
     CannotMoveFolderIntoItself,
     #[error("document is locked by another user")]
@@ -701,6 +713,89 @@ pub async fn move_folder(
     move_or_rename_folder(pool, folder_id, Some(destination_folder), None, user).await
 }
 
+pub async fn delete_empty_folder(
+    pool: &SqlitePool,
+    folder_id: i64,
+    expected_path: &str,
+    user: &UserContext,
+) -> Result<DeletedFolderPayload, FolderError> {
+    let expected_path = normalize_folder(Some(expected_path))?;
+
+    let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let folder = find_folder_by_id_in_tx(&mut transaction, folder_id)
+        .await?
+        .ok_or(FolderError::FolderNotFound)?;
+    if folder.is_root {
+        return Err(FolderError::CannotDeleteRootFolder);
+    }
+    if folder.root_key != VAULT_ROOT_KEY {
+        return Err(FolderError::FolderNotFound);
+    }
+
+    let level = folder_access_level_in_tx(&mut transaction, folder.id, user).await?;
+    if level < 1 {
+        return Err(FolderError::FolderNotFound);
+    }
+    if level < 3 {
+        return Err(FolderError::InsufficientFolderAccess);
+    }
+
+    let (_, current_path) = strict_public_folder_path_in_tx(&mut transaction, folder.clone())
+        .await?
+        .ok_or(FolderError::FolderNotFound)?;
+    if current_path != expected_path {
+        return Err(FolderError::FolderPathChanged);
+    }
+
+    let deleted = sqlx::query(
+        r"
+        DELETE FROM folders
+        WHERE id = ?
+          AND root_key = ?
+          AND is_root = 0
+          AND NOT EXISTS (
+              SELECT 1
+              FROM documents
+              WHERE documents.folder_id = ?
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM folders AS child
+              WHERE child.parent_id = ?
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM upload_sessions
+              WHERE mode = 'create'
+                AND status IN ('active', 'completing')
+                AND folder_path = ?
+          )
+        ",
+    )
+    .bind(folder.id)
+    .bind(VAULT_ROOT_KEY)
+    .bind(folder.id)
+    .bind(folder.id)
+    .bind(&current_path)
+    .execute(&mut *transaction)
+    .await?;
+    if deleted.rows_affected() != 1 {
+        return Err(FolderError::FolderNotEmpty);
+    }
+
+    record_state_event_in_tx(
+        &mut transaction,
+        "folder.deleted",
+        &["contents", "preferences", "sidebar"],
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(DeletedFolderPayload {
+        folder: current_path,
+        id: folder.id,
+    })
+}
+
 async fn move_or_rename_folder(
     pool: &SqlitePool,
     folder_id: i64,
@@ -891,6 +986,54 @@ pub async fn resolve_visible_folder_by_path(
 
     transaction.commit().await?;
     Ok(resolved)
+}
+
+pub async fn empty_folder_delete_eligible_ids(
+    pool: &SqlitePool,
+    candidates: &[(i64, String)],
+) -> Result<HashSet<i64>, FolderError> {
+    if candidates.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let ids = sqlx::query_scalar::<_, i64>(
+        r"
+        WITH requested(id, path) AS (
+            SELECT
+                CAST(json_extract(value, '$[0]') AS INTEGER),
+                json_extract(value, '$[1]')
+            FROM json_each(?)
+        ),
+        active_create_paths(path) AS MATERIALIZED (
+            SELECT DISTINCT folder_path
+            FROM upload_sessions
+            WHERE mode = 'create'
+              AND status IN ('active', 'completing')
+        )
+        SELECT requested.id
+        FROM requested
+        JOIN folders ON folders.id = requested.id
+        LEFT JOIN active_create_paths
+          ON active_create_paths.path = requested.path
+        WHERE folders.root_key = ?
+          AND folders.is_root = 0
+          AND active_create_paths.path IS NULL
+          AND NOT EXISTS (
+              SELECT 1
+              FROM documents
+              WHERE documents.folder_id = folders.id
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM folders AS child
+              WHERE child.parent_id = folders.id
+          )
+        ",
+    )
+    .bind(sqlx::types::Json(candidates))
+    .bind(VAULT_ROOT_KEY)
+    .fetch_all(pool)
+    .await?;
+    Ok(ids.into_iter().collect())
 }
 
 async fn resolve_visible_folder_in_tx(
@@ -1243,7 +1386,7 @@ pub(crate) async fn all_folders_in_tx(
         .await?)
 }
 
-async fn get_folder_by_path_in_tx(
+pub(crate) async fn get_folder_by_path_in_tx(
     transaction: &mut Transaction<'_, Sqlite>,
     path: &str,
 ) -> Result<Option<FolderRecord>, FolderError> {

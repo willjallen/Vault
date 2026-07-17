@@ -10,6 +10,7 @@ import {
 
 export function createFolderActionHandlers({
   apiFetch,
+  clearAllSelections,
   folder,
   handleArchiveItems,
   inlineFolderDraft,
@@ -17,6 +18,7 @@ export function createFolderActionHandlers({
   refresh,
   refreshAfterAction,
   replaceFolder,
+  requestConfirm,
   setBusy,
   setCreatingFolder,
   setError,
@@ -35,6 +37,54 @@ export function createFolderActionHandlers({
       if (shouldNavigate) {
         replaceFolder("Archive");
       }
+    }
+  }
+
+  async function handleDeleteEmptyFolder(folderItem) {
+    const targetPath = typeof folderItem?.path === "string" ? folderItem.path : "";
+    const targetId = folderItem?.id;
+    if (
+      !targetPath ||
+      isArchivedPath(targetPath) ||
+      !Number.isSafeInteger(targetId) ||
+      folderItem?.can_delete_empty !== true
+    ) {
+      setError("Choose an empty Vault folder to delete.");
+      return false;
+    }
+    const confirmed = await requestConfirm({
+      title: "Delete empty folder",
+      message: `Permanently delete "${folderBaseName(targetPath, "Folder")}"? This cannot be undone.`,
+      confirmLabel: "Delete",
+      tone: "danger",
+    });
+    if (!confirmed) {
+      return false;
+    }
+    setBusy(true);
+    setError("");
+    try {
+      const params = new URLSearchParams({ path: targetPath });
+      const res = await apiFetch(`/api/folders/${targetId}?${params.toString()}`, {
+        method: "DELETE",
+      });
+      if (!res.ok) {
+        const detail = await res.json().catch(() => ({}));
+        throw new Error(detail.detail || "Could not delete folder");
+      }
+      const deletingCurrentFolder = folder === targetPath;
+      const refreshTarget = deletingCurrentFolder ? folderParent(targetPath) : folder;
+      await refreshAfterAction(refreshTarget);
+      clearAllSelections();
+      if (deletingCurrentFolder) {
+        replaceFolder(refreshTarget);
+      }
+      return true;
+    } catch (err) {
+      setError(err.message || "Could not delete folder");
+      return false;
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -256,6 +306,7 @@ export function createFolderActionHandlers({
     handleCancelInlineFolder,
     handleCommitInlineFolder,
     handleCreateFolder,
+    handleDeleteEmptyFolder,
     handleInlineFolderNameChange,
     handleRenameFile,
     handleRenameFolder,

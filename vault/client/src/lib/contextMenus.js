@@ -119,10 +119,18 @@ export function buildFolderMenuItems(actions) {
           disabled: busy,
         }
       : null,
-    canMoveFolder
+    canMoveFolder && folderItem.can_delete_empty !== true
       ? {
           label: "Move to Archive",
           action: () => actions.handleArchiveFolder(folderPath, { navigate: false }),
+          disabled: busy,
+        }
+      : null,
+    canMoveFolder && folderItem.can_delete_empty === true
+      ? {
+          label: "Delete",
+          action: () => actions.handleDeleteEmptyFolder(folderItem),
+          danger: true,
           disabled: busy,
         }
       : null,

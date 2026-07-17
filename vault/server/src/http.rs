@@ -48,10 +48,11 @@ use crate::exports::{
     ExportZipOptions,
 };
 use crate::folders::{
-    CreatedFolderPayload, FolderError, FolderPermissionUpdate, FolderRetentionUpdate,
-    create_folder_path, get_or_create_folder_path_in_tx, move_folder, rename_folder,
-    resolve_visible_folder_by_id, resolve_visible_folder_by_path, update_folder_permissions,
-    update_folder_properties, update_folder_retention,
+    CreatedFolderPayload, DeletedFolderPayload, FolderError, FolderPermissionUpdate,
+    FolderRetentionUpdate, create_folder_path, delete_empty_folder,
+    get_or_create_folder_path_in_tx, move_folder, rename_folder, resolve_visible_folder_by_id,
+    resolve_visible_folder_by_path, update_folder_permissions, update_folder_properties,
+    update_folder_retention,
 };
 use crate::oidc::{self, CallbackRequest, OidcError};
 use crate::preferences::{PreferenceError, update_preferences_for_user};
@@ -215,6 +216,10 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/folders/sidebar", get(api_sidebar))
         .route("/api/folders/contents", get(api_folder_contents))
+        .route(
+            "/api/folders/{folder_id}",
+            axum::routing::delete(api_delete_empty_folder),
+        )
         .route("/api/share-links", post(api_create_share_link))
         .route("/api/share-links/{code}", get(api_resolve_share_link))
         .route(
@@ -735,6 +740,11 @@ struct FolderPropertiesPatchRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct DeleteFolderQuery {
+    path: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct FolderPermissionRowRequest {
     group_id: i64,
     #[serde(default = "default_true")]
@@ -1232,6 +1242,18 @@ async fn api_folder_contents(
         )
         .await?,
     ))
+}
+
+async fn api_delete_empty_folder(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(folder_id): Path<i64>,
+    Query(query): Query<DeleteFolderQuery>,
+) -> Result<Json<DeletedFolderPayload>, ApiError> {
+    let user = current_user(&state, &headers).await?;
+    let deleted = delete_empty_folder(&state.db, folder_id, &query.path, &user).await?;
+    notify_state_event_committed();
+    Ok(Json(deleted))
 }
 
 async fn api_create_share_link(
@@ -2352,6 +2374,9 @@ fn document_action_error_detail(error: DocumentError) -> Result<String, ApiError
 fn folder_action_error_detail(error: FolderError) -> Result<String, ApiError> {
     match error {
         FolderError::CannotMoveRootFolder => Ok("Cannot move a root folder".to_string()),
+        FolderError::CannotDeleteRootFolder => Ok("Cannot delete a root folder".to_string()),
+        FolderError::FolderNotEmpty => Ok("Folder is not empty".to_string()),
+        FolderError::FolderPathChanged => Ok("Folder changed; refresh and try again".to_string()),
         FolderError::CannotMoveFolderIntoItself => {
             Ok("Cannot move a folder into itself".to_string())
         }
@@ -4027,6 +4052,15 @@ fn folder_error_response(error: FolderError) -> (StatusCode, String) {
         FolderError::CannotMoveRootFolder => (
             StatusCode::BAD_REQUEST,
             "Cannot move a root folder".to_string(),
+        ),
+        FolderError::CannotDeleteRootFolder => (
+            StatusCode::BAD_REQUEST,
+            "Cannot delete a root folder".to_string(),
+        ),
+        FolderError::FolderNotEmpty => (StatusCode::CONFLICT, "Folder is not empty".to_string()),
+        FolderError::FolderPathChanged => (
+            StatusCode::CONFLICT,
+            "Folder changed; refresh and try again".to_string(),
         ),
         FolderError::CannotMoveFolderIntoItself => (
             StatusCode::BAD_REQUEST,

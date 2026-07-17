@@ -16,9 +16,9 @@ use crate::documents::{
 };
 use crate::folders::{
     ARCHIVE_ROOT, ARCHIVE_ROOT_KEY, FolderError, FolderRecord, VAULT_ROOT_KEY, all_folders,
-    build_folder_path_cache, ensure_root_folders, folder_access_level, folder_access_levels,
-    folder_path_from_cache, get_folder_by_path, get_folder_by_path_read, join_path,
-    normalize_folder,
+    build_folder_path_cache, empty_folder_delete_eligible_ids, ensure_root_folders,
+    folder_access_level, folder_access_levels, folder_path_from_cache, get_folder_by_path,
+    get_folder_by_path_read, join_path, normalize_folder,
 };
 use crate::preferences::{PreferenceError, preferences_for_user};
 use crate::site_settings::{SiteSettingsError, site_settings_for_db};
@@ -267,6 +267,7 @@ pub struct BootstrapPayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FolderMetadataPayload {
     pub id: i64,
+    pub can_delete_empty: bool,
     pub color: String,
     pub icon: String,
     pub access: AccessPayload,
@@ -320,6 +321,7 @@ pub struct InitialStatePayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FolderSummaryPayload {
     pub id: i64,
+    pub can_delete_empty: bool,
     pub path: String,
     pub name: String,
     pub color: String,
@@ -622,6 +624,11 @@ pub async fn build_sidebar_page_payload(
         .iter()
         .map(|folder| (folder.id, folder))
         .collect::<HashMap<_, _>>();
+    let delete_candidates = folders
+        .iter()
+        .map(|folder| Ok((folder.id, folder_path_from_cache(folder, &path_cache)?)))
+        .collect::<Result<Vec<_>, FolderError>>()?;
+    let delete_eligible = empty_folder_delete_eligible_ids(pool, &delete_candidates).await?;
     let mut metadata = HashMap::new();
     for folder in &folders {
         let level = access_levels.get(&folder.id).copied().unwrap_or(0);
@@ -629,7 +636,15 @@ pub async fn build_sidebar_page_payload(
             continue;
         }
         let path = folder_path_from_cache(folder, &path_cache)?;
-        metadata.insert(path, folder_metadata_payload(folder, level, &by_id));
+        metadata.insert(
+            path,
+            folder_metadata_payload(
+                folder,
+                level,
+                &by_id,
+                level >= 3 && delete_eligible.contains(&folder.id),
+            ),
+        );
     }
 
     Ok(SidebarPayload {
@@ -827,16 +842,24 @@ async fn contents_folder_page(
         .collect::<HashMap<_, _>>();
     let stats = folder_page_stats(context.pool, &folder_page, context.user).await?;
     let levels = folder_access_levels(context.pool, &candidate_ids, context.user).await?;
+    let delete_candidates = folder_page
+        .iter()
+        .map(|folder| (folder.id, folder.path.clone()))
+        .collect::<Vec<_>>();
+    let delete_eligible =
+        empty_folder_delete_eligible_ids(context.pool, &delete_candidates).await?;
     let rows = folder_page
         .iter()
         .map(|row| {
             let record = row.record();
+            let level = levels.get(&record.id).copied().unwrap_or(0);
             folder_summary_payload_from_aggregate(
                 &record,
                 &row.path,
                 &stats,
-                levels.get(&record.id).copied().unwrap_or(0),
+                level,
                 &folder_by_id,
+                level >= 3 && delete_eligible.contains(&record.id),
             )
         })
         .collect();
@@ -1572,7 +1595,17 @@ pub async fn build_share_folder_payload(
     let path = folder_path_from_cache(folder, &path_cache)?;
     let visible_docs = visible_document_rows(pool, user).await?;
     let stats = docs_stats_for_folder_payloads(&visible_docs, &folder_by_id, &path_cache)?;
-    let summary = folder_summary_payload(folder, &path, &stats, level, &folder_by_id);
+    let delete_eligible = empty_folder_delete_eligible_ids(pool, &[(folder.id, path.clone())])
+        .await?
+        .contains(&folder.id);
+    let summary = folder_summary_payload(
+        folder,
+        &path,
+        &stats,
+        level,
+        &folder_by_id,
+        level >= 3 && delete_eligible,
+    );
     Ok(Some((path, folder_summary_without_access(summary)?)))
 }
 
@@ -1600,7 +1633,17 @@ pub async fn build_folder_properties_payload(
     let path = folder_path_from_cache(&folder, &path_cache)?;
     let visible_docs = visible_document_rows(pool, user).await?;
     let stats = docs_stats_for_folder_payloads(&visible_docs, &folder_by_id, &path_cache)?;
-    let summary = folder_summary_payload(&folder, &path, &stats, level, &folder_by_id);
+    let delete_eligible = empty_folder_delete_eligible_ids(pool, &[(folder.id, path.clone())])
+        .await?
+        .contains(&folder.id);
+    let summary = folder_summary_payload(
+        &folder,
+        &path,
+        &stats,
+        level,
+        &folder_by_id,
+        level >= 3 && delete_eligible,
+    );
     let mut payload = folder_summary_without_access(summary)?;
     if let Some(object) = payload.as_object_mut() {
         let can_manage_permissions = level >= 3;
@@ -1860,6 +1903,8 @@ async fn resolved_favorite_items(
         })
         .collect::<Result<Vec<_>, ViewError>>()?;
     let stats = folder_page_stats(pool, &visible_favorite_folders, user).await?;
+    let delete_eligible =
+        favorite_empty_folder_delete_eligible_ids(pool, &visible_favorite_folders).await?;
     let document_levels = folder_access_levels(pool, &document_folder_ids, user).await?;
     let user_group_ids = user_group_ids(pool, user).await?;
     let document_by_id = documents
@@ -1893,6 +1938,7 @@ async fn resolved_favorite_items(
                     &path_cache,
                     &stats,
                     &favorite_folder_levels,
+                    &delete_eligible,
                 )? {
                     resolved.push(row);
                 }
@@ -1908,12 +1954,24 @@ async fn resolved_favorite_items(
     Ok(resolved)
 }
 
+async fn favorite_empty_folder_delete_eligible_ids(
+    pool: &SqlitePool,
+    folders: &[FolderPageRow],
+) -> Result<HashSet<i64>, ViewError> {
+    let candidates = folders
+        .iter()
+        .map(|folder| (folder.id, folder.path.clone()))
+        .collect::<Vec<_>>();
+    Ok(empty_folder_delete_eligible_ids(pool, &candidates).await?)
+}
+
 fn favorite_folder_payload(
     folder_id: i64,
     folder_by_id: &HashMap<i64, &FolderRecord>,
     path_cache: &HashMap<i64, String>,
     stats: &[DocStat],
     access_levels: &HashMap<i64, i64>,
+    delete_eligible: &HashSet<i64>,
 ) -> Result<Option<Value>, ViewError> {
     let Some(folder) = folder_by_id.get(&folder_id) else {
         return Ok(None);
@@ -1929,6 +1987,7 @@ fn favorite_folder_payload(
         stats,
         level,
         folder_by_id,
+        level >= 3 && delete_eligible.contains(&folder.id),
     ))?;
     if let Some(object) = value.as_object_mut() {
         object.insert("type".to_string(), json!("folder"));
@@ -2033,6 +2092,7 @@ fn folder_summary_payload(
     stats: &[DocStat],
     level: i64,
     folder_by_id: &HashMap<i64, &FolderRecord>,
+    can_delete_empty: bool,
 ) -> FolderSummaryPayload {
     let mut latest: Option<String> = None;
     let mut latest_by = None;
@@ -2050,6 +2110,7 @@ fn folder_summary_payload(
     let effective = effective_ttl_policy(folder, folder_by_id);
     FolderSummaryPayload {
         id: folder.id,
+        can_delete_empty,
         path: path.to_string(),
         name: path
             .rsplit('/')
@@ -2080,6 +2141,7 @@ fn folder_summary_payload_from_aggregate(
     stats: &[DocStat],
     level: i64,
     folder_by_id: &HashMap<i64, &FolderRecord>,
+    can_delete_empty: bool,
 ) -> FolderSummaryPayload {
     let aggregate = stats.iter().find(|stat| stat.folder == path);
     folder_summary_payload(
@@ -2088,6 +2150,7 @@ fn folder_summary_payload_from_aggregate(
         aggregate.map_or(&[], std::slice::from_ref),
         level,
         folder_by_id,
+        can_delete_empty,
     )
 }
 
@@ -2103,10 +2166,12 @@ fn folder_metadata_payload(
     folder: &FolderRecord,
     level: i64,
     folder_by_id: &HashMap<i64, &FolderRecord>,
+    can_delete_empty: bool,
 ) -> FolderMetadataPayload {
     let effective = effective_ttl_policy(folder, folder_by_id);
     FolderMetadataPayload {
         id: folder.id,
+        can_delete_empty,
         color: folder.color.clone().unwrap_or_default(),
         icon: folder.icon.clone().unwrap_or_default(),
         access: access_payload(level),

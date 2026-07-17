@@ -570,12 +570,7 @@ export function App({ initial }) {
     refreshAfterAction,
   } = createBulkActionHandlers({
     apiFetch,
-    clearAllSelections: () => {
-      setContentsSelection([]);
-      setContentsAnchor(null);
-      setFolderSelection([]);
-      setFolderAnchor(null);
-    },
+    clearAllSelections,
     docs,
     downloadWithProgress,
     folder,
@@ -608,11 +603,13 @@ export function App({ initial }) {
     handleArchiveFolder,
     handleCancelInlineFolder,
     handleCommitInlineFolder,
+    handleDeleteEmptyFolder,
     handleInlineFolderNameChange,
     handleRenameFile,
     handleRenameFolder,
   } = createFolderActionHandlers({
     apiFetch,
+    clearAllSelections,
     folder,
     handleArchiveItems,
     inlineFolderDraft,
@@ -620,6 +617,7 @@ export function App({ initial }) {
     refresh,
     refreshAfterAction,
     replaceFolder,
+    requestConfirm,
     setBusy,
     setCreatingFolder,
     setError,
@@ -735,6 +733,7 @@ export function App({ initial }) {
       handleArchiveItems,
       handleArchiveFolder,
       handleDeleteForeverItems,
+      handleDeleteEmptyFolder,
       handleDownloadSelection,
       handleLockItems,
       handleLock,

@@ -17,6 +17,7 @@ function metadataFromContents(contents) {
       item.path || "",
       {
         access: item.access || {},
+        can_delete_empty: item.can_delete_empty === true,
         color: item.color || "",
         default_ttl_action: item.default_ttl_action || "none",
         default_ttl_days: item.default_ttl_days || null,

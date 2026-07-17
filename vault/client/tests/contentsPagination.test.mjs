@@ -179,6 +179,27 @@ test("contents cache is a bounded LRU and evicts derived folder data with its pa
   assert.equal(protectedCache.has("incoming"), true);
 });
 
+test("contents cache preserves only an explicit empty-folder delete capability", () => {
+  const cache = new ContentsPageCache(3);
+  cache.set("parent", {
+    documents: [],
+    folder: "Parent",
+    folders: [
+      { can_delete_empty: true, id: 1, path: "Parent/Empty", size_bytes: 0 },
+      { can_delete_empty: false, id: 2, path: "Parent/Nonempty", size_bytes: 0 },
+      { id: 3, path: "Parent/Unknown", size_bytes: 0 },
+    ],
+    next_cursor: null,
+    q: "",
+    recursive: false,
+  });
+
+  const metadata = cache.folderData().metadata;
+  assert.equal(metadata["Parent/Empty"].can_delete_empty, true);
+  assert.equal(metadata["Parent/Nonempty"].can_delete_empty, false);
+  assert.equal(metadata["Parent/Unknown"].can_delete_empty, false);
+});
+
 test("deleting a folder evicts all of only that folder's base and search pages", () => {
   const targetFolder = "Shared/Target";
   const otherFolder = "Shared/Other";

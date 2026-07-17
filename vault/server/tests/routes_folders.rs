@@ -235,6 +235,30 @@ fn authed_json_put(uri: &str, user: &str, groups: &str, payload: &Value) -> Requ
     authed_json_request(Method::PUT, uri, user, groups, payload)
 }
 
+fn authed_delete(uri: &str, user: &str, groups: &str) -> Request<Body> {
+    authed_request(Method::DELETE, uri, user, groups, Body::empty())
+}
+
+async fn insert_active_create_upload(pool: &sqlx::SqlitePool, id: &str, folder_path: &str) {
+    sqlx::query(
+        r"
+        INSERT INTO upload_sessions
+            (
+                id, mode, status, folder_path, filename, total_size, chunk_size,
+                part_count, created_by, created_by_name, user_context, expires_at
+            )
+        VALUES
+            (?, 'create', 'active', ?, 'pending.txt', 1, 1, 1,
+             'writer', 'Writer', '{}', '2999-01-01T00:00:00Z')
+        ",
+    )
+    .bind(id)
+    .bind(folder_path)
+    .execute(pool)
+    .await
+    .expect("active create upload");
+}
+
 fn authed_json_request(
     method: Method,
     uri: &str,
@@ -1526,6 +1550,7 @@ fn assert_sidebar_payload_shape(sidebar_json: &Value) {
         metadata,
         &[
             "access",
+            "can_delete_empty",
             "color",
             "default_ttl_action",
             "default_ttl_days",
@@ -1539,6 +1564,7 @@ fn assert_sidebar_payload_shape(sidebar_json: &Value) {
     );
     assert_object_keys(&metadata["access"], &["read", "visible", "write"]);
     assert_eq!(metadata["color"], "");
+    assert_eq!(metadata["can_delete_empty"], false);
     assert_eq!(metadata["icon"], "");
     assert_eq!(metadata["default_ttl_days"], Value::Null);
     assert_eq!(metadata["default_ttl_action"], "none");
@@ -1567,6 +1593,7 @@ fn assert_folder_summary_payload_shape(folder_row: &Value) {
         folder_row,
         &[
             "access",
+            "can_delete_empty",
             "color",
             "default_ttl_action",
             "default_ttl_days",
@@ -1586,6 +1613,7 @@ fn assert_folder_summary_payload_shape(folder_row: &Value) {
         ],
     );
     assert_eq!(folder_row["path"], "Project/Assets");
+    assert_eq!(folder_row["can_delete_empty"], false);
     assert_eq!(folder_row["name"], "Assets");
     assert_eq!(folder_row["color"], "#445566");
     assert_eq!(folder_row["icon"], "palette");
@@ -3109,6 +3137,357 @@ async fn move_folder_rejects_descendant_destination_without_creating_missing_par
     assert_eq!(non_root_count, 1);
     assert_eq!(folder_events, 0);
     assert_eq!(state_events, 0);
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // One endpoint scenario keeps every destructive guard and cascade assertion together.
+async fn delete_empty_folder_is_leaf_only_stale_safe_and_uses_folder_write_access() {
+    let (state, _temp_dir) = test_state().await;
+    let writers = create_group(&state.db, "writers").await;
+    let readers = create_group(&state.db, "readers").await;
+    let dependents = create_group(&state.db, "dependents").await;
+    let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
+        .await
+        .expect("vault root");
+    let archive_root = get_root_folder(&state.db, ARCHIVE_ROOT_KEY)
+        .await
+        .expect("archive root");
+    add_folder_permission(&state.db, root.id, writers, true, true, true)
+        .await
+        .expect("writer root");
+    add_folder_permission(&state.db, root.id, readers, true, true, false)
+        .await
+        .expect("reader root");
+
+    let empty = get_or_create_folder_path(&state.db, Some("Empty"))
+        .await
+        .expect("empty folder");
+    let with_document = get_or_create_folder_path(&state.db, Some("WithDocument"))
+        .await
+        .expect("document folder");
+    let with_child = get_or_create_folder_path(&state.db, Some("WithChild"))
+        .await
+        .expect("parent folder");
+    let child = get_or_create_folder_path(&state.db, Some("WithChild/Child"))
+        .await
+        .expect("child folder");
+    let uploading = get_or_create_folder_path(&state.db, Some("Uploading"))
+        .await
+        .expect("upload folder");
+    let renamed_folder = get_or_create_folder_path(&state.db, Some("CurrentName"))
+        .await
+        .expect("stale folder");
+    let sibling = get_or_create_folder_path(&state.db, Some("Sibling"))
+        .await
+        .expect("sibling folder");
+    let document_id = insert_document(&state.db, with_document.id, "plan.txt").await;
+    insert_active_create_upload(&state.db, "pending-delete-guard", "Uploading").await;
+    add_folder_permission(&state.db, empty.id, writers, true, true, true)
+        .await
+        .expect("empty writer permission");
+    add_folder_permission(&state.db, empty.id, dependents, true, false, false)
+        .await
+        .expect("dependent permission");
+    let share_id = sqlx::query(
+        r"
+        INSERT INTO share_links (code, target_type, folder_id)
+        VALUES ('empty-folder-share', 'folder', ?)
+        ",
+    )
+    .bind(empty.id)
+    .execute(&state.db)
+    .await
+    .expect("folder share")
+    .last_insert_rowid();
+    let pool = state.db.clone();
+    let app = http::router(state);
+
+    let reader_denied = app
+        .clone()
+        .oneshot(authed_delete(
+            &format!("/api/folders/{}?path=CurrentName", renamed_folder.id),
+            "reader",
+            "readers",
+        ))
+        .await
+        .expect("reader delete response");
+    assert_eq!(reader_denied.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        response_json(reader_denied).await["detail"],
+        "Insufficient folder access"
+    );
+
+    let stale_path = app
+        .clone()
+        .oneshot(authed_delete(
+            &format!("/api/folders/{}?path=OldName", renamed_folder.id),
+            "writer",
+            "writers",
+        ))
+        .await
+        .expect("stale delete response");
+    assert_eq!(stale_path.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        response_json(stale_path).await["detail"],
+        "Folder changed; refresh and try again"
+    );
+
+    for (folder, path) in [
+        (&with_document, "WithDocument"),
+        (&with_child, "WithChild"),
+        (&uploading, "Uploading"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(authed_delete(
+                &format!("/api/folders/{}?path={path}", folder.id),
+                "writer",
+                "writers",
+            ))
+            .await
+            .expect("nonempty delete response");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(response).await["detail"],
+            "Folder is not empty"
+        );
+    }
+
+    for (folder_id, path) in [(root.id, ""), (archive_root.id, "Archive")] {
+        let response = app
+            .clone()
+            .oneshot(authed_delete(
+                &format!("/api/folders/{folder_id}?path={path}"),
+                "writer",
+                "writers",
+            ))
+            .await
+            .expect("root delete response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_json(response).await["detail"],
+            "Cannot delete a root folder"
+        );
+    }
+
+    let deleted = app
+        .oneshot(authed_delete(
+            &format!("/api/folders/{}?path=Empty", empty.id),
+            "writer",
+            "writers",
+        ))
+        .await
+        .expect("empty delete response");
+    assert_eq!(deleted.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(deleted).await,
+        json!({"folder": "Empty", "id": empty.id})
+    );
+
+    let remaining_ids = sqlx::query_scalar::<_, i64>(
+        "SELECT id FROM folders WHERE id IN (?, ?, ?, ?, ?, ?) ORDER BY id",
+    )
+    .bind(with_document.id)
+    .bind(with_child.id)
+    .bind(child.id)
+    .bind(uploading.id)
+    .bind(renamed_folder.id)
+    .bind(sibling.id)
+    .fetch_all(&pool)
+    .await
+    .expect("remaining folders");
+    assert_eq!(remaining_ids.len(), 6);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM folders WHERE id = ?")
+            .bind(empty.id)
+            .fetch_one(&pool)
+            .await
+            .expect("empty folder count"),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM documents WHERE id = ?")
+            .bind(document_id)
+            .fetch_one(&pool)
+            .await
+            .expect("document count"),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM share_links WHERE id = ?")
+            .bind(share_id)
+            .fetch_one(&pool)
+            .await
+            .expect("share count"),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM folder_permissions WHERE folder_id = ?")
+            .bind(empty.id)
+            .fetch_one(&pool)
+            .await
+            .expect("permission count"),
+        0
+    );
+    let state_event = sqlx::query_as::<_, (String, String)>(
+        "SELECT event_type, resources FROM state_events ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("folder deleted state event");
+    assert_eq!(state_event.0, "folder.deleted");
+    assert_eq!(
+        serde_json::from_str::<Value>(&state_event.1).expect("state resources"),
+        json!(["contents", "preferences", "sidebar"])
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM state_events")
+            .fetch_one(&pool)
+            .await
+            .expect("state event count"),
+        1
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // One payload scenario compares every eligibility surface against the same folder states.
+async fn folder_payloads_report_authoritative_empty_delete_eligibility() {
+    let (state, _temp_dir) = test_state().await;
+    let writers = create_group(&state.db, "writers").await;
+    let readers = create_group(&state.db, "readers").await;
+    let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
+        .await
+        .expect("vault root");
+    add_folder_permission(&state.db, root.id, writers, true, true, true)
+        .await
+        .expect("writer root");
+    add_folder_permission(&state.db, root.id, readers, true, true, false)
+        .await
+        .expect("reader root");
+    let eligible = get_or_create_folder_path(&state.db, Some("Eligible"))
+        .await
+        .expect("eligible folder");
+    let with_document = get_or_create_folder_path(&state.db, Some("WithDocument"))
+        .await
+        .expect("document folder");
+    let with_child = get_or_create_folder_path(&state.db, Some("WithChild"))
+        .await
+        .expect("parent folder");
+    get_or_create_folder_path(&state.db, Some("WithChild/Child"))
+        .await
+        .expect("child folder");
+    let uploading = get_or_create_folder_path(&state.db, Some("Uploading"))
+        .await
+        .expect("upload folder");
+    insert_document(&state.db, with_document.id, "zero-byte.txt").await;
+    insert_active_create_upload(&state.db, "payload-upload-guard", "Uploading").await;
+    let app = http::router(state);
+
+    let contents = app
+        .clone()
+        .oneshot(authed_get(
+            "/api/folders/contents?folder=",
+            "writer",
+            "writers",
+        ))
+        .await
+        .expect("contents response");
+    let contents_json = response_json(contents).await;
+    let folder_rows = contents_json["folders"].as_array().expect("folder rows");
+    for (path, expected) in [
+        ("Eligible", true),
+        ("WithDocument", false),
+        ("WithChild", false),
+        ("Uploading", false),
+    ] {
+        let row = folder_rows
+            .iter()
+            .find(|row| row["path"] == path)
+            .expect("folder summary");
+        assert_eq!(row["can_delete_empty"], expected, "contents {path}");
+    }
+
+    let sidebar = app
+        .clone()
+        .oneshot(authed_get("/api/folders/sidebar", "writer", "writers"))
+        .await
+        .expect("sidebar response");
+    let sidebar_json = response_json(sidebar).await;
+    for (path, expected) in [
+        ("Eligible", true),
+        ("WithDocument", false),
+        ("WithChild", false),
+        ("Uploading", false),
+        ("", false),
+        ("Archive", false),
+    ] {
+        assert_eq!(
+            sidebar_json["folder_metadata"][path]["can_delete_empty"], expected,
+            "sidebar {path}"
+        );
+    }
+
+    let favorites = app
+        .clone()
+        .oneshot(authed_json_patch(
+            "/api/preferences",
+            "writer",
+            "writers",
+            &json!({
+                "preferences": {
+                    "favoriteItems": [
+                        {"type": "folder", "id": eligible.id},
+                        {"type": "folder", "id": with_document.id},
+                        {"type": "folder", "id": with_child.id},
+                        {"type": "folder", "id": uploading.id}
+                    ]
+                }
+            }),
+        ))
+        .await
+        .expect("favorites response");
+    let favorites_json = response_json(favorites).await;
+    let favorite_rows = favorites_json["preferences"]["favoriteItems"]
+        .as_array()
+        .expect("favorite rows");
+    for (path, expected) in [
+        ("Eligible", true),
+        ("WithDocument", false),
+        ("WithChild", false),
+        ("Uploading", false),
+    ] {
+        let row = favorite_rows
+            .iter()
+            .find(|row| row["path"] == path)
+            .expect("favorite folder");
+        assert_eq!(row["can_delete_empty"], expected, "favorite {path}");
+    }
+
+    let properties = app
+        .clone()
+        .oneshot(authed_get(
+            "/api/folders/properties?path=Eligible",
+            "writer",
+            "writers",
+        ))
+        .await
+        .expect("properties response");
+    assert_eq!(response_json(properties).await["can_delete_empty"], true);
+
+    let reader_contents = app
+        .oneshot(authed_get(
+            "/api/folders/contents?folder=",
+            "reader",
+            "readers",
+        ))
+        .await
+        .expect("reader contents response");
+    for row in response_json(reader_contents).await["folders"]
+        .as_array()
+        .expect("reader folder rows")
+    {
+        assert_eq!(row["can_delete_empty"], false, "reader {}", row["path"]);
+    }
 }
 
 #[tokio::test]

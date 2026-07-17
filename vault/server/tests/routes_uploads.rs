@@ -2385,6 +2385,98 @@ async fn empty_v2_upload_completes_with_canonical_part_manifest() {
 }
 
 #[tokio::test]
+async fn create_upload_completion_does_not_recreate_a_deleted_target_folder() {
+    let (state, _temp_dir) =
+        test_state_with_upload_settings(5 * 1024 * 1024 * 1024, 4, 86_400).await;
+    grant_writer_root(&state.db).await;
+    let target = get_or_create_folder_path(&state.db, Some("Transient"))
+        .await
+        .expect("target folder");
+    let transfers_path = state.config.transfers_path();
+    let pool = state.db.clone();
+    let app = http::router(state);
+    let created = app
+        .clone()
+        .oneshot(authed_json_request(
+            Method::POST,
+            "/api/uploads",
+            &json!({
+                "mode": "create",
+                "folder": "Transient",
+                "filename": "empty.txt",
+                "mime_type": "text/plain",
+                "size_bytes": 0,
+                "resume_identity_sha256": "ab".repeat(32)
+            }),
+        ))
+        .await
+        .expect("create upload");
+    assert_eq!(created.status(), StatusCode::OK);
+    let created = response_json(created).await;
+    let session_id = created["id"].as_str().expect("session id").to_string();
+    let chunk_size = usize::try_from(created["chunk_size"].as_i64().expect("chunk size"))
+        .expect("positive chunk size");
+    let session_dir = transfers_path.join("uploads").join(&session_id);
+    assert!(session_dir.is_dir(), "upload staging should exist");
+
+    sqlx::query("DELETE FROM folders WHERE id = ?")
+        .bind(target.id)
+        .execute(&pool)
+        .await
+        .expect("delete upload target");
+
+    let completed = app
+        .oneshot(authed_json_request(
+            Method::POST,
+            &format!("/api/uploads/{session_id}/complete"),
+            &json!({"part_manifest_sha256": part_manifest_sha256_hex(b"", chunk_size)}),
+        ))
+        .await
+        .expect("complete upload");
+    assert_eq!(completed.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response_json(completed).await["detail"], "Folder not found");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM folders WHERE root_key = 'vault' AND name = 'Transient'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("target folder count"),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM documents WHERE name = 'empty.txt'")
+            .fetch_one(&pool)
+            .await
+            .expect("document count"),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT status FROM upload_sessions WHERE id = ?")
+            .bind(&session_id)
+            .fetch_one(&pool)
+            .await
+            .expect("session status"),
+        "failed"
+    );
+    assert!(
+        !session_dir.exists(),
+        "failed completion must remove upload staging"
+    );
+    let orphan_counts = sqlx::query_as::<_, (i64, i64)>(
+        r"
+        SELECT
+            (SELECT COUNT(*) FROM blobs),
+            (SELECT COUNT(*) FROM blob_locations)
+        ",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("orphan metadata counts");
+    assert_eq!(orphan_counts, (0, 0));
+}
+
+#[tokio::test]
 async fn checkin_session_adds_version_renames_and_releases_lock() {
     let (state, _temp_dir) = test_state().await;
     grant_writer_root(&state.db).await;

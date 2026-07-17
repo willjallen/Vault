@@ -32,8 +32,9 @@ use crate::documents::{
     normalize_file_name,
 };
 use crate::folders::{
-    FolderError, apply_effective_ttl_to_document_in_tx, get_or_create_folder_path_in_tx, join_path,
-    normalize_folder, parse_public_folder_path, require_write_for_folder_path,
+    FolderError, apply_effective_ttl_to_document_in_tx, get_folder_by_path_in_tx,
+    get_or_create_folder_path_in_tx, join_path, normalize_folder, parse_public_folder_path,
+    require_write_for_folder_path,
 };
 use crate::state_events::state_event_resources_json;
 use crate::storage::{
@@ -1489,7 +1490,9 @@ async fn complete_create_upload_in_tx(
     blob_id: i64,
 ) -> Result<UploadResultPayload, UploadError> {
     let folder_path = session.folder_path.clone().unwrap_or_default();
-    let target_folder = get_or_create_folder_path_in_tx(transaction, &folder_path).await?;
+    let target_folder = get_folder_by_path_in_tx(transaction, &folder_path)
+        .await?
+        .ok_or(FolderError::FolderNotFound)?;
     ensure_unique_document_name_in_tx(transaction, target_folder.id, &session.filename, None)
         .await?;
     let inserted = sqlx::query(

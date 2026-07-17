@@ -42,6 +42,7 @@ export function folderToItem(folderItem) {
   return {
     archived: isArchiveRootPath(folderItem.path || ""),
     access: folderItem.access || {},
+    can_delete_empty: folderItem.can_delete_empty === true,
     color: folderItem.color || "",
     default_ttl_action: folderItem.default_ttl_action || "none",
     default_ttl_days: folderItem.default_ttl_days || null,

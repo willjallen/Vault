@@ -1,14 +1,17 @@
+use std::time::Duration;
+
+use tokio::sync::oneshot;
 use vault_server::auth::UserContext;
 use vault_server::db;
 use vault_server::documents::{DocumentRecord, document_path};
 use vault_server::folders::{
     ARCHIVE_ROOT_KEY, FolderError, VAULT_ROOT_KEY, access_level, add_folder_permission,
-    all_folders, build_folder_path_cache, folder_access_level, folder_access_levels,
-    folder_path_by_id, folder_path_from_cache, get_folder_by_path, get_folder_by_path_read,
-    get_or_create_folder_path, get_or_create_folder_path_with_created, get_root_folder,
-    normalize_folder, parse_public_folder_path, public_folder_path, require_folder_read_access,
-    require_folder_write_access, resolve_visible_folder_by_id, resolve_visible_folder_by_path,
-    subtree_folder_ids_from_records, validate_permission_flags,
+    all_folders, build_folder_path_cache, delete_empty_folder, folder_access_level,
+    folder_access_levels, folder_path_by_id, folder_path_from_cache, get_folder_by_path,
+    get_folder_by_path_read, get_or_create_folder_path, get_or_create_folder_path_with_created,
+    get_root_folder, normalize_folder, parse_public_folder_path, public_folder_path,
+    require_folder_read_access, require_folder_write_access, resolve_visible_folder_by_id,
+    resolve_visible_folder_by_path, subtree_folder_ids_from_records, validate_permission_flags,
 };
 
 async fn test_pool() -> sqlx::SqlitePool {
@@ -266,6 +269,87 @@ async fn visible_folder_resolver_returns_only_viewable_canonical_paths() {
             .expect("resolve visible folder path")
             .expect("viewable folder path");
     assert_eq!(resolved_by_path, resolved);
+}
+
+#[tokio::test]
+async fn delete_empty_folder_rechecks_contents_after_waiting_for_writer_gate() {
+    let pool = test_pool().await;
+    let folder = get_or_create_folder_path(&pool, Some("Race"))
+        .await
+        .expect("race folder");
+    let mut gate = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .expect("writer gate");
+    let delete_pool = pool.clone();
+    let delete_user = user(&[], true);
+    let (started_tx, started_rx) = oneshot::channel();
+    let mut deletion = tokio::spawn(async move {
+        started_tx.send(()).expect("signal delete start");
+        delete_empty_folder(&delete_pool, folder.id, "Race", &delete_user).await
+    });
+    started_rx.await.expect("delete started");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut deletion)
+            .await
+            .is_err(),
+        "delete completed before the competing writer committed",
+    );
+
+    let child_id = sqlx::query(
+        r"
+        INSERT INTO folders (root_key, parent_id, name, is_root)
+        VALUES ('vault', ?, 'LateChild', 0)
+        ",
+    )
+    .bind(folder.id)
+    .execute(&mut *gate)
+    .await
+    .expect("late child")
+    .last_insert_rowid();
+    let document_id = sqlx::query(
+        r"
+        INSERT INTO documents (folder_id, name, created_by, created_by_name, latest_modified_by)
+        VALUES (?, 'late.txt', 'admin', 'Admin', 'admin')
+        ",
+    )
+    .bind(folder.id)
+    .execute(&mut *gate)
+    .await
+    .expect("late document")
+    .last_insert_rowid();
+    gate.commit().await.expect("commit competing contents");
+
+    let error = tokio::time::timeout(Duration::from_secs(5), deletion)
+        .await
+        .expect("delete timed out")
+        .expect("delete task")
+        .expect_err("nonempty folder must not be deleted");
+    assert!(matches!(error, FolderError::FolderNotEmpty));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM folders WHERE id IN (?, ?)")
+            .bind(folder.id)
+            .bind(child_id)
+            .fetch_one(&pool)
+            .await
+            .expect("folder count"),
+        2
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM documents WHERE id = ?")
+            .bind(document_id)
+            .fetch_one(&pool)
+            .await
+            .expect("document count"),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM state_events")
+            .fetch_one(&pool)
+            .await
+            .expect("state event count"),
+        0
+    );
 }
 
 #[tokio::test]

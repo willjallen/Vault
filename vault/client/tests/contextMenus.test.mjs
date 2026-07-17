@@ -15,7 +15,7 @@ const bundled = await build({
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(bundled.outputFiles[0].text).toString(
   "base64"
 )}`;
-const { buildFileMenuItems, buildPageMenuItems } = await import(moduleUrl);
+const { buildFileMenuItems, buildFolderMenuItems, buildPageMenuItems } = await import(moduleUrl);
 
 function fileMenuItemsFor(doc) {
   return buildFileMenuItems({
@@ -33,6 +33,22 @@ function fileMenuItemsFor(doc) {
     openFileDetails: () => {},
     openMoveDialogForDoc: () => {},
     siteSettings: {},
+  });
+}
+
+function folderMenuItemsFor(folderItem, overrides = {}) {
+  return buildFolderMenuItems({
+    beginRenameFolder: () => {},
+    busy: false,
+    folderItem,
+    handleArchiveFolder: () => {},
+    handleDeleteEmptyFolder: () => {},
+    handleDownloadSelection: () => {},
+    handleShareItem: () => {},
+    navigateToFolder: () => {},
+    openFolderProperties: () => {},
+    openMoveDialogForFolder: () => {},
+    ...overrides,
   });
 }
 
@@ -61,6 +77,72 @@ test("active file rename action remains enabled", () => {
   });
 
   assert.equal(items.find((item) => item.label === "Rename")?.disabled, false);
+});
+
+test("empty active folder exposes a dangerous Delete action", () => {
+  const folderItem = {
+    archived: false,
+    can_delete_empty: true,
+    id: 17,
+    name: "Empty",
+    path: "Projects/Empty",
+    type: "folder",
+  };
+  let deleted = null;
+  const items = folderMenuItemsFor(folderItem, {
+    handleDeleteEmptyFolder: (item) => {
+      deleted = item;
+    },
+  });
+
+  const deleteItem = items.find((item) => item.label === "Delete");
+  assert.equal(deleteItem?.danger, true);
+  assert.equal(deleteItem?.disabled, false);
+  assert.equal(
+    items.some((item) => item.label === "Move to Archive"),
+    false
+  );
+  deleteItem.action();
+  assert.equal(deleted, folderItem);
+});
+
+test("nonempty active folder retains Move to Archive without Delete", () => {
+  const items = folderMenuItemsFor({
+    archived: false,
+    can_delete_empty: false,
+    id: 18,
+    name: "Nonempty",
+    path: "Projects/Nonempty",
+    type: "folder",
+  });
+
+  assert.equal(
+    items.some((item) => item.label === "Move to Archive"),
+    true
+  );
+  assert.equal(
+    items.some((item) => item.label === "Delete"),
+    false
+  );
+});
+
+test("folder Delete action requires the explicit server capability", () => {
+  const unavailable = [
+    { can_delete_empty: false, id: 1, path: "Nonempty", size_bytes: 0 },
+    { id: 2, path: "Unknown", size_bytes: 0 },
+    { can_delete_empty: true, id: 3, path: "" },
+    { can_delete_empty: true, id: 4, path: "Archive" },
+    { archived: true, can_delete_empty: true, id: 5, path: "Archived" },
+  ];
+
+  unavailable.forEach((folderItem) => {
+    const items = folderMenuItemsFor({ name: "Folder", type: "folder", ...folderItem });
+    assert.equal(
+      items.some((item) => item.label === "Delete"),
+      false,
+      folderItem.path || "Vault root"
+    );
+  });
 });
 
 test("picker capability keeps a single Download menu action", () => {

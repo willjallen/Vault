@@ -28,13 +28,8 @@ from typing import Any, Iterable
 MIB = 1024 * 1024
 DEFAULT_BODY_BLOCK_BYTES = 256 * 1024
 LOCAL_DIRECT_PROFILE = "local-direct"
-RUST_SINK_MODE = "rust-sink"
 BENCHMARK_SERVER_ENV_KEYS = (
     "BASE_DOMAIN",
-    "VAULT_BENCH_ROUTES",
-    "VAULT_BENCH_SINK_DIR",
-    "VAULT_BENCH_SINK_HASH",
-    "VAULT_BENCH_SINK_WRITE",
     "VAULT_AUTH_MODE",
     "VAULT_DATA_DIR",
     "VAULT_DB_PATH",
@@ -121,12 +116,6 @@ class HttpResponse:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--mode",
-        choices=("app", RUST_SINK_MODE, "both"),
-        default="app",
-        help="Benchmark the real Rust app, the Rust sink route, or both.",
-    )
-    parser.add_argument(
         "--case",
         action="append",
         choices=tuple(default_cases()),
@@ -156,16 +145,6 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Override upload workers/client parallelism for selected cases.",
-    )
-    parser.add_argument(
-        "--sink-no-checksum",
-        action="store_true",
-        help="In Rust sink mode, read request bodies without hashing them.",
-    )
-    parser.add_argument(
-        "--sink-write",
-        action="store_true",
-        help="In Rust sink mode, write request bodies to temporary files.",
     )
     parser.add_argument(
         "--rust-bin",
@@ -522,7 +501,6 @@ def server_env(temp_dir: Path, chunk_mib: int | None, port: int) -> dict[str, st
             "VAULT_TRANSFER_SESSION_TTL_SECONDS": "86400",
             "VAULT_SECURITY_HEADERS_ENABLED": "0",
             "VAULT_GZIP_MINIMUM_SIZE": "0",
-            "VAULT_BENCH_SINK_DIR": str(temp_dir / "sink"),
         },
     )
     if chunk_mib is not None:
@@ -591,13 +569,10 @@ def build_docker_image(image: str) -> None:
 
 def start_server(
     *,
-    mode: str,
     runner: str,
     port: int,
     temp_dir: Path,
     chunk_mib: int | None,
-    sink_checksum: bool,
-    sink_write: bool,
     rust_bin: Path | None,
     docker_image: str,
 ) -> subprocess.Popen[bytes]:
@@ -611,9 +586,6 @@ def start_server(
         env = os.environ.copy()
     else:
         env = server_env(temp_dir, chunk_mib, port)
-        env["VAULT_BENCH_SINK_HASH"] = "1" if sink_checksum else "0"
-        env["VAULT_BENCH_SINK_WRITE"] = "1" if sink_write else "0"
-        env["VAULT_BENCH_ROUTES"] = "1" if mode == RUST_SINK_MODE else "0"
         command = rust_server_command(rust_bin)
     return subprocess.Popen(
         command,
@@ -621,75 +593,6 @@ def start_server(
         env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-    )
-
-
-def benchmark_sink_case(
-    *,
-    host: str,
-    port: int,
-    case: BenchCase,
-    body_block: bytes,
-    client_rate_mib: float | None,
-    sink_checksum: bool,
-) -> CaseResult:
-    file_size = case.file_mib * MIB
-    total_mib = case.users * case.file_mib
-    part_size = case.chunk_mib * MIB if case.chunk_mib else min(32 * MIB, file_size)
-    part_durations: list[float] = []
-    lock = threading.Lock()
-    started = time.perf_counter()
-
-    def put_part(size: int) -> None:
-        expected = repeated_sha256(size, body_block) if sink_checksum else None
-        t0 = time.perf_counter()
-        response = request_bytes(
-            host,
-            port,
-            "PUT",
-            "/api/bench/sink",
-            headers={"Content-Length": str(size)},
-            body=repeated_body(size, body_block, client_rate_mib),
-        )
-        elapsed = time.perf_counter() - t0
-        raise_for_status(response, "sink upload")
-        if sink_checksum and response.json()["sha256"] != expected:
-            raise AssertionError("sink checksum mismatch")
-        with lock:
-            part_durations.append(elapsed)
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=case.users * case.workers) as executor:
-        futures = []
-        for _ in range(case.users):
-            for offset in range(0, file_size, part_size):
-                futures.append(executor.submit(put_part, min(part_size, file_size - offset)))
-        for future in concurrent.futures.as_completed(futures):
-            future.result()
-
-    upload_wall = time.perf_counter() - started
-    return CaseResult(
-        name=case.name,
-        mode=RUST_SINK_MODE,
-        server="rust",
-        users=case.users,
-        file_mib=case.file_mib,
-        workers=case.workers,
-        chunk_mib=case.chunk_mib,
-        upload_wall_seconds=upload_wall,
-        upload_mib_per_second=total_mib / upload_wall,
-        part_wall_seconds=upload_wall,
-        part_mib_per_second=total_mib / upload_wall,
-        complete_wall_seconds=None,
-        download_wall_seconds=None,
-        download_mib_per_second=None,
-        part_count=len(part_durations),
-        part_min_seconds=min(part_durations),
-        part_p50_seconds=percentile(part_durations, 0.50),
-        part_p95_seconds=percentile(part_durations, 0.95),
-        part_max_seconds=max(part_durations),
-        server_cpu_seconds=None,
-        server_rss_mib=None,
-        server_peak_rss_mib=None,
     )
 
 
@@ -858,14 +761,11 @@ def benchmark_app_case(
 
 
 def run_case(
-    mode: str,
     case: BenchCase,
     body_block: bytes,
     *,
     part_checksum: bool,
     client_rate_mib: float | None,
-    sink_checksum: bool,
-    sink_write: bool,
     rust_bin: Path | None,
     runner: str,
     docker_image: str,
@@ -877,37 +777,24 @@ def run_case(
             temp_dir.chmod(0o777)
         port = free_port()
         proc = start_server(
-            mode=mode,
             runner=runner,
             port=port,
             temp_dir=temp_dir,
             chunk_mib=case.chunk_mib,
-            sink_checksum=sink_checksum,
-            sink_write=sink_write,
             rust_bin=rust_bin,
             docker_image=docker_image,
         )
         try:
             wait_health("127.0.0.1", port, proc, startup_timeout)
             before_usage = process_usage(proc.pid)
-            if mode == RUST_SINK_MODE:
-                result = benchmark_sink_case(
-                    host="127.0.0.1",
-                    port=port,
-                    case=case,
-                    body_block=body_block,
-                    client_rate_mib=client_rate_mib,
-                    sink_checksum=sink_checksum,
-                )
-            else:
-                result = benchmark_app_case(
-                    host="127.0.0.1",
-                    port=port,
-                    case=case,
-                    body_block=body_block,
-                    part_checksum=part_checksum,
-                    client_rate_mib=client_rate_mib,
-                )
+            result = benchmark_app_case(
+                host="127.0.0.1",
+                port=port,
+                case=case,
+                body_block=body_block,
+                part_checksum=part_checksum,
+                client_rate_mib=client_rate_mib,
+            )
             return with_process_usage(result, before_usage, process_usage(proc.pid))
         finally:
             proc.terminate()
@@ -946,36 +833,29 @@ def print_result(result: CaseResult) -> None:
 
 def run() -> dict[str, Any]:
     args = parse_args()
-    if args.runner == "docker" and args.mode != "app":
-        raise SystemExit("--runner=docker currently supports only --mode=app")
     if args.runner == "docker" and args.docker_build:
         build_docker_image(args.docker_image)
     cases_by_name = default_cases()
     selected = [cases_by_name[name] for name in (args.case or cases_by_name)]
     if args.workers is not None:
         selected = [replace(case, workers=max(1, args.workers)) for case in selected]
-    modes = ("app", RUST_SINK_MODE) if args.mode == "both" else (args.mode,)
     body_block = b"x" * max(1, args.body_block_kib * 1024)
     results: list[CaseResult] = []
     thresholds = configured_thresholds(args)
-    for mode in modes:
-        for case in selected:
-            result = run_case(
-                mode,
-                case,
-                body_block,
-                part_checksum=args.part_checksum,
-                client_rate_mib=args.client_rate_mib,
-                sink_checksum=not args.sink_no_checksum,
-                sink_write=args.sink_write,
-                rust_bin=args.rust_bin,
-                runner=args.runner,
-                docker_image=args.docker_image,
-                startup_timeout=args.startup_timeout,
-            )
-            results.append(result)
-            if not args.quiet:
-                print_result(result)
+    for case in selected:
+        result = run_case(
+            case,
+            body_block,
+            part_checksum=args.part_checksum,
+            client_rate_mib=args.client_rate_mib,
+            rust_bin=args.rust_bin,
+            runner=args.runner,
+            docker_image=args.docker_image,
+            startup_timeout=args.startup_timeout,
+        )
+        results.append(result)
+        if not args.quiet:
+            print_result(result)
     failures = threshold_failures(results, thresholds)
     payload = {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -985,8 +865,6 @@ def run() -> dict[str, Any]:
         "app_server": "rust",
         "runner": args.runner,
         "docker_image": args.docker_image if args.runner == "docker" else None,
-        "sink_checksum": not args.sink_no_checksum,
-        "sink_write": args.sink_write,
         "thresholds": [asdict(threshold) for threshold in thresholds],
         "threshold_failures": failures,
         "results": [asdict(result) for result in results],

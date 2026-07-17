@@ -1,6 +1,5 @@
 use std::collections::{HashSet, VecDeque};
 use std::convert::Infallible;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -16,8 +15,6 @@ use axum::{Form, Json, Router};
 use futures_util::{Stream, StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore, broadcast};
 use tower_http::compression::predicate::{NotForContentType, Predicate, SizeAbove};
 use tower_http::compression::{CompressionLayer, CompressionLevel};
@@ -174,7 +171,6 @@ pub fn router(state: AppState) -> Router {
         .route("/static/{*path}", get(static_asset))
         .route("/health", get(health))
         .route("/api/health", get(api_health))
-        .route("/api/bench/sink", put(api_bench_sink))
         .route("/folders", post(create_folder))
         .route("/api/bootstrap", get(api_bootstrap))
         .route("/api/settings", get(api_settings))
@@ -318,90 +314,6 @@ fn admin_debug_routes() -> Router<AppState> {
 
 async fn health() -> &'static str {
     "ok"
-}
-
-async fn api_bench_sink(request: Request) -> Result<Json<Value>, ApiError> {
-    if !bench_env_flag("VAULT_BENCH_ROUTES") {
-        return Err(ApiError::NotFound("Not found".to_string()));
-    }
-    let hash_body = bench_env_flag("VAULT_BENCH_SINK_HASH");
-    let write_body = bench_env_flag("VAULT_BENCH_SINK_WRITE");
-    let mut digest = hash_body.then(Sha256::new);
-    let mut output = if write_body {
-        Some(open_bench_sink_file().await?)
-    } else {
-        None
-    };
-    let mut size_bytes = 0_i64;
-    let mut body = request.into_body().into_data_stream();
-    while let Some(chunk) = body.next().await {
-        let chunk = chunk.map_err(|_| ApiError::BadRequest("Upload failed".to_string()))?;
-        if chunk.is_empty() {
-            continue;
-        }
-        size_bytes += i64::try_from(chunk.len())
-            .map_err(|_| ApiError::BadRequest("Upload too large".to_string()))?;
-        if let Some(digest) = digest.as_mut() {
-            digest.update(&chunk);
-        }
-        if let Some(output) = output.as_mut() {
-            output
-                .write_all(&chunk)
-                .await
-                .map_err(|error| bench_sink_io_error(&error))?;
-        }
-    }
-    if let Some(output) = output.as_mut() {
-        output
-            .flush()
-            .await
-            .map_err(|error| bench_sink_io_error(&error))?;
-    }
-    Ok(Json(json!({
-        "bytes": size_bytes,
-        "sha256": digest.map(|digest| lower_hex(&digest.finalize())),
-    })))
-}
-
-async fn open_bench_sink_file() -> Result<tokio::fs::File, ApiError> {
-    let sink_dir = std::env::var("VAULT_BENCH_SINK_DIR")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .map_or_else(
-            || std::env::temp_dir().join("vault-bench-sink"),
-            PathBuf::from,
-        );
-    tokio::fs::create_dir_all(&sink_dir)
-        .await
-        .map_err(|error| bench_sink_io_error(&error))?;
-    let path = sink_dir.join(format!("sink-{}.bin", Uuid::new_v4().simple()));
-    tokio::fs::File::create(path)
-        .await
-        .map_err(|error| bench_sink_io_error(&error))
-}
-
-fn bench_env_flag(name: &str) -> bool {
-    std::env::var(name).ok().is_some_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
-}
-
-fn bench_sink_io_error(error: &std::io::Error) -> ApiError {
-    tracing::error!(?error, "benchmark sink I/O failed");
-    ApiError::Internal("Benchmark sink I/O failed".to_string())
-}
-
-fn lower_hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(char::from(HEX[usize::from(byte >> 4)]));
-        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    output
 }
 
 async fn security_headers_middleware(

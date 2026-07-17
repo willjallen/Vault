@@ -66,8 +66,9 @@ Fixes for streaming, repository-scale queries, and queues must add deterministic
 resource-contract tests to the regular gate as well as running this suite.
 
 `extras/bench_transfers.py` remains useful for deployment-scale transfer and
-container/topology experiments. It complements this harness; it is not the
-canonical per-change regression suite.
+container/topology experiments against the real application routes. It does
+not register or depend on a diagnostic sink in the production server. It
+complements this harness; it is not the canonical per-change regression suite.
 
 ## Temporary-data safety
 

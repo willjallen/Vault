@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use axum::http::{Method, Request, StatusCode};
 use tower::ServiceExt;
 use vault_server::auth::AuthSettings;
 use vault_server::config::Config;
@@ -11,6 +11,43 @@ use vault_server::storage::LocalBlobStorage;
 
 #[tokio::test]
 async fn health_returns_ok() {
+    let (_temp_dir, app) = test_app().await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn production_router_does_not_register_benchmark_sink() {
+    let (_temp_dir, app) = test_app().await;
+
+    for method in [Method::GET, Method::PUT] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri("/api/bench/sink")
+                    .body(Body::from("small probe"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+}
+
+async fn test_app() -> (tempfile::TempDir, axum::Router) {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let config = Config {
         host: "127.0.0.1".parse().expect("host"),
@@ -44,16 +81,5 @@ async fn health_returns_ok() {
         db,
         Arc::new(storage),
     ));
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/health")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
-
-    assert_eq!(response.status(), StatusCode::OK);
+    (temp_dir, app)
 }

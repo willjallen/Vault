@@ -64,7 +64,7 @@ Before the final hot-path fixes, representative local numbers were lower:
 
 The improvements are material: roughly 34 percent, 57 percent, and 73 percent respectively for those local cases. Against the older DB-heavy path, the 10-user 32 MiB case improved from about 229 MiB/s to 437.3 MiB/s, roughly 91 percent.
 
-The remaining local upload ceiling is now better isolated. A minimal ASGI sink that only receives and counts bytes measured about 1.35 GiB/s for a 128 MiB local upload. The same sink with SHA-256 enabled measured about 0.62 to 0.64 GiB/s. Vault's part-ingress path now lands in the same class as the hashing sink, which means raw Uvicorn/ASGI receive is not the local ceiling. The remaining cost is the durable upload path: queue handoff, worker scheduling, part-file writes, full-file assembly/hash, and completion metadata.
+The remaining local upload ceiling is now better isolated. A historical minimal ASGI sink that only received and counted bytes measured about 1.35 GiB/s for a 128 MiB local upload. The same historical diagnostic with SHA-256 enabled measured about 0.62 to 0.64 GiB/s. Vault's part-ingress path landed in the same class as that hashing diagnostic, which showed that raw Uvicorn/ASGI receive was not the local ceiling. The remaining cost is the durable upload path: queue handoff, worker scheduling, part-file writes, full-file assembly/hash, and completion metadata.
 
 ## Current Upload Architecture
 
@@ -177,13 +177,13 @@ kevin-114m, 16 workers, 1.5 MiB/s/request cap:
   upload 19.8 MiB/s, part ingress 20.2 MiB/s, complete 0.029s
 ```
 
-The minimal sink measurements are also important:
+The historical minimal-sink measurements are also important:
 
 ```text
-sink receive-only, single-128m:
+historical sink receive-only, single-128m:
   about 1.35 GiB/s
 
-sink receive + SHA-256, single-128m:
+historical sink receive + SHA-256, single-128m:
   about 0.62 to 0.64 GiB/s
 ```
 
@@ -207,10 +207,10 @@ Current Rust local-direct benchmark evidence after the upload hot-path cleanup:
 single-128m: upload about 503 MiB/s, download about 1032 MiB/s
 ten-64m: upload about 647 MiB/s, download about 996 MiB/s
 ten-64m-4m-parts: upload about 209 to 270 MiB/s, download about 849 to 1033 MiB/s depending on the writer experiment
-rust-sink ten-64m-4m-parts receive+write: about 559 to 602 MiB/s
+historical rust-sink ten-64m-4m-parts receive+write: about 559 to 602 MiB/s
 ```
 
-The 4 MiB part case is still the failing benchmark target. Removing per-part SQLite writes, no-checksum JSON sidecars, per-part token response signing, disabled-security nonce generation, and generic request tracing did not clear that case. The Rust in-process sink proves Axum/hyper can receive and write the same high-fanout request shape at roughly 560 to 600 MiB/s, so the remaining gap is inside upload session handling, part validation/promotion, and storage-session bookkeeping rather than the Rust HTTP stack itself. Reducing client workers to one per user measured about 618 MiB/s for the same 4 MiB workload, so high fanout still triggers app-specific contention that the sink route does not have.
+The 4 MiB part case is still the failing benchmark target. Removing per-part SQLite writes, no-checksum JSON sidecars, per-part token response signing, disabled-security nonce generation, and generic request tracing did not clear that case. The historical Rust in-process sink measurement proved Axum/hyper could receive and write the same high-fanout request shape at roughly 560 to 600 MiB/s, so the remaining gap is inside upload session handling, part validation/promotion, and storage-session bookkeeping rather than the Rust HTTP stack itself. Reducing client workers to one per user measured about 618 MiB/s for the same 4 MiB workload, so high fanout still triggers app-specific contention. The diagnostic sink was subsequently removed from the production router; the numbers remain here only as historical evidence.
 
 1. Each HTTP body chunk is received by the Rust service and handed to the part writer path.
 2. Queue backpressure can yield the route task if workers cannot drain quickly enough.
@@ -232,12 +232,11 @@ The deployment-scale benchmark is `extras/bench_transfers.py`. It remains an opt
 The script supports:
 
 1. Direct Rust app benchmark.
-2. Rust in-process sink benchmarks with checksum enabled or disabled, and optional write-to-file mode for receive+write or receive+hash+write measurements.
-3. Upload matrix by file size, chunk size, upload concurrency, body chunk size, and optional per-request rate cap.
-4. Download measurement after app uploads.
-5. JSON output for trend comparison.
-6. Human-readable summary output for quick local runs.
-7. Docker-container Rust app benchmark using the production image runtime contract.
+2. Upload matrix by file size, chunk size, upload concurrency, body chunk size, and optional per-request rate cap.
+3. Download measurement after app uploads.
+4. JSON output for trend comparison.
+5. Human-readable summary output for quick local runs.
+6. Docker-container Rust app benchmark using the production image runtime contract.
 
 Current baseline cases include:
 
@@ -259,7 +258,7 @@ The benchmark reports:
 5. Download wall time and aggregate MiB/s for completed uploads.
 6. Server CPU seconds, current RSS, and peak RSS when the host exposes process metrics.
 
-The missing harness work is nginx/TLS-topology benchmarking. Server CPU/RSS capture, container-mode Rust benchmarking, Rust receive/hash/write sink variants, and explicit throughput thresholds are available without repo-managed Python dependencies, so release or CI runs can fail instead of relying on after-the-fact interpretation.
+The missing harness work is nginx/TLS-topology benchmarking. Server CPU/RSS capture, container-mode Rust app benchmarking, and explicit throughput thresholds are available without repo-managed Python dependencies, so release or CI runs can fail instead of relying on after-the-fact interpretation.
 
 ## Low-Overhead Telemetry
 
@@ -309,14 +308,13 @@ If `request_wall_ms` is high but worker write time is low, the issue is ingress 
 
 ### Step 1: Commit the benchmark harness
 
-Status: implemented as a dependency-free optional Python script.
+Status: implemented as the canonical Criterion suite, with a dependency-free optional Python utility for deployment-scale app measurements.
 
 Acceptance:
 
 1. The script reproduces the existing post-refactor baseline within reasonable variance.
 2. The script can run direct Rust app mode.
-3. The script can run a minimal Rust receive sink mode.
-4. The script records enough data to compare chunk/concurrency changes.
+3. The script records enough data to compare chunk/concurrency changes.
 
 ### Step 2: Add adaptive upload chunk sizing
 
@@ -388,17 +386,17 @@ Acceptance:
 3. Telemetry can be enabled in production without creating high write contention.
 4. Telemetry is covered by tests for shape and disabled-by-default behavior.
 
-### Step 6: Benchmark minimal ASGI receive ceiling
+### Step 6: Historical minimal receive-ceiling experiment
 
-Status: partially implemented. The benchmark has a minimal sink that can receive with SHA-256 enabled or disabled.
+Status: completed as a one-off diagnostic and retained here as historical evidence. The sink is no longer a supported mode and is not registered on the production application router. Any future raw-ingress experiment must run in a dedicated benchmark process that cannot be enabled on a deployed Vault server.
 
-Implemented variants:
+Historical variants:
 
 1. receive and discard
 2. receive and hash
 3. full Vault route
 
-Missing variants:
+Variants that were not retained as supported tooling:
 
 1. receive and write to temp file
 2. receive, hash, and write
@@ -452,7 +450,7 @@ For local direct Rust service runs, after adaptive chunking and conditional part
 4. Single 114 MB Kevin-shaped upload materially above the fixed-32-MiB baseline.
 5. Single 38 MB Kevin-shaped upload materially above the fixed-32-MiB baseline.
 
-Those numbers are not the final ambition. They are the next ratchet. The ten-user target is now met in the best 8-worker local run. The single 128 MiB upload target is not consistently met yet. The receive-only sink work showed raw request ingress can be much faster than the current Vault route, so the remaining work is durable-path overhead, not raw receive.
+Those numbers are not the final ambition. They are the next ratchet. The ten-user target is now met in the best 8-worker local run. The single 128 MiB upload target is not consistently met yet. The historical receive-only sink experiment showed raw request ingress could be much faster than the Vault route, so the remaining work is durable-path overhead, not raw receive.
 
 For local downloads, target:
 
@@ -496,8 +494,7 @@ This problem is not solved by one more refactor. It is solved when:
 The immediate next implementation should be:
 
 1. Add disabled-by-default per-session and per-part summary telemetry.
-2. Keep sink variants for receive+write and receive+hash+write so the benchmark can isolate filesystem write cost without Vault state.
-3. Investigate a durable-path redesign that reduces part-file plus assembly write amplification without event-loop blocking or in-flight flush coordination.
-4. Add nginx/container benchmark mode so local direct results can be compared to the deployed topology.
+2. Investigate a durable-path redesign that reduces part-file plus assembly write amplification without event-loop blocking or in-flight flush coordination.
+3. Add nginx/container benchmark mode so local direct results can be compared to the deployed topology.
 
 Those steps directly address the remaining measured problem. They do not require speculation about the user's ISP, and they do not chase storage cleanup that only indirectly affects throughput.

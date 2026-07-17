@@ -1,5 +1,6 @@
 import { useTransfers } from "./useTransfers.js";
 import { normalizeSiteSettings } from "./siteSettings.js";
+import { authRedirectUrl } from "./authRedirects.js";
 
 const { useCallback, useMemo, useRef } = React;
 
@@ -21,13 +22,16 @@ export function useAuthFetch({ initialBootstrap, requestConfirm, showNotice }) {
   ).customDownloadStreamingEnabled;
   const downloadLocationGuidanceDismissed =
     initialBootstrap.preferences?.downloadLocationGuidanceDismissed === true;
-  const logoutUrl = useMemo(() => {
-    const rd = encodeURIComponent(window.location.href);
-    if (authMode === "headers" && baseDomain) {
-      return `https://auth.${baseDomain}/logout?rd=${rd}`;
-    }
-    return `/logout?rd=${rd}`;
-  }, [authMode, baseDomain]);
+  const logoutUrl = useMemo(
+    () =>
+      authRedirectUrl({
+        action: "logout",
+        authMode,
+        baseDomain,
+        location: window.location,
+      }),
+    [authMode, baseDomain]
+  );
   const redirectingRef = useRef(false);
 
   const redirectToLogin = useCallback(() => {
@@ -41,11 +45,12 @@ export function useAuthFetch({ initialBootstrap, requestConfirm, showNotice }) {
       kind: "info",
       title: "Session expired",
     });
-    const rd = encodeURIComponent(window.location.href);
-    const loginUrl =
-      authMode === "headers" && baseDomain
-        ? `https://auth.${baseDomain}/?rd=${rd}`
-        : `/login?rd=${rd}`;
+    const loginUrl = authRedirectUrl({
+      action: "login",
+      authMode,
+      baseDomain,
+      location: window.location,
+    });
     window.location.href = loginUrl;
   }, [authMode, baseDomain, showNotice]);
 

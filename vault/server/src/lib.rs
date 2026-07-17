@@ -11,6 +11,7 @@ pub mod http;
 pub mod oidc;
 pub mod preferences;
 pub mod reconciliation;
+pub mod redirects;
 pub mod shares;
 pub mod site_settings;
 pub mod state_events;

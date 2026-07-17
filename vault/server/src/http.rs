@@ -56,6 +56,7 @@ use crate::folders::{
 use crate::oidc::{self, CallbackRequest, OidcError};
 use crate::preferences::{PreferenceError, update_preferences_for_user};
 use crate::reconciliation::{self, ReconciliationError};
+use crate::redirects::safe_redirect;
 use crate::shares::{self, CreateShareLinkRequest, CreateShareLinkResponse, ShareError};
 use crate::site_settings::{
     SiteSettingsError, archive_permanent_delete_admin_only, site_settings_for_db,
@@ -3122,13 +3123,6 @@ fn cookie_secure(auth: &AuthSettings, headers: &HeaderMap) -> bool {
         "0" | "false" | "no" | "off" => false,
         _ => auth.public_url.starts_with("https://") || forwarded_proto_is_https(headers),
     }
-}
-
-fn safe_redirect(value: Option<&str>) -> String {
-    value
-        .filter(|item| item.starts_with('/') && !item.starts_with("//"))
-        .unwrap_or("/")
-        .to_string()
 }
 
 fn redirect_response(location: &str, set_cookies: Vec<String>) -> Response {

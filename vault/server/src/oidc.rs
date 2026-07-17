@@ -16,6 +16,7 @@ use crate::auth::{
     AuthError, AuthSettings, UserContext, cookie_value, oidc_identity, split_groups,
     verify_session_payload,
 };
+use crate::redirects::safe_redirect;
 
 #[derive(Debug)]
 pub struct CallbackRequest<'a> {
@@ -108,7 +109,7 @@ pub async fn complete_callback(
         return Err(OidcError::StateValidationFailed);
     }
     let nonce = string_claim(&state_payload, "nonce").ok_or(OidcError::StateValidationFailed)?;
-    let redirect_path = safe_redirect(string_claim(&state_payload, "rd").as_deref());
+    let redirect_path = safe_redirect(state_payload.get("rd").and_then(Value::as_str));
 
     let discovery = discovery(auth).await?;
     let token =
@@ -447,13 +448,6 @@ fn value_to_string(value: &Value) -> Option<String> {
         Value::Bool(value) => Some(value.to_string()),
         _ => None,
     }
-}
-
-fn safe_redirect(value: Option<&str>) -> String {
-    value
-        .filter(|item| item.starts_with('/') && !item.starts_with("//"))
-        .unwrap_or("/")
-        .to_string()
 }
 
 fn is_local_hostname(hostname: &str) -> bool {

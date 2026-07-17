@@ -563,6 +563,48 @@ async fn oidc_login_redirects_to_provider_and_sets_signed_state_cookie() {
     assert_eq!(payload["rd"], "/Project");
 }
 
+#[tokio::test]
+async fn oidc_login_preserves_safe_redirects_and_rejects_ambiguous_or_external_forms() {
+    let auth = oidc_auth("https://idp.example.com/auth");
+    let (state, _temp_dir) = test_state(auth.clone()).await;
+    let app = http::router(state);
+
+    let safe = app
+        .clone()
+        .oneshot(request(
+            Method::GET,
+            "/login?rd=%2FProject%2FPlan%3Ftab%3Dactivity%23history",
+        ))
+        .await
+        .expect("safe login redirect");
+    let safe_cookie = first_set_cookie(&safe);
+    let safe_payload = verify_session_payload(&auth, &oidc_state_cookie_value(&safe_cookie))
+        .expect("safe state payload");
+    assert_eq!(safe_payload["rd"], "/Project/Plan?tab=activity#history");
+
+    for encoded in [
+        "%2F%2Fevil.example.com",
+        "%2F%2Fuser%3Apassword%40evil.example.com",
+        "https%3A%2F%2Fevil.example.com",
+        "%2F%5Cevil.example.com",
+        "%2F%255cevil.example.com",
+        "%2F%25255cevil.example.com",
+        "%2F%252fevil.example.com",
+        "%2F%25252fevil.example.com",
+        "%2F%250d%250aLocation%3A%252f%252fevil.example.com",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(request(Method::GET, &format!("/login?rd={encoded}")))
+            .await
+            .expect("unsafe login redirect");
+        let cookie = first_set_cookie(&response);
+        let payload = verify_session_payload(&auth, &oidc_state_cookie_value(&cookie))
+            .expect("sanitized state payload");
+        assert_eq!(payload["rd"], "/", "{encoded}");
+    }
+}
+
 #[test]
 fn oidc_state_cookie_accepts_a_bounded_previous_signing_root() {
     let mut old_auth = oidc_auth("https://idp.example.com/auth");
@@ -930,6 +972,46 @@ async fn logout_deletes_session_and_state_cookies_and_uses_safe_redirects() {
 }
 
 #[tokio::test]
+async fn logout_preserves_safe_redirects_and_rejects_encoded_external_forms() {
+    let (state, _temp_dir) = test_state(oidc_auth("https://idp.example.com/auth")).await;
+    let app = http::router(state);
+
+    let safe = app
+        .clone()
+        .oneshot(same_origin_post(
+            "/logout?rd=%2FProject%2FPlan%3Ftab%3Dactivity%23history",
+        ))
+        .await
+        .expect("safe logout redirect");
+    assert_eq!(safe.status(), StatusCode::SEE_OTHER);
+    assert_eq!(location(&safe), "/Project/Plan?tab=activity#history");
+
+    for encoded in [
+        "%2F%2Fevil.example.com",
+        "%2F%2Fuser%3Apassword%40evil.example.com",
+        "%2F%5Cevil.example.com",
+        "%2F%255cevil.example.com",
+        "%2F%25255cevil.example.com",
+        "%2F%252fevil.example.com",
+        "%2F%25252fevil.example.com",
+        "%2F%250d%250aLocation%3A%252f%252fevil.example.com",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(same_origin_post(&format!("/logout?rd={encoded}")))
+            .await
+            .expect("unsafe logout redirect");
+        assert_eq!(response.status(), StatusCode::SEE_OTHER, "{encoded}");
+        assert_eq!(location(&response), "/", "{encoded}");
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "no-store, max-age=0",
+        );
+        assert_eq!(all_set_cookies(&response).len(), 2);
+    }
+}
+
+#[tokio::test]
 async fn logout_requires_post_and_unambiguous_same_origin_provenance_without_deleting_cookies() {
     let (state, _temp_dir) = test_state(oidc_auth("https://idp.example.com/auth")).await;
     let app = http::router(state);
@@ -1010,6 +1092,61 @@ async fn logout_matches_normalized_public_and_trusted_effective_request_origins(
         .await
         .expect("effective origin logout");
     assert_eq!(effective_response.status(), StatusCode::SEE_OTHER);
+}
+
+#[tokio::test]
+async fn oidc_callback_preserves_safe_redirects_and_rejects_encoded_external_forms() {
+    let provider = start_mock_provider("nonce-123", json!({"sub": "kevin"})).await;
+    let auth = oidc_provider_auth(&provider.issuer);
+    let (state, _temp_dir) = test_state(auth.clone()).await;
+    let app = http::router(state);
+
+    let safe_cookie = signed_state_cookie(
+        &auth,
+        "safe-state",
+        "nonce-123",
+        "/Project/Plan?tab=activity#history",
+    );
+    let safe = app
+        .clone()
+        .oneshot(callback_request(
+            "/auth/callback?code=auth-code&state=safe-state",
+            &auth,
+            &safe_cookie,
+        ))
+        .await
+        .expect("safe callback redirect");
+    assert_eq!(safe.status(), StatusCode::SEE_OTHER);
+    assert_eq!(location(&safe), "/Project/Plan?tab=activity#history");
+
+    for (index, redirect) in [
+        "//evil.example.com",
+        "//user:password@evil.example.com",
+        "https://evil.example.com",
+        "/\\evil.example.com",
+        "/%5cevil.example.com",
+        "/%255cevil.example.com",
+        "/%2fevil.example.com",
+        "/%252fevil.example.com",
+        "/%250d%250aLocation:%252f%252fevil.example.com",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let state_value = format!("unsafe-state-{index}");
+        let state_cookie = signed_state_cookie(&auth, &state_value, "nonce-123", redirect);
+        let response = app
+            .clone()
+            .oneshot(callback_request(
+                &format!("/auth/callback?code=auth-code&state={state_value}"),
+                &auth,
+                &state_cookie,
+            ))
+            .await
+            .expect("unsafe callback redirect");
+        assert_eq!(response.status(), StatusCode::SEE_OTHER, "{redirect:?}");
+        assert_eq!(location(&response), "/", "{redirect:?}");
+    }
 }
 
 #[tokio::test]

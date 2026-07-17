@@ -39,6 +39,11 @@ pub type SharedBlobStorage = Arc<dyn BlobStorageBackend>;
 /// Storage implementations must emit nonempty frames no larger than [`STORAGE_CHUNK_SIZE`].
 pub type BlobByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, StorageError>> + Send + 'static>>;
 
+#[derive(Debug)]
+pub(crate) struct LocalObjectReadGuard {
+    _guard: OwnedRwLockReadGuard<()>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlobLocation {
     pub backend: String,
@@ -689,6 +694,18 @@ impl LocalBlobStorage {
     #[must_use]
     pub fn object_key_for_hash(&self, hash_algo: &str, digest: &str) -> String {
         object_key_for_hash(&self.prefix, hash_algo, digest)
+    }
+
+    pub(crate) fn try_object_read_guard(
+        &self,
+        object_key: &str,
+    ) -> Result<LocalObjectReadGuard, StorageError> {
+        let guard = self
+            .lifecycle_locks
+            .for_object(object_key)
+            .try_read_owned()
+            .map_err(|_| StorageError::Busy)?;
+        Ok(LocalObjectReadGuard { _guard: guard })
     }
 
     #[must_use]

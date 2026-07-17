@@ -12,6 +12,7 @@
 //! reserved lifecycle states: download/reconciliation queries must never serve them, and code
 //! outside this module must not directly discard unreferenced blob/location rows.
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::time::Duration;
 
@@ -25,6 +26,7 @@ use crate::storage::{BlobStorageBackend, BlobWriteKind, StorageError, StoredBlob
 
 const PENDING_BACKEND_PREFIX: &str = "_vault_pending:";
 const DELETING_BACKEND_PREFIX: &str = "_vault_deleting:";
+const UNTRACKED_RESERVATION_HASH_ALGO: &str = "_vault_untracked_reservation";
 const PUBLICATION_HEARTBEAT_SECONDS: u64 = 15;
 const PUBLICATION_STALE_SECONDS: i64 = 3_600;
 const DELETE_TIMEOUT_SECONDS: u64 = 5;
@@ -386,11 +388,98 @@ pub async fn collect_unreferenced_blobs_with_limit(
             candidate_ids.push(*blob_id);
         }
     }
+    collect_blob_candidates(
+        pool,
+        storage,
+        &candidate_ids,
+        Some(Duration::from_secs(GC_RUN_BUDGET_SECONDS)),
+    )
+    .await
+}
+
+/// Collects only the supplied blob IDs while revalidating every candidate through the
+/// crash-recoverable deletion state machine.
+pub(crate) async fn collect_unreferenced_blob_candidates(
+    pool: &SqlitePool,
+    storage: &dyn BlobStorageBackend,
+    candidate_ids: &[i64],
+) -> Result<BlobGcResult, BlobLifecycleError> {
+    collect_blob_candidates(pool, storage, candidate_ids, None).await
+}
+
+/// Reserves and collects a backend object that currently has no lifecycle metadata.
+///
+/// The reservation is committed before the backend effect, so a concurrent publisher either
+/// wins the initial write transaction or observes the deletion tombstone and retries. A failed
+/// or interrupted deletion remains discoverable by normal blob garbage collection.
+pub(crate) async fn collect_untracked_blob_object(
+    pool: &SqlitePool,
+    storage: &dyn BlobStorageBackend,
+    object_key: &str,
+) -> Result<BlobGcResult, BlobLifecycleError> {
+    let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let existing_backends = sqlx::query_scalar::<_, String>(
+        r"
+        SELECT backend
+        FROM blob_locations
+        WHERE object_key = ?
+          AND (bucket = '' OR bucket = ?)
+        ",
+    )
+    .bind(object_key)
+    .bind(storage.bucket())
+    .fetch_all(&mut *transaction)
+    .await?;
+    if existing_backends
+        .iter()
+        .any(|backend| backend == storage.name() || actual_backend(backend) == Some(storage.name()))
+    {
+        transaction.commit().await?;
+        let mut result = BlobGcResult {
+            deferred_objects: vec![object_key.to_string()],
+            ..BlobGcResult::default()
+        };
+        normalize_gc_result(&mut result);
+        return Ok(result);
+    }
+
+    let reservation = Uuid::new_v4().simple().to_string();
+    let blob_id = sqlx::query("INSERT INTO blobs (hash_algo, hash, size_bytes) VALUES (?, ?, 0)")
+        .bind(UNTRACKED_RESERVATION_HASH_ALGO)
+        .bind(&reservation)
+        .execute(&mut *transaction)
+        .await?
+        .last_insert_rowid();
+    let deleting_backend = format!("{DELETING_BACKEND_PREFIX}{reservation}:{}", storage.name());
+    sqlx::query(
+        "INSERT INTO blob_locations (blob_id, backend, bucket, object_key) VALUES (?, ?, ?, ?)",
+    )
+    .bind(blob_id)
+    .bind(deleting_backend)
+    .bind(storage.bucket())
+    .bind(object_key)
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+
+    collect_unreferenced_blob_candidates(pool, storage, &[blob_id]).await
+}
+
+async fn collect_blob_candidates(
+    pool: &SqlitePool,
+    storage: &dyn BlobStorageBackend,
+    candidate_ids: &[i64],
+    run_budget: Option<Duration>,
+) -> Result<BlobGcResult, BlobLifecycleError> {
     let mut result = BlobGcResult::default();
     let started_at = Instant::now();
-    for blob_id in candidate_ids {
+    let mut visited = HashSet::new();
+    for &blob_id in candidate_ids {
+        if !visited.insert(blob_id) {
+            continue;
+        }
         loop {
-            if started_at.elapsed() >= Duration::from_secs(GC_RUN_BUDGET_SECONDS) {
+            if run_budget.is_some_and(|budget| started_at.elapsed() >= budget) {
                 break;
             }
             if !collect_blob_candidate(pool, storage, blob_id, &mut result).await? {
@@ -398,6 +487,11 @@ pub async fn collect_unreferenced_blobs_with_limit(
             }
         }
     }
+    normalize_gc_result(&mut result);
+    Ok(result)
+}
+
+fn normalize_gc_result(result: &mut BlobGcResult) {
     result.deleted_blob_ids.sort_unstable();
     result.deleted_objects.sort();
     result.deleted_objects.dedup();
@@ -411,7 +505,6 @@ pub async fn collect_unreferenced_blobs_with_limit(
             &right.object_key,
         ))
     });
-    Ok(result)
 }
 
 // This is the deletion state machine: eligibility, claim, backend effect, and finalization order

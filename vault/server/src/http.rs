@@ -3959,6 +3959,13 @@ fn reconciliation_error_response(error: ReconciliationError) -> (StatusCode, Str
                 "Internal server error".to_string(),
             )
         }
+        ReconciliationError::BlobLifecycle(error) => {
+            tracing::error!(?error, "storage reconciliation request failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal server error".to_string(),
+            )
+        }
     }
 }
 

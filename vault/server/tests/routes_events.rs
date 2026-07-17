@@ -4,13 +4,15 @@ use std::time::Duration;
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode};
 use futures_util::StreamExt;
+use tokio::sync::oneshot;
 use tower::ServiceExt;
 use vault_server::auth::AuthSettings;
 use vault_server::config::Config;
 use vault_server::db;
 use vault_server::http::{self, AppState};
 use vault_server::state_events::{
-    notify_state_event_committed, record_state_event, state_events_after,
+    StateEventRetentionPolicy, compact_state_events_with_policy, notify_state_event_committed,
+    record_state_event, state_events_after,
 };
 use vault_server::storage::LocalBlobStorage;
 
@@ -69,6 +71,173 @@ async fn first_sse_chunk(response: axum::response::Response) -> String {
         .expect("sse chunk")
         .expect("sse body");
     String::from_utf8(item.to_vec()).expect("utf8 sse")
+}
+
+const FULL_STATE_EVENT_RESOURCES_JSON: &str =
+    r#"["admin","contents","document_detail","my_edits","preferences","settings","sidebar"]"#;
+
+#[tokio::test]
+async fn state_event_compaction_keeps_one_marker_and_a_bounded_replay_suffix() {
+    let (state, _temp_dir) = test_state().await;
+    let policy = StateEventRetentionPolicy::new(3, Duration::from_hours(168));
+
+    compact_state_events_with_policy(&state.db, policy)
+        .await
+        .expect("initialize state event marker");
+    let initial_marker = sqlx::query_as::<_, (i64, String, String)>(
+        "SELECT id, event_type, resources FROM state_events",
+    )
+    .fetch_one(&state.db)
+    .await
+    .expect("initial marker");
+    assert_eq!(initial_marker.1, "state.compacted");
+    assert_eq!(initial_marker.2, FULL_STATE_EVENT_RESOURCES_JSON);
+
+    compact_state_events_with_policy(&state.db, policy)
+        .await
+        .expect("idempotent state event compaction");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT id FROM state_events")
+            .fetch_one(&state.db)
+            .await
+            .expect("idempotent marker"),
+        initial_marker.0,
+    );
+
+    let mut event_ids = Vec::new();
+    for index in 0..5 {
+        event_ids.push(
+            insert_state_event(&state.db, &format!("test.event.{index}"), r#"["contents"]"#).await,
+        );
+    }
+    compact_state_events_with_policy(&state.db, policy)
+        .await
+        .expect("bounded state event compaction");
+
+    let rows = sqlx::query_as::<_, (i64, String, String)>(
+        "SELECT id, event_type, resources FROM state_events ORDER BY id",
+    )
+    .fetch_all(&state.db)
+    .await
+    .expect("compacted state events");
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[0].0, event_ids[1]);
+    assert_eq!(rows[0].1, "state.compacted");
+    assert_eq!(rows[0].2, FULL_STATE_EVENT_RESOURCES_JSON);
+    assert_eq!(
+        rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+        event_ids[1..].to_vec(),
+    );
+    assert_eq!(rows[1].1, "test.event.2");
+    assert_eq!(rows[2].1, "test.event.3");
+    assert_eq!(rows[3].1, "test.event.4");
+
+    compact_state_events_with_policy(&state.db, policy)
+        .await
+        .expect("no-op bounded state event compaction");
+    let rows_after_noop = sqlx::query_as::<_, (i64, String, String)>(
+        "SELECT id, event_type, resources FROM state_events ORDER BY id",
+    )
+    .fetch_all(&state.db)
+    .await
+    .expect("state events after no-op compaction");
+    assert_eq!(rows_after_noop, rows);
+}
+
+#[tokio::test]
+async fn state_event_compaction_uses_the_newer_age_or_count_boundary() {
+    let (state, _temp_dir) = test_state().await;
+    compact_state_events_with_policy(
+        &state.db,
+        StateEventRetentionPolicy::new(3, Duration::from_hours(1)),
+    )
+    .await
+    .expect("initialize state event marker");
+
+    let mut event_ids = Vec::new();
+    for index in 0..6 {
+        event_ids.push(
+            insert_state_event(&state.db, &format!("test.aged.{index}"), r#"["contents"]"#).await,
+        );
+    }
+    sqlx::query("UPDATE state_events SET created_at = '2000-01-01 00:00:00' WHERE id <= ?")
+        .bind(event_ids[3])
+        .execute(&state.db)
+        .await
+        .expect("age state events");
+
+    compact_state_events_with_policy(
+        &state.db,
+        StateEventRetentionPolicy::new(3, Duration::from_hours(1)),
+    )
+    .await
+    .expect("age and count compaction");
+
+    let rows =
+        sqlx::query_as::<_, (i64, String)>("SELECT id, event_type FROM state_events ORDER BY id")
+            .fetch_all(&state.db)
+            .await
+            .expect("age-compacted state events");
+    assert_eq!(
+        rows,
+        vec![
+            (event_ids[3], "state.compacted".to_string()),
+            (event_ids[4], "test.aged.4".to_string()),
+            (event_ids[5], "test.aged.5".to_string()),
+        ],
+    );
+}
+
+#[tokio::test]
+async fn state_event_compaction_waits_for_concurrent_event_writers() {
+    let (state, _temp_dir) = test_state().await;
+    let policy = StateEventRetentionPolicy::new(3, Duration::from_hours(168));
+    compact_state_events_with_policy(&state.db, policy)
+        .await
+        .expect("initialize state event marker");
+    let mut writer = state
+        .db
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .expect("event writer gate");
+    let pending_id = sqlx::query(
+        "INSERT INTO state_events (event_type, resources) VALUES ('test.pending', '[\"contents\"]')",
+    )
+    .execute(&mut *writer)
+    .await
+    .expect("pending state event")
+    .last_insert_rowid();
+
+    let compact_pool = state.db.clone();
+    let (started_tx, started_rx) = oneshot::channel();
+    let mut compaction = tokio::spawn(async move {
+        started_tx.send(()).expect("signal compaction start");
+        compact_state_events_with_policy(&compact_pool, policy).await
+    });
+    started_rx.await.expect("compaction started");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(75), &mut compaction)
+            .await
+            .is_err(),
+        "compaction bypassed the active event writer",
+    );
+
+    writer.commit().await.expect("commit pending state event");
+    tokio::time::timeout(Duration::from_secs(2), compaction)
+        .await
+        .expect("compaction timed out")
+        .expect("compaction task")
+        .expect("compaction result");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM state_events WHERE id = ? AND event_type = 'test.pending'",
+        )
+        .bind(pending_id)
+        .fetch_one(&state.db)
+        .await
+        .expect("pending event count"),
+        1,
+    );
 }
 
 #[tokio::test]
@@ -161,6 +330,64 @@ async fn event_stream_replays_events_after_last_event_id() {
         chunk.contains(r#"data: {"type":"test.commit","resources":["contents","sidebar"]}"#),
         "{chunk}"
     );
+}
+
+#[tokio::test]
+async fn event_stream_rewinds_stale_and_future_cursors_to_the_compaction_marker() {
+    let (state, _temp_dir) = test_state().await;
+    let policy = StateEventRetentionPolicy::new(2, Duration::from_hours(168));
+    compact_state_events_with_policy(&state.db, policy)
+        .await
+        .expect("initialize state event marker");
+    for index in 0..5 {
+        insert_state_event(
+            &state.db,
+            &format!("test.replay.{index}"),
+            r#"["contents"]"#,
+        )
+        .await;
+    }
+    compact_state_events_with_policy(&state.db, policy)
+        .await
+        .expect("compact replay window");
+    let (marker_id, latest_id) = sqlx::query_as::<_, (i64, i64)>(
+        r"
+        SELECT
+            MIN(id),
+            MAX(id)
+        FROM state_events
+        ",
+    )
+    .fetch_one(&state.db)
+    .await
+    .expect("state event window");
+    let app = http::router(state);
+
+    for requested_id in [marker_id - 2, latest_id + 100] {
+        let response = app
+            .clone()
+            .oneshot(authed_stream_request(Some(requested_id)))
+            .await
+            .expect("stale stream response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let chunk = first_sse_chunk(response).await;
+        assert!(chunk.contains(&format!("id: {marker_id}")), "{chunk}");
+        assert!(
+            chunk.contains(&format!(
+                "data: {{\"type\":\"state.compacted\",\"resources\":{FULL_STATE_EVENT_RESOURCES_JSON}}}"
+            )),
+            "{chunk}",
+        );
+    }
+
+    let response = app
+        .oneshot(authed_stream_request(Some(marker_id)))
+        .await
+        .expect("marker cursor response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let chunk = first_sse_chunk(response).await;
+    assert!(chunk.contains(&format!("id: {}", marker_id + 1)), "{chunk}");
+    assert!(!chunk.contains("state.compacted"), "{chunk}");
 }
 
 #[tokio::test]

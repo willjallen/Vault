@@ -410,6 +410,55 @@ async fn dev_database_reset_cleans_tracked_upload_resources() {
 }
 
 #[tokio::test]
+async fn dev_database_reset_preserves_monotonic_state_event_ids_with_a_refresh_marker() {
+    let (state, _temp_dir) = test_state(dev_auth()).await;
+    let old_event_id = sqlx::query(
+        r#"
+        INSERT INTO state_events (event_type, resources)
+        VALUES ('test.before-reset', '["contents"]')
+        "#,
+    )
+    .execute(&state.db)
+    .await
+    .expect("state event before reset")
+    .last_insert_rowid();
+    let db = state.db.clone();
+
+    let reset = http::router(state)
+        .oneshot(dev_post("/api/admin/debug/reset-database"))
+        .await
+        .expect("reset");
+    assert_eq!(reset.status(), StatusCode::OK);
+
+    let rows = sqlx::query_as::<_, (i64, String, String)>(
+        "SELECT id, event_type, resources FROM state_events ORDER BY id",
+    )
+    .fetch_all(&db)
+    .await
+    .expect("reset state events");
+    assert_eq!(rows.len(), 1);
+    let marker = &rows[0];
+    assert!(marker.0 > old_event_id);
+    assert_eq!(marker.1, "state.compacted");
+    assert_eq!(
+        marker.2,
+        r#"["admin","contents","document_detail","my_edits","preferences","settings","sidebar"]"#,
+    );
+
+    let next_event_id = sqlx::query(
+        r#"
+        INSERT INTO state_events (event_type, resources)
+        VALUES ('test.after-reset', '["contents"]')
+        "#,
+    )
+    .execute(&db)
+    .await
+    .expect("state event after reset")
+    .last_insert_rowid();
+    assert!(next_event_id > marker.0);
+}
+
+#[tokio::test]
 async fn debug_seed_rolls_back_all_metadata_when_outbox_insert_fails() {
     let (state, _temp_dir) = test_state(dev_auth()).await;
     let db = state.db.clone();

@@ -65,7 +65,8 @@ use crate::site_settings::{
 };
 use crate::state_events::{
     StateEventError, StateEventRecord, latest_state_event_id, notify_state_event_committed,
-    record_state_event, record_state_event_in_tx, state_events_after, subscribe_state_events,
+    record_state_event, record_state_event_in_tx, state_event_resume_id, state_events_after,
+    subscribe_state_events,
 };
 use crate::storage::{
     BlobByteStream, BlobReadRange, BlobWriteKind, LocalBlobStorage, STORAGE_CHUNK_SIZE,
@@ -2350,7 +2351,7 @@ async fn event_stream_start_id(pool: &DbPool, headers: &HeaderMap) -> Result<i64
         return Ok(latest_state_event_id(pool).await?);
     };
     match value.trim().parse::<i64>() {
-        Ok(last_id) if last_id >= 0 => Ok(last_id),
+        Ok(last_id) if last_id >= 0 => Ok(state_event_resume_id(pool, last_id).await?),
         _ => Ok(latest_state_event_id(pool).await?),
     }
 }

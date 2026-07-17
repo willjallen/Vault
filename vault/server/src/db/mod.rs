@@ -8,6 +8,8 @@ use std::time::Duration;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Executor, Row, Sqlite, SqlitePool, Transaction};
 
+use crate::state_events::replace_state_events_with_compaction_marker_in_tx;
+
 pub use schema::SQLITE_BUSY_TIMEOUT_MS;
 
 const SQLITE_POOL_SIZE: u32 = 10;
@@ -37,7 +39,7 @@ pub async fn connect(db_path: &Path) -> anyhow::Result<DbPool> {
 }
 
 pub async fn reset(pool: &DbPool) -> anyhow::Result<Vec<String>> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     let upload_session_ids =
         sqlx::query_scalar::<_, String>("SELECT id FROM upload_sessions ORDER BY id")
             .fetch_all(&mut *tx)
@@ -60,13 +62,13 @@ pub async fn reset(pool: &DbPool) -> anyhow::Result<Vec<String>> {
         "vault_groups",
         "vault_users",
         "vault_settings",
-        "state_events",
         "folders",
     ] {
         tx.execute(format!("DELETE FROM {table}").as_str()).await?;
     }
     seed_root_folder(&mut tx, "vault", "", "Vault").await?;
     seed_root_folder(&mut tx, "archive", "Archive", "Archive").await?;
+    replace_state_events_with_compaction_marker_in_tx(&mut tx).await?;
     tx.commit().await?;
     Ok(upload_session_ids)
 }

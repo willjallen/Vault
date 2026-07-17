@@ -11,13 +11,14 @@ use vault_server::config::Config;
 use vault_server::documents;
 use vault_server::http::{self, AppState};
 use vault_server::reconciliation;
-use vault_server::state_events::notify_state_event_committed;
+use vault_server::state_events::{compact_state_events, notify_state_event_committed};
 use vault_server::storage::{configured_blob_storage, sweep_legacy_s3_stage_files};
 use vault_server::transfers;
 
 use vault_server::db;
 
 const SERVER_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+const STATE_EVENT_COMPACTION_INTERVAL: Duration = Duration::from_mins(1);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -63,6 +64,8 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
     sweep_local_multipart_parts(&state).await;
+    compact_state_events(&state.db).await?;
+    spawn_state_event_compactor(state.db.clone());
     spawn_ttl_sweeper(state.clone(), transfers_path.clone());
 
     let export_execution = state.export_execution.clone();
@@ -109,6 +112,17 @@ async fn main() -> anyhow::Result<()> {
     export_execution.shutdown_dispatcher().await;
     server_result?;
     Ok(())
+}
+
+fn spawn_state_event_compactor(db: db::DbPool) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(STATE_EVENT_COMPACTION_INTERVAL).await;
+            if let Err(error) = compact_state_events(&db).await {
+                tracing::error!(%error, "state event compaction failed");
+            }
+        }
+    });
 }
 
 async fn wait_for_shutdown_signal() {

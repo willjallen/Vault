@@ -3,6 +3,7 @@ use std::sync::Arc;
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode};
 use serde_json::{Value, json};
+use tokio::sync::Barrier;
 use tower::ServiceExt;
 use vault_server::admin::{
     AdminError, AdminGroupRequest, AdminUserUpdatePayload, delete_group, remove_group_member,
@@ -14,6 +15,8 @@ use vault_server::db;
 use vault_server::folders::{VAULT_ROOT_KEY, add_folder_permission, get_root_folder};
 use vault_server::http::{self, AppState};
 use vault_server::storage::LocalBlobStorage;
+
+const CONCURRENT_ADMIN_RACE_ATTEMPTS: usize = 4;
 
 async fn test_state() -> (AppState, tempfile::TempDir) {
     test_state_with_auth(AuthSettings::default()).await
@@ -74,6 +77,148 @@ async fn group_id(pool: &sqlx::SqlitePool, name: &str) -> i64 {
         .fetch_one(pool)
         .await
         .expect("group id")
+}
+
+async fn insert_stored_user(
+    pool: &sqlx::SqlitePool,
+    subject: &str,
+    is_admin: bool,
+    is_active: bool,
+) -> i64 {
+    sqlx::query(
+        r"
+        INSERT INTO vault_users
+            (issuer, subject, email, name, is_admin, is_active)
+        VALUES
+            ('oidc', ?, ?, ?, ?, ?)
+        ",
+    )
+    .bind(subject)
+    .bind(format!("{subject}@example.com"))
+    .bind(subject)
+    .bind(is_admin)
+    .bind(is_active)
+    .execute(pool)
+    .await
+    .expect("insert stored user")
+    .last_insert_rowid()
+}
+
+async fn concurrent_user_updates(
+    pool: &sqlx::SqlitePool,
+    auth: &AuthSettings,
+    user_ids: [i64; 2],
+    payload: AdminUserUpdatePayload,
+) -> [Result<(), AdminError>; 2] {
+    let barrier = Arc::new(Barrier::new(3));
+    let first_pool = pool.clone();
+    let first_auth = auth.clone();
+    let first_barrier = Arc::clone(&barrier);
+    let first_payload = payload.clone();
+    let first = tokio::spawn(async move {
+        first_barrier.wait().await;
+        update_user(&first_pool, &first_auth, user_ids[0], &first_payload).await
+    });
+    let second_pool = pool.clone();
+    let second_auth = auth.clone();
+    let second_barrier = Arc::clone(&barrier);
+    let second = tokio::spawn(async move {
+        second_barrier.wait().await;
+        update_user(&second_pool, &second_auth, user_ids[1], &payload).await
+    });
+
+    barrier.wait().await;
+    [
+        first.await.expect("first concurrent user update"),
+        second.await.expect("second concurrent user update"),
+    ]
+}
+
+async fn concurrent_membership_removals(
+    pool: &sqlx::SqlitePool,
+    auth: &AuthSettings,
+    group_id: i64,
+    user_ids: [i64; 2],
+) -> [Result<(), AdminError>; 2] {
+    let barrier = Arc::new(Barrier::new(3));
+    let first_pool = pool.clone();
+    let first_auth = auth.clone();
+    let first_barrier = Arc::clone(&barrier);
+    let first = tokio::spawn(async move {
+        first_barrier.wait().await;
+        remove_group_member(&first_pool, &first_auth, group_id, user_ids[0]).await
+    });
+    let second_pool = pool.clone();
+    let second_auth = auth.clone();
+    let second_barrier = Arc::clone(&barrier);
+    let second = tokio::spawn(async move {
+        second_barrier.wait().await;
+        remove_group_member(&second_pool, &second_auth, group_id, user_ids[1]).await
+    });
+
+    barrier.wait().await;
+    [
+        first.await.expect("first concurrent membership removal"),
+        second.await.expect("second concurrent membership removal"),
+    ]
+}
+
+async fn concurrent_user_demotion_and_membership_removal(
+    pool: &sqlx::SqlitePool,
+    auth: &AuthSettings,
+    stored_admin_user_id: i64,
+    group_id: i64,
+    group_admin_user_id: i64,
+) -> [Result<(), AdminError>; 2] {
+    let barrier = Arc::new(Barrier::new(3));
+    let update_pool = pool.clone();
+    let update_auth = auth.clone();
+    let update_barrier = Arc::clone(&barrier);
+    let update = tokio::spawn(async move {
+        update_barrier.wait().await;
+        update_user(
+            &update_pool,
+            &update_auth,
+            stored_admin_user_id,
+            &AdminUserUpdatePayload {
+                is_admin: Some(false),
+                is_active: None,
+            },
+        )
+        .await
+    });
+    let removal_pool = pool.clone();
+    let removal_auth = auth.clone();
+    let removal_barrier = Arc::clone(&barrier);
+    let removal = tokio::spawn(async move {
+        removal_barrier.wait().await;
+        remove_group_member(&removal_pool, &removal_auth, group_id, group_admin_user_id).await
+    });
+
+    barrier.wait().await;
+    [
+        update.await.expect("concurrent stored-admin demotion"),
+        removal
+            .await
+            .expect("concurrent admin-group membership removal"),
+    ]
+}
+
+fn assert_one_success_and_one_last_admin_guard(
+    results: [Result<(), AdminError>; 2],
+    context: &str,
+) {
+    let mut successes = 0;
+    let mut guarded = 0;
+    for result in results {
+        match result {
+            Ok(()) => successes += 1,
+            Err(AdminError::LastActiveAdminRequired) => guarded += 1,
+            Err(error) => panic!("{context}: unexpected concurrent result: {error:?}"),
+        }
+    }
+    assert_eq!(successes, 1, "{context}");
+    assert_eq!(guarded, 1, "{context}");
 }
 
 async fn assert_admin_events(pool: &sqlx::SqlitePool, expected: &[&str]) {
@@ -559,6 +704,260 @@ async fn admin_user_routes_allow_bootstrap_admin_email_without_stored_admin_flag
     assert_eq!(editor_row["is_active"], false);
     assert_eq!(owner_row["is_admin"], true);
     assert_eq!(stored_owner_admin, 0);
+    assert_admin_events(&pool, &["admin.user.updated"]).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_stored_admin_demotions_preserve_one_active_admin() {
+    for attempt in 0..CONCURRENT_ADMIN_RACE_ATTEMPTS {
+        let (state, _temp_dir) = test_state().await;
+        let pool = state.db.clone();
+        let auth = state.auth.clone();
+        let user_ids = [
+            insert_stored_user(&pool, "first-admin", true, true).await,
+            insert_stored_user(&pool, "second-admin", true, true).await,
+        ];
+
+        let results = concurrent_user_updates(
+            &pool,
+            &auth,
+            user_ids,
+            AdminUserUpdatePayload {
+                is_admin: Some(false),
+                is_active: None,
+            },
+        )
+        .await;
+        assert_one_success_and_one_last_admin_guard(
+            results,
+            &format!("demotion attempt {attempt}"),
+        );
+
+        let flags = sqlx::query_as::<_, (i64, i64)>(
+            "SELECT is_admin, is_active FROM vault_users ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("demoted admin flags");
+        assert_eq!(flags.len(), 2, "attempt {attempt}");
+        assert_eq!(
+            flags.iter().map(|(is_admin, _)| *is_admin).sum::<i64>(),
+            1,
+            "attempt {attempt}",
+        );
+        assert!(
+            flags.iter().all(|(_, is_active)| *is_active == 1),
+            "attempt {attempt}",
+        );
+        assert_admin_events(&pool, &["admin.user.updated"]).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_stored_admin_deactivations_preserve_one_active_admin() {
+    for attempt in 0..CONCURRENT_ADMIN_RACE_ATTEMPTS {
+        let (state, _temp_dir) = test_state().await;
+        let pool = state.db.clone();
+        let auth = state.auth.clone();
+        let user_ids = [
+            insert_stored_user(&pool, "first-admin", true, true).await,
+            insert_stored_user(&pool, "second-admin", true, true).await,
+        ];
+
+        let results = concurrent_user_updates(
+            &pool,
+            &auth,
+            user_ids,
+            AdminUserUpdatePayload {
+                is_admin: None,
+                is_active: Some(false),
+            },
+        )
+        .await;
+        assert_one_success_and_one_last_admin_guard(
+            results,
+            &format!("deactivation attempt {attempt}"),
+        );
+
+        let flags = sqlx::query_as::<_, (i64, i64)>(
+            "SELECT is_admin, is_active FROM vault_users ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("deactivated admin flags");
+        assert_eq!(flags.len(), 2, "attempt {attempt}");
+        assert!(
+            flags.iter().all(|(is_admin, _)| *is_admin == 1),
+            "attempt {attempt}",
+        );
+        assert_eq!(
+            flags.iter().map(|(_, is_active)| *is_active).sum::<i64>(),
+            1,
+            "attempt {attempt}",
+        );
+        assert_admin_events(&pool, &["admin.user.updated"]).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_vault_admin_membership_removals_preserve_one_active_admin() {
+    for attempt in 0..CONCURRENT_ADMIN_RACE_ATTEMPTS {
+        let (state, _temp_dir) = test_state().await;
+        let pool = state.db.clone();
+        let auth = state.auth.clone();
+        let group_id = create_group(&pool, "Vault-Admin").await;
+        let user_ids = [
+            insert_stored_user(&pool, "first-group-admin", false, true).await,
+            insert_stored_user(&pool, "second-group-admin", false, true).await,
+        ];
+        for user_id in user_ids {
+            sqlx::query("INSERT INTO vault_group_memberships (user_id, group_id) VALUES (?, ?)")
+                .bind(user_id)
+                .bind(group_id)
+                .execute(&pool)
+                .await
+                .expect("insert admin group membership");
+        }
+
+        let results = concurrent_membership_removals(&pool, &auth, group_id, user_ids).await;
+        assert_one_success_and_one_last_admin_guard(
+            results,
+            &format!("membership attempt {attempt}"),
+        );
+
+        let membership_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM vault_group_memberships WHERE group_id = ?",
+        )
+        .bind(group_id)
+        .fetch_one(&pool)
+        .await
+        .expect("remaining admin group membership count");
+        let flags = sqlx::query_as::<_, (i64, i64)>(
+            "SELECT is_admin, is_active FROM vault_users ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("group admin flags");
+        assert_eq!(membership_count, 1, "attempt {attempt}");
+        assert_eq!(flags, vec![(0, 1), (0, 1)], "attempt {attempt}");
+        assert_admin_events(&pool, &["admin.group.member.removed"]).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_cross_path_admin_reductions_preserve_one_active_admin() {
+    for attempt in 0..CONCURRENT_ADMIN_RACE_ATTEMPTS {
+        let (state, _temp_dir) = test_state().await;
+        let pool = state.db.clone();
+        let auth = state.auth.clone();
+        let group_id = create_group(&pool, "Vault-Admin").await;
+        let stored_admin_user_id = insert_stored_user(&pool, "stored-admin", true, true).await;
+        let group_admin_user_id = insert_stored_user(&pool, "group-admin", false, true).await;
+        sqlx::query("INSERT INTO vault_group_memberships (user_id, group_id) VALUES (?, ?)")
+            .bind(group_admin_user_id)
+            .bind(group_id)
+            .execute(&pool)
+            .await
+            .expect("insert group-only admin membership");
+
+        let results = concurrent_user_demotion_and_membership_removal(
+            &pool,
+            &auth,
+            stored_admin_user_id,
+            group_id,
+            group_admin_user_id,
+        )
+        .await;
+        let demotion_succeeded = results[0].is_ok();
+        let removal_succeeded = results[1].is_ok();
+        assert_one_success_and_one_last_admin_guard(
+            results,
+            &format!("cross-path attempt {attempt}"),
+        );
+
+        let stored_flags = sqlx::query_as::<_, (i64, i64)>(
+            "SELECT is_admin, is_active FROM vault_users WHERE id = ?",
+        )
+        .bind(stored_admin_user_id)
+        .fetch_one(&pool)
+        .await
+        .expect("stored-only admin flags");
+        let group_flags = sqlx::query_as::<_, (i64, i64)>(
+            "SELECT is_admin, is_active FROM vault_users WHERE id = ?",
+        )
+        .bind(group_admin_user_id)
+        .fetch_one(&pool)
+        .await
+        .expect("group-only admin flags");
+        let membership_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM vault_group_memberships WHERE group_id = ? AND user_id = ?",
+        )
+        .bind(group_id)
+        .bind(group_admin_user_id)
+        .fetch_one(&pool)
+        .await
+        .expect("group-only admin membership count");
+        let expected_stored_admin = i64::from(!demotion_succeeded);
+        let expected_membership = i64::from(!removal_succeeded);
+        assert_eq!(
+            stored_flags,
+            (expected_stored_admin, 1),
+            "attempt {attempt}"
+        );
+        assert_eq!(group_flags, (0, 1), "attempt {attempt}");
+        assert_eq!(membership_count, expected_membership, "attempt {attempt}");
+        assert_eq!(stored_flags.0 + membership_count, 1, "attempt {attempt}");
+        let expected_event = if demotion_succeeded {
+            "admin.user.updated"
+        } else {
+            "admin.group.member.removed"
+        };
+        assert_admin_events(&pool, &[expected_event]).await;
+    }
+}
+
+#[tokio::test]
+async fn sole_stored_admin_can_clear_flag_when_normalized_group_keeps_effective_admin() {
+    let (state, _temp_dir) = test_state().await;
+    let pool = state.db.clone();
+    let auth = state.auth.clone();
+    let group_id = create_group(&pool, "Vault-Admin").await;
+    let user_id = insert_stored_user(&pool, "group-backed-admin", true, true).await;
+    sqlx::query("INSERT INTO vault_group_memberships (user_id, group_id) VALUES (?, ?)")
+        .bind(user_id)
+        .bind(group_id)
+        .execute(&pool)
+        .await
+        .expect("insert normalized admin membership");
+
+    update_user(
+        &pool,
+        &auth,
+        user_id,
+        &AdminUserUpdatePayload {
+            is_admin: Some(false),
+            is_active: None,
+        },
+    )
+    .await
+    .expect("group-backed admin demotion");
+
+    let flags =
+        sqlx::query_as::<_, (i64, i64)>("SELECT is_admin, is_active FROM vault_users WHERE id = ?")
+            .bind(user_id)
+            .fetch_one(&pool)
+            .await
+            .expect("group-backed admin flags");
+    let membership_count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM vault_group_memberships WHERE group_id = ? AND user_id = ?",
+    )
+    .bind(group_id)
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("group-backed admin membership");
+    assert_eq!(flags, (0, 1));
+    assert_eq!(membership_count, 1);
     assert_admin_events(&pool, &["admin.user.updated"]).await;
 }
 

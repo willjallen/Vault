@@ -211,14 +211,15 @@ pub async fn update_user(
     user_id: i64,
     payload: &AdminUserUpdatePayload,
 ) -> Result<(), AdminError> {
-    let target = user_by_id(pool, user_id)
+    let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let target = user_by_id_in_tx(&mut transaction, user_id)
         .await?
         .ok_or(AdminError::UserNotFound)?;
     if payload.is_admin == Some(false) || payload.is_active == Some(false) {
-        ensure_not_last_active_admin(pool, auth, &target).await?;
+        ensure_active_admin_after_user_update_in_tx(&mut transaction, auth, &target, payload)
+            .await?;
     }
-    let mut transaction = pool.begin().await?;
-    sqlx::query(
+    let updated = sqlx::query(
         r"
         UPDATE vault_users
         SET
@@ -232,6 +233,9 @@ pub async fn update_user(
     .bind(user_id)
     .execute(&mut *transaction)
     .await?;
+    if updated.rows_affected() != 1 {
+        return Err(AdminError::UserNotFound);
+    }
     record_admin_change(&mut transaction, "admin.user.updated", &["admin"]).await?;
     transaction.commit().await?;
     Ok(())
@@ -264,17 +268,19 @@ pub async fn update_group(
     group_id: i64,
     request: &AdminGroupRequest,
 ) -> Result<(), AdminError> {
-    let group = group_by_id(pool, group_id)
+    let name = normalize_group_name(&request.name)?;
+    let description = normalize_optional_description(request.description.as_deref());
+    let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let group = group_by_id_in_tx(&mut transaction, group_id)
         .await?
         .ok_or(AdminError::GroupNotFound)?;
-    let name = normalize_group_name(&request.name)?;
-    if let Some(existing) = find_group_by_normalized_name(pool, &name).await?
+    if let Some(existing) = find_group_by_normalized_name_in_tx(&mut transaction, &name).await?
         && existing.id != group.id
     {
         return Err(AdminError::GroupAlreadyExists);
     }
-    ensure_active_admin_after_group_change(
-        pool,
+    ensure_active_admin_after_group_change_in_tx(
+        &mut transaction,
         auth,
         GroupAdminChange::Rename {
             group_id,
@@ -282,15 +288,15 @@ pub async fn update_group(
         },
     )
     .await?;
-    let mut transaction = pool.begin().await?;
-    sqlx::query("UPDATE vault_groups SET name = ?, description = ? WHERE id = ?")
+    let updated = sqlx::query("UPDATE vault_groups SET name = ?, description = ? WHERE id = ?")
         .bind(name)
-        .bind(normalize_optional_description(
-            request.description.as_deref(),
-        ))
+        .bind(description)
         .bind(group_id)
         .execute(&mut *transaction)
         .await?;
+    if updated.rows_affected() != 1 {
+        return Err(AdminError::GroupNotFound);
+    }
     record_admin_change(&mut transaction, "admin.group.updated", &["admin"]).await?;
     transaction.commit().await?;
     Ok(())
@@ -301,25 +307,32 @@ pub async fn delete_group(
     auth: &AuthSettings,
     group_id: i64,
 ) -> Result<(), AdminError> {
-    let group = group_by_id(pool, group_id)
+    let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let group = group_by_id_in_tx(&mut transaction, group_id)
         .await?
         .ok_or(AdminError::GroupNotFound)?;
     let permission_id = sqlx::query_scalar::<_, i64>(
         "SELECT id FROM folder_permissions WHERE group_id = ? LIMIT 1",
     )
     .bind(group.id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *transaction)
     .await?;
     if permission_id.is_some() {
         return Err(AdminError::GroupUsedByFolderPermissions);
     }
-    ensure_active_admin_after_group_change(pool, auth, GroupAdminChange::Delete { group_id })
-        .await?;
-    let mut transaction = pool.begin().await?;
-    sqlx::query("DELETE FROM vault_groups WHERE id = ?")
+    ensure_active_admin_after_group_change_in_tx(
+        &mut transaction,
+        auth,
+        GroupAdminChange::Delete { group_id },
+    )
+    .await?;
+    let deleted = sqlx::query("DELETE FROM vault_groups WHERE id = ?")
         .bind(group_id)
         .execute(&mut *transaction)
         .await?;
+    if deleted.rows_affected() != 1 {
+        return Err(AdminError::GroupNotFound);
+    }
     record_admin_change(&mut transaction, "admin.group.deleted", &["admin"]).await?;
     transaction.commit().await?;
     Ok(())
@@ -357,6 +370,7 @@ pub async fn remove_group_member(
     group_id: i64,
     user_id: i64,
 ) -> Result<(), AdminError> {
+    let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
     let membership_exists = sqlx::query_scalar::<_, i64>(
         r"
         SELECT id
@@ -366,24 +380,27 @@ pub async fn remove_group_member(
     )
     .bind(group_id)
     .bind(user_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *transaction)
     .await?
     .is_some();
     if !membership_exists {
         return Err(AdminError::MembershipNotFound);
     }
-    ensure_active_admin_after_group_change(
-        pool,
+    ensure_active_admin_after_group_change_in_tx(
+        &mut transaction,
         auth,
         GroupAdminChange::RemoveMembership { group_id, user_id },
     )
     .await?;
-    let mut transaction = pool.begin().await?;
-    sqlx::query("DELETE FROM vault_group_memberships WHERE group_id = ? AND user_id = ?")
-        .bind(group_id)
-        .bind(user_id)
-        .execute(&mut *transaction)
-        .await?;
+    let removed =
+        sqlx::query("DELETE FROM vault_group_memberships WHERE group_id = ? AND user_id = ?")
+            .bind(group_id)
+            .bind(user_id)
+            .execute(&mut *transaction)
+            .await?;
+    if removed.rows_affected() != 1 {
+        return Err(AdminError::MembershipNotFound);
+    }
     record_admin_change(&mut transaction, "admin.group.member.removed", &["admin"]).await?;
     transaction.commit().await?;
     Ok(())
@@ -500,41 +517,56 @@ fn format_python_naive_iso_utc(timestamp: PrimitiveDateTime) -> String {
     format!("{base}.{microsecond:06}")
 }
 
-async fn ensure_not_last_active_admin(
-    pool: &SqlitePool,
+async fn ensure_active_admin_after_user_update_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
     auth: &AuthSettings,
     target: &UserRow,
+    payload: &AdminUserUpdatePayload,
 ) -> Result<(), AdminError> {
-    if !target.is_active {
-        return Ok(());
-    }
     let groups_by_user =
-        group_names_by_user_after_group_change(pool, GroupAdminChange::None).await?;
-    let group_names = groups_by_user.get(&target.id).cloned().unwrap_or_default();
-    if !effective_admin_from_parts(
-        auth,
-        target.is_admin,
-        &target.issuer,
-        &target.subject,
-        target.email.as_deref(),
-        &group_names,
-    ) {
+        group_names_by_user_after_group_change_in_tx(transaction, GroupAdminChange::None).await?;
+    let target_groups = groups_by_user
+        .get(&target.id)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let currently_active_admin = target.is_active
+        && effective_admin_from_parts(
+            auth,
+            target.is_admin,
+            &target.issuer,
+            &target.subject,
+            target.email.as_deref(),
+            target_groups,
+        );
+    let remains_active_admin = payload.is_active.unwrap_or(target.is_active)
+        && effective_admin_from_parts(
+            auth,
+            payload.is_admin.unwrap_or(target.is_admin),
+            &target.issuer,
+            &target.subject,
+            target.email.as_deref(),
+            target_groups,
+        );
+    if !currently_active_admin || remains_active_admin {
         return Ok(());
     }
-    let active_admins = active_admin_user_ids(pool, auth, &groups_by_user).await?;
-    if active_admins.len() == 1 && active_admins[0] == target.id {
-        return Err(AdminError::LastActiveAdminRequired);
+    if active_admin_user_ids_in_tx(transaction, auth, &groups_by_user)
+        .await?
+        .into_iter()
+        .any(|user_id| user_id != target.id)
+    {
+        return Ok(());
     }
-    Ok(())
+    Err(AdminError::LastActiveAdminRequired)
 }
 
-async fn ensure_active_admin_after_group_change(
-    pool: &SqlitePool,
+async fn ensure_active_admin_after_group_change_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
     auth: &AuthSettings,
     change: GroupAdminChange,
 ) -> Result<(), AdminError> {
-    let groups_by_user = group_names_by_user_after_group_change(pool, change).await?;
-    if active_admin_user_ids(pool, auth, &groups_by_user)
+    let groups_by_user = group_names_by_user_after_group_change_in_tx(transaction, change).await?;
+    if active_admin_user_ids_in_tx(transaction, auth, &groups_by_user)
         .await?
         .is_empty()
     {
@@ -543,12 +575,12 @@ async fn ensure_active_admin_after_group_change(
     Ok(())
 }
 
-async fn active_admin_user_ids(
-    pool: &SqlitePool,
+async fn active_admin_user_ids_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
     auth: &AuthSettings,
     groups_by_user: &HashMap<i64, Vec<String>>,
 ) -> Result<Vec<i64>, AdminError> {
-    let users = all_users(pool).await?;
+    let users = all_users_in_tx(transaction).await?;
     Ok(users
         .into_iter()
         .filter(|user| user.is_active)
@@ -577,12 +609,12 @@ enum GroupAdminChange {
     RemoveMembership { group_id: i64, user_id: i64 },
 }
 
-async fn group_names_by_user_after_group_change(
-    pool: &SqlitePool,
+async fn group_names_by_user_after_group_change_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
     change: GroupAdminChange,
 ) -> Result<HashMap<i64, Vec<String>>, AdminError> {
-    let groups = groups_by_id(pool).await?;
-    let memberships = all_memberships(pool).await?;
+    let groups = groups_by_id_in_tx(transaction).await?;
+    let memberships = all_memberships_in_tx(transaction).await?;
     let mut group_names_by_user: HashMap<i64, Vec<String>> = HashMap::new();
     for membership in memberships {
         if matches!(change, GroupAdminChange::Delete { group_id } if membership.group_id == group_id)
@@ -624,9 +656,23 @@ async fn user_by_id(pool: &SqlitePool, user_id: i64) -> Result<Option<UserRow>, 
     )
 }
 
-async fn all_users(pool: &SqlitePool) -> Result<Vec<UserRow>, AdminError> {
+async fn user_by_id_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    user_id: i64,
+) -> Result<Option<UserRow>, AdminError> {
+    Ok(
+        sqlx::query_as::<_, UserRow>(&format!("{} WHERE id = ?", user_select_sql()))
+            .bind(user_id)
+            .fetch_optional(&mut **transaction)
+            .await?,
+    )
+}
+
+async fn all_users_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+) -> Result<Vec<UserRow>, AdminError> {
     Ok(sqlx::query_as::<_, UserRow>(user_select_sql())
-        .fetch_all(pool)
+        .fetch_all(&mut **transaction)
         .await?)
 }
 
@@ -637,6 +683,20 @@ async fn group_by_id(pool: &SqlitePool, group_id: i64) -> Result<Option<GroupRow
         )
         .bind(group_id)
         .fetch_optional(pool)
+        .await?,
+    )
+}
+
+async fn group_by_id_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    group_id: i64,
+) -> Result<Option<GroupRow>, AdminError> {
+    Ok(
+        sqlx::query_as::<_, GroupRow>(
+            "SELECT id, name, description FROM vault_groups WHERE id = ?",
+        )
+        .bind(group_id)
+        .fetch_optional(&mut **transaction)
         .await?,
     )
 }
@@ -658,10 +718,29 @@ async fn find_group_by_normalized_name(
     .await?)
 }
 
-async fn groups_by_id(pool: &SqlitePool) -> Result<HashMap<i64, GroupRow>, AdminError> {
+async fn find_group_by_normalized_name_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    name: &str,
+) -> Result<Option<GroupRow>, AdminError> {
+    let lowered = name.to_ascii_lowercase();
+    Ok(sqlx::query_as::<_, GroupRow>(
+        r"
+        SELECT id, name, description
+        FROM vault_groups
+        WHERE lower(name) = ?
+        ",
+    )
+    .bind(lowered)
+    .fetch_optional(&mut **transaction)
+    .await?)
+}
+
+async fn groups_by_id_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+) -> Result<HashMap<i64, GroupRow>, AdminError> {
     Ok(
         sqlx::query_as::<_, GroupRow>("SELECT id, name, description FROM vault_groups")
-            .fetch_all(pool)
+            .fetch_all(&mut **transaction)
             .await?
             .into_iter()
             .map(|group| (group.id, group))
@@ -669,14 +748,16 @@ async fn groups_by_id(pool: &SqlitePool) -> Result<HashMap<i64, GroupRow>, Admin
     )
 }
 
-async fn all_memberships(pool: &SqlitePool) -> Result<Vec<MembershipRow>, AdminError> {
+async fn all_memberships_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+) -> Result<Vec<MembershipRow>, AdminError> {
     Ok(sqlx::query_as::<_, MembershipRow>(
         r"
         SELECT user_id, group_id
         FROM vault_group_memberships
         ",
     )
-    .fetch_all(pool)
+    .fetch_all(&mut **transaction)
     .await?)
 }
 

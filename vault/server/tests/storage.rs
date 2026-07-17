@@ -4,9 +4,10 @@ use std::sync::{Arc, Mutex};
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use vault_server::storage::{
-    BlobReadRange, LocalBlobStorage, LocalDurabilityHook, LocalDurabilityPoint, STORAGE_CHUNK_SIZE,
-    StorageError, is_multipart_part_key, multipart_manifest_key_for_hash,
+    BlobLocation, BlobReadRange, LocalBlobStorage, LocalDurabilityHook, LocalDurabilityPoint,
+    STORAGE_CHUNK_SIZE, StorageError, is_multipart_part_key, multipart_manifest_key_for_hash,
     multipart_part_key_for_hash, multipart_part_key_for_hash_layout, object_key_for_hash,
+    open_ranked_location_stream,
 };
 
 #[derive(Debug)]
@@ -319,6 +320,94 @@ async fn verified_part_files_promote_to_manifest_without_listing_parts() {
         Vec::<String>::new(),
     );
     assert!(published_part_paths.iter().all(|path| !path.exists()));
+}
+
+#[tokio::test]
+async fn multipart_ranges_prevalidate_only_the_parts_they_can_expose() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let (sources, digest) = multipart_sources(&temp_dir.path().join("sources")).await;
+    let storage = test_storage(&temp_dir.path().join("store"));
+    let multipart = storage
+        .put_part_files(&sources, Some(&digest))
+        .await
+        .expect("multipart object");
+    let fallback = storage.put_bytes(b"abcdef").await.expect("fallback object");
+    let manifest = storage
+        .read_multipart_manifest(&multipart.object_key)
+        .await
+        .expect("multipart manifest");
+    let missing_later_part = manifest.parts[1].path.clone();
+    assert!(missing_later_part.starts_with(storage.root()));
+    tokio::fs::remove_file(&missing_later_part)
+        .await
+        .expect("remove exact later test part");
+
+    let first_part_location = [BlobLocation {
+        backend: multipart.backend.clone(),
+        bucket: multipart.bucket.clone(),
+        object_key: multipart.object_key.clone(),
+    }];
+    let mut first_part = open_ranked_location_stream(
+        &storage,
+        &first_part_location,
+        BlobReadRange {
+            expected_size: 6,
+            offset: 0,
+            length: 3,
+        },
+    )
+    .await
+    .expect("range wholly inside healthy first part");
+    assert_eq!(
+        first_part
+            .next()
+            .await
+            .expect("first-part frame")
+            .expect("first-part bytes"),
+        b"abc"[..]
+    );
+    assert!(first_part.next().await.is_none());
+
+    let crossing = storage
+        .stream_range(
+            &multipart.object_key,
+            BlobReadRange {
+                expected_size: 6,
+                offset: 2,
+                length: 2,
+            },
+        )
+        .await;
+    assert!(matches!(crossing, Err(StorageError::NotFound)));
+
+    let locations = [
+        BlobLocation {
+            backend: multipart.backend,
+            bucket: multipart.bucket,
+            object_key: multipart.object_key,
+        },
+        BlobLocation {
+            backend: fallback.backend,
+            bucket: fallback.bucket,
+            object_key: fallback.object_key,
+        },
+    ];
+    let mut full = open_ranked_location_stream(
+        &storage,
+        &locations,
+        BlobReadRange {
+            expected_size: 6,
+            offset: 0,
+            length: 6,
+        },
+    )
+    .await
+    .expect("full range fails over before exposing multipart bytes");
+    let mut content = Vec::new();
+    while let Some(frame) = full.next().await {
+        content.extend_from_slice(&frame.expect("fallback frame"));
+    }
+    assert_eq!(content, b"abcdef");
 }
 
 #[tokio::test]

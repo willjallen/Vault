@@ -13,7 +13,7 @@ use aws_sdk_s3::config::Region;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::{Client as S3Client, Config as S3ClientConfig};
 use axum::body::Bytes;
-use futures_util::{Stream, stream};
+use futures_util::{Stream, StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -36,6 +36,13 @@ pub const STORAGE_MULTIPART_MAX_PARTS: usize = 1024;
 pub type SharedBlobStorage = Arc<dyn BlobStorageBackend>;
 /// Storage implementations must emit nonempty frames no larger than [`STORAGE_CHUNK_SIZE`].
 pub type BlobByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, StorageError>> + Send + 'static>>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobLocation {
+    pub backend: String,
+    pub bucket: String,
+    pub object_key: String,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlobReadRange {
@@ -267,6 +274,103 @@ pub trait BlobStorageBackend: std::fmt::Debug + Send + Sync {
             Err(StorageError::BackendMismatch)
         }
     }
+}
+
+/// Returns the locations that the active backend can serve, in failover order.
+///
+/// Callers provide locations in database order. Exact backend/bucket matches are
+/// preferred; an empty bucket is accepted second for legacy rows created before
+/// bucket identity was persisted. Locations for another backend or bucket are
+/// deliberately skipped instead of being attempted through the active client.
+fn ranked_blob_locations<'a>(
+    storage: &dyn BlobStorageBackend,
+    locations: &'a [BlobLocation],
+) -> Vec<&'a BlobLocation> {
+    let backend = storage.name();
+    let bucket = storage.bucket();
+    let mut ranked = locations
+        .iter()
+        .filter(|location| location.backend == backend && location.bucket == bucket)
+        .collect::<Vec<_>>();
+    if !bucket.is_empty() {
+        ranked.extend(
+            locations
+                .iter()
+                .filter(|location| location.backend == backend && location.bucket.is_empty()),
+        );
+    }
+    ranked
+}
+
+/// Retains the most actionable failure observed while probing blob copies.
+/// Missing or incompatible copies must not hide corruption, I/O, or lifecycle
+/// failures from another otherwise serviceable location.
+fn remember_blob_location_error(current: &mut Option<StorageError>, candidate: StorageError) {
+    fn priority(error: &StorageError) -> u8 {
+        match error {
+            StorageError::BackendMismatch | StorageError::NotFound => 0,
+            StorageError::Busy => 2,
+            _ => 1,
+        }
+    }
+    if current
+        .as_ref()
+        .is_none_or(|error| priority(&candidate) > priority(error))
+    {
+        *current = Some(candidate);
+    }
+}
+
+/// Opens the first usable active-backend copy and validates one bounded frame
+/// before returning it to a response or ZIP writer. Failover ends once the
+/// returned stream is consumed, so callers can never splice locations after
+/// exposing bytes.
+pub async fn open_ranked_location_stream(
+    storage: &dyn BlobStorageBackend,
+    locations: &[BlobLocation],
+    range: BlobReadRange,
+) -> Result<BlobByteStream, StorageError> {
+    range.validate()?;
+    let locations = ranked_blob_locations(storage, locations);
+    if locations.is_empty() {
+        return Err(StorageError::BackendMismatch);
+    }
+    let mut preferred_error = None;
+    for location in locations {
+        let mut source = match storage
+            .stream_location_range(
+                &location.backend,
+                &location.bucket,
+                &location.object_key,
+                range,
+            )
+            .await
+        {
+            Ok(source) => source,
+            Err(error) => {
+                remember_blob_location_error(&mut preferred_error, error);
+                continue;
+            }
+        };
+        match source.next().await {
+            None if range.length == 0 => return Ok(source),
+            Some(Ok(first))
+                if range.length > 0
+                    && !first.is_empty()
+                    && first.len() <= STORAGE_CHUNK_SIZE
+                    && first.len() as u64 <= range.length =>
+            {
+                return Ok(Box::pin(
+                    stream::once(async move { Ok(first) }).chain(source),
+                ));
+            }
+            Some(Err(error)) => remember_blob_location_error(&mut preferred_error, error),
+            Some(Ok(_)) | None => {
+                remember_blob_location_error(&mut preferred_error, StorageError::ContentMismatch);
+            }
+        }
+    }
+    Err(preferred_error.unwrap_or(StorageError::BackendMismatch))
 }
 
 #[derive(Debug, Clone)]
@@ -822,6 +926,11 @@ impl LocalBlobStorage {
             if manifest.size_bytes != range.expected_size {
                 return Err(StorageError::ContentMismatch);
             }
+            // Validate every part the requested range can reach before a caller
+            // selects this location. Once a response body exposes its prefetched
+            // frame, switching copies would splice two objects into one download.
+            // Tiny range probes do not pay an O(total multipart parts) stat cost.
+            validate_multipart_range_parts(&manifest, range).await?;
             return multipart_range_stream(manifest, range, read_guard).await;
         }
 
@@ -1703,6 +1812,45 @@ async fn multipart_range_stream(
             }
         },
     )))
+}
+
+async fn validate_multipart_range_parts(
+    manifest: &LocalMultipartManifest,
+    range: BlobReadRange,
+) -> Result<(), StorageError> {
+    if range.length == 0 {
+        return Ok(());
+    }
+    let range_end = range
+        .offset
+        .checked_add(range.length)
+        .ok_or(StorageError::InvalidRange)?;
+    let mut part_start = 0_u64;
+    for part in &manifest.parts {
+        let part_end = part_start
+            .checked_add(part.size_bytes)
+            .ok_or(StorageError::InvalidMultipartManifest)?;
+        if part_end > range.offset && part_start < range_end {
+            let metadata = match fs::metadata(&part.path).await {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(StorageError::NotFound);
+                }
+                Err(error) => return Err(StorageError::Io(error)),
+            };
+            if !metadata.is_file() {
+                return Err(StorageError::NotFound);
+            }
+            if metadata.len() != part.size_bytes {
+                return Err(StorageError::InvalidMultipartManifest);
+            }
+        }
+        if part_end >= range_end {
+            break;
+        }
+        part_start = part_end;
+    }
+    Ok(())
 }
 
 async fn open_multipart_part(

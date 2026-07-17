@@ -15,6 +15,7 @@ use crate::folders::{
     subtree_folder_ids_from_records,
 };
 use crate::state_events::state_event_resources_json;
+use crate::storage::BlobLocation;
 
 #[derive(Debug, Clone, PartialEq, Eq, FromRow)]
 pub struct DocumentRecord {
@@ -77,9 +78,7 @@ pub struct VersionDownload {
     pub hash_algo: String,
     pub hash: String,
     pub size_bytes: i64,
-    pub backend: String,
-    pub bucket: String,
-    pub object_key: String,
+    pub locations: Vec<BlobLocation>,
 }
 
 #[derive(Debug, Error)]
@@ -172,9 +171,7 @@ struct VersionDownloadRow {
     hash_algo: String,
     hash: String,
     size_bytes: i64,
-    backend: Option<String>,
-    bucket: Option<String>,
-    object_key: Option<String>,
+    blob_id: i64,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -592,19 +589,11 @@ pub async fn version_download_by_id(
             b.hash_algo,
             b.hash,
             b.size_bytes,
-            bl.backend,
-            bl.bucket,
-            bl.object_key
+            b.id AS blob_id
         FROM document_versions v
         JOIN documents d ON d.id = v.document_id
         JOIN blobs b ON b.id = v.blob_id
-        LEFT JOIN blob_locations bl
-         ON bl.blob_id = b.id
-         AND bl.backend NOT GLOB '_vault_pending:*'
-         AND bl.backend NOT GLOB '_vault_deleting:*'
         WHERE d.id = ? AND v.id = ?
-        ORDER BY CASE WHEN bl.backend = 'local' THEN 0 ELSE 1 END, bl.id
-        LIMIT 1
         ",
     )
     .bind(document.id)
@@ -614,14 +603,31 @@ pub async fn version_download_by_id(
     else {
         return Err(DocumentError::VersionNotFound);
     };
-    let object_key = row
-        .object_key
-        .filter(|object_key| !object_key.trim().is_empty())
-        .ok_or(DocumentError::BlobHasNoStorageLocation)?;
-    let backend = row
-        .backend
-        .filter(|backend| !backend.trim().is_empty())
-        .ok_or(DocumentError::BlobHasNoStorageLocation)?;
+    let locations = sqlx::query_as::<_, (String, String, String)>(
+        r"
+        SELECT backend, bucket, object_key
+        FROM blob_locations
+        WHERE blob_id = ?
+          AND backend NOT GLOB '_vault_pending:*'
+          AND backend NOT GLOB '_vault_deleting:*'
+          AND TRIM(backend) != ''
+          AND TRIM(object_key) != ''
+        ORDER BY id
+        ",
+    )
+    .bind(row.blob_id)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|(backend, bucket, object_key)| BlobLocation {
+        backend,
+        bucket,
+        object_key,
+    })
+    .collect::<Vec<_>>();
+    if locations.is_empty() {
+        return Err(DocumentError::BlobHasNoStorageLocation);
+    }
     let row_document = DocumentRecord {
         id: row.document_id,
         folder_id: row.folder_id,
@@ -648,9 +654,7 @@ pub async fn version_download_by_id(
         hash_algo: row.hash_algo,
         hash: row.hash,
         size_bytes: row.size_bytes,
-        backend,
-        bucket: row.bucket.unwrap_or_default(),
-        object_key,
+        locations,
     })
 }
 

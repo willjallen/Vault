@@ -33,8 +33,8 @@ use crate::folders::{
     subtree_folder_ids_from_records,
 };
 use crate::storage::{
-    BlobByteStream, BlobReadRange, BlobStorageBackend, BlobWriteKind, STORAGE_CHUNK_SIZE,
-    SharedBlobStorage, StorageError,
+    BlobByteStream, BlobLocation, BlobReadRange, BlobStorageBackend, BlobWriteKind,
+    STORAGE_CHUNK_SIZE, SharedBlobStorage, StorageError, open_ranked_location_stream,
 };
 
 const EXPORT_TTL_SECONDS: i64 = 86_400;
@@ -240,9 +240,7 @@ pub struct ExportArtifactDownload {
     pub hash_algo: String,
     pub hash: String,
     pub size_bytes: i64,
-    pub backend: String,
-    pub bucket: String,
-    pub object_key: String,
+    pub locations: Vec<BlobLocation>,
 }
 
 #[derive(Debug, Error)]
@@ -317,9 +315,7 @@ struct ExportArtifactRow {
     size_bytes: Option<i64>,
     hash_algo: Option<String>,
     hash: Option<String>,
-    backend: Option<String>,
-    bucket: Option<String>,
-    object_key: Option<String>,
+    blob_id: Option<i64>,
 }
 
 #[derive(Debug, FromRow)]
@@ -831,17 +827,10 @@ pub async fn export_artifact_download(
             a.size_bytes,
             a.hash_algo,
             a.hash,
-            l.backend,
-            l.bucket,
-            l.object_key
+            a.blob_id
         FROM export_jobs j
         LEFT JOIN export_artifacts a ON a.job_id = j.id
-        LEFT JOIN blob_locations l
-         ON l.blob_id = a.blob_id
-         AND l.backend NOT GLOB '_vault_pending:*'
-         AND l.backend NOT GLOB '_vault_deleting:*'
         WHERE j.id = ?
-        ORDER BY a.id, l.id
         LIMIT 1
         ",
     )
@@ -856,6 +845,32 @@ pub async fn export_artifact_download(
     if row.status != "complete" {
         return Err(ExportError::ExportNotComplete);
     }
+    let blob_id = row.blob_id.ok_or(ExportError::ExportNotComplete)?;
+    let locations = sqlx::query_as::<_, (String, String, String)>(
+        r"
+        SELECT backend, bucket, object_key
+        FROM blob_locations
+        WHERE blob_id = ?
+          AND backend NOT GLOB '_vault_pending:*'
+          AND backend NOT GLOB '_vault_deleting:*'
+          AND TRIM(backend) != ''
+          AND TRIM(object_key) != ''
+        ORDER BY id
+        ",
+    )
+    .bind(blob_id)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|(backend, bucket, object_key)| BlobLocation {
+        backend,
+        bucket,
+        object_key,
+    })
+    .collect::<Vec<_>>();
+    if locations.is_empty() {
+        return Err(ExportError::ArtifactMissingStorageLocation);
+    }
     Ok(ExportArtifactDownload {
         job_id: row.job_id,
         filename: row
@@ -865,15 +880,7 @@ pub async fn export_artifact_download(
         hash_algo: row.hash_algo.ok_or(ExportError::ExportNotComplete)?,
         hash: row.hash.ok_or(ExportError::ExportNotComplete)?,
         size_bytes: row.size_bytes.ok_or(ExportError::ExportNotComplete)?,
-        backend: row
-            .backend
-            .ok_or(ExportError::ArtifactMissingStorageLocation)?,
-        bucket: row
-            .bucket
-            .ok_or(ExportError::ArtifactMissingStorageLocation)?,
-        object_key: row
-            .object_key
-            .ok_or(ExportError::ArtifactMissingStorageLocation)?,
+        locations,
     })
 }
 
@@ -1562,12 +1569,7 @@ async fn open_export_source(
     download: &VersionDownload,
     range: BlobReadRange,
 ) -> Result<BlobByteStream, ExportError> {
-    let open = context.storage.stream_location_range(
-        &download.backend,
-        &download.bucket,
-        &download.object_key,
-        range,
-    );
+    let open = open_ranked_location_stream(context.storage, &download.locations, range);
     tokio::pin!(open);
     loop {
         tokio::select! {

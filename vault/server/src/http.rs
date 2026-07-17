@@ -70,7 +70,7 @@ use crate::state_events::{
 };
 use crate::storage::{
     BlobByteStream, BlobReadRange, BlobWriteKind, LocalBlobStorage, STORAGE_CHUNK_SIZE,
-    SharedBlobStorage, StorageError, StoredBlob, sha256_hex,
+    SharedBlobStorage, StorageError, StoredBlob, open_ranked_location_stream, sha256_hex,
 };
 use crate::transfers::{self, TransferMaintenanceError};
 use crate::uploads::{
@@ -1432,9 +1432,7 @@ async fn download_export_artifact(
         hash_algo: artifact.hash_algo,
         hash: artifact.hash,
         size_bytes: artifact.size_bytes,
-        backend: artifact.backend,
-        bucket: artifact.bucket,
-        object_key: artifact.object_key,
+        locations: artifact.locations,
     };
     version_download_response(&state, &download, &headers).await
 }
@@ -2479,20 +2477,17 @@ async fn version_download_response(
                 "Download capacity is currently exhausted; retry shortly".to_string(),
             )
         })?;
-    let body = state
-        .storage
-        .stream_location_range(
-            &download.backend,
-            &download.bucket,
-            &download.object_key,
-            BlobReadRange {
-                expected_size: size,
-                offset: range.start,
-                length: range.len,
-            },
-        )
-        .await
-        .map_err(|error| storage_download_error(error, size))?;
+    let body = open_ranked_location_stream(
+        state.storage.as_ref(),
+        &download.locations,
+        BlobReadRange {
+            expected_size: size,
+            offset: range.start,
+            length: range.len,
+        },
+    )
+    .await
+    .map_err(|error| storage_download_error(error, size))?;
     let mut response = Response::new(Body::from_stream(limit_download_stream(
         body, permit, range.len,
     )));

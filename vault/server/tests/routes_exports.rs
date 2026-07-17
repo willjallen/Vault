@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -79,6 +79,98 @@ async fn create_group(pool: &sqlx::SqlitePool, name: &str) -> i64 {
         .await
         .expect("create group")
         .last_insert_rowid()
+}
+
+#[derive(Debug)]
+struct FailoverExportStorage {
+    inner: LocalBlobStorage,
+    stream_calls: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl BlobStorageBackend for FailoverExportStorage {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn bucket(&self) -> &str {
+        self.inner.bucket()
+    }
+
+    async fn ensure(&self) -> Result<(), StorageError> {
+        self.inner.ensure().await
+    }
+
+    fn planned_object_key(
+        &self,
+        hash_algo: &str,
+        digest: &str,
+        write_kind: BlobWriteKind,
+    ) -> Result<String, StorageError> {
+        self.inner.planned_object_key(hash_algo, digest, write_kind)
+    }
+
+    async fn put_bytes(&self, data: &[u8]) -> Result<StoredBlob, StorageError> {
+        self.inner.put_bytes(data).await
+    }
+
+    async fn put_file(
+        &self,
+        source_path: &Path,
+        digest: &str,
+        size_bytes: u64,
+    ) -> Result<StoredBlob, StorageError> {
+        self.inner.put_file(source_path, digest, size_bytes).await
+    }
+
+    async fn put_part_files(
+        &self,
+        part_paths: &[PathBuf],
+        expected_digest: Option<&str>,
+    ) -> Result<StoredBlob, StorageError> {
+        self.inner.put_part_files(part_paths, expected_digest).await
+    }
+
+    async fn read_bytes(&self, object_key: &str) -> Result<Vec<u8>, StorageError> {
+        self.inner.read_bytes(object_key).await
+    }
+
+    async fn read_range(
+        &self,
+        object_key: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<u8>, StorageError> {
+        self.inner.read_range(object_key, start, end).await
+    }
+
+    async fn stream_range(
+        &self,
+        object_key: &str,
+        range: BlobReadRange,
+    ) -> Result<BlobByteStream, StorageError> {
+        self.stream_calls
+            .lock()
+            .expect("export failover calls")
+            .push(object_key.to_string());
+        match object_key {
+            "bad-first-source" => Ok(Box::pin(stream::once(async {
+                Err(StorageError::Remote(
+                    "injected export source first-frame failure".to_string(),
+                ))
+            }))),
+            "missing-artifact" => Err(StorageError::NotFound),
+            _ => self.inner.stream_range(object_key, range).await,
+        }
+    }
+
+    async fn list_object_keys(&self) -> Result<Vec<String>, StorageError> {
+        self.inner.list_object_keys().await
+    }
+
+    async fn delete_object(&self, object_key: &str) -> Result<(), StorageError> {
+        self.inner.delete_object(object_key).await
+    }
 }
 
 #[derive(Debug)]
@@ -1838,6 +1930,126 @@ async fn export_job_creates_downloadable_zip_for_folder() {
         .expect("artifact count");
     assert_eq!(artifact_count, 1);
     wait_for_export_event_count(&pool, 2).await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // One coupled E2E scenario covers source and artifact failover.
+async fn export_sources_and_artifacts_fail_over_before_exposing_bytes() {
+    let (mut state, _temp_dir) = test_state().await;
+    let stream_calls = Arc::new(Mutex::new(Vec::new()));
+    state.storage = Arc::new(FailoverExportStorage {
+        inner: LocalBlobStorage::new(state.config.objects_path(), &state.config.storage_prefix),
+        stream_calls: Arc::clone(&stream_calls),
+    });
+    let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
+        .await
+        .expect("root");
+    let source = b"the prefetched export source frame appears exactly once";
+    let document_id =
+        insert_stored_document(&state.db, &state.storage, root.id, "failover.txt", source).await;
+    let (source_location_id, source_blob_id, source_object_key) =
+        sqlx::query_as::<_, (i64, i64, String)>(
+            r"
+            SELECT l.id, l.blob_id, l.object_key
+            FROM document_versions v
+            JOIN blob_locations l ON l.blob_id = v.blob_id
+            WHERE v.document_id = ?
+            ORDER BY l.id
+            LIMIT 1
+            ",
+        )
+        .bind(document_id)
+        .fetch_one(&state.db)
+        .await
+        .expect("source location");
+    sqlx::query("UPDATE blob_locations SET object_key = 'bad-first-source' WHERE id = ?")
+        .bind(source_location_id)
+        .execute(&state.db)
+        .await
+        .expect("stale source location");
+    sqlx::query(
+        "INSERT INTO blob_locations (blob_id, backend, bucket, object_key) VALUES (?, 'local', '', ?)",
+    )
+    .bind(source_blob_id)
+    .bind(&source_object_key)
+    .execute(&state.db)
+    .await
+    .expect("healthy source location");
+    let pool = state.db.clone();
+    let app = http::router(state);
+
+    let queued = app
+        .clone()
+        .oneshot(authed_json_post(
+            "/api/exports",
+            "admin",
+            "vault-admin",
+            &json!({"items": [{"type": "document", "id": document_id}]}),
+        ))
+        .await
+        .expect("export response");
+    assert_eq!(queued.status(), StatusCode::OK);
+    let job_id = response_json(queued).await["id"]
+        .as_str()
+        .expect("job id")
+        .to_string();
+    let completed =
+        wait_for_export_status(app.clone(), &job_id, "admin", "vault-admin", "complete").await;
+
+    let (artifact_location_id, artifact_blob_id, artifact_object_key) =
+        sqlx::query_as::<_, (i64, i64, String)>(
+            r"
+            SELECT l.id, l.blob_id, l.object_key
+            FROM export_artifacts a
+            JOIN blob_locations l ON l.blob_id = a.blob_id
+            WHERE a.job_id = ?
+            ORDER BY l.id
+            LIMIT 1
+            ",
+        )
+        .bind(&job_id)
+        .fetch_one(&pool)
+        .await
+        .expect("artifact location");
+    sqlx::query("UPDATE blob_locations SET object_key = 'missing-artifact' WHERE id = ?")
+        .bind(artifact_location_id)
+        .execute(&pool)
+        .await
+        .expect("stale artifact location");
+    sqlx::query(
+        "INSERT INTO blob_locations (blob_id, backend, bucket, object_key) VALUES (?, 'local', '', ?)",
+    )
+    .bind(artifact_blob_id)
+    .bind(&artifact_object_key)
+    .execute(&pool)
+    .await
+    .expect("healthy artifact location");
+
+    let download = app
+        .oneshot(authed_get(
+            completed["download_url"].as_str().expect("download url"),
+            "admin",
+            "vault-admin",
+        ))
+        .await
+        .expect("artifact failover response");
+    assert_eq!(download.status(), StatusCode::OK);
+    let zip = to_bytes(download.into_body(), usize::MAX)
+        .await
+        .expect("artifact body");
+    let entries = local_zip_entries(&zip);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].name, "failover.txt");
+    assert_eq!(zip_entry_payload(&entries[0]), source);
+    assert_eq!(
+        *stream_calls.lock().expect("export failover calls"),
+        [
+            "bad-first-source",
+            source_object_key.as_str(),
+            "missing-artifact",
+            artifact_object_key.as_str(),
+        ]
+    );
 }
 
 #[tokio::test]

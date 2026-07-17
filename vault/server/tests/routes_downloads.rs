@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -42,6 +42,134 @@ struct GatedStreamStorage {
     produced_chunks: Arc<AtomicUsize>,
     release: Arc<Notify>,
     waiting: Arc<Notify>,
+}
+
+#[derive(Debug)]
+struct FailoverStorage {
+    calls: Arc<Mutex<Vec<String>>>,
+    data: Vec<u8>,
+}
+
+#[async_trait]
+impl BlobStorageBackend for FailoverStorage {
+    fn name(&self) -> &'static str {
+        "s3"
+    }
+
+    fn bucket(&self) -> &'static str {
+        "active-bucket"
+    }
+
+    async fn ensure(&self) -> Result<(), StorageError> {
+        Ok(())
+    }
+
+    async fn put_bytes(&self, _data: &[u8]) -> Result<StoredBlob, StorageError> {
+        Err(StorageError::UnsupportedOperation(
+            "test storage is read-only".to_string(),
+        ))
+    }
+
+    async fn put_file(
+        &self,
+        _source_path: &Path,
+        _digest: &str,
+        _size_bytes: u64,
+    ) -> Result<StoredBlob, StorageError> {
+        Err(StorageError::UnsupportedOperation(
+            "test storage is read-only".to_string(),
+        ))
+    }
+
+    async fn put_part_files(
+        &self,
+        _part_paths: &[PathBuf],
+        _expected_digest: Option<&str>,
+    ) -> Result<StoredBlob, StorageError> {
+        Err(StorageError::UnsupportedOperation(
+            "test storage is read-only".to_string(),
+        ))
+    }
+
+    async fn read_bytes(&self, _object_key: &str) -> Result<Vec<u8>, StorageError> {
+        Err(StorageError::UnsupportedOperation(
+            "failover must use the canonical stream".to_string(),
+        ))
+    }
+
+    async fn read_range(
+        &self,
+        _object_key: &str,
+        _start: u64,
+        _end: u64,
+    ) -> Result<Vec<u8>, StorageError> {
+        Err(StorageError::UnsupportedOperation(
+            "failover must use the canonical stream".to_string(),
+        ))
+    }
+
+    async fn stream_range(
+        &self,
+        object_key: &str,
+        range: BlobReadRange,
+    ) -> Result<BlobByteStream, StorageError> {
+        self.calls
+            .lock()
+            .expect("failover calls")
+            .push(object_key.to_string());
+        if range.expected_size != self.data.len() as u64
+            || range.offset.saturating_add(range.length) > range.expected_size
+        {
+            return Err(StorageError::InvalidRange);
+        }
+        match object_key {
+            "busy-exact" => Err(StorageError::Busy),
+            "bad-first-frame" => Ok(Box::pin(stream::once(async {
+                Err(StorageError::Remote(
+                    "injected first-frame failure".to_string(),
+                ))
+            }))),
+            "midstream-failure" => {
+                let split = self.data.len().min(4);
+                let first = self.data[..split].to_vec();
+                Ok(Box::pin(stream::iter([
+                    Ok(first.into()),
+                    Err(StorageError::Remote(
+                        "injected midstream failure".to_string(),
+                    )),
+                ])))
+            }
+            "healthy-exact" | "healthy-legacy" | "healthy-after-midstream" => {
+                let start =
+                    usize::try_from(range.offset).map_err(|_| StorageError::InvalidRange)?;
+                let end = usize::try_from(range.offset + range.length)
+                    .map_err(|_| StorageError::InvalidRange)?;
+                let bytes = self
+                    .data
+                    .get(start..end)
+                    .ok_or(StorageError::InvalidRange)?
+                    .to_vec();
+                if bytes.is_empty() {
+                    Ok(Box::pin(stream::empty()))
+                } else {
+                    Ok(Box::pin(stream::once(async move { Ok(bytes.into()) })))
+                }
+            }
+            _ => Err(StorageError::NotFound),
+        }
+    }
+
+    async fn list_object_keys(&self) -> Result<Vec<String>, StorageError> {
+        Err(StorageError::UnsupportedOperation(
+            "test storage cannot list objects".to_string(),
+        ))
+    }
+
+    async fn delete_object(&self, _object_key: &str) -> Result<(), StorageError> {
+        Err(StorageError::UnsupportedOperation(
+            "test storage cannot delete objects".to_string(),
+        ))
+    }
 }
 
 #[derive(Debug)]
@@ -153,7 +281,11 @@ impl BlobStorageBackend for RangeOnlyStorage {
             .get(start..end)
             .ok_or(StorageError::InvalidRange)?
             .to_vec();
-        Ok(Box::pin(stream::once(async move { Ok(bytes.into()) })))
+        if bytes.is_empty() {
+            Ok(Box::pin(stream::empty()))
+        } else {
+            Ok(Box::pin(stream::once(async move { Ok(bytes.into()) })))
+        }
     }
 
     async fn list_object_keys(&self) -> Result<Vec<String>, StorageError> {
@@ -859,6 +991,178 @@ async fn midstream_storage_failure_is_not_reported_as_clean_eof_and_releases_cap
 }
 
 #[tokio::test]
+async fn download_prefers_active_bucket_and_fails_over_before_exposing_bytes() {
+    let data = b"healthy failover bytes".to_vec();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let storage = Arc::new(FailoverStorage {
+        calls: Arc::clone(&calls),
+        data: data.clone(),
+    });
+    let (state, _temp_dir) = test_state(storage).await;
+    let project_id = grant_reader_project(&state).await;
+    let document_id =
+        insert_downloadable_document(&state.db, project_id, "stale-local-copy", &data).await;
+    let blob_id: i64 =
+        sqlx::query_scalar("SELECT blob_id FROM document_versions WHERE document_id = ?")
+            .bind(document_id)
+            .fetch_one(&state.db)
+            .await
+            .expect("download blob id");
+    for (bucket, object_key) in [
+        ("", "healthy-legacy"),
+        ("other-bucket", "wrong-bucket"),
+        ("active-bucket", "missing-exact"),
+        ("active-bucket", "bad-first-frame"),
+        ("active-bucket", "healthy-exact"),
+    ] {
+        sqlx::query(
+            "INSERT INTO blob_locations (blob_id, backend, bucket, object_key) VALUES (?, 's3', ?, ?)",
+        )
+        .bind(blob_id)
+        .bind(bucket)
+        .bind(object_key)
+        .execute(&state.db)
+        .await
+        .expect("alternate blob location");
+    }
+
+    let pool = state.db.clone();
+    let app = http::router(state);
+    let response = app
+        .clone()
+        .oneshot(authed_get(&format!("/documents/{document_id}/download")))
+        .await
+        .expect("failover response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        to_bytes(response.into_body(), data.len())
+            .await
+            .expect("failover body"),
+        data
+    );
+    assert_eq!(
+        *calls.lock().expect("failover calls"),
+        ["missing-exact", "bad-first-frame", "healthy-exact"]
+    );
+
+    calls.lock().expect("failover calls").clear();
+    sqlx::query(
+        "UPDATE blob_locations SET object_key = 'missing-exact-two' WHERE object_key = 'healthy-exact'",
+    )
+    .execute(&pool)
+    .await
+    .expect("make exact copies unavailable");
+    let legacy = app
+        .oneshot(authed_get(&format!("/documents/{document_id}/download")))
+        .await
+        .expect("legacy fallback response");
+    assert_eq!(legacy.status(), StatusCode::OK);
+    assert_eq!(
+        to_bytes(legacy.into_body(), data.len())
+            .await
+            .expect("legacy fallback body"),
+        data
+    );
+    assert_eq!(
+        *calls.lock().expect("failover calls"),
+        [
+            "missing-exact",
+            "bad-first-frame",
+            "missing-exact-two",
+            "healthy-legacy",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn download_never_switches_locations_after_the_first_frame() {
+    let data = b"midstream failover must not splice".to_vec();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let storage = Arc::new(FailoverStorage {
+        calls: Arc::clone(&calls),
+        data: data.clone(),
+    });
+    let (state, _temp_dir) = test_state(storage).await;
+    let project_id = grant_reader_project(&state).await;
+    let document_id = insert_downloadable_document(&state.db, project_id, "old-local", &data).await;
+    let blob_id: i64 =
+        sqlx::query_scalar("SELECT blob_id FROM document_versions WHERE document_id = ?")
+            .bind(document_id)
+            .fetch_one(&state.db)
+            .await
+            .expect("download blob id");
+    for object_key in ["midstream-failure", "healthy-after-midstream"] {
+        sqlx::query(
+            "INSERT INTO blob_locations (blob_id, backend, bucket, object_key) VALUES (?, 's3', 'active-bucket', ?)",
+        )
+        .bind(blob_id)
+        .bind(object_key)
+        .execute(&state.db)
+        .await
+        .expect("alternate blob location");
+    }
+
+    let response = http::router(state)
+        .oneshot(authed_get(&format!("/documents/{document_id}/download")))
+        .await
+        .expect("midstream response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body().into_data_stream();
+    assert_eq!(
+        body.next()
+            .await
+            .expect("prefetched frame")
+            .expect("prefetched bytes"),
+        &data[..4]
+    );
+    assert!(body.next().await.expect("failure frame").is_err());
+    assert_eq!(
+        *calls.lock().expect("failover calls"),
+        ["midstream-failure"]
+    );
+}
+
+#[tokio::test]
+async fn transient_alternate_failure_is_not_masked_by_a_missing_copy() {
+    let data = b"busy failover".to_vec();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let storage = Arc::new(FailoverStorage {
+        calls: Arc::clone(&calls),
+        data: data.clone(),
+    });
+    let (state, _temp_dir) = test_state(storage).await;
+    let project_id = grant_reader_project(&state).await;
+    let document_id = insert_downloadable_document(&state.db, project_id, "old-local", &data).await;
+    let blob_id: i64 =
+        sqlx::query_scalar("SELECT blob_id FROM document_versions WHERE document_id = ?")
+            .bind(document_id)
+            .fetch_one(&state.db)
+            .await
+            .expect("download blob id");
+    for object_key in ["missing-exact", "busy-exact"] {
+        sqlx::query(
+            "INSERT INTO blob_locations (blob_id, backend, bucket, object_key) VALUES (?, 's3', 'active-bucket', ?)",
+        )
+        .bind(blob_id)
+        .bind(object_key)
+        .execute(&state.db)
+        .await
+        .expect("alternate blob location");
+    }
+
+    let response = http::router(state)
+        .oneshot(authed_get(&format!("/documents/{document_id}/download")))
+        .await
+        .expect("busy response");
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers()["retry-after"], "1");
+    assert_eq!(
+        *calls.lock().expect("failover calls"),
+        ["missing-exact", "busy-exact"]
+    );
+}
+
+#[tokio::test]
 async fn oversized_backend_frame_is_rejected_and_releases_capacity() {
     let logical_size = u64::try_from(STORAGE_CHUNK_SIZE + 1).expect("logical size");
     let active_streams = Arc::new(AtomicUsize::new(0));
@@ -891,8 +1195,7 @@ async fn oversized_backend_frame_is_rejected_and_releases_capacity() {
         .oneshot(authed_get(&format!("/documents/{document_id}/download")))
         .await
         .expect("download response");
-    let mut body = response.into_body().into_data_stream();
-    assert!(body.next().await.expect("failure frame").is_err());
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(active_streams.load(Ordering::SeqCst), 0);
 }
 

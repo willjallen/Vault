@@ -937,6 +937,7 @@ async fn upload_session_caps_chunks_for_bounded_client_integrity_hashing() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // One resume flow covers checksum-free upload and sidecar repair.
 async fn upload_part_does_not_require_client_checksum_header() {
     let (state, temp_dir) = test_state().await;
     grant_writer_root(&state.db).await;
@@ -1016,7 +1017,22 @@ async fn upload_part_does_not_require_client_checksum_header() {
         .oneshot(upload_part_request(&session_id, 1, data))
         .await
         .expect("checksum duplicate");
-    assert_eq!(checksum_duplicate.status(), StatusCode::CONFLICT);
+    assert_eq!(checksum_duplicate.status(), StatusCode::NO_CONTENT);
+    assert!(session_dir.join("00000001.json").is_file());
+    let repaired = app
+        .clone()
+        .oneshot(authed_request(
+            Method::GET,
+            &format!("/api/uploads/{session_id}"),
+            Body::empty(),
+        ))
+        .await
+        .expect("resume repaired upload");
+    let repaired_json = response_json(repaired).await;
+    assert_eq!(
+        repaired_json["uploaded_parts"][0]["sha256"],
+        sha256_hex(data)
+    );
 
     assert_rejected_completion_preserves_part(
         &app,
@@ -1035,6 +1051,63 @@ async fn upload_part_does_not_require_client_checksum_header() {
     )
     .await;
     complete_upload_with_manifest_and_assert_download(app, &session_id, data).await;
+}
+
+#[tokio::test]
+async fn upload_resume_ignores_sidecars_without_a_matching_final_part() {
+    let (state, _temp_dir) = test_state().await;
+    grant_writer_root(&state.db).await;
+    let transfers_path = state.config.transfers_path();
+    let app = http::router(state);
+    let data = b"abcd";
+    let created = create_upload_session_for_size(
+        app.clone(),
+        i64::try_from(data.len()).expect("upload size"),
+        None,
+    )
+    .await;
+    let session_id = created["id"].as_str().expect("session id");
+    let session_dir = transfers_path.join("uploads").join(session_id);
+    tokio::fs::write(
+        session_dir.join("00000001.json"),
+        serde_json::to_vec(&json!({
+            "part_number": 1,
+            "offset_bytes": 0,
+            "size_bytes": data.len(),
+            "sha256": sha256_hex(data)
+        }))
+        .expect("part metadata"),
+    )
+    .await
+    .expect("write sidecar without part");
+
+    let sidecar_only = app
+        .clone()
+        .oneshot(authed_request(
+            Method::GET,
+            &format!("/api/uploads/{session_id}"),
+            Body::empty(),
+        ))
+        .await
+        .expect("resume sidecar-only upload");
+    let sidecar_only = response_json(sidecar_only).await;
+    assert_eq!(sidecar_only["uploaded_bytes"], 0);
+    assert_eq!(sidecar_only["uploaded_parts"], json!([]));
+
+    tokio::fs::write(session_dir.join("00000001.part"), b"abc")
+        .await
+        .expect("write wrong-sized final part");
+    let wrong_size = app
+        .oneshot(authed_request(
+            Method::GET,
+            &format!("/api/uploads/{session_id}"),
+            Body::empty(),
+        ))
+        .await
+        .expect("resume wrong-sized upload");
+    let wrong_size = response_json(wrong_size).await;
+    assert_eq!(wrong_size["uploaded_bytes"], 0);
+    assert_eq!(wrong_size["uploaded_parts"], json!([]));
 }
 
 #[tokio::test]
@@ -3159,7 +3232,7 @@ async fn part_read_failure_returns_to_active_and_preserves_retry_data() {
     .await
     .expect_err("missing part file should fail completion");
     assert!(
-        matches!(error, uploads::UploadError::Io(_)),
+        matches!(error, uploads::UploadError::UploadSessionMissingParts),
         "unexpected completion error: {error:?}"
     );
     assert_eq!(

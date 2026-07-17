@@ -1324,6 +1324,10 @@ struct LocalZipEntry {
     data_descriptor: Option<Vec<u8>>,
 }
 
+// Real file and directory durability barriers can take longer than one second
+// when the export tests publish several artifacts concurrently on a busy host.
+const EXPORT_EVENTUAL_ASSERTION_ATTEMPTS: usize = 250;
+
 async fn wait_for_export_status(
     app: axum::Router,
     job_id: &str,
@@ -1331,7 +1335,7 @@ async fn wait_for_export_status(
     groups: &str,
     expected: &str,
 ) -> Value {
-    for _ in 0..50 {
+    for _ in 0..EXPORT_EVENTUAL_ASSERTION_ATTEMPTS {
         let response = app
             .clone()
             .oneshot(authed_get(&format!("/api/exports/{job_id}"), user, groups))
@@ -1348,7 +1352,7 @@ async fn wait_for_export_status(
 }
 
 async fn wait_for_export_status_in_db(pool: &sqlx::SqlitePool, job_id: &str, expected: &str) {
-    for _ in 0..50 {
+    for _ in 0..EXPORT_EVENTUAL_ASSERTION_ATTEMPTS {
         let status = sqlx::query_scalar::<_, String>("SELECT status FROM export_jobs WHERE id = ?")
             .bind(job_id)
             .fetch_one(pool)
@@ -1368,7 +1372,7 @@ async fn wait_for_cancelled_export_cleanup(
     job_id: &str,
     expected_keys: &[String],
 ) {
-    for _ in 0..50 {
+    for _ in 0..EXPORT_EVENTUAL_ASSERTION_ATTEMPTS {
         let status: String = sqlx::query_scalar("SELECT status FROM export_jobs WHERE id = ?")
             .bind(job_id)
             .fetch_one(pool)
@@ -1411,7 +1415,7 @@ async fn wait_for_cancelled_export_cleanup(
 }
 
 async fn wait_for_path_missing(path: &Path) {
-    for _ in 0..50 {
+    for _ in 0..EXPORT_EVENTUAL_ASSERTION_ATTEMPTS {
         if tokio::fs::metadata(path).await.is_err() {
             return;
         }
@@ -1545,7 +1549,7 @@ async fn assert_export_zip_body_contains_project_files(app: axum::Router, downlo
 }
 
 async fn wait_for_export_event_count(pool: &sqlx::SqlitePool, expected: i64) {
-    for _ in 0..50 {
+    for _ in 0..EXPORT_EVENTUAL_ASSERTION_ATTEMPTS {
         let count = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM document_events WHERE event_type = 'download' AND message LIKE 'Exported Project/%'",
         )

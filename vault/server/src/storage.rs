@@ -99,6 +99,24 @@ pub struct LocalMultipartPartObject {
     pub modified_at: Option<SystemTime>,
 }
 
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalDurabilityPoint {
+    DirectoryCreated,
+    StagingDirectory,
+    ObjectFile,
+    ObjectDirectory,
+    MultipartPartFile,
+    MultipartPartDirectory,
+    MultipartManifestFile,
+    MultipartManifestDirectory,
+}
+
+#[doc(hidden)]
+pub trait LocalDurabilityHook: std::fmt::Debug + Send + Sync {
+    fn before_sync(&self, point: LocalDurabilityPoint, path: &Path) -> std::io::Result<()>;
+}
+
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error("invalid object key")]
@@ -257,6 +275,7 @@ pub struct LocalBlobStorage {
     prefix: Arc<str>,
     lifecycle_locks: Arc<ObjectLifecycleLocks>,
     multipart_inventory: Arc<Mutex<MultipartInventoryCursor>>,
+    durability_hook: Option<Arc<dyn LocalDurabilityHook>>,
 }
 
 #[derive(Debug, Clone)]
@@ -296,7 +315,7 @@ struct ManifestPartPayload {
 }
 
 enum MultipartManifestState {
-    Existing(u64),
+    Existing(LocalMultipartManifest),
     Missing,
     Replace,
 }
@@ -436,12 +455,30 @@ impl Drop for OwnedStageFile {
 impl LocalBlobStorage {
     #[must_use]
     pub fn new(root: impl Into<PathBuf>, prefix: impl AsRef<str>) -> Self {
-        let root = root.into();
+        Self::new_with_optional_durability_hook(root.into(), prefix.as_ref(), None)
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn new_with_durability_hook(
+        root: impl Into<PathBuf>,
+        prefix: impl AsRef<str>,
+        durability_hook: Arc<dyn LocalDurabilityHook>,
+    ) -> Self {
+        Self::new_with_optional_durability_hook(root.into(), prefix.as_ref(), Some(durability_hook))
+    }
+
+    fn new_with_optional_durability_hook(
+        root: PathBuf,
+        prefix: &str,
+        durability_hook: Option<Arc<dyn LocalDurabilityHook>>,
+    ) -> Self {
         Self {
             lifecycle_locks: shared_local_lifecycle_locks(&root),
             multipart_inventory: Arc::new(Mutex::new(MultipartInventoryCursor::default())),
             root: Arc::new(root),
-            prefix: Arc::from(normalize_storage_prefix(prefix.as_ref())),
+            prefix: Arc::from(normalize_storage_prefix(prefix)),
+            durability_hook,
         }
     }
 
@@ -456,7 +493,89 @@ impl LocalBlobStorage {
     }
 
     pub async fn ensure(&self) -> Result<(), StorageError> {
-        fs::create_dir_all(self.root()).await?;
+        self.create_dir_all_durable(self.root(), LocalDurabilityPoint::DirectoryCreated)
+            .await
+    }
+
+    fn before_sync(&self, point: LocalDurabilityPoint, path: &Path) -> Result<(), StorageError> {
+        if let Some(hook) = &self.durability_hook {
+            hook.before_sync(point, path)?;
+        }
+        Ok(())
+    }
+
+    async fn sync_open_file(
+        &self,
+        file: &fs::File,
+        path: &Path,
+        point: LocalDurabilityPoint,
+    ) -> Result<(), StorageError> {
+        self.before_sync(point, path)?;
+        file.sync_all().await?;
+        Ok(())
+    }
+
+    async fn sync_file_path(
+        &self,
+        path: &Path,
+        point: LocalDurabilityPoint,
+    ) -> Result<(), StorageError> {
+        #[cfg(windows)]
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .await?;
+        #[cfg(not(windows))]
+        let file = fs::File::open(path).await?;
+        let metadata = file.metadata().await?;
+        if !metadata.is_file() {
+            return Err(StorageError::ContentMismatch);
+        }
+        self.sync_open_file(&file, path, point).await
+    }
+
+    async fn sync_directory_at(
+        &self,
+        path: &Path,
+        point: LocalDurabilityPoint,
+    ) -> Result<(), StorageError> {
+        self.before_sync(point, path)?;
+        sync_directory(path).await
+    }
+
+    async fn create_dir_all_durable(
+        &self,
+        path: &Path,
+        point: LocalDurabilityPoint,
+    ) -> Result<(), StorageError> {
+        let absolute = std::path::absolute(path).map_err(StorageError::Io)?;
+        let mut missing = Vec::new();
+        let mut cursor = absolute.as_path();
+        loop {
+            match fs::symlink_metadata(cursor).await {
+                Ok(metadata)
+                    if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() =>
+                {
+                    break;
+                }
+                Ok(_) => return Err(StorageError::InvalidStoragePath),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    missing.push(cursor.to_path_buf());
+                    cursor = cursor.parent().ok_or(StorageError::InvalidStoragePath)?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        fs::create_dir_all(&absolute).await?;
+        for directory in missing.iter().rev() {
+            let metadata = fs::symlink_metadata(directory).await?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(StorageError::InvalidStoragePath);
+            }
+            let parent = directory.parent().ok_or(StorageError::InvalidStoragePath)?;
+            self.sync_directory_at(parent, point).await?;
+        }
         Ok(())
     }
 
@@ -485,14 +604,26 @@ impl LocalBlobStorage {
         let digest = sha256_hex(data);
         let object_key = self.object_key_for_hash("sha256", &digest);
         let target = self.object_path(&object_key)?;
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-        if !file_matches_digest(&target, &digest, data.len() as u64).await? {
+        let parent = target.parent().ok_or(StorageError::InvalidStoragePath)?;
+        self.create_dir_all_durable(parent, LocalDurabilityPoint::DirectoryCreated)
+            .await?;
+        if file_matches_digest(&target, &digest, data.len() as u64).await? {
+            self.sync_file_path(&target, LocalDurabilityPoint::ObjectFile)
+                .await?;
+            self.sync_directory_at(parent, LocalDurabilityPoint::ObjectDirectory)
+                .await?;
+        } else {
             let temp_path = temp_sibling_path(&target)?;
             let write_result = async {
-                fs::write(&temp_path, data).await?;
-                rename_or_replace(&temp_path, &target).await
+                let mut temp = fs::File::create_new(&temp_path).await?;
+                temp.write_all(data).await?;
+                temp.flush().await?;
+                self.sync_open_file(&temp, &temp_path, LocalDurabilityPoint::ObjectFile)
+                    .await?;
+                drop(temp);
+                rename_or_replace(&temp_path, &target).await?;
+                self.sync_directory_at(parent, LocalDurabilityPoint::ObjectDirectory)
+                    .await
             }
             .await;
             if write_result.is_err() {
@@ -521,17 +652,25 @@ impl LocalBlobStorage {
         }
         let object_key = self.object_key_for_hash("sha256", &normalized_digest);
         let target = self.object_path(&object_key)?;
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-        if !file_matches_digest(&target, &normalized_digest, size_bytes).await? {
+        let parent = target.parent().ok_or(StorageError::InvalidStoragePath)?;
+        self.create_dir_all_durable(parent, LocalDurabilityPoint::DirectoryCreated)
+            .await?;
+        if file_matches_digest(&target, &normalized_digest, size_bytes).await? {
+            self.sync_file_path(&target, LocalDurabilityPoint::ObjectFile)
+                .await?;
+            self.sync_directory_at(parent, LocalDurabilityPoint::ObjectDirectory)
+                .await?;
+        } else {
             let temp_path = temp_sibling_path(&target)?;
             let write_result = async {
-                if fs::rename(source_path, &temp_path).await.is_err() {
+                if fs::hard_link(source_path, &temp_path).await.is_err() {
                     fs::copy(source_path, &temp_path).await?;
-                    let _ = fs::remove_file(source_path).await;
                 }
-                rename_or_replace(&temp_path, &target).await
+                self.sync_file_path(&temp_path, LocalDurabilityPoint::ObjectFile)
+                    .await?;
+                rename_or_replace(&temp_path, &target).await?;
+                self.sync_directory_at(parent, LocalDurabilityPoint::ObjectDirectory)
+                    .await
             }
             .await;
             if write_result.is_err() {
@@ -555,7 +694,8 @@ impl LocalBlobStorage {
 
         self.ensure().await?;
         let staging_dir = self.root().join(".vault-staging");
-        fs::create_dir_all(&staging_dir).await?;
+        self.create_dir_all_durable(&staging_dir, LocalDurabilityPoint::DirectoryCreated)
+            .await?;
         let temp_path = staging_dir.join(format!("upload-{}.tmp", Uuid::new_v4().simple()));
         let mut hasher = Sha256::new();
         let mut size_bytes = 0_u64;
@@ -575,24 +715,39 @@ impl LocalBlobStorage {
                 }
             }
             tokio::io::AsyncWriteExt::flush(&mut output).await?;
+            self.sync_open_file(&output, &temp_path, LocalDurabilityPoint::ObjectFile)
+                .await?;
             Ok::<(), StorageError>(())
         }
         .await;
         if write_result.is_err() {
             let _ = fs::remove_file(&temp_path).await;
+            let _ = self
+                .sync_directory_at(&staging_dir, LocalDurabilityPoint::StagingDirectory)
+                .await;
         }
         write_result?;
 
         let digest = lower_hex(&hasher.finalize());
         let object_key = self.object_key_for_hash("sha256", &digest);
         let target = self.object_path(&object_key)?;
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent).await?;
-        }
+        let parent = target.parent().ok_or(StorageError::InvalidStoragePath)?;
+        self.create_dir_all_durable(parent, LocalDurabilityPoint::DirectoryCreated)
+            .await?;
         if file_matches_digest(&target, &digest, size_bytes).await? {
+            self.sync_file_path(&target, LocalDurabilityPoint::ObjectFile)
+                .await?;
+            self.sync_directory_at(parent, LocalDurabilityPoint::ObjectDirectory)
+                .await?;
             fs::remove_file(&temp_path).await?;
+            self.sync_directory_at(&staging_dir, LocalDurabilityPoint::StagingDirectory)
+                .await?;
         } else {
             rename_or_replace(&temp_path, &target).await?;
+            self.sync_directory_at(parent, LocalDurabilityPoint::ObjectDirectory)
+                .await?;
+            self.sync_directory_at(&staging_dir, LocalDurabilityPoint::StagingDirectory)
+                .await?;
         }
         Ok(stored_blob(digest, size_bytes, object_key))
     }
@@ -1063,7 +1218,10 @@ impl LocalBlobStorage {
         let manifest_state = self
             .verified_multipart_manifest_state(&manifest_key, digest)
             .await?;
-        if let MultipartManifestState::Existing(size_bytes) = manifest_state {
+        if let MultipartManifestState::Existing(manifest) = manifest_state {
+            let size_bytes = manifest.size_bytes;
+            self.sync_multipart_manifest(&manifest_key, &manifest)
+                .await?;
             return Ok(stored_blob(digest.to_string(), size_bytes, manifest_key));
         }
 
@@ -1163,15 +1321,24 @@ impl LocalBlobStorage {
         {
             return Err(StorageError::InvalidMultipartManifest);
         }
+        let mut part_directories = HashSet::new();
         for (part_path, part) in part_paths.iter().zip(&part_entries) {
             let target_path = self.object_path(&part.object_key)?;
             publish_part_file(
+                self,
                 part_path,
                 &target_path,
                 part.size_bytes,
                 publication_rollback_paths,
             )
             .await?;
+            if let Some(parent) = target_path.parent() {
+                part_directories.insert(parent.to_path_buf());
+            }
+        }
+        for directory in part_directories {
+            self.sync_directory_at(&directory, LocalDurabilityPoint::MultipartPartDirectory)
+                .await?;
         }
         Ok((size_bytes, part_entries))
     }
@@ -1206,11 +1373,14 @@ impl LocalBlobStorage {
         replace_existing: bool,
     ) -> Result<bool, StorageError> {
         let manifest_path = self.object_path(manifest_key)?;
-        if let Some(parent) = manifest_path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
+        let parent = manifest_path
+            .parent()
+            .ok_or(StorageError::InvalidStoragePath)?;
+        self.create_dir_all_durable(parent, LocalDurabilityPoint::DirectoryCreated)
+            .await?;
         let staging_dir = self.root().join(".vault-staging");
-        fs::create_dir_all(&staging_dir).await?;
+        self.create_dir_all_durable(&staging_dir, LocalDurabilityPoint::DirectoryCreated)
+            .await?;
         let temp_path = staging_dir.join(format!("manifest-{}.tmp", Uuid::new_v4().simple()));
         let payload = ManifestPayload {
             format: LOCAL_MULTIPART_FORMAT.to_string(),
@@ -1228,18 +1398,56 @@ impl LocalBlobStorage {
             {
                 return Err(StorageError::InvalidMultipartManifest);
             }
-            fs::write(&temp_path, manifest_bytes).await?;
+            let mut temp = fs::File::create_new(&temp_path).await?;
+            temp.write_all(&manifest_bytes).await?;
+            temp.flush().await?;
+            self.sync_open_file(
+                &temp,
+                &temp_path,
+                LocalDurabilityPoint::MultipartManifestFile,
+            )
+            .await?;
+            drop(temp);
             if replace_existing {
                 rename_or_replace(&temp_path, &manifest_path).await?;
+                self.sync_directory_at(parent, LocalDurabilityPoint::MultipartManifestDirectory)
+                    .await?;
+                self.sync_directory_at(&staging_dir, LocalDurabilityPoint::StagingDirectory)
+                    .await?;
                 Ok(true)
             } else {
                 match fs::hard_link(&temp_path, &manifest_path).await {
                     Ok(()) => {
-                        let _ = fs::remove_file(&temp_path).await;
+                        fs::remove_file(&temp_path).await?;
+                        self.sync_directory_at(
+                            parent,
+                            LocalDurabilityPoint::MultipartManifestDirectory,
+                        )
+                        .await?;
+                        self.sync_directory_at(
+                            &staging_dir,
+                            LocalDurabilityPoint::StagingDirectory,
+                        )
+                        .await?;
                         Ok(true)
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                        let _ = fs::remove_file(&temp_path).await;
+                        fs::remove_file(&temp_path).await?;
+                        self.sync_file_path(
+                            &manifest_path,
+                            LocalDurabilityPoint::MultipartManifestFile,
+                        )
+                        .await?;
+                        self.sync_directory_at(
+                            parent,
+                            LocalDurabilityPoint::MultipartManifestDirectory,
+                        )
+                        .await?;
+                        self.sync_directory_at(
+                            &staging_dir,
+                            LocalDurabilityPoint::StagingDirectory,
+                        )
+                        .await?;
                         Ok(false)
                     }
                     Err(error) => Err(StorageError::Io(error)),
@@ -1249,6 +1457,9 @@ impl LocalBlobStorage {
         .await;
         if write_result.is_err() {
             let _ = fs::remove_file(&temp_path).await;
+            let _ = self
+                .sync_directory_at(&staging_dir, LocalDurabilityPoint::StagingDirectory)
+                .await;
         }
         write_result
     }
@@ -1262,7 +1473,7 @@ impl LocalBlobStorage {
             .read_and_verify_multipart_manifest(object_key, expected_digest)
             .await
         {
-            Ok(existing) => Ok(MultipartManifestState::Existing(existing.size_bytes)),
+            Ok(existing) => Ok(MultipartManifestState::Existing(existing)),
             Err(StorageError::NotFound) => Ok(MultipartManifestState::Missing),
             Err(
                 StorageError::ContentMismatch
@@ -1271,6 +1482,33 @@ impl LocalBlobStorage {
             ) => Ok(MultipartManifestState::Replace),
             Err(error) => Err(error),
         }
+    }
+
+    async fn sync_multipart_manifest(
+        &self,
+        manifest_key: &str,
+        manifest: &LocalMultipartManifest,
+    ) -> Result<(), StorageError> {
+        let mut part_directories = HashSet::new();
+        for part in &manifest.parts {
+            self.sync_file_path(&part.path, LocalDurabilityPoint::MultipartPartFile)
+                .await?;
+            if let Some(parent) = part.path.parent() {
+                part_directories.insert(parent.to_path_buf());
+            }
+        }
+        for directory in part_directories {
+            self.sync_directory_at(&directory, LocalDurabilityPoint::MultipartPartDirectory)
+                .await?;
+        }
+        let manifest_path = self.object_path(manifest_key)?;
+        self.sync_file_path(&manifest_path, LocalDurabilityPoint::MultipartManifestFile)
+            .await?;
+        let parent = manifest_path
+            .parent()
+            .ok_or(StorageError::InvalidStoragePath)?;
+        self.sync_directory_at(parent, LocalDurabilityPoint::MultipartManifestDirectory)
+            .await
     }
 
     async fn read_and_verify_multipart_manifest(
@@ -2266,6 +2504,7 @@ async fn file_matches_source(
 }
 
 async fn publish_part_file(
+    storage: &LocalBlobStorage,
     source_path: &Path,
     target_path: &Path,
     size_bytes: u64,
@@ -2275,17 +2514,29 @@ async fn publish_part_file(
     if source_size != size_bytes {
         return Err(StorageError::SourceSizeChanged);
     }
-    if let Some(parent) = target_path.parent() {
-        fs::create_dir_all(parent).await?;
-    }
+    let parent = target_path
+        .parent()
+        .ok_or(StorageError::InvalidStoragePath)?;
+    storage
+        .create_dir_all_durable(parent, LocalDurabilityPoint::DirectoryCreated)
+        .await?;
     if file_matches_source(target_path, source_path, size_bytes).await? {
+        storage
+            .sync_file_path(target_path, LocalDurabilityPoint::MultipartPartFile)
+            .await?;
         return Ok(PartPublication::Existing);
     }
     if fs::hard_link(source_path, target_path).await.is_ok() {
         publication_rollback_paths.push(target_path.to_path_buf());
+        storage
+            .sync_file_path(target_path, LocalDurabilityPoint::MultipartPartFile)
+            .await?;
         return Ok(PartPublication::Created);
     }
     if file_matches_source(target_path, source_path, size_bytes).await? {
+        storage
+            .sync_file_path(target_path, LocalDurabilityPoint::MultipartPartFile)
+            .await?;
         return Ok(PartPublication::Existing);
     }
 
@@ -2299,6 +2550,10 @@ async fn publish_part_file(
         if copied != size_bytes {
             return Err(StorageError::SourceSizeChanged);
         }
+        storage
+            .sync_open_file(&target, &temp_path, LocalDurabilityPoint::MultipartPartFile)
+            .await?;
+        drop(target);
         match fs::hard_link(&temp_path, target_path).await {
             Ok(()) => {
                 publication_rollback_paths.push(target_path.to_path_buf());
@@ -2307,6 +2562,9 @@ async fn publish_part_file(
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 if file_matches_source(target_path, source_path, size_bytes).await? {
+                    storage
+                        .sync_file_path(target_path, LocalDurabilityPoint::MultipartPartFile)
+                        .await?;
                     remove_file_if_present(&temp_path).await?;
                     Ok(PartPublication::Existing)
                 } else {
@@ -2366,11 +2624,18 @@ fn temp_sibling_path(target: &Path) -> Result<PathBuf, StorageError> {
     Ok(target.with_file_name(format!("{name}.tmp-{}", Uuid::new_v4().simple())))
 }
 
+#[cfg(unix)]
 async fn rename_or_replace(source: &Path, target: &Path) -> Result<(), StorageError> {
-    if fs::rename(source, target).await.is_err() {
-        let _ = fs::remove_file(target).await;
-        fs::rename(source, target).await?;
-    }
+    fs::rename(source, target).await?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn rename_or_replace(source: &Path, target: &Path) -> Result<(), StorageError> {
+    // `std::fs::rename` does not replace an existing Windows target. Preserve
+    // the live object and report the repair failure rather than introducing a
+    // destructive unlink-then-rename power-loss window.
+    fs::rename(source, target).await?;
     Ok(())
 }
 
@@ -2391,9 +2656,30 @@ async fn sync_directory(path: &Path) -> Result<(), StorageError> {
     Ok(())
 }
 
-#[cfg(not(unix))]
-async fn sync_directory(_path: &Path) -> Result<(), StorageError> {
+#[cfg(windows)]
+async fn sync_directory(path: &Path) -> Result<(), StorageError> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)?
+            .sync_all()
+    })
+    .await
+    .map_err(|error| StorageError::Io(std::io::Error::other(error)))??;
     Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+async fn sync_directory(_path: &Path) -> Result<(), StorageError> {
+    Err(StorageError::UnsupportedOperation(
+        "durable local storage directory publication is unsupported on this platform".to_string(),
+    ))
 }
 
 fn common_part_parent(part_paths: &[PathBuf]) -> Result<PathBuf, StorageError> {

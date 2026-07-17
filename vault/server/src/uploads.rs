@@ -56,6 +56,7 @@ const UPLOAD_MIN_ADAPTIVE_CHUNK_BYTES: i64 = 4 * 1024 * 1024;
 const UPLOAD_CHUNK_ROUNDING_BYTES: i64 = 1024 * 1024;
 const SMALL_PART_MEMORY_BUFFER_BYTES: i64 = 8 * 1024 * 1024;
 const VERIFICATION_PROGRESS_UPDATE_BYTES: i64 = 32 * 1024 * 1024;
+const MAX_UPLOAD_PART_METADATA_BYTES: u64 = 4096;
 const UPLOAD_RESUME_IDENTITY_CONTEXT_KEY: &str = "_upload_resume_identity_sha256";
 // Preverification is an optimization. Stop caching new sessions at this bound;
 // completion can use a request-owned state and hash the immutable parts without
@@ -640,7 +641,7 @@ pub async fn create_upload_session(
         Uuid::new_v4().simple().to_string()
     };
     let session_dir = upload_session_dir(transfers_path, &session_id)?;
-    fs::create_dir_all(&session_dir).await?;
+    create_durable_upload_session_dir(transfers_path, &session_dir).await?;
     let now = now_rfc3339()?;
     let expires_at = (OffsetDateTime::now_utc()
         + Duration::seconds(settings.transfer_session_ttl_seconds))
@@ -899,22 +900,50 @@ where
         storage_path: final_path.to_string_lossy().to_string(),
     };
     if !promote_part_file(&temp_path, &final_path).await? {
-        if let Some(existing) =
+        if let Some(mut existing) =
             read_part_metadata(&session_dir, &session, ingest.part_number).await?
-            && part_metadata_matches(
+        {
+            if let Some(incoming_sha256) = ingest.headers.sha256
+                && existing.sha256.as_deref() != Some(incoming_sha256)
+            {
+                let incoming_sha256 = incoming_sha256.to_ascii_lowercase();
+                if hash_existing_upload_part(&final_path, expected_size).await? != incoming_sha256 {
+                    return Err(UploadError::UploadPartConflict);
+                }
+                // A first writer can be interrupted after linking its durable
+                // part but before publishing the checksum sidecar. Repair that
+                // state from the verified immutable final file so both the
+                // interrupted writer and an identical concurrent writer remain
+                // safely retryable.
+                existing.sha256 = Some(incoming_sha256);
+                write_part_metadata(&session_dir, &existing).await?;
+            }
+            if part_metadata_matches(
                 &existing,
                 expected_offset,
                 expected_size,
                 ingest.headers.sha256,
-            )
-        {
-            return Ok(());
+            ) {
+                // A concurrent first writer may have linked the part immediately
+                // before this request observed it. Make the data and its directory
+                // entry durable ourselves rather than returning success while that
+                // writer is still between promotion and its directory sync.
+                sync_file(&final_path).await?;
+                if existing.sha256.is_some() {
+                    sync_file(&part_metadata_path(&session_dir, ingest.part_number)).await?;
+                }
+                sync_directory(&session_dir).await?;
+                return Ok(());
+            }
         }
         return Err(UploadError::UploadPartConflict);
     }
     if part.sha256.is_some() {
         write_part_metadata(&session_dir, &part).await?;
     }
+    // The temporary part inode (and optional sidecar inode) have already been
+    // synced. Persist their final names before acknowledging the part.
+    sync_directory(&session_dir).await?;
     Ok(())
 }
 
@@ -1980,7 +2009,6 @@ where
         }
         file.write_all(&chunk).await?;
     }
-    file.flush().await?;
     if size_bytes != expected_size {
         return Err(UploadError::UploadPartSizeMismatch);
     }
@@ -1990,6 +2018,8 @@ where
             return Err(UploadError::UploadPartChecksumMismatch);
         }
     }
+    file.flush().await?;
+    file.sync_all().await?;
     Ok(())
 }
 
@@ -2073,6 +2103,7 @@ fn write_chunked_part_blocking(
         file.write_all(chunk)?;
     }
     file.flush()?;
+    file.sync_all()?;
     Ok(())
 }
 
@@ -2199,29 +2230,47 @@ async fn read_part_metadata(
 ) -> Result<Option<UploadPartRow>, UploadError> {
     let metadata_path = part_metadata_path(session_dir, part_number);
     let storage_path = part_file_path(session_dir, part_number);
-    let metadata_bytes = match fs::read(&metadata_path).await {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let metadata = match fs::metadata(&storage_path).await {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                Err(error) => return Err(error.into()),
-            };
-            let (offset_bytes, size_bytes) = expected_part_bounds(session, part_number)?;
-            if metadata.len() != u64::try_from(size_bytes).unwrap_or(u64::MAX) {
-                return Ok(None);
-            }
-            return Ok(Some(UploadPartRow {
-                part_number,
-                offset_bytes,
-                size_bytes,
-                sha256: None,
-                storage_path: storage_path.to_string_lossy().to_string(),
-            }));
-        }
+    let (offset_bytes, size_bytes) = expected_part_bounds(session, part_number)?;
+    if !valid_upload_part_file(&storage_path, size_bytes).await? {
+        return Ok(None);
+    }
+    let inferred = UploadPartRow {
+        part_number,
+        offset_bytes,
+        size_bytes,
+        sha256: None,
+        storage_path: storage_path.to_string_lossy().to_string(),
+    };
+    let sidecar_metadata = match fs::symlink_metadata(&metadata_path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Some(inferred)),
         Err(error) => return Err(error.into()),
     };
-    let metadata: UploadPartMetadata = serde_json::from_slice(&metadata_bytes)?;
+    if sidecar_metadata.file_type().is_symlink()
+        || !sidecar_metadata.is_file()
+        || sidecar_metadata.len() > MAX_UPLOAD_PART_METADATA_BYTES
+    {
+        return Ok(Some(inferred));
+    }
+    let metadata_bytes = match fs::read(&metadata_path).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Some(inferred)),
+        Err(error) => return Err(error.into()),
+    };
+    let Ok(mut metadata) = serde_json::from_slice::<UploadPartMetadata>(&metadata_bytes) else {
+        return Ok(Some(inferred));
+    };
+    if metadata.part_number != part_number
+        || metadata.offset_bytes != offset_bytes
+        || metadata.size_bytes != size_bytes
+        || metadata
+            .sha256
+            .as_deref()
+            .is_some_and(|sha256| !is_sha256_hex(sha256))
+    {
+        return Ok(Some(inferred));
+    }
+    metadata.sha256 = metadata.sha256.map(|sha256| sha256.to_ascii_lowercase());
     Ok(Some(UploadPartRow {
         part_number: metadata.part_number,
         offset_bytes: metadata.offset_bytes,
@@ -2229,6 +2278,44 @@ async fn read_part_metadata(
         sha256: metadata.sha256,
         storage_path: storage_path.to_string_lossy().to_string(),
     }))
+}
+
+async fn valid_upload_part_file(path: &Path, expected_size: i64) -> Result<bool, UploadError> {
+    let metadata = match fs::symlink_metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(!metadata.file_type().is_symlink()
+        && metadata.is_file()
+        && u64::try_from(expected_size).ok() == Some(metadata.len()))
+}
+
+async fn hash_existing_upload_part(path: &Path, expected_size: i64) -> Result<String, UploadError> {
+    if !valid_upload_part_file(path, expected_size).await? {
+        return Err(UploadError::UploadPartConflict);
+    }
+    let mut file = fs::File::open(path).await?;
+    let mut hasher = Sha256::new();
+    let mut size_bytes = 0_i64;
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        size_bytes = size_bytes
+            .checked_add(i64::try_from(read).map_err(|_| UploadError::UploadPartTooLarge)?)
+            .ok_or(UploadError::UploadPartTooLarge)?;
+        if size_bytes > expected_size {
+            return Err(UploadError::UploadPartConflict);
+        }
+        hasher.update(&buffer[..read]);
+    }
+    if size_bytes != expected_size {
+        return Err(UploadError::UploadPartConflict);
+    }
+    Ok(lower_hex(&hasher.finalize()))
 }
 
 async fn write_part_metadata(session_dir: &Path, part: &UploadPartRow) -> Result<(), UploadError> {
@@ -2242,9 +2329,105 @@ async fn write_part_metadata(session_dir: &Path, part: &UploadPartRow) -> Result
     };
     let mut bytes = serde_json::to_vec(&metadata)?;
     bytes.push(b'\n');
-    fs::write(&temp_path, bytes).await?;
-    fs::rename(&temp_path, &metadata_path).await?;
+    let write_result: Result<(), UploadError> = async {
+        let mut file = fs::File::create(&temp_path).await?;
+        file.write_all(&bytes).await?;
+        file.flush().await?;
+        file.sync_all().await?;
+        drop(file);
+        rename_or_replace_part_metadata(&temp_path, &metadata_path).await?;
+        Ok(())
+    }
+    .await;
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temp_path).await;
+    }
+    write_result
+}
+
+#[cfg(unix)]
+async fn rename_or_replace_part_metadata(source: &Path, target: &Path) -> Result<(), UploadError> {
+    fs::rename(source, target).await?;
     Ok(())
+}
+
+#[cfg(not(unix))]
+async fn rename_or_replace_part_metadata(source: &Path, target: &Path) -> Result<(), UploadError> {
+    match fs::rename(source, target).await {
+        Ok(()) => Ok(()),
+        Err(rename_error) => {
+            let metadata = match fs::symlink_metadata(target).await {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(rename_error.into());
+                }
+                Err(error) => return Err(error.into()),
+            };
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(rename_error.into());
+            }
+            // This is only checksum metadata; the already-synced final part is
+            // authoritative. If power is lost in this replace gap, the missing
+            // sidecar is detected and reconstructed from that part on retry.
+            fs::remove_file(target).await?;
+            fs::rename(source, target).await?;
+            Ok(())
+        }
+    }
+}
+
+#[cfg(not(windows))]
+async fn sync_file(path: &Path) -> Result<(), UploadError> {
+    fs::File::open(path).await?.sync_all().await?;
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn sync_file(path: &Path) -> Result<(), UploadError> {
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .await?
+        .sync_all()
+        .await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn sync_directory(path: &Path) -> Result<(), UploadError> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || std::fs::File::open(path)?.sync_all())
+        .await
+        .map_err(|error| UploadError::Io(std::io::Error::other(error)))??;
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn sync_directory(path: &Path) -> Result<(), UploadError> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)?
+            .sync_all()
+    })
+    .await
+    .map_err(|error| UploadError::Io(std::io::Error::other(error)))??;
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+async fn sync_directory(_path: &Path) -> Result<(), UploadError> {
+    Err(UploadError::Io(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "durable directory synchronization is unsupported on this platform",
+    )))
 }
 
 fn part_file_path(session_dir: &Path, part_number: i64) -> PathBuf {
@@ -2886,6 +3069,26 @@ fn upload_session_dir(transfers_path: &Path, session_id: &str) -> Result<PathBuf
         return Err(UploadError::UploadSessionNotFound);
     }
     Ok(transfers_path.join("uploads").join(session_id))
+}
+
+async fn create_durable_upload_session_dir(
+    transfers_path: &Path,
+    session_dir: &Path,
+) -> Result<(), UploadError> {
+    fs::create_dir_all(session_dir).await?;
+    // The database row makes this directory part of the durable upload state.
+    // Persist the new directory and each containing entry before publishing an
+    // active session that can accept parts.
+    sync_directory(session_dir).await?;
+    sync_directory(&transfers_path.join("uploads")).await?;
+    sync_directory(transfers_path).await?;
+    if let Some(parent) = transfers_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        sync_directory(parent).await?;
+    }
+    Ok(())
 }
 
 pub async fn clear_upload_session_files(transfers_path: &Path, session_id: &str) {

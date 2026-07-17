@@ -1,12 +1,59 @@
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use vault_server::storage::{
-    BlobReadRange, LocalBlobStorage, STORAGE_CHUNK_SIZE, StorageError, is_multipart_part_key,
-    multipart_manifest_key_for_hash, multipart_part_key_for_hash,
-    multipart_part_key_for_hash_layout, object_key_for_hash,
+    BlobReadRange, LocalBlobStorage, LocalDurabilityHook, LocalDurabilityPoint, STORAGE_CHUNK_SIZE,
+    StorageError, is_multipart_part_key, multipart_manifest_key_for_hash,
+    multipart_part_key_for_hash, multipart_part_key_for_hash_layout, object_key_for_hash,
 };
+
+#[derive(Debug)]
+struct RecordingDurability {
+    events: Mutex<Vec<(LocalDurabilityPoint, PathBuf)>>,
+    fail_at: Option<LocalDurabilityPoint>,
+}
+
+impl RecordingDurability {
+    fn new(fail_at: Option<LocalDurabilityPoint>) -> Self {
+        Self {
+            events: Mutex::new(Vec::new()),
+            fail_at,
+        }
+    }
+
+    fn points(&self) -> Vec<LocalDurabilityPoint> {
+        self.events
+            .lock()
+            .expect("durability events")
+            .iter()
+            .map(|(point, _)| *point)
+            .collect()
+    }
+
+    fn clear(&self) {
+        self.events.lock().expect("durability events").clear();
+    }
+}
+
+impl LocalDurabilityHook for RecordingDurability {
+    fn before_sync(
+        &self,
+        point: LocalDurabilityPoint,
+        path: &std::path::Path,
+    ) -> std::io::Result<()> {
+        self.events
+            .lock()
+            .expect("durability events")
+            .push((point, path.to_path_buf()));
+        if self.fail_at == Some(point) {
+            Err(std::io::Error::other("injected durability failure"))
+        } else {
+            Ok(())
+        }
+    }
+}
 
 fn test_storage(root: &std::path::Path) -> LocalBlobStorage {
     LocalBlobStorage::new(root, "objects")
@@ -368,6 +415,269 @@ async fn multipart_manifest_publication_failure_rolls_back_all_created_parts() {
         part_keys
             .iter()
             .all(|part_key| !storage.root().join(part_key).exists())
+    );
+}
+
+#[tokio::test]
+async fn multipart_publication_persists_parts_before_the_manifest_commit_point() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let (sources, digest) = multipart_sources(&temp_dir.path().join("sources")).await;
+    let durability = Arc::new(RecordingDurability::new(None));
+    let storage = LocalBlobStorage::new_with_durability_hook(
+        temp_dir.path().join("store"),
+        "objects",
+        durability.clone(),
+    );
+
+    storage
+        .put_part_files(&sources, Some(&digest))
+        .await
+        .expect("durable multipart publication");
+
+    let points = durability.points();
+    let manifest_file = points
+        .iter()
+        .position(|point| *point == LocalDurabilityPoint::MultipartManifestFile)
+        .expect("manifest file barrier");
+    let final_manifest_directory = points
+        .iter()
+        .rposition(|point| *point == LocalDurabilityPoint::MultipartManifestDirectory)
+        .expect("manifest directory barrier");
+    let final_staging_directory = points
+        .iter()
+        .rposition(|point| *point == LocalDurabilityPoint::StagingDirectory)
+        .expect("staging directory barrier");
+    assert!(points.contains(&LocalDurabilityPoint::MultipartPartFile));
+    assert!(points.contains(&LocalDurabilityPoint::MultipartPartDirectory));
+    assert!(points.iter().enumerate().all(|(index, point)| {
+        !matches!(
+            point,
+            LocalDurabilityPoint::MultipartPartFile | LocalDurabilityPoint::MultipartPartDirectory
+        ) || index < manifest_file
+    }));
+    assert!(manifest_file < final_manifest_directory);
+    assert!(final_manifest_directory < final_staging_directory);
+
+    durability.clear();
+    storage
+        .put_part_files(&sources, Some(&digest))
+        .await
+        .expect("durable deduplicated multipart publication");
+    let deduplicated = durability.points();
+    for required in [
+        LocalDurabilityPoint::MultipartPartFile,
+        LocalDurabilityPoint::MultipartPartDirectory,
+        LocalDurabilityPoint::MultipartManifestFile,
+        LocalDurabilityPoint::MultipartManifestDirectory,
+    ] {
+        assert!(deduplicated.contains(&required), "missing {required:?}");
+    }
+}
+
+#[tokio::test]
+async fn multipart_manifest_sync_failure_rolls_back_uncommitted_parts() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let (sources, digest) = multipart_sources(&temp_dir.path().join("sources")).await;
+    let part_keys =
+        deterministic_multipart_part_keys(&temp_dir.path().join("probe"), &sources, &digest).await;
+    let durability = Arc::new(RecordingDurability::new(Some(
+        LocalDurabilityPoint::MultipartManifestFile,
+    )));
+    let storage = LocalBlobStorage::new_with_durability_hook(
+        temp_dir.path().join("store"),
+        "objects",
+        durability,
+    );
+
+    let error = storage
+        .put_part_files(&sources, Some(&digest))
+        .await
+        .expect_err("manifest sync failure");
+
+    assert!(matches!(error, StorageError::Io(_)));
+    assert!(
+        !storage
+            .root()
+            .join(multipart_manifest_key_for_hash(
+                "objects", "sha256", &digest
+            ))
+            .exists()
+    );
+    assert!(
+        part_keys
+            .iter()
+            .all(|part_key| !storage.root().join(part_key).exists())
+    );
+}
+
+#[tokio::test]
+async fn object_sync_failure_is_reported_before_publication_succeeds() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let durability = Arc::new(RecordingDurability::new(Some(
+        LocalDurabilityPoint::ObjectFile,
+    )));
+    let storage = LocalBlobStorage::new_with_durability_hook(
+        temp_dir.path().join("store"),
+        "objects",
+        durability,
+    );
+
+    let error = storage
+        .put_bytes(b"not durable")
+        .await
+        .expect_err("object sync failure");
+
+    assert!(matches!(error, StorageError::Io(_)));
+    assert_eq!(
+        storage.list_object_keys().await.expect("object keys"),
+        Vec::<String>::new()
+    );
+}
+
+#[tokio::test]
+async fn object_directory_sync_failure_is_reported_after_atomic_publication() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let durability = Arc::new(RecordingDurability::new(Some(
+        LocalDurabilityPoint::ObjectDirectory,
+    )));
+    let storage = LocalBlobStorage::new_with_durability_hook(
+        temp_dir.path().join("store"),
+        "objects",
+        durability,
+    );
+    let data = b"directory barrier";
+    let digest = sha256_hex(data);
+
+    let error = storage
+        .put_bytes(data)
+        .await
+        .expect_err("directory sync failure");
+
+    assert!(matches!(error, StorageError::Io(_)));
+    assert_eq!(
+        tokio::fs::read(
+            storage
+                .root()
+                .join(object_key_for_hash("objects", "sha256", &digest))
+        )
+        .await
+        .expect("atomically published object"),
+        data,
+    );
+}
+
+#[tokio::test]
+async fn multipart_directory_sync_failure_never_reports_publication_success() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let (sources, digest) = multipart_sources(&temp_dir.path().join("sources")).await;
+    let durability = Arc::new(RecordingDurability::new(Some(
+        LocalDurabilityPoint::MultipartManifestDirectory,
+    )));
+    let storage = LocalBlobStorage::new_with_durability_hook(
+        temp_dir.path().join("store"),
+        "objects",
+        durability,
+    );
+    let manifest_key = multipart_manifest_key_for_hash("objects", "sha256", &digest);
+
+    let error = storage
+        .put_part_files(&sources, Some(&digest))
+        .await
+        .expect_err("manifest directory sync failure");
+
+    assert!(matches!(error, StorageError::Io(_)));
+    assert_eq!(
+        storage
+            .read_bytes(&manifest_key)
+            .await
+            .expect("valid but unacknowledged multipart object"),
+        b"abcdef",
+    );
+}
+
+#[tokio::test]
+async fn put_file_sync_failure_preserves_the_source_for_retry() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let source = temp_dir.path().join("source.bin");
+    tokio::fs::write(&source, b"retryable source")
+        .await
+        .expect("source");
+    let digest = sha256_hex(b"retryable source");
+    let durability = Arc::new(RecordingDurability::new(Some(
+        LocalDurabilityPoint::ObjectFile,
+    )));
+    let storage = LocalBlobStorage::new_with_durability_hook(
+        temp_dir.path().join("store"),
+        "objects",
+        durability,
+    );
+
+    let error = storage
+        .put_file(&source, &digest, 16)
+        .await
+        .expect_err("file sync failure");
+
+    assert!(matches!(error, StorageError::Io(_)));
+    assert_eq!(
+        tokio::fs::read(&source).await.expect("retry source"),
+        b"retryable source"
+    );
+    assert_eq!(
+        storage.list_object_keys().await.expect("object keys"),
+        Vec::<String>::new()
+    );
+}
+
+#[tokio::test]
+async fn assembled_part_file_sync_failure_leaves_no_visible_object() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let (sources, _) = multipart_sources(&temp_dir.path().join("sources")).await;
+    let durability = Arc::new(RecordingDurability::new(Some(
+        LocalDurabilityPoint::ObjectFile,
+    )));
+    let storage = LocalBlobStorage::new_with_durability_hook(
+        temp_dir.path().join("store"),
+        "objects",
+        durability,
+    );
+
+    let error = storage
+        .put_part_files(&sources, None)
+        .await
+        .expect_err("assembled file sync failure");
+
+    assert!(matches!(error, StorageError::Io(_)));
+    assert_eq!(
+        storage.list_object_keys().await.expect("object keys"),
+        Vec::<String>::new()
+    );
+}
+
+#[tokio::test]
+async fn assembled_part_staging_sync_failure_never_reports_publication_success() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let (sources, digest) = multipart_sources(&temp_dir.path().join("sources")).await;
+    let durability = Arc::new(RecordingDurability::new(Some(
+        LocalDurabilityPoint::StagingDirectory,
+    )));
+    let storage = LocalBlobStorage::new_with_durability_hook(
+        temp_dir.path().join("store"),
+        "objects",
+        durability,
+    );
+
+    let error = storage
+        .put_part_files(&sources, None)
+        .await
+        .expect_err("staging directory sync failure");
+
+    assert!(matches!(error, StorageError::Io(_)));
+    assert_eq!(
+        storage
+            .read_bytes(&object_key_for_hash("objects", "sha256", &digest))
+            .await
+            .expect("valid but unacknowledged object"),
+        b"abcdef",
     );
 }
 

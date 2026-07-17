@@ -130,6 +130,10 @@ fn request_with_headers(method: Method, uri: &str, headers: &[(&str, &str)]) -> 
     builder.body(Body::empty()).expect("request")
 }
 
+fn same_origin_post(uri: &str) -> Request<Body> {
+    request_with_headers(Method::POST, uri, &[("Origin", "http://vault.example.com")])
+}
+
 async fn login_state_cookie(auth: AuthSettings, headers: &[(&str, &str)]) -> String {
     let (state, _temp_dir) = test_state(auth).await;
     let app = http::router(state);
@@ -504,7 +508,7 @@ async fn non_oidc_auth_routes_preserve_python_redirect_and_cookie_behavior() {
     assert!(all_set_cookies(&callback).is_empty());
 
     let logout = app
-        .oneshot(request(Method::GET, "/logout?rd=/Project"))
+        .oneshot(same_origin_post("/logout?rd=/Project"))
         .await
         .expect("logout");
     assert_eq!(logout.status(), StatusCode::SEE_OTHER);
@@ -660,7 +664,14 @@ async fn custom_oidc_cookie_names_are_used_for_login_callback_and_logout() {
     );
 
     let logout = app
-        .oneshot(request(Method::GET, "/logout?rd=/Project"))
+        .oneshot(request_with_headers(
+            Method::POST,
+            "/logout?rd=/Project",
+            &[
+                ("Origin", "http://vault.example.com"),
+                ("Sec-Fetch-Site", "same-origin"),
+            ],
+        ))
         .await
         .expect("logout");
     assert_eq!(logout.status(), StatusCode::SEE_OTHER);
@@ -881,11 +892,15 @@ async fn logout_deletes_session_and_state_cookies_and_uses_safe_redirects() {
 
     let response = app
         .clone()
-        .oneshot(request(Method::GET, "/logout?rd=/Project"))
+        .oneshot(same_origin_post("/logout?rd=/Project"))
         .await
         .expect("logout");
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
     assert_eq!(location(&response), "/Project");
+    assert_eq!(
+        response.headers()[header::CACHE_CONTROL],
+        "no-store, max-age=0"
+    );
     let cookies = all_set_cookies(&response);
     assert!(
         cookies
@@ -899,11 +914,102 @@ async fn logout_deletes_session_and_state_cookies_and_uses_safe_redirects() {
     );
 
     let unsafe_redirect = app
-        .oneshot(request(Method::GET, "/logout?rd=https://evil.example.com"))
+        .oneshot(request_with_headers(
+            Method::POST,
+            "/logout?rd=https://evil.example.com",
+            &[("Sec-Fetch-Site", "same-origin")],
+        ))
         .await
         .expect("unsafe logout");
     assert_eq!(unsafe_redirect.status(), StatusCode::SEE_OTHER);
     assert_eq!(location(&unsafe_redirect), "/");
+    assert_eq!(
+        unsafe_redirect.headers()[header::CACHE_CONTROL],
+        "no-store, max-age=0",
+    );
+}
+
+#[tokio::test]
+async fn logout_requires_post_and_unambiguous_same_origin_provenance_without_deleting_cookies() {
+    let (state, _temp_dir) = test_state(oidc_auth("https://idp.example.com/auth")).await;
+    let app = http::router(state);
+
+    let get_response = app
+        .clone()
+        .oneshot(request(Method::GET, "/logout?rd=/Project"))
+        .await
+        .expect("logout get");
+    assert_eq!(get_response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert!(all_set_cookies(&get_response).is_empty());
+    assert!(get_response.headers().get(header::LOCATION).is_none());
+
+    let rejected_headers = [
+        vec![],
+        vec![("Origin", "null")],
+        vec![("Origin", "https://evil.example.com")],
+        vec![("Sec-Fetch-Site", "cross-site")],
+        vec![
+            ("Origin", "http://vault.example.com"),
+            ("Sec-Fetch-Site", "same-site"),
+        ],
+        vec![
+            ("Origin", "https://evil.example.com"),
+            ("Sec-Fetch-Site", "same-origin"),
+        ],
+        vec![("Sec-Fetch-Site", "none")],
+        vec![
+            ("Origin", "http://vault.example.com"),
+            ("Origin", "http://vault.example.com"),
+        ],
+    ];
+    for headers in rejected_headers {
+        let response = app
+            .clone()
+            .oneshot(request_with_headers(Method::POST, "/logout", &headers))
+            .await
+            .expect("rejected logout");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "no-store, max-age=0"
+        );
+        assert!(all_set_cookies(&response).is_empty());
+        assert!(response.headers().get(header::LOCATION).is_none());
+        assert_eq!(
+            response_json(response).await["detail"],
+            "Same-origin request provenance required",
+        );
+    }
+}
+
+#[tokio::test]
+async fn logout_matches_normalized_public_and_trusted_effective_request_origins() {
+    let mut public_auth = oidc_auth("https://idp.example.com/auth");
+    public_auth.public_url = "https://VAULT.example.com:443/base".to_string();
+    let (state, _temp_dir) = test_state(public_auth).await;
+    let public_response = http::router(state)
+        .oneshot(request_with_headers(
+            Method::POST,
+            "/logout",
+            &[("Origin", "https://vault.example.com")],
+        ))
+        .await
+        .expect("public origin logout");
+    assert_eq!(public_response.status(), StatusCode::SEE_OTHER);
+
+    let (state, _temp_dir) = test_state(oidc_auth("https://idp.example.com/auth")).await;
+    let effective_response = http::router(state)
+        .oneshot(request_with_headers(
+            Method::POST,
+            "/logout",
+            &[
+                ("Origin", "https://vault.example.com:443"),
+                ("X-Forwarded-Proto", "https"),
+            ],
+        ))
+        .await
+        .expect("effective origin logout");
+    assert_eq!(effective_response.status(), StatusCode::SEE_OTHER);
 }
 
 #[tokio::test]

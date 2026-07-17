@@ -360,6 +360,11 @@ header {
   align-items: center;
 }
 
+.logout-form {
+  display: flex;
+  margin: 0;
+}
+
 .finder-frame {
   display: grid;
   grid-template-columns: 240px minmax(0, 1fr);

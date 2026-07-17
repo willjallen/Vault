@@ -9,6 +9,23 @@ function optimisticLockFor(doc, currentUser) {
   };
 }
 
+async function prepareCheckout(apiFetch, docId, signal) {
+  const response = await apiFetch(`/documents/${docId}/checkout`, {
+    method: "POST",
+    signal,
+  });
+  const payload = (await response.json().catch(() => ({}))) || {};
+  if (!response.ok) {
+    const error = new Error(payload.detail || "Checkout failed.");
+    error.status = response.status;
+    throw error;
+  }
+  if (typeof payload.download_url !== "string" || !payload.download_url) {
+    throw new Error("Checkout did not return a download URL.");
+  }
+  return payload.download_url;
+}
+
 export function createFileLockActions({
   apiFetch,
   currentUser,
@@ -136,10 +153,10 @@ export function createFileLockActions({
       setError("Restore this file from Archive before editing.");
       return;
     }
-    downloadWithProgress({
+    return downloadWithProgress({
       name: doc.name,
+      prepare: (signal) => prepareCheckout(apiFetch, doc.id, signal),
       size: doc.size_bytes,
-      url: `/documents/${doc.id}/checkout`,
     })
       .then((result) => {
         if (!result.cancelled && updateDocument) {
@@ -148,10 +165,12 @@ export function createFileLockActions({
             lock: optimisticLockFor(item, currentUser),
           }));
         }
+        return !result.cancelled;
       })
       .catch((err) => {
         setError(err.message || "Checkout failed.");
         refresh();
+        return false;
       });
   }
 

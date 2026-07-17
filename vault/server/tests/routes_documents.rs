@@ -484,6 +484,69 @@ fn authed_get_with_header(
         .expect("request")
 }
 
+fn authed_post_with_headers(
+    uri: &str,
+    user: &str,
+    groups: &str,
+    headers: &[(&str, &str)],
+) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header("Remote-User", user)
+        .header("Remote-Name", user)
+        .header("Remote-Email", format!("{user}@example.com"))
+        .header("Remote-Groups", groups);
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    builder.body(Body::empty()).expect("request")
+}
+
+fn authed_checkout_post(
+    document_id: i64,
+    user: &str,
+    groups: &str,
+    headers: &[(&str, &str)],
+) -> Request<Body> {
+    authed_post_with_headers(
+        &format!("/documents/{document_id}/checkout"),
+        user,
+        groups,
+        headers,
+    )
+}
+
+async fn assert_no_checkout_mutation(pool: &sqlx::SqlitePool, document_id: i64) {
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM document_locks WHERE document_id = ? AND is_active = 1",
+        )
+        .bind(document_id)
+        .fetch_one(pool)
+        .await
+        .expect("active locks"),
+        0,
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM document_events WHERE document_id = ? AND event_type = 'checkout'",
+        )
+        .bind(document_id)
+        .fetch_one(pool)
+        .await
+        .expect("checkout events"),
+        0,
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM state_events")
+            .fetch_one(pool)
+            .await
+            .expect("state events"),
+        0,
+    );
+}
+
 fn authed_json_post(uri: &str, user: &str, groups: &str, payload: &Value) -> Request<Body> {
     Request::builder()
         .method(Method::POST)
@@ -1661,7 +1724,7 @@ async fn download_routes_reject_truncated_stored_blob_bytes() {
 }
 
 #[tokio::test]
-async fn checkout_document_streams_current_version_locks_and_records_event() {
+async fn checkout_document_returns_pinned_download_locks_and_records_event() {
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -1685,27 +1748,27 @@ async fn checkout_document_streams_current_version_locks_and_records_event() {
     let app = http::router(state);
 
     let response = app
-        .oneshot(authed_get(
+        .clone()
+        .oneshot(authed_post_with_headers(
             &format!("/documents/{document_id}/checkout"),
             "writer",
             "writers",
+            &[
+                ("Origin", "http://localhost"),
+                ("Sec-Fetch-Site", "same-origin"),
+            ],
         ))
         .await
         .expect("checkout response");
     let status = response.status();
     let headers = response.headers().clone();
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body");
+    let payload = response_json(response).await;
 
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(&body[..], b"checkout bytes");
-    assert_eq!(headers["content-length"], "14");
-    assert!(
-        headers["content-disposition"]
-            .to_str()
-            .expect("content disposition")
-            .contains("filename=\"checkout.txt\""),
+    assert_eq!(headers["cache-control"], "no-store, max-age=0");
+    assert_eq!(
+        payload["download_url"],
+        format!("/documents/{document_id}/versions/stored-version-one/download"),
     );
 
     let lock = sqlx::query_as::<_, (String, String, Option<String>, Option<String>)>(
@@ -1720,7 +1783,7 @@ async fn checkout_document_streams_current_version_locks_and_records_event() {
     .await
     .expect("checkout lock");
     let event = sqlx::query_as::<_, (String, String)>(
-        "SELECT event_type, message FROM document_events WHERE document_id = ?",
+        "SELECT event_type, message FROM document_events WHERE document_id = ? AND event_type = 'checkout'",
     )
     .bind(document_id)
     .fetch_one(&pool)
@@ -1742,6 +1805,194 @@ async fn checkout_document_streams_current_version_locks_and_records_event() {
         ),
     );
     assert_eq!(state_event, "document.checkout");
+
+    let download_url = payload["download_url"].as_str().expect("download url");
+    let download = app
+        .oneshot(authed_get(download_url, "writer", "writers"))
+        .await
+        .expect("checkout download");
+    let download_status = download.status();
+    let download_headers = download.headers().clone();
+    let body = to_bytes(download.into_body(), usize::MAX)
+        .await
+        .expect("body");
+
+    assert_eq!(download_status, StatusCode::OK);
+    assert_eq!(&body[..], b"checkout bytes");
+    assert_eq!(download_headers["content-length"], "14");
+    assert!(
+        download_headers["content-disposition"]
+            .to_str()
+            .expect("content disposition")
+            .contains("filename=\"checkout.txt\""),
+    );
+}
+
+#[tokio::test]
+async fn checkout_requires_post_and_unambiguous_same_origin_provenance_without_mutation() {
+    let (state, _temp_dir) = test_state().await;
+    let writers = create_group(&state.db, "writers").await;
+    let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
+        .await
+        .expect("root");
+    add_folder_permission(&state.db, root.id, writers, true, true, true)
+        .await
+        .expect("writer root");
+    let project = get_or_create_folder_path(&state.db, Some("Project"))
+        .await
+        .expect("project");
+    let document_id = insert_stored_versioned_document(
+        &state.db,
+        &state.storage,
+        project.id,
+        b"protected bytes",
+        "protected.txt",
+    )
+    .await;
+    let pool = state.db.clone();
+    let app = http::router(state);
+    let uri = format!("/documents/{document_id}/checkout");
+
+    let get_response = app
+        .clone()
+        .oneshot(authed_get(&uri, "writer", "writers"))
+        .await
+        .expect("checkout get");
+    assert_eq!(get_response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert!(get_response.headers().get("set-cookie").is_none());
+
+    let unauthenticated_missing = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(&uri)
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("missing provenance before authentication");
+    assert_eq!(unauthenticated_missing.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        response_json(unauthenticated_missing).await["detail"],
+        "Same-origin request provenance required",
+    );
+
+    let unauthenticated_same_origin = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(&uri)
+                .header("Origin", "http://localhost")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("authentication after provenance");
+    assert_eq!(
+        unauthenticated_same_origin.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        response_json(unauthenticated_same_origin).await["detail"],
+        "Authentication required",
+    );
+
+    let rejected_headers = [
+        vec![],
+        vec![("Origin", "https://evil.example.com")],
+        vec![("Sec-Fetch-Site", "cross-site")],
+        vec![
+            ("Origin", "http://localhost"),
+            ("Sec-Fetch-Site", "same-site"),
+        ],
+        vec![
+            ("Origin", "https://evil.example.com"),
+            ("Sec-Fetch-Site", "same-origin"),
+        ],
+        vec![("Origin", "http://localhost/path")],
+        vec![
+            ("Origin", "http://localhost"),
+            ("Origin", "http://localhost"),
+        ],
+    ];
+    for headers in rejected_headers {
+        let response = app
+            .clone()
+            .oneshot(authed_post_with_headers(
+                &uri, "writer", "writers", &headers,
+            ))
+            .await
+            .expect("rejected checkout");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.headers()["cache-control"], "no-store, max-age=0");
+        assert_eq!(
+            response_json(response).await["detail"],
+            "Same-origin request provenance required",
+        );
+    }
+
+    assert_no_checkout_mutation(&pool, document_id).await;
+}
+
+#[tokio::test]
+async fn checkout_missing_blob_does_not_create_a_lock_or_events() {
+    let (state, _temp_dir) = test_state().await;
+    let writers = create_group(&state.db, "writers").await;
+    let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
+        .await
+        .expect("root");
+    add_folder_permission(&state.db, root.id, writers, true, true, true)
+        .await
+        .expect("writer root");
+    let project = get_or_create_folder_path(&state.db, Some("Project"))
+        .await
+        .expect("project");
+    let document_id = insert_stored_versioned_document(
+        &state.db,
+        &state.storage,
+        project.id,
+        b"missing checkout bytes",
+        "missing-checkout.txt",
+    )
+    .await;
+    let object_key = sqlx::query_scalar::<_, String>(
+        r"
+        SELECT blob_locations.object_key
+        FROM document_versions
+        JOIN blob_locations ON blob_locations.blob_id = document_versions.blob_id
+        WHERE document_versions.document_id = ?
+        ",
+    )
+    .bind(document_id)
+    .fetch_one(&state.db)
+    .await
+    .expect("object key");
+    let object_path = state.config.objects_path().join(object_key);
+    let detached_path = object_path.with_extension("detached");
+    tokio::fs::rename(&object_path, &detached_path)
+        .await
+        .expect("detach checkout object");
+    let pool = state.db.clone();
+
+    let response = http::router(state)
+        .oneshot(authed_checkout_post(
+            document_id,
+            "writer",
+            "writers",
+            &[("Origin", "http://localhost")],
+        ))
+        .await
+        .expect("missing blob checkout");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.headers()["cache-control"], "no-store, max-age=0");
+    assert_eq!(
+        response_json(response).await["detail"],
+        "Blob missing from storage",
+    );
+    assert!(detached_path.is_file());
+    assert_no_checkout_mutation(&pool, document_id).await;
 }
 
 #[tokio::test]
@@ -1803,51 +2054,46 @@ async fn checkout_document_rejects_archived_and_other_user_locks() {
 
     let archived = app
         .clone()
-        .oneshot(authed_get(
-            &format!("/documents/{archived_doc}/checkout"),
+        .oneshot(authed_checkout_post(
+            archived_doc,
             "writer",
             "writers",
+            &[("Sec-Fetch-Site", "same-origin")],
         ))
         .await
         .expect("archived checkout");
-    let archived_status = archived.status();
-    let archived_json = response_json(archived).await;
-    assert_eq!(archived_status, StatusCode::BAD_REQUEST);
-    assert_eq!(archived_json["detail"], "Restore this file before editing");
+    assert_eq!(archived.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(archived).await["detail"],
+        "Restore this file before editing",
+    );
 
     let locked = app
-        .oneshot(authed_get(
-            &format!("/documents/{locked_doc}/checkout"),
+        .oneshot(authed_checkout_post(
+            locked_doc,
             "writer",
             "writers",
+            &[("Origin", "http://localhost")],
         ))
         .await
         .expect("locked checkout");
-    let locked_status = locked.status();
-    let locked_json = response_json(locked).await;
-    assert_eq!(locked_status, StatusCode::FORBIDDEN);
-    assert_eq!(locked_json["detail"], "Document is locked by another user");
+    assert_eq!(locked.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        response_json(locked).await["detail"],
+        "Document is locked by another user",
+    );
 
-    let event_count = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM document_events WHERE event_type = 'checkout'",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("checkout events");
-    let archived_lock_count = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM document_locks WHERE document_id = ? AND is_active = 1",
-    )
-    .bind(archived_doc)
-    .fetch_one(&pool)
-    .await
-    .expect("archived active locks");
-    let state_event_count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM state_events")
+    assert_no_checkout_mutation(&pool, archived_doc).await;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM document_events WHERE document_id = ? AND event_type = 'checkout'",
+        )
+        .bind(locked_doc)
         .fetch_one(&pool)
         .await
-        .expect("state events");
-    assert_eq!(event_count, 0);
-    assert_eq!(archived_lock_count, 0);
-    assert_eq!(state_event_count, 0);
+        .expect("locked checkout events"),
+        0,
+    );
 }
 
 #[tokio::test]

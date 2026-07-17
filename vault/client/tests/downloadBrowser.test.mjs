@@ -1,3 +1,5 @@
+/* global AbortController, Response, URL, WritableStream, window */
+
 import { Buffer } from "node:buffer";
 import assert from "node:assert/strict";
 import test from "node:test";
@@ -13,11 +15,11 @@ const transferBundle = await build({
   write: false,
 });
 const transferModuleUrl = `data:text/javascript;base64,${Buffer.from(
-  transferBundle.outputFiles[0].text
+  transferBundle.outputFiles.at(0).text
 ).toString("base64")}`;
-const { downloadUrl, exportAndDownload } = await import(transferModuleUrl);
+const { TransferCancelledError, downloadUrl, exportAndDownload } = await import(transferModuleUrl);
 
-function installBrowser() {
+function installBrowser({ onClick } = {}) {
   const downloads = [];
   globalThis.window = {
     location: {
@@ -39,6 +41,7 @@ function installBrowser() {
       return {
         click() {
           assert.equal(this.appended, true);
+          onClick?.();
           downloads.push({ download: this.download, hidden: this.hidden, href: this.href });
         },
         remove() {
@@ -81,6 +84,49 @@ test("default downloads hand the URL directly to the browser without a probe", a
   });
 });
 
+test("browser-managed checkout prepares before click and uses the pinned URL", async () => {
+  const events = [];
+  const downloads = installBrowser({ onClick: () => events.push("click") });
+  globalThis.fetch = async () => {
+    throw new Error("browser-managed downloads must not fetch through JavaScript");
+  };
+
+  const result = await downloadUrl({
+    fallbackName: "checkout.txt",
+    fallbackTotal: 8,
+    onProgress: () => {},
+    prepare: async (signal) => {
+      assert.equal(signal.aborted, false);
+      events.push("prepare");
+      return "/documents/1/versions/version-1/download";
+    },
+    signal: new AbortController().signal,
+  });
+
+  assert.deepEqual(events, ["prepare", "click"]);
+  assert.equal(
+    downloads.at(0).href,
+    "https://vault.example/documents/1/versions/version-1/download"
+  );
+  assert.equal(result.browserManaged, true);
+});
+
+test("browser-managed checkout rejects a prepared cross-origin URL before handoff", async () => {
+  const downloads = installBrowser();
+
+  await assert.rejects(
+    downloadUrl({
+      fallbackName: "checkout.txt",
+      onProgress: () => {},
+      prepare: async () => "https://files.example/checkout.txt",
+      signal: new AbortController().signal,
+    }),
+    /same origin/
+  );
+
+  assert.deepEqual(downloads, []);
+});
+
 test("browser-managed downloads reject cross-origin URLs", async () => {
   const downloads = installBrowser();
 
@@ -99,25 +145,30 @@ test("browser-managed downloads reject cross-origin URLs", async () => {
 
 test("enabled picker downloads use one bounded browser stream without range requests", async () => {
   installBrowser();
+  const events = [];
   const written = [];
   const requests = [];
   let suggestedName = "";
   let closed = false;
   window.showSaveFilePicker = async (options) => {
+    events.push("picker");
     suggestedName = options.suggestedName;
     return {
-      createWritable: async () =>
-        new WritableStream({
+      createWritable: async () => {
+        events.push("writer");
+        return new WritableStream({
           close() {
             closed = true;
           },
           write(chunk) {
             written.push(...chunk);
           },
-        }),
+        });
+      },
     };
   };
   globalThis.fetch = async (url, options) => {
+    events.push("fetch");
     requests.push({ options, url });
     return new Response(new Uint8Array([1, 2, 3, 4]), {
       headers: {
@@ -133,19 +184,115 @@ test("enabled picker downloads use one bounded browser stream without range requ
     customDownloadsEnabled: true,
     fallbackName: "report.pdf",
     onProgress: (nextProgress) => progress.push(nextProgress),
+    prepare: async () => {
+      events.push("prepare");
+      return "/documents/1/versions/version-1/download";
+    },
     signal: new AbortController().signal,
-    url: "/documents/1/download",
   });
 
+  assert.deepEqual(events, ["picker", "writer", "prepare", "fetch"]);
   assert.equal(suggestedName, "report.pdf");
   assert.deepEqual(written, [1, 2, 3, 4]);
   assert.equal(closed, true);
   assert.equal(requests.length, 1);
-  assert.equal(requests[0].url, "/documents/1/download");
-  assert.equal(requests[0].options.credentials, "include");
-  assert.equal(requests[0].options.headers, undefined);
+  assert.equal(requests.at(0).url, "/documents/1/versions/version-1/download");
+  assert.equal(requests.at(0).options.credentials, "include");
+  assert.equal(requests.at(0).options.headers, undefined);
   assert.equal(progress.at(-1).stage, "finalizing");
   assert.deepEqual(result, { filename: "server-report.pdf", size: 4, status: 200 });
+});
+
+test("picker cancellation never prepares checkout", async () => {
+  installBrowser();
+  let prepareCalls = 0;
+  window.showSaveFilePicker = async () => {
+    const error = new Error("picker cancelled");
+    error.name = "AbortError";
+    throw error;
+  };
+  globalThis.fetch = async () => {
+    throw new Error("picker cancellation must not fetch");
+  };
+
+  await assert.rejects(
+    downloadUrl({
+      customDownloadsEnabled: true,
+      fallbackName: "checkout.txt",
+      onProgress: () => {},
+      prepare: async () => {
+        prepareCalls += 1;
+        return "/documents/1/versions/version-1/download";
+      },
+      signal: new AbortController().signal,
+    }),
+    (error) => error instanceof TransferCancelledError
+  );
+
+  assert.equal(prepareCalls, 0);
+});
+
+test("checkout preparation failure aborts the chosen writer without a handoff", async () => {
+  const downloads = installBrowser();
+  let abortCalls = 0;
+  let fetchCalls = 0;
+  window.showSaveFilePicker = async () => ({
+    createWritable: async () => ({
+      abort: async () => {
+        abortCalls += 1;
+      },
+    }),
+  });
+  globalThis.fetch = async () => {
+    fetchCalls += 1;
+    throw new Error("preparation failure must not fetch");
+  };
+
+  await assert.rejects(
+    downloadUrl({
+      customDownloadsEnabled: true,
+      fallbackName: "checkout.txt",
+      onProgress: () => {},
+      prepare: async () => {
+        throw new Error("Lock failed");
+      },
+      signal: new AbortController().signal,
+    }),
+    /Lock failed/
+  );
+
+  assert.equal(abortCalls, 1);
+  assert.equal(fetchCalls, 0);
+  assert.deepEqual(downloads, []);
+});
+
+test("checkout cancellation during preparation aborts the writer and maps to cancellation", async () => {
+  installBrowser();
+  const controller = new AbortController();
+  let abortCalls = 0;
+  window.showSaveFilePicker = async () => ({
+    createWritable: async () => ({
+      abort: async () => {
+        abortCalls += 1;
+      },
+    }),
+  });
+
+  await assert.rejects(
+    downloadUrl({
+      customDownloadsEnabled: true,
+      fallbackName: "checkout.txt",
+      onProgress: () => {},
+      prepare: async () => {
+        controller.abort();
+        throw new Error("wrapped cancellation");
+      },
+      signal: controller.signal,
+    }),
+    (error) => error instanceof TransferCancelledError
+  );
+
+  assert.equal(abortCalls, 1);
 });
 
 test("completed exports are handed directly to the browser", async () => {

@@ -246,7 +246,7 @@ export function useTransfers({
   );
 
   const downloadWithProgress = useCallback(
-    async ({ url, name: displayName, size, exportPayload }) => {
+    async ({ url, name: displayName, size, exportPayload, prepare }) => {
       if (!filePickerDownloadsAvailable) {
         const confirmed = await confirmNativeDownload({
           dismissed: guidanceDismissed,
@@ -272,6 +272,7 @@ export function useTransfers({
               fallbackName: displayName || "download",
               fallbackTotal: size || null,
               onProgress: (progress) => updateProgress(id, progress),
+              prepare,
               signal,
               url,
             });

@@ -183,7 +183,7 @@ pub fn router(state: AppState) -> Router {
         .route("/s/{code}", get(share_entry))
         .route("/login", get(login))
         .route("/auth/callback", get(auth_callback))
-        .route("/logout", get(logout))
+        .route("/logout", post(logout))
         .route("/static/{*path}", get(static_asset))
         .route("/health", get(health))
         .route("/api/health", get(api_health))
@@ -352,7 +352,7 @@ fn document_transfer_routes() -> Router<AppState> {
         )
         .route(
             "/documents/{doc_id}/checkout",
-            get(checkout_document_version),
+            post(checkout_document_version),
         )
         .route("/documents/{doc_id}/checkin", post(legacy_checkin_document))
         .route(
@@ -559,16 +559,28 @@ async fn auth_callback(
 
 async fn logout(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
     Query(query): Query<RedirectQuery>,
-) -> Result<Response, ApiError> {
-    let rd = safe_redirect(query.rd.as_deref());
-    Ok(redirect_response(
-        &rd,
-        vec![
-            delete_cookie_header(&state.auth.session_cookie_name),
-            delete_cookie_header(&state.auth.oidc_state_cookie_name),
-        ],
-    ))
+) -> Response {
+    let result: Result<Response, ApiError> = (|| {
+        require_same_origin_provenance(&state.auth, &headers, &uri)?;
+        let rd = safe_redirect(query.rd.as_deref());
+        Ok(redirect_response(
+            &rd,
+            vec![
+                delete_cookie_header(&state.auth.session_cookie_name),
+                delete_cookie_header(&state.auth.oidc_state_cookie_name),
+            ],
+        ))
+    })();
+    let mut response = result.unwrap_or_else(IntoResponse::into_response);
+    insert_header(
+        response.headers_mut(),
+        header::CACHE_CONTROL,
+        APP_SHELL_CACHE_CONTROL,
+    );
+    response
 }
 
 async fn static_asset(
@@ -647,6 +659,11 @@ struct BootstrapQuery {
 #[derive(Debug, Default, Deserialize)]
 struct RedirectQuery {
     rd: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CheckoutResponse {
+    download_url: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1639,14 +1656,34 @@ async fn download_current_document_version(
 async fn checkout_document_version(
     State(state): State<AppState>,
     headers: HeaderMap,
+    uri: Uri,
     Path(doc_id): Path<i64>,
-) -> Result<Response, ApiError> {
-    let user = current_user(&state, &headers).await?;
-    let download = checkout_version_download(&state.db, doc_id, &user).await?;
-    let response = version_download_response(&state, &download, &headers).await?;
-    record_checkout_event_and_lock(&state.db, &download, &user, &client_meta(&headers)).await?;
-    notify_state_event_committed();
-    Ok(response)
+) -> Response {
+    let result: Result<CheckoutResponse, ApiError> = async {
+        require_same_origin_provenance(&state.auth, &headers, &uri)?;
+        let user = current_user(&state, &headers).await?;
+        let download = checkout_version_download(&state.db, doc_id, &user).await?;
+        probe_version_download(&state, &download).await?;
+        record_checkout_event_and_lock(&state.db, &download, &user, &client_meta(&headers)).await?;
+        notify_state_event_committed();
+        Ok(CheckoutResponse {
+            download_url: format!(
+                "/documents/{doc_id}/versions/{}/download",
+                percent_encode_path_segment(&download.version_id),
+            ),
+        })
+    }
+    .await;
+    let mut response = match result {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => error.into_response(),
+    };
+    insert_header(
+        response.headers_mut(),
+        header::CACHE_CONTROL,
+        APP_SHELL_CACHE_CONTROL,
+    );
+    response
 }
 
 async fn legacy_checkin_document(
@@ -2661,6 +2698,108 @@ fn header_value_by_name<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a st
     headers.get(name).and_then(|value| value.to_str().ok())
 }
 
+fn require_same_origin_provenance(
+    auth: &AuthSettings,
+    headers: &HeaderMap,
+    uri: &Uri,
+) -> Result<(), ApiError> {
+    let expected_origin = expected_request_origin(auth, headers, uri);
+    let origin = single_header_value(headers, "origin");
+    let fetch_site = single_header_value(headers, "sec-fetch-site");
+    let has_provenance = matches!(origin, Ok(Some(_))) || matches!(fetch_site, Ok(Some(_)));
+    let origin_matches = origin.is_ok_and(|value| {
+        value.is_none_or(|value| {
+            expected_origin.as_ref().is_some_and(|expected| {
+                canonical_http_origin(value, true).as_ref() == Some(expected)
+            })
+        })
+    });
+    let fetch_site_matches = fetch_site.is_ok_and(|value| {
+        value.is_none_or(|value| value.trim().eq_ignore_ascii_case("same-origin"))
+    });
+    if has_provenance && origin_matches && fetch_site_matches {
+        Ok(())
+    } else {
+        Err(ApiError::Forbidden(
+            "Same-origin request provenance required".to_string(),
+        ))
+    }
+}
+
+fn single_header_value<'a>(headers: &'a HeaderMap, name: &str) -> Result<Option<&'a str>, ()> {
+    let mut values = headers.get_all(name).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(());
+    }
+    value
+        .to_str()
+        .ok()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(Some)
+        .ok_or(())
+}
+
+fn expected_request_origin(auth: &AuthSettings, headers: &HeaderMap, uri: &Uri) -> Option<String> {
+    let public_url = auth.public_url.trim();
+    if !public_url.is_empty() {
+        return canonical_http_origin(public_url, false);
+    }
+    let scheme = if let Some(value) = header_value_by_name(headers, "x-forwarded-proto") {
+        first_forwarded_value(value)?.to_ascii_lowercase()
+    } else {
+        uri.scheme_str().unwrap_or("http").to_ascii_lowercase()
+    };
+    if !matches!(scheme.as_str(), "http" | "https") {
+        return None;
+    }
+    canonical_http_origin(
+        &format!("{scheme}://{}", external_request_host(headers)),
+        false,
+    )
+}
+
+fn canonical_http_origin(value: &str, require_origin_path: bool) -> Option<String> {
+    let parsed = value.trim().parse::<Uri>().ok()?;
+    let scheme = parsed.scheme_str()?.to_ascii_lowercase();
+    if !matches!(scheme.as_str(), "http" | "https") {
+        return None;
+    }
+    if require_origin_path
+        && !matches!(
+            parsed
+                .path_and_query()
+                .map(axum::http::uri::PathAndQuery::as_str),
+            None | Some("/" | "")
+        )
+    {
+        return None;
+    }
+    let authority = parsed.authority()?;
+    if authority.as_str().contains('@') {
+        return None;
+    }
+    let raw_host = authority.host().to_ascii_lowercase();
+    if raw_host.is_empty() {
+        return None;
+    }
+    let host = if raw_host.starts_with('[') || !raw_host.contains(':') {
+        raw_host
+    } else {
+        format!("[{raw_host}]")
+    };
+    let port = authority
+        .port_u16()
+        .filter(|port| !matches!((scheme.as_str(), *port), ("http", 80) | ("https", 443)));
+    Some(port.map_or_else(
+        || format!("{scheme}://{host}"),
+        |port| format!("{scheme}://{host}:{port}"),
+    ))
+}
+
 fn required_i64_header(headers: &HeaderMap, name: &str) -> Result<i64, ApiError> {
     header_value_by_name(headers, name)
         .and_then(|value| value.parse::<i64>().ok())
@@ -2761,6 +2900,36 @@ fn blob_etag(download: &VersionDownload) -> String {
         "\"{}-{}-{}\"",
         download.hash_algo, download.hash, download.size_bytes
     )
+}
+
+async fn probe_version_download(
+    state: &AppState,
+    download: &VersionDownload,
+) -> Result<(), ApiError> {
+    let size = u64::try_from(download.size_bytes)
+        .map_err(|_| ApiError::Storage(StorageError::ContentMismatch))?;
+    if !download.hash_algo.eq_ignore_ascii_case("sha256")
+        || download.hash.len() != 64
+        || !download
+            .hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(ApiError::Storage(StorageError::ContentMismatch));
+    }
+    let source = open_ranked_location_stream(
+        state.storage.as_ref(),
+        &download.locations,
+        BlobReadRange {
+            expected_size: size,
+            offset: 0,
+            length: u64::from(size > 0),
+        },
+    )
+    .await
+    .map_err(|error| storage_download_error(error, size))?;
+    drop(source);
+    Ok(())
 }
 
 fn safe_download_name(filename: &str) -> String {
@@ -3028,6 +3197,10 @@ fn percent_encode_query_value(value: &str) -> String {
         }
     }
     encoded
+}
+
+fn percent_encode_path_segment(value: &str) -> String {
+    percent_encode_query_value(value)
 }
 
 fn percent_encode_return_path(value: &str) -> String {

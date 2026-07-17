@@ -3,6 +3,23 @@ import { Icon } from "../common/Icon.js";
 
 const h = React.createElement;
 
+function logoutControl(logoutUrl) {
+  const icon = h(Icon, { className: "logout-icon", icon: "logout", size: 18 });
+  const commonProps = {
+    "aria-label": "Log out",
+    className: "btn logout icon-button",
+    title: "Log out",
+  };
+  if (typeof logoutUrl === "string" && logoutUrl.startsWith("/") && !logoutUrl.startsWith("//")) {
+    return h(
+      "form",
+      { action: logoutUrl, className: "logout-form", key: "logout", method: "post" },
+      h("button", { ...commonProps, type: "submit" }, icon)
+    );
+  }
+  return h("a", { ...commonProps, href: logoutUrl, key: "logout" }, icon);
+}
+
 export function Toolbar({
   folder,
   breadcrumbs,
@@ -81,17 +98,7 @@ export function Toolbar({
         },
         h(Icon, { className: "settings-icon", icon: "gear", size: 18 })
       ),
-      h(
-        "a",
-        {
-          "aria-label": "Log out",
-          className: "btn logout icon-button",
-          href: logoutUrl,
-          title: "Log out",
-          key: "logout",
-        },
-        h(Icon, { className: "logout-icon", icon: "logout", size: 18 })
-      ),
+      logoutControl(logoutUrl),
     ])
   );
 }

@@ -765,6 +765,24 @@ function totalFromDownloadResponse(response, fallbackTotal) {
   return Number.isFinite(headerLength) && headerLength > 0 ? headerLength : fallbackTotal;
 }
 
+function sameOriginDownloadUrl(url) {
+  if (typeof url !== "string" || !url) {
+    throw new Error("Download preparation did not return a URL.");
+  }
+  const resolvedUrl = new URL(url, window.location.href);
+  if (resolvedUrl.origin !== window.location.origin) {
+    throw new Error("Download URL must use the same origin as Vault.");
+  }
+  return url;
+}
+
+async function prepareDownloadUrl({ prepare, signal, url }) {
+  throwIfAborted(signal);
+  const preparedUrl = prepare ? await prepare(signal) : url;
+  throwIfAborted(signal);
+  return sameOriginDownloadUrl(preparedUrl);
+}
+
 async function cancelResponseBody(response) {
   if (!response?.body || typeof response.body.cancel !== "function") {
     return;
@@ -810,6 +828,7 @@ export async function downloadUrl({
   fallbackTotal = null,
   signal,
   writer: existingWriter = null,
+  prepare = null,
 }) {
   const startedAt = performance.now();
   let response = null;
@@ -820,19 +839,21 @@ export async function downloadUrl({
     const useBrowserDownload =
       !browserDownload.canUseFileSystemDownloadWriter(customDownloadsEnabled);
     if (!writer && useBrowserDownload) {
+      const browserPreparedUrl = await prepareDownloadUrl({ prepare, signal, url });
       return browserManagedDownload({
         fallbackName,
         fallbackTotal,
         onProgress,
         signal,
         startedAt,
-        url,
+        url: browserPreparedUrl,
       });
     }
     if (!writer) {
       writer = await browserDownload.openFileSystemDownloadWriter(fallbackName, signal);
     }
-    response = await fetch(url, { credentials: "include", signal });
+    const preparedUrl = await prepareDownloadUrl({ prepare, signal, url });
+    response = await fetch(preparedUrl, { credentials: "include", signal });
     if (!response.ok) {
       throw await errorFromResponse(response, "Download failed");
     }
@@ -856,7 +877,7 @@ export async function downloadUrl({
     if (writer) {
       await writer.abort().catch(() => {});
     }
-    if (isAbortError(error)) {
+    if (signal?.aborted || isAbortError(error)) {
       throw new TransferCancelledError();
     }
     throw error;

@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
@@ -14,6 +15,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::{Client as S3Client, Config as S3ClientConfig};
 use axum::body::Bytes;
 use futures_util::{Stream, StreamExt, stream};
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -388,6 +390,7 @@ pub struct S3StorageSettings {
     pub bucket: String,
     pub region: String,
     pub endpoint_url: Option<String>,
+    pub allow_insecure_local_http: bool,
     pub access_key_id: Option<String>,
     pub secret_access_key: Option<String>,
     pub session_token: Option<String>,
@@ -1966,6 +1969,10 @@ impl S3StorageSettings {
             bucket: env_trimmed_from(&env_var, "VAULT_S3_BUCKET"),
             region: env_trimmed_or_from(&env_var, "VAULT_S3_REGION", "us-east-1"),
             endpoint_url: env_optional_from(&env_var, "VAULT_S3_ENDPOINT_URL"),
+            allow_insecure_local_http: env_flag_from(
+                &env_var,
+                "VAULT_S3_ALLOW_INSECURE_LOCAL_HTTP",
+            ),
             access_key_id: env_optional_fallback_from(
                 &env_var,
                 "VAULT_S3_ACCESS_KEY_ID",
@@ -2008,11 +2015,76 @@ impl S3StorageSettings {
             bucket: env_trimmed_from(&env_var, "VAULT_R2_BUCKET"),
             region: "auto".to_string(),
             endpoint_url,
+            allow_insecure_local_http: env_flag_from(
+                &env_var,
+                "VAULT_R2_ALLOW_INSECURE_LOCAL_HTTP",
+            ),
             access_key_id: env_optional_from(&env_var, "VAULT_R2_ACCESS_KEY_ID"),
             secret_access_key: env_optional_from(&env_var, "VAULT_R2_SECRET_ACCESS_KEY"),
             session_token: None,
             prefix: prefix.to_string(),
         }
+    }
+}
+
+fn validate_s3_endpoint_url(
+    endpoint_url: &str,
+    allow_insecure_local_http: bool,
+) -> Result<String, StorageError> {
+    let endpoint = Url::parse(endpoint_url).map_err(|_| {
+        StorageError::Configuration("S3-compatible storage endpoint URL is invalid".to_string())
+    })?;
+    let host = endpoint.host_str().ok_or_else(|| {
+        StorageError::Configuration("S3-compatible storage endpoint URL is invalid".to_string())
+    })?;
+    if !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+    {
+        return Err(StorageError::Configuration(
+            "S3-compatible storage endpoint URL is invalid".to_string(),
+        ));
+    }
+
+    match endpoint.scheme() {
+        "https" => {}
+        "http" if !allow_insecure_local_http => Err(StorageError::Configuration(
+            "S3-compatible storage endpoint must use HTTPS".to_string(),
+        ))?,
+        "http" if is_loopback_endpoint_host(host) => {}
+        "http" => return Err(StorageError::Configuration(
+            "S3-compatible storage endpoint may use HTTP only for loopback hosts when explicitly enabled"
+                .to_string(),
+        )),
+        _ => return Err(StorageError::Configuration(
+            "S3-compatible storage endpoint URL must use HTTP or HTTPS".to_string(),
+        )),
+    }
+    Ok(endpoint.to_string())
+}
+
+fn is_loopback_endpoint_host(host: &str) -> bool {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    let normalized_host = host.to_ascii_lowercase();
+    if normalized_host == "localhost"
+        || (normalized_host.ends_with(".localhost") && normalized_host.len() > ".localhost".len())
+    {
+        return true;
+    }
+
+    match normalized_host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(address)) => address.octets()[0] == 127,
+        Ok(IpAddr::V6(address)) => {
+            address.is_loopback()
+                || address
+                    .to_ipv4_mapped()
+                    .is_some_and(|address| address.octets()[0] == 127)
+        }
+        Err(_) => false,
     }
 }
 
@@ -2026,6 +2098,16 @@ impl S3CompatibleBlobStorage {
                 name.to_ascii_uppercase()
             )));
         }
+        let endpoint_url = settings
+            .endpoint_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|endpoint_url| !endpoint_url.is_empty());
+        let endpoint_url = endpoint_url
+            .map(|endpoint_url| {
+                validate_s3_endpoint_url(endpoint_url, settings.allow_insecure_local_http)
+            })
+            .transpose()?;
         let region = settings.region.trim();
         let shared_config = aws_config::defaults(BehaviorVersion::latest()).region(Region::new(
             if region.is_empty() {
@@ -2071,11 +2153,8 @@ impl S3CompatibleBlobStorage {
         if let Some(credentials_provider) = shared_config.credentials_provider() {
             config_builder = config_builder.credentials_provider(credentials_provider.clone());
         }
-        if let Some(endpoint_url) = settings.endpoint_url.as_deref() {
-            let endpoint_url = endpoint_url.trim();
-            if !endpoint_url.is_empty() {
-                config_builder = config_builder.endpoint_url(endpoint_url);
-            }
+        if let Some(endpoint_url) = endpoint_url.as_deref() {
+            config_builder = config_builder.endpoint_url(endpoint_url);
         }
         Ok(Self {
             name: Arc::from(name),
@@ -3050,6 +3129,18 @@ where
     F: Fn(&str) -> Option<String>,
 {
     env_optional_from(env_var, primary).or_else(|| env_optional_from(env_var, fallback))
+}
+
+fn env_flag_from<F>(env_var: &F, name: &str) -> bool
+where
+    F: Fn(&str) -> Option<String>,
+{
+    env_var(name).is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 fn remote_storage_error(error: impl std::fmt::Display) -> StorageError {

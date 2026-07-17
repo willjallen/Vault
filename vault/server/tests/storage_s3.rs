@@ -38,6 +38,7 @@ async fn s3_compatible_storage_puts_reads_ranges_and_deletes_objects() {
         bucket: "vault-test".to_string(),
         region: "us-east-1".to_string(),
         endpoint_url: Some(endpoint_url),
+        allow_insecure_local_http: true,
         access_key_id: Some("test-access".to_string()),
         secret_access_key: Some("test-secret".to_string()),
         session_token: None,
@@ -106,6 +107,7 @@ async fn s3_compatible_storage_overwrites_existing_digest_key_with_new_bytes() {
         bucket: "vault-test".to_string(),
         region: "us-east-1".to_string(),
         endpoint_url: Some(endpoint_url),
+        allow_insecure_local_http: true,
         access_key_id: Some("test-access".to_string()),
         secret_access_key: Some("test-secret".to_string()),
         session_token: None,
@@ -141,6 +143,7 @@ async fn s3_full_object_stream_is_bounded_across_multiple_mebibytes() {
         bucket: "vault-test".to_string(),
         region: "us-east-1".to_string(),
         endpoint_url: Some(endpoint_url),
+        allow_insecure_local_http: true,
         access_key_id: Some("test-access".to_string()),
         secret_access_key: Some("test-secret".to_string()),
         session_token: None,
@@ -204,6 +207,7 @@ async fn s3_range_stream_rejects_a_provider_that_ignores_the_range() {
         bucket: "vault-test".to_string(),
         region: "us-east-1".to_string(),
         endpoint_url: Some(endpoint_url(addr)),
+        allow_insecure_local_http: true,
         access_key_id: Some("test-access".to_string()),
         secret_access_key: Some("test-secret".to_string()),
         session_token: None,
@@ -233,6 +237,7 @@ async fn s3_compatible_storage_rejects_missing_bucket_configuration() {
         bucket: String::new(),
         region: "auto".to_string(),
         endpoint_url: Some("http://127.0.0.1:1".to_string()),
+        allow_insecure_local_http: true,
         access_key_id: Some("access".to_string()),
         secret_access_key: Some("secret".to_string()),
         session_token: None,
@@ -245,12 +250,140 @@ async fn s3_compatible_storage_rejects_missing_bucket_configuration() {
     assert!(error.to_string().contains("VAULT_R2_BUCKET"));
 }
 
+fn endpoint_policy_settings(
+    endpoint_url: &str,
+    allow_insecure_local_http: bool,
+) -> S3StorageSettings {
+    S3StorageSettings {
+        name: "s3".to_string(),
+        bucket: "vault-test".to_string(),
+        region: "us-east-1".to_string(),
+        endpoint_url: Some(endpoint_url.to_string()),
+        allow_insecure_local_http,
+        access_key_id: Some("test-access".to_string()),
+        secret_access_key: Some("test-secret".to_string()),
+        session_token: None,
+        prefix: "objects".to_string(),
+    }
+}
+
+#[tokio::test]
+async fn s3_endpoint_policy_accepts_https_and_explicit_loopback_http() {
+    for (endpoint_url, allow_insecure_local_http) in [
+        ("https://s3.example.test", false),
+        ("http://localhost:9000", true),
+        ("http://minio.localhost:9000", true),
+        ("http://127.42.1.9:9000", true),
+        ("http://2130706433:9000", true),
+        ("http://0177.0.0.1:9000", true),
+        ("http://0x7f000001:9000", true),
+        ("http://[::1]:9000", true),
+        ("http://[::ffff:127.42.1.9]:9000", true),
+    ] {
+        let result = S3CompatibleBlobStorage::from_settings(endpoint_policy_settings(
+            endpoint_url,
+            allow_insecure_local_http,
+        ))
+        .await;
+
+        assert!(result.is_ok(), "{endpoint_url}: {result:?}");
+    }
+}
+
+#[tokio::test]
+async fn s3_endpoint_policy_rejects_http_without_explicit_opt_in() {
+    let error = S3CompatibleBlobStorage::from_settings(endpoint_policy_settings(
+        "http://127.0.0.1:9000",
+        false,
+    ))
+    .await
+    .expect_err("insecure endpoint must be rejected by default");
+
+    assert!(matches!(error, StorageError::Configuration(_)));
+    assert!(error.to_string().contains("must use HTTPS"));
+}
+
+#[tokio::test]
+async fn s3_endpoint_policy_rejects_non_loopback_http_even_with_opt_in() {
+    for endpoint_url in [
+        "http://example.test:9000",
+        "http://8.8.8.8:9000",
+        "http://localhost.evil:9000",
+        "http://localhost.:9000",
+        "http://10.0.0.1:9000",
+        "http://172.16.0.1:9000",
+        "http://192.168.0.1:9000",
+        "http://169.254.1.1:9000",
+        "http://[fe80::1]:9000",
+        "http://[::ffff:10.0.0.1]:9000",
+        "http://100.64.0.1:9000",
+        "http://0.0.0.0:9000",
+        "http://[::]:9000",
+        "http://minio.local:9000",
+        "http://minio:9000",
+    ] {
+        let error =
+            S3CompatibleBlobStorage::from_settings(endpoint_policy_settings(endpoint_url, true))
+                .await
+                .expect_err("non-loopback HTTP endpoint must be rejected");
+
+        assert!(
+            matches!(error, StorageError::Configuration(_)),
+            "{endpoint_url}: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("only for loopback hosts"),
+            "{endpoint_url}: {error}"
+        );
+        assert!(!error.to_string().contains(endpoint_url));
+    }
+}
+
+#[tokio::test]
+async fn s3_endpoint_policy_rejects_non_http_and_malformed_urls() {
+    for (endpoint_url, message) in [
+        ("ftp://localhost/bucket", "must use HTTP or HTTPS"),
+        ("not a URL", "URL is invalid"),
+        ("https://[::1", "URL is invalid"),
+        ("http://evil@localhost:9000", "URL is invalid"),
+        ("http://localhost@evil:9000", "URL is invalid"),
+        ("http://user:pass@localhost:9000", "URL is invalid"),
+        ("http://localhost:9000?bucket=other", "URL is invalid"),
+        ("http://localhost:9000#other", "URL is invalid"),
+    ] {
+        let error =
+            S3CompatibleBlobStorage::from_settings(endpoint_policy_settings(endpoint_url, true))
+                .await
+                .expect_err("invalid endpoint must be rejected");
+
+        assert!(
+            matches!(error, StorageError::Configuration(_)),
+            "{endpoint_url}: {error:?}"
+        );
+        assert!(
+            error.to_string().contains(message),
+            "{endpoint_url}: {error}"
+        );
+        assert!(!error.to_string().contains(endpoint_url));
+    }
+}
+
+#[test]
+fn s3_storage_settings_treat_unknown_insecure_http_flag_as_disabled() {
+    let settings = S3StorageSettings::s3_from_env_with("objects", |name| {
+        (name == "VAULT_S3_ALLOW_INSECURE_LOCAL_HTTP").then(|| "sometimes".to_string())
+    });
+
+    assert!(!settings.allow_insecure_local_http);
+}
+
 #[test]
 fn s3_storage_settings_use_vault_env_with_aws_credential_fallbacks() {
     let env = HashMap::from([
         ("VAULT_S3_BUCKET", "vault-prod"),
         ("VAULT_S3_REGION", "us-west-2"),
         ("VAULT_S3_ENDPOINT_URL", "https://s3.example.test"),
+        ("VAULT_S3_ALLOW_INSECURE_LOCAL_HTTP", "1"),
         ("AWS_ACCESS_KEY_ID", "aws-access"),
         ("AWS_SECRET_ACCESS_KEY", "aws-secret"),
         ("AWS_SESSION_TOKEN", "aws-session"),
@@ -267,6 +400,7 @@ fn s3_storage_settings_use_vault_env_with_aws_credential_fallbacks() {
         settings.endpoint_url.as_deref(),
         Some("https://s3.example.test")
     );
+    assert!(settings.allow_insecure_local_http);
     assert_eq!(settings.access_key_id.as_deref(), Some("aws-access"));
     assert_eq!(settings.secret_access_key.as_deref(), Some("aws-secret"));
     assert_eq!(settings.session_token.as_deref(), Some("aws-session"));
@@ -280,6 +414,7 @@ fn r2_storage_settings_derive_endpoint_from_account_id() {
         ("VAULT_R2_ACCOUNT_ID", "acct123"),
         ("VAULT_R2_ACCESS_KEY_ID", "r2-access"),
         ("VAULT_R2_SECRET_ACCESS_KEY", "r2-secret"),
+        ("VAULT_R2_ALLOW_INSECURE_LOCAL_HTTP", "true"),
     ]);
 
     let settings = S3StorageSettings::r2_from_env_with("objects", |name| {
@@ -293,6 +428,7 @@ fn r2_storage_settings_derive_endpoint_from_account_id() {
         settings.endpoint_url.as_deref(),
         Some("https://acct123.r2.cloudflarestorage.com"),
     );
+    assert!(settings.allow_insecure_local_http);
     assert_eq!(settings.access_key_id.as_deref(), Some("r2-access"));
     assert_eq!(settings.secret_access_key.as_deref(), Some("r2-secret"));
     assert_eq!(settings.session_token, None);
@@ -307,6 +443,7 @@ async fn s3_compatible_storage_promotes_part_files_as_content_addressed_object()
         bucket: "vault-parts".to_string(),
         region: "auto".to_string(),
         endpoint_url: Some(endpoint_url),
+        allow_insecure_local_http: true,
         access_key_id: Some("test-access".to_string()),
         secret_access_key: Some("test-secret".to_string()),
         session_token: None,
@@ -354,6 +491,7 @@ async fn s3_compatible_storage_rejects_part_file_checksum_mismatch_without_uploa
         bucket: "vault-parts".to_string(),
         region: "us-east-1".to_string(),
         endpoint_url: Some(endpoint_url),
+        allow_insecure_local_http: true,
         access_key_id: Some("test-access".to_string()),
         secret_access_key: Some("test-secret".to_string()),
         session_token: None,
@@ -392,6 +530,7 @@ async fn s3_staged_part_upload_supports_empty_objects() {
         bucket: "vault-parts".to_string(),
         region: "us-east-1".to_string(),
         endpoint_url: Some(endpoint_url),
+        allow_insecure_local_http: true,
         access_key_id: Some("test-access".to_string()),
         secret_access_key: Some("test-secret".to_string()),
         session_token: None,
@@ -427,6 +566,7 @@ async fn s3_part_staging_is_session_local_and_cancel_safe() {
         bucket: "vault-parts".to_string(),
         region: "us-east-1".to_string(),
         endpoint_url: Some(endpoint_url),
+        allow_insecure_local_http: true,
         access_key_id: Some("test-access".to_string()),
         secret_access_key: Some("test-secret".to_string()),
         session_token: None,
@@ -584,6 +724,7 @@ async fn blob_lifecycle_garbage_collection_deletes_s3_object_and_metadata() {
         bucket: "vault-gc".to_string(),
         region: "us-east-1".to_string(),
         endpoint_url: Some(endpoint_url),
+        allow_insecure_local_http: true,
         access_key_id: Some("test-access".to_string()),
         secret_access_key: Some("test-secret".to_string()),
         session_token: None,

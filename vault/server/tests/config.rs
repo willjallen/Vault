@@ -366,7 +366,17 @@ fn production_compose_uses_latest_image_single_data_volume_and_hardened_defaults
         compose.contains("VAULT_OIDC_HTTP_TIMEOUT_SECONDS: ${VAULT_OIDC_HTTP_TIMEOUT_SECONDS:-8}")
     );
     assert!(compose.contains("VAULT_S3_BUCKET: ${VAULT_S3_BUCKET:-}"));
+    assert!(
+        compose.contains(
+            "VAULT_S3_ALLOW_INSECURE_LOCAL_HTTP: ${VAULT_S3_ALLOW_INSECURE_LOCAL_HTTP:-0}"
+        )
+    );
     assert!(compose.contains("VAULT_R2_BUCKET: ${VAULT_R2_BUCKET:-}"));
+    assert!(
+        compose.contains(
+            "VAULT_R2_ALLOW_INSECURE_LOCAL_HTTP: ${VAULT_R2_ALLOW_INSECURE_LOCAL_HTTP:-0}"
+        )
+    );
     assert!(!compose.contains("VAULT_DEV_AUTH"));
     assert!(!compose.contains("dev-insecure-session-secret"));
     assert!(!compose.contains("/vault-metadata"));

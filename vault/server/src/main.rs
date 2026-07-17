@@ -1,4 +1,5 @@
 use std::future::IntoFuture;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -69,7 +70,7 @@ async fn main() -> anyhow::Result<()> {
     spawn_ttl_sweeper(state.clone(), transfers_path.clone());
 
     let export_execution = state.export_execution.clone();
-    let app = http::router(state);
+    let app = http::network_router(state);
 
     tracing::info!(%bind_addr, "vault rust server listening");
     let (http_shutdown_tx, http_shutdown_rx) = oneshot::channel();
@@ -82,11 +83,14 @@ async fn main() -> anyhow::Result<()> {
         let _ = shutdown_observed_tx.send(());
     });
     let server_result = {
-        let server = axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                let _ = http_shutdown_rx.await;
-            })
-            .into_future();
+        let server = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            let _ = http_shutdown_rx.await;
+        })
+        .into_future();
         tokio::pin!(server);
         tokio::select! {
             result = &mut server => {

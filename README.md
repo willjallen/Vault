@@ -6,7 +6,7 @@ The published image stores all local runtime state under `/data`. A standard dep
 
 ```sh
 cp .env.example .env
-# Set VAULT_SESSION_SECRET in .env before starting.
+# Set VAULT_SESSION_SECRET and, for header auth, FORWARDED_ALLOW_IPS before starting.
 docker compose up -d
 ```
 
@@ -20,7 +20,9 @@ docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 
 Do not use the dev override for production. `VAULT_DEV_MODE=1` exposes admin-only debug tools and the app shows prominent development warnings. Production deployments should set a strong `VAULT_SESSION_SECRET` and either run behind a trusted header-auth proxy or configure `VAULT_AUTH_MODE=oidc` with the OIDC variables in `.env.example`.
 
-For OIDC behind TLS termination, set `VAULT_PUBLIC_URL` to the external `https://` origin and leave `VAULT_SESSION_COOKIE_SECURE=auto` so session and OIDC state cookies are marked `Secure` even when the container receives internal HTTP. The Rust service also honors `X-Forwarded-Proto: https` for generated OIDC callback URLs, secure cookies, and HSTS decisions when a trusted reverse proxy supplies that header. The app emits baseline security headers by default and adds HSTS when the public request origin is HTTPS; tune `VAULT_HSTS_MAX_AGE_SECONDS` and `VAULT_HSTS_INCLUDE_SUBDOMAINS` for your domain.
+Header authentication requires `FORWARDED_ALLOW_IPS` to contain the direct source IPs or CIDRs of the trusted reverse proxies, separated by commas. Vault matches the TCP peer that connected to it and never uses `X-Forwarded-For` to decide whether identity headers are trusted. Configure the address as seen inside the Vault container; a reverse proxy running on the Docker host commonly appears as the Docker bridge gateway rather than `127.0.0.1`. The proxy must remove or overwrite client-supplied `Remote-User`, `Remote-Name`, `Remote-Email`, `Remote-Groups`, and `X-Forwarded-*` headers. Changes to the trust list require a restart. Vault refuses to start in header mode when the trust list is missing or invalid.
+
+For OIDC behind TLS termination, set `VAULT_PUBLIC_URL` to the external `https://` origin and leave `VAULT_SESSION_COOKIE_SECURE=auto` so session and OIDC state cookies are marked `Secure` even when the container receives internal HTTP. The Rust service also honors `X-Forwarded-Proto: https` for generated OIDC callback URLs, secure cookies, and HSTS decisions when the direct proxy peer is listed in `FORWARDED_ALLOW_IPS`; forwarded headers from every other source are removed. The app emits baseline security headers by default and adds HSTS when the public request origin is HTTPS; tune `VAULT_HSTS_MAX_AGE_SECONDS` and `VAULT_HSTS_INCLUDE_SUBDOMAINS` for your domain.
 
 Bootstrap OIDC administrators with exact, case-sensitive subject identifiers in `VAULT_OIDC_BOOTSTRAP_ADMIN_SUBJECTS` (comma-separated and implicitly bound to `VAULT_OIDC_ISSUER`). `VAULT_BOOTSTRAP_ADMIN_EMAILS` applies only to trusted header/dev identities; OIDC email claims are not authorization identifiers.
 

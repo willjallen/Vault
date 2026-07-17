@@ -1,11 +1,12 @@
 use std::collections::{HashSet, VecDeque};
 use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
-use axum::extract::{Extension, Path, Query, Request, State};
+use axum::extract::{ConnectInfo, Extension, Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, Sse};
@@ -86,6 +87,21 @@ const APP_SHELL_CACHE_CONTROL: &str = "no-store, max-age=0";
 const STATIC_IMMUTABLE_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 const STATIC_REVALIDATE_CACHE_CONTROL: &str = "no-cache";
 const DEFAULT_DOWNLOAD_CONCURRENCY_LIMIT: usize = 64;
+const IDENTITY_HEADER_NAMES: [&str; 4] = [
+    "remote-user",
+    "remote-name",
+    "remote-email",
+    "remote-groups",
+];
+const FORWARDED_HEADER_NAMES: [&str; 7] = [
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-port",
+    "x-forwarded-prefix",
+    "x-forwarded-proto",
+    "x-forwarded-server",
+];
 static DEBUG_EVENT_STREAM_GENERATION: AtomicI64 = AtomicI64::new(0);
 static DEBUG_EVENT_STREAM_RETRY_MS: AtomicI64 = AtomicI64::new(3000);
 
@@ -222,6 +238,58 @@ pub fn router(state: AppState) -> Router {
             security_headers_middleware,
         ));
     gzip_layer(app, &state.config).with_state(state)
+}
+
+/// Adds the direct TCP peer boundary required by the production server.
+///
+/// `router` remains the transport-independent application used by focused
+/// route tests. Every network listener must use this wrapper and supply
+/// `ConnectInfo<SocketAddr>` from the accepted socket.
+pub fn network_router(state: AppState) -> Router {
+    let boundary_state = state.clone();
+    router(state).layer(middleware::from_fn_with_state(
+        boundary_state,
+        trusted_proxy_boundary,
+    ))
+}
+
+async fn trusted_proxy_boundary(
+    State(state): State<AppState>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let peer = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(address)| *address);
+    let peer_is_trusted =
+        peer.is_some_and(|address| state.auth.trusted_proxies.contains(address.ip()));
+    let has_identity_headers = IDENTITY_HEADER_NAMES
+        .iter()
+        .any(|name| request.headers().contains_key(*name));
+
+    if state.auth.mode == AuthMode::Headers && has_identity_headers && !peer_is_trusted {
+        tracing::warn!(
+            ?peer,
+            "rejected header authentication from an untrusted peer"
+        );
+        return ApiError::Auth(AuthError::AuthenticationRequired).into_response();
+    }
+
+    if !peer_is_trusted {
+        remove_headers(request.headers_mut(), &FORWARDED_HEADER_NAMES);
+    }
+    if state.auth.mode != AuthMode::Headers {
+        remove_headers(request.headers_mut(), &IDENTITY_HEADER_NAMES);
+    }
+
+    next.run(request).await
+}
+
+fn remove_headers(headers: &mut HeaderMap, names: &[&str]) {
+    for name in names {
+        headers.remove(*name);
+    }
 }
 
 fn gzip_layer(app: Router<AppState>, config: &Config) -> Router<AppState> {

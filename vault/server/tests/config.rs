@@ -297,6 +297,7 @@ fn production_compose_uses_latest_image_single_data_volume_and_hardened_defaults
     assert!(compose.contains("VAULT_DEV_MODE: ${VAULT_DEV_MODE:-0}"));
     assert!(compose.contains("VAULT_DOCKER_RUNTIME: ${VAULT_DOCKER_RUNTIME:-1}"));
     assert!(compose.contains("VAULT_AUTH_MODE: ${VAULT_AUTH_MODE:-headers}"));
+    assert!(compose.contains("FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-}"));
     assert!(compose.contains("VAULT_REQUIRE_SESSION_SECRET: ${VAULT_REQUIRE_SESSION_SECRET:-}"));
     assert!(compose.contains("VAULT_SESSION_SECRET: ${VAULT_SESSION_SECRET:-}"));
     assert!(
@@ -367,7 +368,6 @@ fn production_compose_uses_latest_image_single_data_volume_and_hardened_defaults
     assert!(compose.contains("VAULT_R2_BUCKET: ${VAULT_R2_BUCKET:-}"));
     assert!(!compose.contains("VAULT_DEV_AUTH"));
     assert!(!compose.contains("dev-insecure-session-secret"));
-    assert!(!compose.contains("FORWARDED_ALLOW_IPS"));
     assert!(!compose.contains("/vault-metadata"));
     assert!(!compose.contains("/vault-objects"));
     assert!(!compose.contains("0.0.0.0:8000:8000"));

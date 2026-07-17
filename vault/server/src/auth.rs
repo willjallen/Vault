@@ -1,11 +1,13 @@
 use std::collections::{BTreeSet, HashSet};
 use std::env;
+use std::net::IpAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::http::HeaderMap;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use hmac::{Hmac, Mac};
+use ipnet::{IpNet, Ipv4Net};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::Sha256;
@@ -57,6 +59,110 @@ pub enum SessionSecretRequirement {
     Required,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct TrustedProxySet {
+    networks: Vec<IpNet>,
+    invalid_entries: Vec<String>,
+    configured: bool,
+}
+
+impl TrustedProxySet {
+    #[must_use]
+    pub fn parse(value: &str) -> Self {
+        let value = value.trim();
+        if value.is_empty() {
+            return Self::default();
+        }
+
+        let mut networks = Vec::new();
+        let mut invalid_entries = Vec::new();
+        for entry in value.split(',') {
+            let entry = entry.trim();
+            let network = if entry.is_empty() || entry == "*" {
+                None
+            } else if let Ok(address) = entry.parse::<IpAddr>() {
+                Some(IpNet::from(normalize_peer_ip(address)))
+            } else {
+                entry
+                    .parse::<IpNet>()
+                    .ok()
+                    .and_then(normalize_proxy_network)
+            };
+            match network {
+                Some(network) if network.prefix_len() != 0 => {
+                    if !networks.contains(&network) {
+                        networks.push(network);
+                    }
+                }
+                _ => invalid_entries.push(if entry.is_empty() {
+                    "<empty>".to_string()
+                } else {
+                    entry.to_string()
+                }),
+            }
+        }
+
+        Self {
+            networks,
+            invalid_entries,
+            configured: true,
+        }
+    }
+
+    #[must_use]
+    pub fn contains(&self, address: IpAddr) -> bool {
+        let address = normalize_peer_ip(address);
+        self.networks
+            .iter()
+            .any(|network| network.contains(&address))
+    }
+
+    fn validation_error(&self, required: bool) -> Option<String> {
+        if !self.configured {
+            return required.then(|| {
+                "FORWARDED_ALLOW_IPS is required when VAULT_AUTH_MODE=headers".to_string()
+            });
+        }
+        if !self.invalid_entries.is_empty() {
+            return Some(format!(
+                "FORWARDED_ALLOW_IPS contains invalid IP/CIDR entries: {}",
+                self.invalid_entries.join(", ")
+            ));
+        }
+        if self.networks.is_empty() {
+            return Some(
+                "FORWARDED_ALLOW_IPS must contain at least one trusted proxy IP or CIDR"
+                    .to_string(),
+            );
+        }
+        None
+    }
+}
+
+fn normalize_peer_ip(address: IpAddr) -> IpAddr {
+    match address {
+        IpAddr::V6(address) => address
+            .to_ipv4_mapped()
+            .map_or(IpAddr::V6(address), IpAddr::V4),
+        address @ IpAddr::V4(_) => address,
+    }
+}
+
+fn normalize_proxy_network(network: IpNet) -> Option<IpNet> {
+    let IpNet::V6(ipv6_network) = network else {
+        return Some(network);
+    };
+    if ipv6_network.prefix_len() < 96 {
+        return Some(IpNet::V6(ipv6_network));
+    }
+    let Some(ipv4_address) = ipv6_network.network().to_ipv4_mapped() else {
+        return Some(IpNet::V6(ipv6_network));
+    };
+    Ipv4Net::new(ipv4_address, ipv6_network.prefix_len() - 96)
+        .ok()
+        .map(IpNet::V4)
+}
+
 #[derive(Debug, Clone)]
 pub struct AuthSettings {
     pub mode: AuthMode,
@@ -71,6 +177,7 @@ pub struct AuthSettings {
     pub session_cookie_name: String,
     pub session_cookie_secure: String,
     pub session_max_age_seconds: i64,
+    pub trusted_proxies: TrustedProxySet,
     pub header_auth_issuer: String,
     pub dev_auth_issuer: String,
     pub admin_groups: HashSet<String>,
@@ -93,7 +200,6 @@ pub struct AuthSettings {
     pub oidc_discovery_ttl_seconds: i64,
     pub oidc_http_timeout_seconds: f64,
     pub security_headers: SecurityHeaderSettings,
-    pub default_user_email: String,
     pub dev_user: String,
     pub dev_name: String,
     pub dev_email: String,
@@ -142,6 +248,7 @@ impl Default for AuthSettings {
             session_cookie_name: "vault_session".to_string(),
             session_cookie_secure: "auto".to_string(),
             session_max_age_seconds: 604_800,
+            trusted_proxies: TrustedProxySet::default(),
             header_auth_issuer: "headers".to_string(),
             dev_auth_issuer: "dev".to_string(),
             admin_groups: split_groups_set("admin,vault-admin"),
@@ -164,7 +271,6 @@ impl Default for AuthSettings {
             oidc_discovery_ttl_seconds: 3600,
             oidc_http_timeout_seconds: 8.0,
             security_headers: SecurityHeaderSettings::default(),
-            default_user_email: "admin@example.com".to_string(),
             dev_user: "local-admin".to_string(),
             dev_name: "Local Admin".to_string(),
             dev_email: "admin@example.com".to_string(),
@@ -208,6 +314,9 @@ impl AuthSettings {
             session_cookie_secure: env_string("VAULT_SESSION_COOKIE_SECURE", "auto")
                 .to_ascii_lowercase(),
             session_max_age_seconds: env_i64("VAULT_SESSION_MAX_AGE_SECONDS", 604_800),
+            trusted_proxies: TrustedProxySet::parse(
+                &env::var("FORWARDED_ALLOW_IPS").unwrap_or_default(),
+            ),
             header_auth_issuer: env_string("VAULT_HEADER_AUTH_ISSUER", "headers"),
             dev_auth_issuer: env_string("VAULT_DEV_AUTH_ISSUER", "dev"),
             admin_groups: split_groups_set(&env_string("VAULT_ADMIN_GROUPS", "admin,vault-admin")),
@@ -245,7 +354,6 @@ impl AuthSettings {
                 hsts_include_subdomains: env_flag("VAULT_HSTS_INCLUDE_SUBDOMAINS"),
                 hsts_preload: env_flag("VAULT_HSTS_PRELOAD"),
             },
-            default_user_email,
             dev_user: env_string("VAULT_DEV_USER", "local-admin"),
             dev_name: env_string("VAULT_DEV_NAME", "Local Admin"),
             dev_email,
@@ -257,6 +365,9 @@ impl AuthSettings {
         let mut errors = Vec::new();
         if !matches!(self.auth_mode_raw.trim(), "headers" | "oidc" | "dev") {
             errors.push("VAULT_AUTH_MODE must be one of dev, headers, oidc".to_string());
+        }
+        if self.dev_auth_enabled && self.mode != AuthMode::Dev {
+            errors.push("VAULT_DEV_AUTH requires VAULT_AUTH_MODE=dev".to_string());
         }
         if !valid_cookie_secure_mode(&self.session_cookie_secure) {
             errors.push("VAULT_SESSION_COOKIE_SECURE must be auto, true, or false".to_string());
@@ -288,6 +399,12 @@ impl AuthSettings {
         }
         if !self.dev_mode && self.session_secret == development_session_secret() {
             errors.push("VAULT_SESSION_SECRET is required outside development mode".to_string());
+        }
+        if let Some(error) = self
+            .trusted_proxies
+            .validation_error(self.mode == AuthMode::Headers)
+        {
+            errors.push(error);
         }
         validate_public_url(self, &mut errors);
         if self.mode == AuthMode::Oidc {
@@ -349,21 +466,12 @@ pub async fn header_identity(
 ) -> Result<UserContext, AuthError> {
     let remote_user = clean_header(headers.get("Remote-User"));
     if remote_user.is_empty() {
-        if let Some(user) = dev_identity(settings, pool).await? {
-            return Ok(user);
-        }
         return Err(AuthError::AuthenticationRequired);
     }
 
     let groups = split_groups_header(headers.get("Remote-Groups"));
-    let email = {
-        let value = clean_header(headers.get("Remote-Email"));
-        if value.is_empty() {
-            settings.default_user_email.clone()
-        } else {
-            value
-        }
-    };
+    let email = clean_header(headers.get("Remote-Email"));
+    let email = (!email.is_empty()).then_some(email);
     let remote_name = {
         let value = clean_header(headers.get("Remote-Name"));
         if value.is_empty() {
@@ -377,7 +485,7 @@ pub async fn header_identity(
         pool,
         &settings.header_auth_issuer,
         &remote_user,
-        Some(&email),
+        email.as_deref(),
         Some(&remote_name),
         Some(&groups),
         false,
@@ -560,8 +668,12 @@ async fn upsert_vault_user_once(
             .execute(&mut *tx)
             .await?;
         } else {
+            // Header identity claims are authoritative. In particular, an absent
+            // email must clear an old value so it cannot retain bootstrap-admin
+            // privileges. OIDC logins intentionally preserve a verified email
+            // when a later response omits that optional claim.
             sqlx::query(
-                "UPDATE vault_users SET email = COALESCE(?, email), name = ?, last_seen_at = ? WHERE id = ?",
+                "UPDATE vault_users SET email = ?, name = ?, last_seen_at = ? WHERE id = ?",
             )
             .bind(email)
             .bind(&display_name)

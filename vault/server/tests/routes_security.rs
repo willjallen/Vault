@@ -1,11 +1,13 @@
 use std::sync::Arc;
 
 use axum::body::{Body, to_bytes};
+use axum::extract::ConnectInfo;
 use axum::http::{Method, Request, StatusCode, header};
 use flate2::read::GzDecoder;
 use std::io::Read;
+use std::net::SocketAddr;
 use tower::ServiceExt;
-use vault_server::auth::{AuthSettings, SecurityHeaderSettings};
+use vault_server::auth::{AuthSettings, SecurityHeaderSettings, TrustedProxySet};
 use vault_server::config::Config;
 use vault_server::db;
 use vault_server::http::{self, AppState};
@@ -65,6 +67,13 @@ fn request_with_headers(method: Method, uri: &str, headers: &[(&str, &str)]) -> 
         builder = builder.header(*name, *value);
     }
     builder.body(Body::empty()).expect("request")
+}
+
+fn request_from(mut request: Request<Body>, peer: &str) -> Request<Body> {
+    request.extensions_mut().insert(ConnectInfo(
+        peer.parse::<SocketAddr>().expect("peer socket address"),
+    ));
+    request
 }
 
 fn authed_get(uri: &str) -> Request<Body> {
@@ -167,6 +176,150 @@ async fn security_headers_are_applied_to_health_and_hsts_follows_https_public_ur
         .expect("forwarded secure health");
     assert!(
         forwarded_secure_response
+            .headers()
+            .contains_key(header::STRICT_TRANSPORT_SECURITY)
+    );
+}
+
+#[tokio::test]
+async fn network_boundary_rejects_untrusted_identity_before_any_identity_writes() {
+    let auth = AuthSettings {
+        trusted_proxies: TrustedProxySet::parse("127.0.0.1/32"),
+        bootstrap_admin_emails: ["admin@example.com".to_string()].into_iter().collect(),
+        ..AuthSettings::default()
+    };
+    let (state, _temp_dir) = test_state(auth).await;
+    let pool = state.db.clone();
+    let app = http::network_router(state);
+    let counts_before: (i64, i64, i64) = sqlx::query_as(
+        r"
+        SELECT
+            (SELECT COUNT(*) FROM vault_users),
+            (SELECT COUNT(*) FROM vault_groups),
+            (SELECT COUNT(*) FROM folder_permissions)
+        ",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("identity counts before rejection");
+
+    let untrusted = app
+        .clone()
+        .oneshot(request_from(
+            authed_get("/api/settings"),
+            "203.0.113.7:43100",
+        ))
+        .await
+        .expect("untrusted header request");
+    assert_eq!(untrusted.status(), StatusCode::UNAUTHORIZED);
+
+    let missing_peer = app
+        .clone()
+        .oneshot(authed_get("/api/settings"))
+        .await
+        .expect("missing-peer header request");
+    assert_eq!(missing_peer.status(), StatusCode::UNAUTHORIZED);
+
+    let counts_after: (i64, i64, i64) = sqlx::query_as(
+        r"
+        SELECT
+            (SELECT COUNT(*) FROM vault_users),
+            (SELECT COUNT(*) FROM vault_groups),
+            (SELECT COUNT(*) FROM folder_permissions)
+        ",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("identity counts after rejection");
+    assert_eq!(counts_after, counts_before);
+
+    let trusted = app
+        .oneshot(request_from(authed_get("/api/settings"), "127.0.0.1:43101"))
+        .await
+        .expect("trusted header request");
+    assert_eq!(trusted.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn header_mode_never_falls_back_to_dev_auth_for_an_untrusted_peer() {
+    let auth = AuthSettings {
+        dev_mode: true,
+        dev_auth_enabled: true,
+        trusted_proxies: TrustedProxySet::parse("127.0.0.1/32"),
+        ..AuthSettings::default()
+    };
+    let (state, _temp_dir) = test_state(auth).await;
+    let pool = state.db.clone();
+    let app = http::network_router(state);
+    let counts_before: (i64, i64, i64) = sqlx::query_as(
+        r"
+        SELECT
+            (SELECT COUNT(*) FROM vault_users),
+            (SELECT COUNT(*) FROM vault_groups),
+            (SELECT COUNT(*) FROM folder_permissions)
+        ",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("identity counts before no-header request");
+
+    let response = app
+        .oneshot(request_from(
+            request(Method::GET, "/api/settings"),
+            "203.0.113.9:43104",
+        ))
+        .await
+        .expect("untrusted no-header request");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let counts_after: (i64, i64, i64) = sqlx::query_as(
+        r"
+        SELECT
+            (SELECT COUNT(*) FROM vault_users),
+            (SELECT COUNT(*) FROM vault_groups),
+            (SELECT COUNT(*) FROM folder_permissions)
+        ",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("identity counts after no-header request");
+    assert_eq!(counts_after, counts_before);
+}
+
+#[tokio::test]
+async fn network_boundary_sanitizes_forwarded_proto_before_security_headers() {
+    let auth = AuthSettings {
+        trusted_proxies: TrustedProxySet::parse("127.0.0.1/32"),
+        ..AuthSettings::default()
+    };
+    let (state, _temp_dir) = test_state(auth).await;
+    let app = http::network_router(state);
+
+    let untrusted = app
+        .clone()
+        .oneshot(request_from(
+            request_with_headers(Method::GET, "/health", &[("X-Forwarded-Proto", "https")]),
+            "203.0.113.8:43102",
+        ))
+        .await
+        .expect("untrusted forwarded request");
+    assert_eq!(untrusted.status(), StatusCode::OK);
+    assert!(
+        !untrusted
+            .headers()
+            .contains_key(header::STRICT_TRANSPORT_SECURITY)
+    );
+
+    let trusted = app
+        .oneshot(request_from(
+            request_with_headers(Method::GET, "/health", &[("X-Forwarded-Proto", "https")]),
+            "127.0.0.1:43103",
+        ))
+        .await
+        .expect("trusted forwarded request");
+    assert_eq!(trusted.status(), StatusCode::OK);
+    assert!(
+        trusted
             .headers()
             .contains_key(header::STRICT_TRANSPORT_SECURITY)
     );

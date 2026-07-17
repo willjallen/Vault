@@ -4,10 +4,10 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Map, Value, json};
 use sqlx::Row;
 use vault_server::auth::{
-    AuthError, AuthMode, AuthSettings, SessionSecretRequirement, SessionSecretSource, UserContext,
-    cookie_value, effective_admin_from_parts, folder_permission_count_for_group, header_identity,
-    oidc_identity, oidc_token_urlsafe, session_identity, sign_session_payload, split_groups,
-    verify_session_payload,
+    AuthError, AuthMode, AuthSettings, SessionSecretRequirement, SessionSecretSource,
+    TrustedProxySet, UserContext, cookie_value, dev_identity, effective_admin_from_parts,
+    folder_permission_count_for_group, header_identity, oidc_identity, oidc_token_urlsafe,
+    session_identity, sign_session_payload, split_groups, verify_session_payload,
 };
 use vault_server::db;
 
@@ -98,6 +98,73 @@ async fn header_identity_is_stripped_and_groups_are_synced() {
             .expect("permissions"),
         2,
     );
+}
+
+#[tokio::test]
+async fn missing_header_email_stays_null_and_cannot_match_a_bootstrap_admin_email() {
+    let pool = test_pool().await;
+    let settings = AuthSettings {
+        bootstrap_admin_emails: ["admin@example.com".to_string()].into_iter().collect(),
+        ..AuthSettings::default()
+    };
+
+    for subject in ["alice", "bob"] {
+        let request_headers = headers(&[
+            ("Remote-User", subject),
+            ("Remote-Name", subject),
+            ("Remote-Groups", "artists"),
+        ]);
+        let user = header_identity(&settings, &pool, &request_headers)
+            .await
+            .expect("email-less header identity");
+
+        assert_eq!(user.email, "");
+        assert!(!user.is_admin);
+        let stored_email: Option<String> = sqlx::query_scalar(
+            "SELECT email FROM vault_users WHERE issuer = 'headers' AND subject = ?",
+        )
+        .bind(subject)
+        .fetch_one(&pool)
+        .await
+        .expect("stored email");
+        assert_eq!(stored_email, None);
+    }
+}
+
+#[tokio::test]
+async fn missing_header_email_clears_a_legacy_synthetic_bootstrap_email() {
+    let pool = test_pool().await;
+    let settings = AuthSettings {
+        bootstrap_admin_emails: ["admin@example.com".to_string()].into_iter().collect(),
+        ..AuthSettings::default()
+    };
+    sqlx::query(
+        r"
+        INSERT INTO vault_users (issuer, subject, email, name, is_admin, is_active)
+        VALUES ('headers', 'legacy', 'admin@example.com', 'Legacy User', 0, 1)
+        ",
+    )
+    .execute(&pool)
+    .await
+    .expect("legacy synthetic email");
+    let request_headers = headers(&[
+        ("Remote-User", "legacy"),
+        ("Remote-Name", "Legacy User"),
+        ("Remote-Groups", "artists"),
+    ]);
+
+    let user = header_identity(&settings, &pool, &request_headers)
+        .await
+        .expect("legacy identity refresh");
+
+    assert_eq!(user.email, "");
+    assert!(!user.is_admin);
+    let stored_email: Option<String> =
+        sqlx::query_scalar("SELECT email FROM vault_users WHERE subject = 'legacy'")
+            .fetch_one(&pool)
+            .await
+            .expect("cleared email");
+    assert_eq!(stored_email, None);
 }
 
 #[tokio::test]
@@ -415,22 +482,26 @@ async fn concurrent_header_identity_upserts_create_one_user_and_membership() {
 async fn dev_auth_requires_local_base_domain() {
     let pool = test_pool().await;
     let settings = AuthSettings {
+        mode: AuthMode::Dev,
+        auth_mode_raw: "dev".to_string(),
         dev_auth_enabled: true,
         base_domain: "vault.example.com".to_string(),
         ..AuthSettings::default()
     };
 
-    let error = header_identity(&settings, &pool, &HeaderMap::new())
+    let user = dev_identity(&settings, &pool)
         .await
-        .expect_err("non-local dev auth should reject");
+        .expect("development identity check");
 
-    assert!(matches!(error, AuthError::AuthenticationRequired));
+    assert_eq!(user, None);
 }
 
 #[tokio::test]
 async fn dev_auth_syncs_configured_groups_on_local_domain() {
     let pool = test_pool().await;
     let settings = AuthSettings {
+        mode: AuthMode::Dev,
+        auth_mode_raw: "dev".to_string(),
         dev_auth_enabled: true,
         base_domain: "localhost".to_string(),
         dev_user: "dev-user".to_string(),
@@ -439,8 +510,9 @@ async fn dev_auth_syncs_configured_groups_on_local_domain() {
         ..AuthSettings::default()
     };
 
-    let user = header_identity(&settings, &pool, &HeaderMap::new())
+    let user = dev_identity(&settings, &pool)
         .await
+        .expect("development identity check")
         .expect("dev user");
 
     assert_eq!(user.subject, "dev-user");
@@ -624,6 +696,8 @@ fn runtime_validation_rejects_development_session_secret_outside_dev() {
 #[test]
 fn runtime_validation_allows_development_session_secret_in_dev_mode() {
     let settings = AuthSettings {
+        mode: AuthMode::Dev,
+        auth_mode_raw: "dev".to_string(),
         dev_mode: true,
         session_secret: "dev-insecure-session-secret".to_string(),
         session_secret_source: SessionSecretSource::Fallback,
@@ -633,6 +707,103 @@ fn runtime_validation_allows_development_session_secret_in_dev_mode() {
     settings
         .validate_runtime_config()
         .expect("dev mode may use development secret");
+}
+
+#[test]
+fn trusted_proxy_set_matches_exact_cidrs_ipv6_and_mapped_ipv6() {
+    let proxies =
+        TrustedProxySet::parse("127.0.0.1, 10.20.0.0/16, 2001:db8::/48, ::ffff:192.0.2.0/120");
+
+    assert!(proxies.contains("127.0.0.1".parse().expect("loopback")));
+    assert!(proxies.contains("10.20.4.5".parse().expect("private CIDR")));
+    assert!(!proxies.contains("10.21.4.5".parse().expect("outside CIDR")));
+    assert!(proxies.contains("2001:db8::1234".parse().expect("IPv6 CIDR")));
+    assert!(!proxies.contains("2001:db9::1".parse().expect("outside IPv6 CIDR")));
+    assert!(proxies.contains("::ffff:192.0.2.44".parse().expect("mapped peer")));
+    assert!(!proxies.contains("::ffff:192.0.3.44".parse().expect("mapped outside")));
+}
+
+#[test]
+fn runtime_validation_requires_valid_proxy_trust_for_header_auth() {
+    let base = AuthSettings {
+        session_secret: "0123456789abcdef0123456789abcdef".to_string(),
+        session_secret_source: SessionSecretSource::Explicit,
+        ..AuthSettings::default()
+    };
+
+    let missing = base
+        .validate_runtime_config()
+        .expect_err("header auth must require proxy trust")
+        .to_string();
+    assert!(missing.contains("FORWARDED_ALLOW_IPS is required"));
+
+    for invalid in [
+        "*",
+        "0.0.0.0/0",
+        "::/0",
+        "::ffff:0:0/96",
+        "127.0.0.1,,10.0.0.1",
+        "proxy.local",
+    ] {
+        let settings = AuthSettings {
+            trusted_proxies: TrustedProxySet::parse(invalid),
+            ..base.clone()
+        };
+        let error = settings
+            .validate_runtime_config()
+            .expect_err("invalid proxy trust must reject")
+            .to_string();
+        assert!(error.contains("FORWARDED_ALLOW_IPS contains invalid IP/CIDR entries"));
+    }
+
+    AuthSettings {
+        trusted_proxies: TrustedProxySet::parse("127.0.0.1,10.0.0.0/8"),
+        ..base
+    }
+    .validate_runtime_config()
+    .expect("valid proxy trust");
+}
+
+#[test]
+fn runtime_validation_rejects_dev_auth_mixed_with_header_auth() {
+    let settings = AuthSettings {
+        dev_mode: true,
+        dev_auth_enabled: true,
+        trusted_proxies: TrustedProxySet::parse("127.0.0.1"),
+        ..AuthSettings::default()
+    };
+
+    let error = settings
+        .validate_runtime_config()
+        .expect_err("mixed header and dev auth must reject")
+        .to_string();
+    assert!(error.contains("VAULT_DEV_AUTH requires VAULT_AUTH_MODE=dev"));
+}
+
+#[test]
+fn malformed_optional_proxy_trust_rejects_outside_header_mode() {
+    let settings = AuthSettings {
+        mode: AuthMode::Dev,
+        auth_mode_raw: "dev".to_string(),
+        dev_mode: true,
+        trusted_proxies: TrustedProxySet::parse("proxy.local"),
+        ..AuthSettings::default()
+    };
+
+    let error = settings
+        .validate_runtime_config()
+        .expect_err("malformed optional proxy trust must reject")
+        .to_string();
+    assert!(error.contains("FORWARDED_ALLOW_IPS contains invalid IP/CIDR entries"));
+
+    AuthSettings {
+        mode: AuthMode::Dev,
+        auth_mode_raw: "dev".to_string(),
+        dev_mode: true,
+        ..AuthSettings::default()
+    }
+    .validate_runtime_config()
+    .expect("dev auth may omit proxy trust");
 }
 
 #[test]

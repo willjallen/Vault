@@ -6,6 +6,9 @@ import { build } from "esbuild";
 
 let hookSlots = new Map();
 let hookIndex = 0;
+let effectCallbacks = new Map();
+let effectCleanups = new Map();
+let effectIndex = 0;
 
 function nextHookIndex() {
   const current = hookIndex;
@@ -15,7 +18,11 @@ function nextHookIndex() {
 
 globalThis.React = {
   useCallback: (callback) => callback,
-  useEffect: () => {},
+  useEffect: (callback) => {
+    const index = effectIndex;
+    effectIndex += 1;
+    effectCallbacks.set(index, callback);
+  },
   useMemo: (factory) => factory(),
   useRef(initialValue) {
     const index = nextHookIndex();
@@ -47,10 +54,23 @@ const bundled = await build({
   platform: "node",
   write: false,
 });
-const moduleUrl = `data:text/javascript;base64,${Buffer.from(bundled.outputFiles[0].text).toString(
-  "base64"
-)}`;
+const moduleUrl = `data:text/javascript;base64,${Buffer.from(
+  bundled.outputFiles.at(0).text
+).toString("base64")}`;
 const { mergeContentsPage, mergeSidebarPage, useVaultResources } = await import(moduleUrl);
+
+const boundsSourceUrl = new URL("../src/lib/vaultResourceBounds.js", import.meta.url);
+const boundsBundle = await build({
+  bundle: true,
+  entryPoints: [boundsSourceUrl.pathname],
+  format: "esm",
+  platform: "node",
+  write: false,
+});
+const boundsModuleUrl = `data:text/javascript;base64,${Buffer.from(
+  boundsBundle.outputFiles.at(0).text
+).toString("base64")}`;
+const { BoundedPrefetchScheduler, ContentsPageCache } = await import(boundsModuleUrl);
 
 function deferred() {
   let resolve;
@@ -61,12 +81,27 @@ function deferred() {
 }
 
 function resetHooks() {
+  effectCleanups.forEach((cleanup) => cleanup?.());
+  effectCallbacks = new Map();
+  effectCleanups = new Map();
+  effectIndex = 0;
   hookSlots = new Map();
   hookIndex = 0;
 }
 
+function commitEffect(index) {
+  effectCleanups.get(index)?.();
+  effectCleanups.set(index, effectCallbacks.get(index)?.() || null);
+}
+
+function cleanupEffect(index) {
+  effectCleanups.get(index)?.();
+  effectCleanups.set(index, null);
+}
+
 function renderResources(overrides = {}) {
   hookIndex = 0;
+  effectIndex = 0;
   return useVaultResources({
     apiFetch: async () => {
       throw new Error("Unexpected request");
@@ -94,6 +129,125 @@ function renderResources(overrides = {}) {
     ...overrides,
   });
 }
+
+function cachePage(index) {
+  return {
+    documents: [],
+    folder: `Parent-${index}`,
+    folders: [{ id: index, path: `Child-${index}` }],
+    next_cursor: null,
+    q: "",
+    recursive: false,
+  };
+}
+
+async function flushMicrotasks() {
+  await Promise.resolve();
+  await Promise.resolve();
+}
+
+test("contents cache is a bounded LRU and evicts derived folder data with its page", () => {
+  const cache = new ContentsPageCache(32);
+  for (let index = 0; index < 32; index += 1) {
+    cache.set(`key-${index}`, cachePage(index));
+  }
+
+  assert.equal(cache.get("key-0").folder, "Parent-0");
+  cache.set("key-32", cachePage(32));
+
+  assert.equal(cache.size, 32);
+  assert.equal(cache.has("key-0"), true);
+  assert.equal(cache.has("key-1"), false);
+  const folderData = cache.folderData();
+  assert.deepEqual(folderData.children["Parent-0"], ["Child-0"]);
+  assert.equal(folderData.children["Parent-1"], undefined);
+  assert.equal(folderData.metadata["Child-1"], undefined);
+  assert.equal(folderData.metadata["Child-32"].id, 32);
+
+  const protectedCache = new ContentsPageCache(3, [
+    ["active", cachePage("active")],
+    ["load-more", cachePage("load-more")],
+    ["old", cachePage("old")],
+  ]);
+  protectedCache.set("incoming", cachePage("incoming"), ["active", "load-more"]);
+  assert.equal(protectedCache.size, 3);
+  assert.equal(protectedCache.has("active"), true);
+  assert.equal(protectedCache.has("load-more"), true);
+  assert.equal(protectedCache.has("old"), false);
+  assert.equal(protectedCache.has("incoming"), true);
+});
+
+test("prefetch scheduler bounds work, deduplicates, prioritizes, and aborts on clear", async () => {
+  const scheduler = new BoundedPrefetchScheduler({ concurrency: 3, maxQueued: 32 });
+  const runs = [];
+  scheduler.setRunner(
+    (payload, signal) =>
+      new Promise((resolve) => {
+        const run = { payload, resolve, signal };
+        runs.push(run);
+        signal.addEventListener("abort", resolve, { once: true });
+      })
+  );
+
+  for (let index = 0; index < 35; index += 1) {
+    assert.equal(scheduler.enqueue(`task-${index}`, { index }, 0), true);
+  }
+  assert.equal(scheduler.enqueue("overflow", {}, 0), false);
+  assert.equal(scheduler.enqueue("task-0", {}, 2), false);
+  assert.equal(scheduler.enqueue("priority", { priority: true }, 2), true);
+  await flushMicrotasks();
+
+  assert.equal(scheduler.activeCount, 3);
+  assert.equal(scheduler.queuedCount, 32);
+  assert.equal(scheduler.has("priority"), true);
+  assert.equal(runs.length, 3);
+
+  runs.at(0).resolve();
+  await flushMicrotasks();
+  await flushMicrotasks();
+  assert.equal(scheduler.activeCount, 3);
+  assert.equal(runs.length, 4);
+
+  scheduler.clear();
+  assert.equal(scheduler.queuedCount, 0);
+  assert.equal(scheduler.has("priority"), false);
+  assert.equal(
+    runs.filter((run) => run !== runs.at(0)).every((run) => run.signal.aborted),
+    true
+  );
+  await flushMicrotasks();
+});
+
+test("prefetch completion from an old generation cannot remove a replacement task", async () => {
+  const scheduler = new BoundedPrefetchScheduler({ concurrency: 1, maxQueued: 1 });
+  const runs = [];
+  scheduler.setRunner(
+    (_payload, signal) =>
+      new Promise((resolve) => {
+        runs.push({ resolve, signal });
+      })
+  );
+
+  scheduler.enqueue("same-key", { generation: 0 });
+  await flushMicrotasks();
+  scheduler.clear();
+  assert.equal(runs.at(0).signal.aborted, true);
+  scheduler.enqueue("same-key", { generation: 1 });
+  assert.equal(scheduler.has("same-key"), true);
+  assert.equal(scheduler.queuedCount, 1);
+
+  runs.at(0).resolve();
+  await flushMicrotasks();
+  await flushMicrotasks();
+  assert.equal(runs.length, 2);
+  assert.equal(scheduler.has("same-key"), true);
+
+  runs.at(1).resolve();
+  await flushMicrotasks();
+  await flushMicrotasks();
+  assert.equal(scheduler.activeCount, 0);
+  assert.equal(scheduler.has("same-key"), false);
+});
 
 test("contents pages merge by stable ID and replace duplicate metadata", () => {
   const merged = mergeContentsPage(
@@ -215,7 +369,7 @@ test("load more folders sends one opaque cursor request and merges the sidebar p
   assert.equal(resources.sidebarPagination.hasMore, true);
   assert.equal(resources.sidebarPagination.loadingMore, true);
   assert.equal(requests.length, 1);
-  const requestUrl = new URL(requests[0], "https://vault.invalid");
+  const requestUrl = new URL(requests.at(0), "https://vault.invalid");
   assert.equal(requestUrl.pathname, "/api/folders/sidebar");
   assert.equal(requestUrl.searchParams.get("cursor"), "opaque sidebar+/=");
 
@@ -348,7 +502,7 @@ test("load more sends the opaque cursor and merges one requested page", async ()
   assert.equal(resources.contentsLoadingMore, true);
   assert.equal(resources.contentsHasMore, true);
   assert.equal(requests.length, 1);
-  const requestUrl = new URL(requests[0], "https://vault.invalid");
+  const requestUrl = new URL(requests.at(0), "https://vault.invalid");
   assert.equal(requestUrl.searchParams.get("folder"), "Projects");
   assert.equal(requestUrl.searchParams.get("q"), " needle ");
   assert.equal(requestUrl.searchParams.get("recursive"), "true");
@@ -486,4 +640,134 @@ test("invalidating contents clears the cursor and a first page replaces cached r
     ["document-2"]
   );
   assert.equal(resources.contentsHasMore, false);
+});
+
+test("search waits 250ms, captures exact parameters, and aborts superseded work", async () => {
+  resetHooks();
+  const requests = [];
+  const errors = [];
+  const initial = {
+    contents: {
+      documents: [],
+      folder: "Projects",
+      folders: [],
+      next_cursor: null,
+      q: "",
+      recursive: false,
+    },
+    my_edits: { documents: [] },
+    sidebar: { folder_children: {} },
+  };
+  const props = {
+    apiFetch: (url, options = {}) => {
+      const request = { options, url };
+      requests.push(request);
+      if (requests.length === 1) {
+        return new Promise((_resolve, reject) => {
+          options.signal.addEventListener(
+            "abort",
+            () => {
+              const error = new Error("aborted");
+              error.name = "AbortError";
+              reject(error);
+            },
+            { once: true }
+          );
+        });
+      }
+      const requestUrl = new URL(url, "https://vault.invalid");
+      return Promise.resolve({
+        json: async () => ({
+          documents: [],
+          folder: requestUrl.searchParams.get("folder"),
+          folders: [],
+          next_cursor: null,
+          q: requestUrl.searchParams.get("q"),
+          recursive: requestUrl.searchParams.get("recursive") === "true",
+        }),
+        ok: true,
+        status: 200,
+      });
+    },
+    initial,
+    setError: (message) => errors.push(message),
+  };
+
+  let resources = renderResources(props);
+  commitEffect(0);
+  resources.setSearchQuery("n");
+  resources = renderResources(props);
+  commitEffect(0);
+  resources.setSearchQuery("ne");
+  resources = renderResources(props);
+  commitEffect(0);
+
+  await new Promise((resolve) => setTimeout(resolve, 275));
+  assert.equal(requests.length, 1);
+  assert.equal(new URL(requests.at(0).url, "https://vault.invalid").searchParams.get("q"), "ne");
+  assert.equal(requests.at(0).options.signal.aborted, false);
+
+  resources.setSearchQuery("needle");
+  resources.setRecursiveSearch(true);
+  resources = renderResources(props);
+  commitEffect(0);
+  assert.equal(requests.at(0).options.signal.aborted, true);
+
+  await new Promise((resolve) => setTimeout(resolve, 275));
+  assert.equal(requests.length, 2);
+  const finalUrl = new URL(requests.at(1).url, "https://vault.invalid");
+  assert.equal(finalUrl.searchParams.get("folder"), "Projects");
+  assert.equal(finalUrl.searchParams.get("q"), "needle");
+  assert.equal(finalUrl.searchParams.get("recursive"), "true");
+  assert.deepEqual(errors, []);
+  cleanupEffect(0);
+});
+
+test("ordinary folder navigation starts immediately without the search debounce", async () => {
+  resetHooks();
+  const requests = [];
+  const initial = {
+    contents: {
+      documents: [],
+      folder: "Projects",
+      folders: [],
+      next_cursor: null,
+      q: "",
+      recursive: false,
+    },
+    my_edits: { documents: [] },
+    sidebar: { folder_children: {} },
+  };
+  const props = {
+    apiFetch: async (url) => {
+      requests.push(url);
+      const requestUrl = new URL(url, "https://vault.invalid");
+      return {
+        json: async () => ({
+          documents: [],
+          folder: requestUrl.searchParams.get("folder"),
+          folders: [],
+          next_cursor: null,
+          q: "",
+          recursive: false,
+        }),
+        ok: true,
+        status: 200,
+      };
+    },
+    initial,
+  };
+
+  renderResources(props);
+  commitEffect(0);
+  renderResources({ ...props, folder: "Other" });
+  commitEffect(0);
+
+  assert.equal(requests.length, 1);
+  assert.equal(
+    new URL(requests.at(0), "https://vault.invalid").searchParams.get("folder"),
+    "Other"
+  );
+  await flushMicrotasks();
+  cleanupEffect(0);
 });

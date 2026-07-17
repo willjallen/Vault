@@ -1,3 +1,13 @@
+import {
+  BoundedPrefetchScheduler,
+  CONTENTS_CACHE_LIMIT,
+  ContentsPageCache,
+  PREFETCH_PRIORITY_ROOT,
+  PREFETCH_PRIORITY_SIDEBAR,
+  PREFETCH_PRIORITY_VISIBLE,
+  SEARCH_DEBOUNCE_MS,
+} from "./vaultResourceBounds.js";
+
 const { useCallback, useEffect, useMemo, useRef, useState } = React;
 
 function contentsKey(folder, q, recursive) {
@@ -82,30 +92,6 @@ export function mergeSidebarPage(current, next) {
   };
 }
 
-function childrenFromContents(contents) {
-  return (contents.folders || []).map((item) => item.path);
-}
-
-function metadataFromContents(contents) {
-  return Object.fromEntries(
-    (contents.folders || []).map((item) => [
-      item.path || "",
-      {
-        access: item.access || {},
-        color: item.color || "",
-        default_ttl_action: item.default_ttl_action || "none",
-        default_ttl_days: item.default_ttl_days || null,
-        effective_ttl_action: item.effective_ttl_action || "none",
-        effective_ttl_days: item.effective_ttl_days || null,
-        effective_ttl_inherited: Boolean(item.effective_ttl_inherited),
-        effective_ttl_source_id: item.effective_ttl_source_id || null,
-        icon: item.icon || "",
-        id: item.id || null,
-      },
-    ])
-  );
-}
-
 function emptyContents(folder, q, recursive) {
   return {
     folder: folder || "",
@@ -155,6 +141,78 @@ function optionalRefresh(promise) {
   return promise.catch(() => null);
 }
 
+function prepareContentsRequest({
+  beginForegroundContentsRequest,
+  contentRequestRef,
+  folderRef,
+  nextFolder,
+  options,
+  recursiveSearchRef,
+  searchQueryRef,
+}) {
+  const background = Boolean(options.background);
+  const controller = background ? null : (options.controller ?? beginForegroundContentsRequest());
+  const signal = background ? options.signal : controller.signal;
+  const targetFolder = nextFolder ?? folderRef.current;
+  const q = options.q ?? searchQueryRef.current;
+  const recursive = options.recursive ?? recursiveSearchRef.current;
+  const requestId = background ? null : contentRequestRef.current + 1;
+  const key = contentsKey(targetFolder, q, recursive);
+  const params = new URLSearchParams({
+    folder: targetFolder || "",
+    q: q || "",
+    recursive: recursive ? "true" : "false",
+  });
+  return {
+    background,
+    controller,
+    key,
+    requestId,
+    signal,
+    targetFolder,
+    url: `/api/folders/contents?${params.toString()}`,
+  };
+}
+
+function contentsRequestIsDiscarded({
+  background,
+  cacheGeneration,
+  contentsCacheGenerationRef,
+  contentRequestRef,
+  requestId,
+  signal,
+}) {
+  return Boolean(
+    signal?.aborted ||
+    cacheGeneration !== contentsCacheGenerationRef.current ||
+    (!background && requestId !== contentRequestRef.current)
+  );
+}
+
+async function readContentsResponse({
+  background,
+  onMissingFolder,
+  options,
+  response,
+  targetFolder,
+}) {
+  if (response.status === 404) {
+    if (!background && onMissingFolder) {
+      onMissingFolder(targetFolder, {
+        fallbackFolder: options.missingFolderFallback || "",
+        suppressError: Boolean(options.suppressMissingFolderError),
+      });
+    }
+    const error = new Error("Folder not found");
+    error.suppressRefreshError = Boolean(options.suppressMissingFolderError);
+    throw error;
+  }
+  if (!response.ok) {
+    throw new Error("Could not refresh contents");
+  }
+  return response.json();
+}
+
 export function useVaultResources({
   initial,
   apiFetch,
@@ -175,24 +233,22 @@ export function useVaultResources({
     initialContents.q || "",
     initialContents.recursive
   );
-  const initialContentsChildren = initialContents.folder
-    ? { [initialContents.folder]: childrenFromContents(initialContents) }
-    : { "": childrenFromContents(initialContents) };
-  const initialContentsMetadata = metadataFromContents(initialContents);
   const [contents, setContents] = useState(initialContents);
   const [sidebar, setSidebar] = useState(initialSidebar);
-  const [contentsChildren, setContentsChildren] = useState(initialContentsChildren);
-  const [contentsMetadata, setContentsMetadata] = useState(initialContentsMetadata);
+  const [contentsCache] = useState(
+    () => new ContentsPageCache(CONTENTS_CACHE_LIMIT, [[initialContentsKey, initialContents]])
+  );
+  const [contentsFolderData, setContentsFolderData] = useState(() => contentsCache.folderData());
+  const [prefetchScheduler] = useState(() => new BoundedPrefetchScheduler());
   const [myEditsState, setMyEditsState] = useState(initialMyEdits);
   const [selectedDocDetail, setSelectedDocDetail] = useState(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [recursiveSearch, setRecursiveSearch] = useState(false);
   const [loadingMoreRequest, setLoadingMoreRequest] = useState(null);
   const [sidebarLoadingMoreRequest, setSidebarLoadingMoreRequest] = useState(null);
-  const contentsCacheRef = useRef(new Map([[initialContentsKey, initialContents]]));
-  const prefetchingKeysRef = useRef(new Set());
   const contentRequestRef = useRef(0);
   const contentsCacheGenerationRef = useRef(0);
+  const foregroundContentsControllerRef = useRef(null);
   const loadingMoreRequestRef = useRef(null);
   const sidebarRef = useRef(initialSidebar);
   const sidebarRequestRef = useRef(0);
@@ -223,12 +279,13 @@ export function useVaultResources({
     };
     contentRequestRef.current += 1;
   }
+  const activeCachedContents = contentsCache.get(activeContentsKey);
   const storedContentsKey = contentsKey(
     contents.folder || "",
     contents.q || "",
     contents.recursive
   );
-  const activeContentsCached = contentsCacheRef.current.has(activeContentsKey);
+  const activeContentsCached = Boolean(activeCachedContents);
   const contentsPending = isContentsPending({
     activeContentsCached,
     activeContentsKey,
@@ -248,9 +305,8 @@ export function useVaultResources({
     if (storedContentsKey === activeContentsKey) {
       return contents;
     }
-    const cached = contentsCacheRef.current.get(activeContentsKey);
-    if (cached) {
-      return cached;
+    if (activeCachedContents) {
+      return activeCachedContents;
     }
     if (contentsPending) {
       return contents;
@@ -258,6 +314,7 @@ export function useVaultResources({
     return emptyContents(folder, searchQuery, recursiveSearch);
   }, [
     activeContentsKey,
+    activeCachedContents,
     contents,
     contentsPending,
     folder,
@@ -270,6 +327,7 @@ export function useVaultResources({
   const subfolders = useMemo(() => displayedContents.folders || [], [displayedContents.folders]);
   const sidebarChildren = useMemo(() => sidebar.folder_children || {}, [sidebar.folder_children]);
   const sidebarMetadata = useMemo(() => sidebar.folder_metadata || {}, [sidebar.folder_metadata]);
+  const { children: contentsChildren, metadata: contentsMetadata } = contentsFolderData;
   const folderChildren = useMemo(() => {
     return mergeFolderChildrenMaps(sidebarChildren, contentsChildren);
   }, [contentsChildren, sidebarChildren]);
@@ -298,16 +356,35 @@ export function useVaultResources({
     sidebarLoadingMoreRequest.generation === sidebarGenerationRef.current
   );
 
+  const abortForegroundContentsRequest = useCallback(() => {
+    foregroundContentsControllerRef.current?.abort();
+    foregroundContentsControllerRef.current = null;
+  }, []);
+
+  const beginForegroundContentsRequest = useCallback(() => {
+    abortForegroundContentsRequest();
+    const controller = new AbortController();
+    foregroundContentsControllerRef.current = controller;
+    return controller;
+  }, [abortForegroundContentsRequest]);
+
+  const finishForegroundContentsRequest = useCallback((controller) => {
+    if (foregroundContentsControllerRef.current === controller) {
+      foregroundContentsControllerRef.current = null;
+    }
+  }, []);
+
   const invalidateContentsCache = useCallback(() => {
+    abortForegroundContentsRequest();
+    prefetchScheduler.clear();
     contentsCacheGenerationRef.current += 1;
     contentRequestRef.current += 1;
-    contentsCacheRef.current.clear();
-    prefetchingKeysRef.current.clear();
+    contentsCache.clear();
     loadingMoreRequestRef.current = null;
     setLoadingMoreRequest(null);
     setContents((previous) => ({ ...previous, next_cursor: null }));
-    setContentsChildren({});
-  }, []);
+    setContentsFolderData({ children: {}, metadata: {} });
+  }, [abortForegroundContentsRequest, contentsCache, prefetchScheduler]);
 
   const invalidateSidebar = useCallback(() => {
     sidebarGenerationRef.current += 1;
@@ -319,77 +396,82 @@ export function useVaultResources({
     setSidebar(invalidated);
   }, []);
 
-  const rememberContents = useCallback((data) => {
-    const normalized = normalizeContentsPage(data);
-    const key = contentsKey(normalized.folder || "", normalized.q || "", normalized.recursive);
-    contentsCacheRef.current.set(key, normalized);
-    if (!normalized.q && !normalized.recursive) {
-      setContentsChildren((prev) => ({
-        ...prev,
-        [normalized.folder || ""]: childrenFromContents(normalized),
-      }));
-      setContentsMetadata((prev) => ({
-        ...prev,
-        ...metadataFromContents(normalized),
-      }));
-    }
-    return normalized;
-  }, []);
+  const rememberContents = useCallback(
+    (data) => {
+      const normalized = normalizeContentsPage(data);
+      const key = contentsKey(normalized.folder || "", normalized.q || "", normalized.recursive);
+      contentsCache.set(key, normalized, [
+        contentsContextRef.current.key,
+        loadingMoreRequestRef.current?.key,
+      ]);
+      setContentsFolderData(contentsCache.folderData());
+      return normalized;
+    },
+    [contentsCache]
+  );
 
   const fetchContents = useCallback(
     async (nextFolder, options = {}) => {
-      const background = Boolean(options.background);
-      const requestId = background ? null : contentRequestRef.current + 1;
-      const cacheGeneration = contentsCacheGenerationRef.current;
-      if (!background) {
-        contentRequestRef.current = requestId;
-      }
-      const targetFolder = nextFolder ?? folderRef.current;
-      const q = options.q ?? searchQueryRef.current;
-      const recursive = options.recursive ?? recursiveSearchRef.current;
-      const key = contentsKey(targetFolder, q, recursive);
-      const params = new URLSearchParams({
-        folder: targetFolder || "",
-        q: q || "",
-        recursive: recursive ? "true" : "false",
+      const request = prepareContentsRequest({
+        beginForegroundContentsRequest,
+        contentRequestRef,
+        folderRef,
+        nextFolder,
+        options,
+        recursiveSearchRef,
+        searchQueryRef,
       });
-      const res = await apiFetch(`/api/folders/contents?${params.toString()}`);
-      if (!background && requestId !== contentRequestRef.current) {
-        return null;
+      const cacheGeneration = contentsCacheGenerationRef.current;
+      if (!request.background) {
+        contentRequestRef.current = request.requestId;
       }
-      if (res.status === 404) {
-        if (!background && onMissingFolderRef.current) {
-          onMissingFolderRef.current(targetFolder, {
-            fallbackFolder: options.missingFolderFallback || "",
-            suppressError: Boolean(options.suppressMissingFolderError),
-          });
+      const discarded = () =>
+        contentsRequestIsDiscarded({
+          background: request.background,
+          cacheGeneration,
+          contentsCacheGenerationRef,
+          contentRequestRef,
+          requestId: request.requestId,
+          signal: request.signal,
+        });
+      try {
+        const response = await apiFetch(request.url, { signal: request.signal });
+        if (discarded()) {
+          return null;
         }
-        const error = new Error("Folder not found");
-        error.suppressRefreshError = Boolean(options.suppressMissingFolderError);
+        const responseData = await readContentsResponse({
+          background: request.background,
+          onMissingFolder: onMissingFolderRef.current,
+          options,
+          response,
+          targetFolder: request.targetFolder,
+        });
+        if (discarded()) {
+          return null;
+        }
+        const data = rememberContents(responseData);
+        if (request.background) {
+          return null;
+        }
+        if (
+          request.key ===
+          contentsKey(folderRef.current, searchQueryRef.current, recursiveSearchRef.current)
+        ) {
+          setContents(data);
+        }
+        return data;
+      } catch (error) {
+        if (request.signal?.aborted) {
+          return null;
+        }
         throw error;
+      } finally {
+        if (request.controller) {
+          finishForegroundContentsRequest(request.controller);
+        }
       }
-      if (!res.ok) {
-        throw new Error("Could not refresh contents");
-      }
-      const responseData = await res.json();
-      if (cacheGeneration !== contentsCacheGenerationRef.current) {
-        return null;
-      }
-      const data = rememberContents(responseData);
-      if (background) {
-        return null;
-      }
-      if (requestId !== contentRequestRef.current) {
-        return null;
-      }
-      if (
-        key === contentsKey(folderRef.current, searchQueryRef.current, recursiveSearchRef.current)
-      ) {
-        setContents(data);
-      }
-      return data;
     },
-    [apiFetch, rememberContents]
+    [apiFetch, beginForegroundContentsRequest, finishForegroundContentsRequest, rememberContents]
   );
 
   const loadMoreContents = useCallback(async () => {
@@ -397,7 +479,7 @@ export function useVaultResources({
     const q = searchQueryRef.current;
     const recursive = recursiveSearchRef.current;
     const key = contentsKey(targetFolder, q, recursive);
-    const current = contentsCacheRef.current.get(key);
+    const current = contentsCache.get(key);
     const cursor = current?.next_cursor;
     const contextGeneration = contentsContextRef.current.generation;
     const activeLoad = loadingMoreRequestRef.current;
@@ -408,6 +490,7 @@ export function useVaultResources({
       return null;
     }
 
+    const controller = beginForegroundContentsRequest();
     const requestId = contentRequestRef.current + 1;
     contentRequestRef.current = requestId;
     const cacheGeneration = contentsCacheGenerationRef.current;
@@ -428,7 +511,9 @@ export function useVaultResources({
         recursive: recursive ? "true" : "false",
         cursor,
       });
-      const res = await apiFetch(`/api/folders/contents?${params.toString()}`);
+      const res = await apiFetch(`/api/folders/contents?${params.toString()}`, {
+        signal: controller.signal,
+      });
       if (!isCurrentRequest()) {
         return null;
       }
@@ -442,7 +527,7 @@ export function useVaultResources({
       if (contentsKey(page.folder || "", page.q || "", page.recursive) !== key) {
         throw new Error("Contents page did not match the current view");
       }
-      const latest = contentsCacheRef.current.get(key);
+      const latest = contentsCache.get(key);
       if (!latest || latest.next_cursor !== cursor) {
         return null;
       }
@@ -454,7 +539,7 @@ export function useVaultResources({
       setContents(merged);
       return merged;
     } catch {
-      if (isCurrentRequest()) {
+      if (isCurrentRequest() && !controller.signal.aborted) {
         setError("Could not load more contents.");
       }
       return null;
@@ -463,21 +548,38 @@ export function useVaultResources({
         loadingMoreRequestRef.current = null;
         setLoadingMoreRequest(null);
       }
+      finishForegroundContentsRequest(controller);
     }
-  }, [apiFetch, rememberContents, setError]);
+  }, [
+    apiFetch,
+    beginForegroundContentsRequest,
+    contentsCache,
+    finishForegroundContentsRequest,
+    rememberContents,
+    setError,
+  ]);
+
+  prefetchScheduler.setRunner(async ({ key, targetFolder }, signal) => {
+    if (signal.aborted || contentsCache.has(key)) {
+      return;
+    }
+    await fetchContents(targetFolder, {
+      background: true,
+      q: "",
+      recursive: false,
+      signal,
+    });
+  });
 
   const prefetchContents = useCallback(
-    (targetFolder) => {
+    (targetFolder, priority = PREFETCH_PRIORITY_SIDEBAR) => {
       const key = contentsKey(targetFolder, "", false);
-      if (contentsCacheRef.current.has(key) || prefetchingKeysRef.current.has(key)) {
-        return;
+      if (contentsCache.has(key)) {
+        return false;
       }
-      prefetchingKeysRef.current.add(key);
-      fetchContents(targetFolder, { q: "", recursive: false, background: true })
-        .catch(() => {})
-        .finally(() => prefetchingKeysRef.current.delete(key));
+      return prefetchScheduler.enqueue(key, { key, targetFolder }, priority);
     },
-    [fetchContents]
+    [contentsCache, prefetchScheduler]
   );
 
   const fetchSidebar = useCallback(async () => {
@@ -649,25 +751,22 @@ export function useVaultResources({
     ]
   );
 
-  const updateDocumentInViews = useCallback((docId, updater) => {
-    const updateList = (items = []) =>
-      items.map((item) => (item.id === docId ? updater(item) : item));
-    contentsCacheRef.current.forEach((cached, key) => {
-      if ((cached.documents || []).some((item) => item.id === docId)) {
-        contentsCacheRef.current.set(key, {
-          ...cached,
-          documents: updateList(cached.documents),
-        });
-      }
-    });
-    setContents((prev) => ({ ...prev, documents: updateList(prev.documents) }));
-    setMyEditsState((prev) => ({ ...prev, documents: updateList(prev.documents) }));
-    setSelectedDocDetail((prev) => (prev && prev.id === docId ? updater(prev) : prev));
-  }, []);
+  const updateDocumentInViews = useCallback(
+    (docId, updater) => {
+      const updateList = (items = []) =>
+        items.map((item) => (item.id === docId ? updater(item) : item));
+      contentsCache.updateDocument(docId, updater);
+      setContents((prev) => ({ ...prev, documents: updateList(prev.documents) }));
+      setMyEditsState((prev) => ({ ...prev, documents: updateList(prev.documents) }));
+      setSelectedDocDetail((prev) => (prev && prev.id === docId ? updater(prev) : prev));
+    },
+    [contentsCache]
+  );
 
   useEffect(() => {
+    abortForegroundContentsRequest();
     const key = contentsKey(folder, searchQuery, recursiveSearch);
-    const cached = contentsCacheRef.current.get(key);
+    const cached = contentsCache.get(key);
     if (cached) {
       setContents(cached);
       return undefined;
@@ -675,25 +774,58 @@ export function useVaultResources({
     if (!searchQuery && !recursiveSearch) {
       setContents(emptyContents(folder, searchQuery, recursiveSearch));
     }
-    const timer = setTimeout(() => {
-      fetchContents(folder).catch(() => setError("Could not refresh contents."));
-    }, 0);
-    return () => clearTimeout(timer);
-  }, [fetchContents, folder, recursiveSearch, searchQuery, setError]);
+    const controller = beginForegroundContentsRequest();
+    let timer = null;
+    const request = () => {
+      fetchContents(folder, {
+        controller,
+        q: searchQuery,
+        recursive: recursiveSearch,
+      }).catch(() => {
+        if (!controller.signal.aborted) {
+          setError("Could not refresh contents.");
+        }
+      });
+    };
+    if (searchQuery || recursiveSearch) {
+      timer = setTimeout(request, SEARCH_DEBOUNCE_MS);
+    } else {
+      request();
+    }
+    return () => {
+      if (timer) {
+        clearTimeout(timer);
+      }
+      controller.abort();
+      finishForegroundContentsRequest(controller);
+    };
+  }, [
+    beginForegroundContentsRequest,
+    abortForegroundContentsRequest,
+    contentsCache,
+    fetchContents,
+    finishForegroundContentsRequest,
+    folder,
+    recursiveSearch,
+    searchQuery,
+    setError,
+  ]);
 
   useEffect(() => {
     if (displayedContents.q || displayedContents.recursive) {
       return;
     }
-    (displayedContents.folders || []).forEach((item) => prefetchContents(item.path));
+    (displayedContents.folders || []).forEach((item) =>
+      prefetchContents(item.path, PREFETCH_PRIORITY_VISIBLE)
+    );
   }, [displayedContents, prefetchContents]);
 
   useEffect(() => {
-    prefetchContents("");
-    prefetchContents("Archive");
+    prefetchContents("", PREFETCH_PRIORITY_ROOT);
+    prefetchContents("Archive", PREFETCH_PRIORITY_ROOT);
     Object.values(sidebarChildren)
       .flat()
-      .forEach((path) => prefetchContents(path));
+      .forEach((path) => prefetchContents(path, PREFETCH_PRIORITY_SIDEBAR));
   }, [prefetchContents, sidebarChildren]);
 
   useEffect(() => {
@@ -796,6 +928,16 @@ export function useVaultResources({
     setError,
     showNotice,
   ]);
+
+  useEffect(
+    () => () => {
+      contentsCacheGenerationRef.current += 1;
+      contentRequestRef.current += 1;
+      abortForegroundContentsRequest();
+      prefetchScheduler.clear();
+    },
+    [abortForegroundContentsRequest, prefetchScheduler]
+  );
 
   return {
     docs,

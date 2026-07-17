@@ -74,7 +74,7 @@ use crate::transfers::{self, TransferMaintenanceError};
 use crate::uploads::{
     self, CompleteUploadRequest, CreateUploadRequest, UploadError, UploadIntegrityExpectations,
     UploadPartHeaders, UploadPartIngest, UploadResultPayload, UploadRuntimeSettings,
-    UploadSessionPayload,
+    UploadSessionPayload, UploadSessionStatusPayload,
 };
 use crate::views::{
     self, BootstrapPayload, ContentsPageOptions, ContentsPayload, DocumentDetailPayload,
@@ -319,6 +319,10 @@ fn document_transfer_routes() -> Router<AppState> {
         .route(
             "/api/uploads/{session_id}",
             get(api_get_upload_session).delete(api_abort_upload_session),
+        )
+        .route(
+            "/api/uploads/{session_id}/status",
+            get(api_get_upload_session_status),
         )
         .route(
             "/api/uploads/{session_id}/parts/{part_number}",
@@ -1455,6 +1459,28 @@ async fn api_get_upload_session(
         )
         .await?,
     ))
+}
+
+async fn api_get_upload_session_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+) -> Response {
+    let result: Result<UploadSessionStatusPayload, ApiError> = async {
+        let user = current_user(&state, &headers).await?;
+        Ok(uploads::get_upload_session_status(&state.db, &session_id, &user).await?)
+    }
+    .await;
+    let mut response = match result {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => error.into_response(),
+    };
+    insert_header(
+        response.headers_mut(),
+        header::CACHE_CONTROL,
+        APP_SHELL_CACHE_CONTROL,
+    );
+    response
 }
 
 async fn api_upload_session_part(

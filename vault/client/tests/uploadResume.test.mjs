@@ -815,6 +815,10 @@ test("upload polls a stored completing session and recovers its committed result
       return jsonResponse({ ok: true });
     }
     if (url === "/api/uploads/stored-completing" && !options.method) {
+      return jsonResponse(completingSession);
+    }
+    if (url === "/api/uploads/stored-completing/status" && !options.method) {
+      assert.equal(options.cache, "no-store");
       statusReads += 1;
       return jsonResponse(statusReads === 1 ? completingSession : completedSession);
     }
@@ -845,6 +849,7 @@ test("upload resumes when a stored completing session returns to active", async 
     [STORAGE_KEY]: JSON.stringify([await storedSessionRecord(file, activeSession.id)]),
   });
   const xhrRequests = installXhrRecorder();
+  let fullReads = 0;
   let statusReads = 0;
   let created = false;
   globalThis.fetch = async (url, options = {}) => {
@@ -856,8 +861,17 @@ test("upload resumes when a stored completing session returns to active", async 
       throw new Error("stored active session must be resumed");
     }
     if (url === "/api/uploads/completing-reset" && !options.method) {
+      fullReads += 1;
+      return jsonResponse(fullReads === 1 ? completingSession : activeSession);
+    }
+    if (url === "/api/uploads/completing-reset/status" && !options.method) {
       statusReads += 1;
-      return jsonResponse(statusReads === 1 ? completingSession : activeSession);
+      return jsonResponse({
+        part_manifest_sha256: null,
+        result: null,
+        status: "active",
+        verification: null,
+      });
     }
     if (url === "/api/uploads/completing-reset/complete" && options.method === "POST") {
       return jsonResponse({ id: 43, path: file.name, version: "version-reset" });
@@ -873,7 +887,8 @@ test("upload resumes when a stored completing session returns to active", async 
 
   assert.equal(result.body.version, "version-reset");
   assert.equal(created, false);
-  assert.ok(statusReads >= 2);
+  assert.equal(fullReads, 2);
+  assert.ok(statusReads >= 1);
   assert.deepEqual(
     xhrRequests.map((request) => request.url),
     ["/api/uploads/completing-reset/parts/2"]
@@ -1223,7 +1238,7 @@ test("upload reconciles a lost completion response through completing to complet
       completionAttempted = true;
       throw new Error("completion response lost");
     }
-    if (url === "/api/uploads/ambiguous-completion" && !options.method) {
+    if (url === "/api/uploads/ambiguous-completion/status" && !options.method) {
       if (!completionAttempted) {
         return jsonResponse(activeSession);
       }
@@ -1266,7 +1281,7 @@ test("completion reconciliation refresh failure preserves the original error and
       completionAttempted = true;
       throw new Error("original completion failure");
     }
-    if (url === "/api/uploads/completion-refresh-failure" && !options.method) {
+    if (url === "/api/uploads/completion-refresh-failure/status" && !options.method) {
       return completionAttempted
         ? jsonResponse({ detail: "refresh unavailable" }, 503)
         : jsonResponse(activeSession);
@@ -1304,7 +1319,8 @@ test("a stalled verification refresh is aborted and cannot hang successful compl
     if (url === "/api/uploads" && options.method === "POST") {
       return jsonResponse(activeSession);
     }
-    if (url === "/api/uploads/stalled-verification" && !options.method) {
+    if (url === "/api/uploads/stalled-verification/status" && !options.method) {
+      assert.equal(options.cache, "no-store");
       return new Promise((resolve, reject) => {
         options.signal.addEventListener(
           "abort",

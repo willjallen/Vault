@@ -141,6 +141,14 @@ pub struct UploadSessionPayload {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct UploadSessionStatusPayload {
+    pub status: String,
+    pub verification: Option<UploadVerificationPayload>,
+    pub result: Option<UploadResultPayload>,
+    pub part_manifest_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct UploadPartPayload {
     pub part_number: i64,
     pub offset: i64,
@@ -268,6 +276,19 @@ struct UploadSessionRow {
     result_version_id: Option<String>,
     result_path: Option<String>,
     resume_identity_sha256: Option<String>,
+    part_manifest_sha256: Option<String>,
+}
+
+#[derive(Debug, FromRow)]
+struct UploadSessionStatusRow {
+    status: String,
+    total_size: i64,
+    verification_total_bytes: i64,
+    verification_processed_bytes: i64,
+    created_by: String,
+    result_document_id: Option<i64>,
+    result_version_id: Option<String>,
+    result_path: Option<String>,
     part_manifest_sha256: Option<String>,
 }
 
@@ -782,6 +803,72 @@ pub async fn get_upload_session(
         ensure_session_not_expired(pool, transfers_path, &session).await?;
     }
     upload_session_payload(pool, transfers_path, signing_keys, session_id).await
+}
+
+pub async fn get_upload_session_status(
+    pool: &SqlitePool,
+    session_id: &str,
+    user: &UserContext,
+) -> Result<UploadSessionStatusPayload, UploadError> {
+    let row = sqlx::query_as::<_, UploadSessionStatusRow>(
+        r"
+        SELECT
+            status,
+            total_size,
+            verification_total_bytes,
+            verification_processed_bytes,
+            created_by,
+            result_document_id,
+            result_version_id,
+            result_path,
+            json_extract(user_context, '$.' || ?)
+                AS part_manifest_sha256
+        FROM upload_sessions
+        WHERE id = ?
+        ",
+    )
+    .bind(UPLOAD_PART_MANIFEST_CONTEXT_KEY)
+    .bind(session_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or(UploadError::UploadSessionNotFound)?;
+    if row.created_by != user.id && !user.is_admin {
+        return Err(UploadError::UploadSessionNotFound);
+    }
+
+    let verification = match row.status.as_str() {
+        "completing" => {
+            let total_bytes = row.verification_total_bytes.clamp(0, row.total_size.max(0));
+            Some(UploadVerificationPayload {
+                processed_bytes: row.verification_processed_bytes.clamp(0, total_bytes),
+                total_bytes,
+            })
+        }
+        "complete" => {
+            let total_bytes = row.total_size.max(0);
+            Some(UploadVerificationPayload {
+                processed_bytes: total_bytes,
+                total_bytes,
+            })
+        }
+        _ => None,
+    };
+    let result = if row.status == "complete" {
+        Some(completed_status_result(&row)?)
+    } else {
+        None
+    };
+    let part_manifest_sha256 = if row.status == "complete" {
+        row.part_manifest_sha256
+    } else {
+        None
+    };
+    Ok(UploadSessionStatusPayload {
+        status: row.status,
+        verification,
+        result,
+        part_manifest_sha256,
+    })
 }
 
 pub async fn ingest_upload_part<S, E>(
@@ -2981,6 +3068,23 @@ fn expected_part_bounds(
 }
 
 fn completed_result(session: &UploadSessionRow) -> Result<UploadResultPayload, UploadError> {
+    let id = session
+        .result_document_id
+        .ok_or(UploadError::CompletedSessionMissingResult)?;
+    let version = session
+        .result_version_id
+        .clone()
+        .ok_or(UploadError::CompletedSessionMissingResult)?;
+    let path = session
+        .result_path
+        .clone()
+        .ok_or(UploadError::CompletedSessionMissingResult)?;
+    Ok(UploadResultPayload { id, version, path })
+}
+
+fn completed_status_result(
+    session: &UploadSessionStatusRow,
+) -> Result<UploadResultPayload, UploadError> {
     let id = session
         .result_document_id
         .ok_or(UploadError::CompletedSessionMissingResult)?;

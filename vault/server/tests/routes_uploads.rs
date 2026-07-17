@@ -683,6 +683,177 @@ async fn assert_completed_manifest_is_durable(
     assert_eq!(delete_complete["part_manifest_sha256"], manifest);
 }
 
+async fn assert_lightweight_upload_status(app: &axum::Router, session_id: &str, expected: Value) {
+    let response = app
+        .clone()
+        .oneshot(authed_request(
+            Method::GET,
+            &format!("/api/uploads/{session_id}/status"),
+            Body::empty(),
+        ))
+        .await
+        .expect("lightweight upload status");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["cache-control"], "no-store, max-age=0");
+    assert_eq!(response_json(response).await, expected);
+}
+
+#[tokio::test]
+async fn lightweight_upload_status_uses_only_persisted_state() {
+    let (state, _temp_dir) =
+        test_state_with_upload_settings(5 * 1024 * 1024 * 1024, 4, 86_400).await;
+    grant_writer_root(&state.db).await;
+    let pool = state.db.clone();
+    let transfers_path = state.config.transfers_path();
+    let app = http::router(state);
+    let created = create_upload_session_for_size(app.clone(), 4, None).await;
+    let session_id = created["id"].as_str().expect("session id").to_string();
+    let session_dir = transfers_path.join("uploads").join(&session_id);
+
+    tokio::fs::write(session_dir.join("00000001.part"), b"data")
+        .await
+        .expect("status test part");
+    tokio::fs::write(session_dir.join("00000001.json"), b"{")
+        .await
+        .expect("malformed status test sidecar");
+    assert_lightweight_upload_status(
+        &app,
+        &session_id,
+        json!({
+            "status": "active",
+            "verification": null,
+            "result": null,
+            "part_manifest_sha256": null
+        }),
+    )
+    .await;
+
+    let detached_staging = transfers_path.join(format!("detached-status-{session_id}"));
+    tokio::fs::rename(&session_dir, &detached_staging)
+        .await
+        .expect("detach upload staging");
+    sqlx::query(
+        r"
+        UPDATE upload_sessions
+        SET status = 'completing',
+            verification_total_bytes = 99,
+            verification_processed_bytes = -7
+        WHERE id = ?
+        ",
+    )
+    .bind(&session_id)
+    .execute(&pool)
+    .await
+    .expect("mark upload completing");
+    assert_lightweight_upload_status(
+        &app,
+        &session_id,
+        json!({
+            "status": "completing",
+            "verification": {"processed_bytes": 0, "total_bytes": 4},
+            "result": null,
+            "part_manifest_sha256": null
+        }),
+    )
+    .await;
+
+    let manifest = "ab".repeat(32);
+    sqlx::query(
+        r"
+        UPDATE upload_sessions
+        SET status = 'complete',
+            result_document_id = 42,
+            result_version_id = 'version-42',
+            result_path = 'Project/status.bin',
+            user_context = json_set(user_context, '$._upload_part_manifest_sha256', ?)
+        WHERE id = ?
+        ",
+    )
+    .bind(&manifest)
+    .bind(&session_id)
+    .execute(&pool)
+    .await
+    .expect("mark upload complete");
+    assert_lightweight_upload_status(
+        &app,
+        &session_id,
+        json!({
+            "status": "complete",
+            "verification": {"processed_bytes": 4, "total_bytes": 4},
+            "result": {
+                "id": 42,
+                "version": "version-42",
+                "path": "Project/status.bin"
+            },
+            "part_manifest_sha256": manifest
+        }),
+    )
+    .await;
+    assert!(detached_staging.join("00000001.part").is_file());
+    assert!(detached_staging.join("00000001.json").is_file());
+}
+
+#[tokio::test]
+async fn lightweight_upload_status_is_hidden_from_other_owners_and_visible_to_admins() {
+    let (state, _temp_dir) = test_state().await;
+    grant_writer_root(&state.db).await;
+    let app = http::router(state);
+    let created = create_upload_session_for_size(app.clone(), 4, None).await;
+    let session_id = created["id"].as_str().expect("session id");
+
+    let missing = app
+        .clone()
+        .oneshot(authed_request(
+            Method::GET,
+            "/api/uploads/missing-session/status",
+            Body::empty(),
+        ))
+        .await
+        .expect("missing lightweight upload status");
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    assert_eq!(missing.headers()["cache-control"], "no-store, max-age=0");
+    assert_eq!(
+        response_json(missing).await["detail"],
+        "Upload session not found"
+    );
+
+    let blocked = app
+        .clone()
+        .oneshot(authed_request_for(
+            Method::GET,
+            &format!("/api/uploads/{session_id}/status"),
+            "intruder",
+            "Intruder",
+            "intruder@example.com",
+            "",
+            Body::empty(),
+        ))
+        .await
+        .expect("other-owner lightweight upload status");
+    assert_eq!(blocked.status(), StatusCode::NOT_FOUND);
+    assert_eq!(blocked.headers()["cache-control"], "no-store, max-age=0");
+    assert_eq!(
+        response_json(blocked).await["detail"],
+        "Upload session not found"
+    );
+
+    let admin = app
+        .oneshot(authed_request_for(
+            Method::GET,
+            &format!("/api/uploads/{session_id}/status"),
+            "admin",
+            "Admin",
+            "admin@example.com",
+            "vault-admin",
+            Body::empty(),
+        ))
+        .await
+        .expect("admin lightweight upload status");
+    assert_eq!(admin.status(), StatusCode::OK);
+    assert_eq!(admin.headers()["cache-control"], "no-store, max-age=0");
+    assert_eq!(response_json(admin).await["status"], "active");
+}
+
 #[tokio::test]
 async fn upload_size_limit_rejects_before_metadata_or_blob_write() {
     let (state, temp_dir) = test_state_with_upload_settings(5, 32 * 1024 * 1024, 86_400).await;

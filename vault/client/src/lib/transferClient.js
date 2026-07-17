@@ -21,9 +21,17 @@ import {
   storedUploadSessionId,
   uploadSessionKey,
 } from "./uploadSessionStore.js";
+import {
+  completedUploadSessionManifest,
+  completedUploadSessionResult,
+  pollUploadVerificationStatus,
+  readUploadSessionStatus,
+  uploadSessionLayoutMatchesFile,
+  validateInMemoryCompletionManifest,
+  waitForUploadSessionTransition as pollUploadSessionTransition,
+} from "./uploadStatusPolicy.js";
 const EXPORT_POLL_MS = 900;
 const PROGRESS_TICK_MS = 80;
-const VERIFICATION_POLL_MS = 240;
 const SERVER_PROGRESS_RATE_MIN_BYTES = 1024 * 1024;
 
 export class TransferCancelledError extends Error {
@@ -169,6 +177,10 @@ async function existingUploadSession(sessionId, signal) {
   }
 }
 
+function existingUploadSessionStatus(sessionId, signal) {
+  return readUploadSessionStatus({ requestJson, sessionId, signal });
+}
+
 async function createUploadSession({
   file,
   folder,
@@ -216,43 +228,25 @@ async function completeUploadSession(session, { partManifestSha256, sha256 = nul
   );
 }
 
-async function pollUploadVerification({ sessionId, signal, onProgress, isDone }) {
+function pollUploadVerification({ sessionId, signal, onProgress, isDone }) {
   const startedAt = performance.now();
-  let immediate = true;
-  while (!isDone()) {
-    if (immediate) {
-      immediate = false;
-    } else {
-      await waitFor(VERIFICATION_POLL_MS, signal);
-    }
-    if (isDone()) {
-      break;
-    }
-    let current;
-    try {
-      current = await existingUploadSession(sessionId, signal);
-    } catch (error) {
-      if (isAbortError(error)) {
-        throw error;
-      }
-      // Verification progress is advisory. A status refresh failure must not
-      // turn an otherwise successful completion into a reported failure.
-      return;
-    }
-    const verification = current?.verification;
-    if (!verification) {
-      continue;
-    }
-    reportUploadProgress(
-      onProgress,
-      progressFromValues(
-        verification.processed_bytes || 0,
-        verification.total_bytes || null,
-        startedAt,
-        { stage: "verifying" }
-      )
-    );
-  }
+  return pollUploadVerificationStatus({
+    isDone,
+    onVerification: (verification) =>
+      reportUploadProgress(
+        onProgress,
+        progressFromValues(
+          verification.processed_bytes || 0,
+          verification.total_bytes || null,
+          startedAt,
+          { stage: "verifying" }
+        )
+      ),
+    readStatus: existingUploadSessionStatus,
+    sessionId,
+    signal,
+    wait: waitFor,
+  });
 }
 
 async function abortUploadSession(sessionId) {
@@ -292,37 +286,6 @@ function expectedUploadPart(fileSize, chunkSize, partNumber) {
   };
 }
 
-function normalizedUploadFilename(filename) {
-  return String(filename || "")
-    .replaceAll("\\", "/")
-    .split("/")
-    .at(-1)
-    .trim();
-}
-
-function uploadSessionLayoutMatchesFile(session, file, resumeIdentitySha256) {
-  const chunkSize = Number(session?.chunk_size);
-  const partCount = Number(session?.part_count);
-  const sizeBytes = Number(session?.size_bytes);
-  if (
-    typeof session?.id !== "string" ||
-    !session.id ||
-    !Number.isSafeInteger(chunkSize) ||
-    chunkSize <= 0 ||
-    !Number.isSafeInteger(partCount) ||
-    !Number.isSafeInteger(sizeBytes)
-  ) {
-    return false;
-  }
-  const expectedPartCount = file.size > 0 ? Math.ceil(file.size / chunkSize) : 0;
-  return (
-    partCount === expectedPartCount &&
-    sizeBytes === file.size &&
-    session.filename === normalizedUploadFilename(file.name) &&
-    session.resume_identity_sha256 === resumeIdentitySha256
-  );
-}
-
 function activeUploadSessionMatchesFile(session, file, resumeIdentitySha256) {
   return (
     session?.status === "active" &&
@@ -330,39 +293,6 @@ function activeUploadSessionMatchesFile(session, file, resumeIdentitySha256) {
     Boolean(session.upload_token) &&
     uploadSessionLayoutMatchesFile(session, file, resumeIdentitySha256)
   );
-}
-
-function completedUploadSessionResult(session, file, resumeIdentitySha256) {
-  if (!uploadSessionLayoutMatchesFile(session, file, resumeIdentitySha256)) {
-    throw new Error("Completed upload session layout does not match the selected file.");
-  }
-  const result = session?.result;
-  if (
-    session.status !== "complete" ||
-    !Number.isSafeInteger(result?.id) ||
-    result.id <= 0 ||
-    typeof result.version !== "string" ||
-    !result.version ||
-    typeof result.path !== "string" ||
-    !result.path
-  ) {
-    throw new Error("Completed upload session is missing its result.");
-  }
-  return result;
-}
-
-function completedUploadSessionManifest(session) {
-  const manifest = session?.part_manifest_sha256;
-  if (typeof manifest !== "string" || !/^[a-f0-9]{64}$/.test(manifest)) {
-    throw new Error("Completed upload session is missing its integrity manifest.");
-  }
-  return manifest;
-}
-
-function validateInMemoryCompletionManifest(session, partManifestSha256) {
-  if (completedUploadSessionManifest(session) !== partManifestSha256) {
-    throw new Error("Completed upload session integrity manifest does not match this upload.");
-  }
 }
 
 async function validateStoredCompletionManifest(file, session, signal) {
@@ -377,13 +307,14 @@ async function validateStoredCompletionManifest(file, session, signal) {
   }
 }
 
-async function waitForUploadSessionTransition(session, signal) {
-  let current = session;
-  while (current?.status === "completing") {
-    await waitFor(VERIFICATION_POLL_MS, signal);
-    current = await existingUploadSession(current.id, signal);
-  }
-  return current;
+function waitForUploadSessionTransition(session, signal) {
+  return pollUploadSessionTransition({
+    readSession: existingUploadSession,
+    readStatus: existingUploadSessionStatus,
+    session,
+    signal,
+    wait: waitFor,
+  });
 }
 
 async function verifiedCommittedPartDigests(file, session, resumeIdentitySha256, signal) {
@@ -512,7 +443,8 @@ async function reconcileAmbiguousUploadCompletion({
   signal,
 }) {
   try {
-    let current = await existingUploadSession(session.id, signal);
+    const statusPayload = await existingUploadSessionStatus(session.id, signal);
+    let current = statusPayload ? { ...session, ...statusPayload } : null;
     if (
       current?.status === "completing" &&
       !uploadSessionLayoutMatchesFile(current, file, resumeIdentitySha256)

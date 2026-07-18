@@ -189,20 +189,37 @@ export function FileRow({
           },
     },
     [
-      h(
-        "div",
-        { className: "file-cell icon", role: "gridcell" },
+      h("div", { className: "file-cell icon", role: "gridcell" }, [
         h(RowSelectionIcon, {
           disabled: editing,
           fileName: doc.name,
           item: doc,
+          key: "visual",
           kind: "file",
           label: selected ? `Deselect ${doc.name}` : `Select ${doc.name}`,
           onSelect: onToggleSelect,
           selected,
           size: visualSize,
-        })
-      ),
+        }),
+        locked
+          ? h(
+              "span",
+              {
+                className: classNames(
+                  "compact-lock-indicator",
+                  lockedByMe ? "locked-self" : "locked-other"
+                ),
+                key: "lock",
+                title: `Checked out by ${lockHolderName}`,
+              },
+              h(Icon, {
+                icon: "lock",
+                label: `Checked out by ${lockHolderName}`,
+                size: 9,
+              })
+            )
+          : null,
+      ]),
       h("div", { className: "file-cell main", role: "gridcell" }, [
         editing
           ? h("input", {

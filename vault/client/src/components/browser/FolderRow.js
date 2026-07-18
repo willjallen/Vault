@@ -146,8 +146,12 @@ function folderNameCell({
         })
       : h(
           "div",
-          { className: classNames("name", isArchived ? "archived-text" : "") },
-          folder.name || "Folder"
+          { className: "file-name-line" },
+          h(
+            "div",
+            { className: classNames("name", isArchived ? "archived-text" : "") },
+            folder.name || "Folder"
+          )
         ),
   ]);
 }

@@ -31,24 +31,103 @@ function viewIcon(mode) {
   return mode === CONTENTS_VIEW_MODES.LIST ? "view-list" : "view-details";
 }
 
-function ContentsCompactSort({ onSortChange, sort }) {
+function focusSortOption(root, direction) {
+  const options = Array.from(root?.querySelectorAll(".contents-compact-sort-option") || []);
+  if (!options.length) {
+    return;
+  }
+  const currentIndex = options.indexOf(document.activeElement);
+  let nextIndex = currentIndex;
+  if (direction === "first") {
+    nextIndex = 0;
+  } else if (direction === "last") {
+    nextIndex = options.length - 1;
+  } else if (currentIndex === -1) {
+    nextIndex = direction > 0 ? 0 : options.length - 1;
+  } else {
+    nextIndex = (currentIndex + direction + options.length) % options.length;
+  }
+  options.at(nextIndex)?.focus();
+}
+
+export function ContentsCompactSort({ onSortChange, sort }) {
+  const [menuOpen, setMenuOpen] = useState(false);
+  const rootRef = useRef(null);
+  const triggerRef = useRef(null);
   const currentKey = sort?.key || SORT_OPTIONS[0].key;
-  return h("div", { className: "contents-compact-sort" }, [
-    h("label", { className: "contents-compact-sort-field", key: "field" }, [
-      h("span", { className: "visually-hidden", key: "label" }, "Sort contents by"),
-      h(
-        "select",
-        {
-          "aria-label": "Sort contents by",
-          key: "select",
-          onChange: (evt) => onSortChange?.(evt.target.value),
-          value: currentKey,
+  const currentOption = SORT_OPTIONS.find((option) => option.key === currentKey) || SORT_OPTIONS[0];
+
+  useEffect(() => {
+    if (!menuOpen) {
+      return undefined;
+    }
+    rootRef.current?.querySelector('[aria-checked="true"]')?.focus();
+    function closeOnOutsidePointer(evt) {
+      if (!rootRef.current?.contains(evt.target)) {
+        setMenuOpen(false);
+      }
+    }
+    function closeOnEscape(evt) {
+      if (evt.key === "Escape") {
+        setMenuOpen(false);
+        triggerRef.current?.focus();
+      }
+    }
+    document.addEventListener("pointerdown", closeOnOutsidePointer);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsidePointer);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [menuOpen]);
+
+  function chooseSort(key) {
+    if (key !== currentKey) {
+      onSortChange?.(key);
+    }
+    setMenuOpen(false);
+    triggerRef.current?.focus();
+  }
+
+  function handleMenuKeyDown(evt) {
+    const directions = {
+      ArrowDown: 1,
+      ArrowUp: -1,
+      End: "last",
+      Home: "first",
+    };
+    const direction = directions[evt.key];
+    if (direction === undefined) {
+      return;
+    }
+    evt.preventDefault();
+    focusSortOption(rootRef.current, direction);
+  }
+
+  return h("div", { className: "contents-compact-sort", ref: rootRef }, [
+    h(
+      "button",
+      {
+        "aria-expanded": menuOpen,
+        "aria-haspopup": "menu",
+        "aria-label": `Sort contents by. Current: ${currentOption.label}`,
+        className: "contents-compact-sort-trigger",
+        key: "field",
+        onClick: () => setMenuOpen((current) => !current),
+        onKeyDown: (evt) => {
+          if (evt.key === "ArrowDown" || evt.key === "ArrowUp") {
+            evt.preventDefault();
+            setMenuOpen(true);
+          }
         },
-        SORT_OPTIONS.map((option) =>
-          h("option", { key: option.key, value: option.key }, option.label)
-        )
-      ),
-    ]),
+        ref: triggerRef,
+        type: "button",
+      },
+      [
+        h("span", { key: "label" }, currentOption.label),
+        h(Icon, { icon: "chevron-down", key: "chevron", size: 9 }),
+      ]
+    ),
     h(
       "button",
       {
@@ -61,6 +140,34 @@ function ContentsCompactSort({ onSortChange, sort }) {
       },
       h(Icon, { icon: sort?.direction === "desc" ? "arrow-down" : "arrow-up", size: 12 })
     ),
+    menuOpen
+      ? h(
+          "div",
+          {
+            "aria-label": "Sort contents by",
+            className: "contents-compact-sort-menu",
+            key: "menu",
+            onKeyDown: handleMenuKeyDown,
+            role: "menu",
+          },
+          SORT_OPTIONS.map((option) => {
+            const active = option.key === currentKey;
+            return h(
+              "button",
+              {
+                "aria-checked": active,
+                className: classNames("contents-compact-sort-option", active ? "active" : ""),
+                key: option.key,
+                onClick: () => chooseSort(option.key),
+                role: "menuitemradio",
+                tabIndex: active ? 0 : -1,
+                type: "button",
+              },
+              option.label
+            );
+          })
+        )
+      : null,
   ]);
 }
 

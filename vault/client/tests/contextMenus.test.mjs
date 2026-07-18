@@ -17,13 +17,15 @@ const moduleUrl = `data:text/javascript;base64,${Buffer.from(bundled.outputFiles
 )}`;
 const { buildFileMenuItems, buildFolderMenuItems, buildPageMenuItems } = await import(moduleUrl);
 
-function fileMenuItemsFor(doc) {
+function fileMenuItemsFor(doc, overrides = {}) {
   return buildFileMenuItems({
     busy: false,
     currentUser: { id: "user" },
     doc,
     handleArchive: () => {},
+    handleLock: () => {},
     handlePermanentDelete: () => {},
+    handleRelease: () => {},
     handleRemoveFavoriteItem: () => {},
     handleRenameFile: () => {},
     handleShareItem: () => {},
@@ -33,6 +35,7 @@ function fileMenuItemsFor(doc) {
     openFileDetails: () => {},
     openMoveDialogForDoc: () => {},
     siteSettings: {},
+    ...overrides,
   });
 }
 
@@ -77,6 +80,81 @@ test("active file rename action remains enabled", () => {
   });
 
   assert.equal(items.find((item) => item.label === "Rename")?.disabled, false);
+});
+
+test("active file context actions follow the requested order", () => {
+  const items = fileMenuItemsFor({
+    archived: false,
+    favorite: false,
+    id: 1,
+    lock: {},
+    name: "active.txt",
+    type: "document",
+  });
+
+  assert.deepEqual(
+    items.map((item) => item.label),
+    ["Download", "Replace", "Rename", "Lock", "Share", "History", "Move...", "Archive"]
+  );
+});
+
+test("file context lock action locks unlocked files and unlocks owned locks", () => {
+  const doc = {
+    archived: false,
+    favorite: false,
+    id: 7,
+    lock: {},
+    name: "active.txt",
+    type: "document",
+  };
+  let locked = null;
+  let released = null;
+  const unlockedItems = fileMenuItemsFor(doc, {
+    handleLock: (item) => {
+      locked = item;
+    },
+  });
+  unlockedItems.find((item) => item.label === "Lock").action();
+  assert.equal(locked, doc);
+
+  const ownedItems = fileMenuItemsFor(
+    { ...doc, lock: { by: "user", name: "Current User" } },
+    {
+      handleRelease: (id) => {
+        released = id;
+      },
+    }
+  );
+  ownedItems.find((item) => item.label === "Unlock").action();
+  assert.equal(released, doc.id);
+});
+
+test("file context lock action explains locks owned by another user", () => {
+  const doc = {
+    archived: false,
+    favorite: false,
+    id: 7,
+    lock: { by: "other", name: "Grace" },
+    name: "active.txt",
+    type: "document",
+  };
+  const items = fileMenuItemsFor(doc);
+  const lockItem = items.find((item) => item.label === "Unlock");
+
+  assert.equal(lockItem.disabled, true);
+  assert.equal(lockItem.note, "Locked by Grace");
+
+  let released = null;
+  const adminItems = fileMenuItemsFor(doc, {
+    handleRelease: (id) => {
+      released = id;
+    },
+    isAdmin: true,
+  });
+  const adminUnlock = adminItems.find((item) => item.label === "Unlock");
+  assert.equal(adminUnlock.disabled, false);
+  adminUnlock.action();
+  assert.equal(released, doc.id);
 });
 
 test("empty active folder exposes a dangerous Delete action", () => {

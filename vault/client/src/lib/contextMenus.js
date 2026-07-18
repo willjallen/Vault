@@ -17,10 +17,24 @@ function compactMenuItems(items) {
 }
 
 export function buildFileMenuItems(actions) {
-  const { doc, currentUser, busy } = actions;
+  const { doc, currentUser, busy, isAdmin } = actions;
   const lock = doc.lock || {};
-  const lockedByOther = lock && lock.by && lock.by !== currentUser.id;
-  const lockedByMe = lock && lock.by && lock.by === currentUser.id;
+  const locked = Boolean(lock.by);
+  const lockedByOther = locked && lock.by !== currentUser.id;
+  const lockedByMe = locked && lock.by === currentUser.id;
+  const canUnlock = locked && (lockedByMe || isAdmin);
+  const lockItem = locked
+    ? {
+        label: "Unlock",
+        action: () => actions.handleRelease(doc.id),
+        disabled: busy || !canUnlock,
+        note: lockedByOther ? `Locked by ${lock.name || lock.by}` : undefined,
+      }
+    : {
+        label: "Lock",
+        action: () => actions.handleLock(doc),
+        disabled: busy || doc.archived,
+      };
   return compactMenuItems([
     { label: "Download", action: () => actions.handleView(doc) },
     {
@@ -28,22 +42,16 @@ export function buildFileMenuItems(actions) {
       action: () => actions.handleVersionUploadClick(doc, { renameToUploadedName: !lockedByMe }),
       disabled: busy || doc.archived || lockedByOther,
     },
-    actions.openFileDetails
-      ? { label: "History", action: () => actions.openFileDetails(doc) }
-      : null,
     {
       label: "Rename",
       action: () => actions.handleRenameFile(doc),
       disabled: busy || doc.archived,
     },
-    doc.favorite && actions.handleRemoveFavoriteItem
-      ? {
-          label: "Remove from Favorites",
-          action: () => actions.handleRemoveFavoriteItem(doc),
-          disabled: busy,
-        }
-      : null,
+    lockItem,
     { label: "Share", action: () => actions.handleShareItem(doc), disabled: busy },
+    actions.openFileDetails
+      ? { label: "History", action: () => actions.openFileDetails(doc) }
+      : null,
     doc.archived
       ? null
       : {
@@ -54,6 +62,13 @@ export function buildFileMenuItems(actions) {
     doc.archived
       ? { label: "Restore to Vault", action: () => actions.handleUnarchive(doc.id), disabled: busy }
       : { label: "Archive", action: () => actions.handleArchive(doc.id), disabled: busy },
+    doc.favorite && actions.handleRemoveFavoriteItem
+      ? {
+          label: "Remove from Favorites",
+          action: () => actions.handleRemoveFavoriteItem(doc),
+          disabled: busy,
+        }
+      : null,
     canDeleteForeverItem(doc, actions)
       ? {
           label: "Delete forever",

@@ -1,8 +1,8 @@
+import { CONTENTS_VIEW_MODES, contentsVisualSize } from "../../lib/contentsView.js";
 import { writeLocalPreference } from "../../lib/localPreferences.js";
 import { classNames, formatBytes, isArchiveRootPath } from "../../lib/utils.js";
 import { Icon } from "../common/Icon.js";
 import {
-  COLUMN_RESIZE_HANDLES,
   COLUMN_WIDTH_STORAGE_KEY,
   columnWidthsForResize,
   contentColumnStyle,
@@ -12,16 +12,20 @@ import {
 import { FolderRow } from "./FolderRow.js";
 import { FileRow } from "./FileRow.js";
 import { EmptyState } from "./EmptyState.js";
+import { ContentsTableHeader } from "./ContentsTableHeader.js";
+import { ContentsViewToolbarControls, ViewModeControl } from "./ContentsViewControl.js";
+import {
+  clientPointToContent,
+  clientRectToContent,
+  combineMarqueeSelection,
+  contentRectToVisibleClientRect,
+  rectFromPoints,
+  rectsIntersect,
+} from "./marqueeSelection.js";
+import { useContentsView } from "./useContentsView.js";
 
 const { useCallback, useEffect, useRef, useState } = React;
 const h = React.createElement;
-const NAME_COLUMN = { key: "name", label: "Name", className: "name", defaultDirection: "asc" };
-const DETAIL_SORT_COLUMNS = [
-  { key: "modified", label: "Modified", className: "modified", defaultDirection: "desc" },
-  { key: "user", label: "User", className: "user", defaultDirection: "asc" },
-  { key: "size", label: "Size", className: "size", defaultDirection: "desc" },
-  { key: "ttl", label: "Status", className: "status", defaultDirection: "asc" },
-];
 const MARQUEE_MIN_DISTANCE = 4;
 const MARQUEE_AUTO_SCROLL_EDGE = 48;
 const MARQUEE_AUTO_SCROLL_MAX = 18;
@@ -35,6 +39,13 @@ function itemSelectionKey(item) {
 
 function classIf(condition, className) {
   return condition ? className : "";
+}
+
+function rovingSelectionKey(orderedKeys, focusedKey) {
+  if (orderedKeys.includes(focusedKey)) {
+    return focusedKey;
+  }
+  return orderedKeys[0] || "";
 }
 
 function isActiveFolderDropTarget(dropHint, activeDropTarget, path) {
@@ -59,13 +70,9 @@ function shouldIgnoreMarqueeTarget(target) {
   return Boolean(
     target.closest &&
     target.closest(
-      ".contents-table-head, .contents-toolbar, .contents-selection-readout, button, input, textarea, select, a, [role='button'], [contenteditable='true']"
+      ".contents-table-head, .contents-toolbar, .contents-statusbar, button, input, textarea, select, a, [role='button'], [contenteditable='true']"
     )
   );
-}
-
-function rectsIntersect(a, b) {
-  return a.left <= b.right && a.right >= b.left && a.top <= b.bottom && a.bottom >= b.top;
 }
 
 function clearNativeSelection() {
@@ -73,91 +80,6 @@ function clearNativeSelection() {
   if (selection && selection.rangeCount) {
     selection.removeAllRanges();
   }
-}
-
-function combineMarqueeSelection({ baseSelection, hitKeys, mode, orderedKeys }) {
-  if (mode === "replace") {
-    return hitKeys;
-  }
-  const baseSet = new Set(baseSelection);
-  const hitSet = new Set(hitKeys);
-  return orderedKeys.filter((key) => {
-    if (mode === "toggle") {
-      return hitSet.has(key) ? !baseSet.has(key) : baseSet.has(key);
-    }
-    return baseSet.has(key) || hitSet.has(key);
-  });
-}
-
-function ContentsSortButton({ column, sort, onSortChange }) {
-  const active = sort?.key === column.key;
-  const direction = active ? sort.direction : column.defaultDirection;
-  return h(
-    "button",
-    {
-      type: "button",
-      className: classNames(
-        "contents-sort-button",
-        `contents-sort-${column.className}`,
-        active ? "active" : ""
-      ),
-      "aria-sort": active ? (direction === "desc" ? "descending" : "ascending") : "none",
-      onClick: (e) => {
-        e.stopPropagation();
-        if (onSortChange) {
-          onSortChange(column.key);
-        }
-      },
-    },
-    [
-      h("span", { key: "label" }, column.label),
-      h(Icon, {
-        className: classNames("contents-sort-arrow", active ? "active" : "preview"),
-        icon: direction === "desc" ? "arrow-down" : "arrow-up",
-        key: "icon",
-        size: 10,
-      }),
-    ]
-  );
-}
-
-function ContentsHeaderCell({
-  children,
-  columnKey,
-  onResizeEnd,
-  onResizeMove,
-  onResizeStart,
-  resizeHandle,
-}) {
-  return h(
-    "div",
-    {
-      className: classNames(
-        "contents-head-cell",
-        columnKey === "name" ? "name-column" : "",
-        columnKey === "actions" ? "actions-column" : "",
-        columnKey !== "name" && columnKey !== "actions" ? "detail-column" : ""
-      ),
-      "data-column-key": columnKey,
-    },
-    [
-      h(React.Fragment, { key: "content" }, children),
-      resizeHandle
-        ? h("button", {
-            "aria-label": `Resize ${resizeHandle.left} and ${resizeHandle.right} columns`,
-            className: "contents-column-resizer",
-            key: "resize",
-            onClick: (e) => e.stopPropagation(),
-            onPointerCancel: onResizeEnd,
-            onPointerDown: (e) => onResizeStart(resizeHandle, e),
-            onPointerMove: onResizeMove,
-            onPointerUp: onResizeEnd,
-            title: "Resize column",
-            type: "button",
-          })
-        : null,
-    ]
-  );
 }
 
 function ContentsLoadMore({ hasMore, loading, onLoadMore }) {
@@ -291,7 +213,13 @@ export function VaultFileList({
   const resizeDragRef = useRef(null);
   const suppressClickRef = useRef(false);
   const [columnWidths, setColumnWidths] = useState(readStoredColumnWidths);
+  const [focusedSelectionKey, setFocusedSelectionKey] = useState("");
   const [marquee, setMarquee] = useState(null);
+  const { contentsView, requestContentsView } = useContentsView({
+    interactionRef: resizeDragRef,
+    listRef: fileListRef,
+    locked: Boolean(inlineFolderDraft || dragActive),
+  });
   const {
     allVisibleSelected,
     createDraft,
@@ -319,6 +247,8 @@ export function VaultFileList({
     selectedKeys,
     subfolders,
   });
+  const rovingFocusKey = rovingSelectionKey(orderedKeys, focusedSelectionKey);
+  const visualSize = contentsVisualSize(contentsView);
 
   const updateMarqueeSelection = useCallback(() => {
     marqueeFrameRef.current = null;
@@ -351,25 +281,42 @@ export function VaultFileList({
       list.scrollTop += scrollDelta;
     }
 
-    const marqueeLeft = Math.max(Math.min(drag.startX, drag.currentX), listRect.left);
-    const marqueeRight = Math.min(Math.max(drag.startX, drag.currentX), listRect.right);
-    const marqueeTop = Math.max(Math.min(drag.startY, drag.currentY), listRect.top);
-    const marqueeBottom = Math.min(Math.max(drag.startY, drag.currentY), listRect.bottom);
-    const marqueeRect = {
-      bottom: marqueeBottom,
-      left: marqueeLeft,
-      right: marqueeRight,
-      top: marqueeTop,
-    };
+    const currentContentPoint = clientPointToContent({
+      clientX: drag.currentX,
+      clientY: drag.currentY,
+      listRect,
+      scrollLeft: list.scrollLeft,
+      scrollTop: list.scrollTop,
+    });
+    const marqueeRect = rectFromPoints(
+      { x: drag.startContentX, y: drag.startContentY },
+      currentContentPoint
+    );
+    const visibleMarqueeRect = contentRectToVisibleClientRect(
+      marqueeRect,
+      listRect,
+      list.scrollLeft,
+      list.scrollTop
+    );
     setMarquee({
-      height: Math.max(0, marqueeBottom - marqueeTop),
-      left: marqueeLeft,
-      top: marqueeTop,
-      width: Math.max(0, marqueeRight - marqueeLeft),
+      height: visibleMarqueeRect.height,
+      left: visibleMarqueeRect.left,
+      top: visibleMarqueeRect.top,
+      width: visibleMarqueeRect.width,
     });
 
     const hitKeys = Array.from(list.querySelectorAll("[data-selection-key]"))
-      .filter((row) => rectsIntersect(marqueeRect, row.getBoundingClientRect()))
+      .filter((row) =>
+        rectsIntersect(
+          marqueeRect,
+          clientRectToContent(
+            row.getBoundingClientRect(),
+            listRect,
+            list.scrollLeft,
+            list.scrollTop
+          )
+        )
+      )
       .map((row) => row.dataset.selectionKey)
       .filter(Boolean);
     const nextKeys = combineMarqueeSelection({
@@ -401,6 +348,15 @@ export function VaultFileList({
   }
 
   function createMarqueeDrag(evt, extra = {}) {
+    const list = fileListRef.current || evt.currentTarget;
+    const listRect = list.getBoundingClientRect();
+    const startContentPoint = clientPointToContent({
+      clientX: evt.clientX,
+      clientY: evt.clientY,
+      listRect,
+      scrollLeft: list.scrollLeft,
+      scrollTop: list.scrollTop,
+    });
     return {
       active: false,
       baseSelection: selectedKeys.slice(),
@@ -410,6 +366,8 @@ export function VaultFileList({
       mode: marqueeModeFromEvent(evt),
       orderedKeys: orderedKeys.slice(),
       pointerId: evt.pointerId,
+      startContentX: startContentPoint.x,
+      startContentY: startContentPoint.y,
       startX: evt.clientX,
       startY: evt.clientY,
       ...extra,
@@ -613,9 +571,7 @@ export function VaultFileList({
     }
     if (
       e.target.closest &&
-      e.target.closest(
-        ".file-row, .contents-table-head, .contents-toolbar, .contents-selection-readout"
-      )
+      e.target.closest(".file-row, .contents-table-head, .contents-toolbar, .contents-statusbar")
     ) {
       return;
     }
@@ -663,6 +619,70 @@ export function VaultFileList({
     }
   }
 
+  function handleCollectionKeyDown(e) {
+    if (e.target.closest?.("button, input, textarea, select, [contenteditable='true']")) {
+      return;
+    }
+    if ((e.ctrlKey || e.metaKey) && e.key.toLocaleLowerCase() === "a") {
+      e.preventDefault();
+      handleSelectAllChange(e);
+      return;
+    }
+    const row = e.target.closest?.("[data-selection-key]");
+    if (!row) {
+      return;
+    }
+    if (e.key === " ") {
+      const item = orderedItems.find(
+        (candidate) => itemSelectionKey(candidate) === row.dataset.selectionKey
+      );
+      if (item) {
+        e.preventDefault();
+        handleToggleSelect(item, item.type, e);
+      }
+      return;
+    }
+    if (!["ArrowDown", "ArrowLeft", "ArrowRight", "ArrowUp", "End", "Home"].includes(e.key)) {
+      return;
+    }
+    const rows = Array.from(fileListRef.current?.querySelectorAll("[data-selection-key]") || []);
+    const currentIndex = rows.indexOf(row);
+    if (currentIndex < 0) {
+      return;
+    }
+    const firstTop = rows[0]?.getBoundingClientRect().top;
+    const columns =
+      contentsView.mode === CONTENTS_VIEW_MODES.ICONS
+        ? Math.max(
+            1,
+            rows.filter(
+              (candidate) => Math.abs(candidate.getBoundingClientRect().top - firstTop) < 2
+            ).length
+          )
+        : 1;
+    const offsets = {
+      ArrowDown: columns,
+      ArrowLeft: -1,
+      ArrowRight: 1,
+      ArrowUp: -columns,
+    };
+    let nextIndex = currentIndex;
+    if (e.key === "Home") {
+      nextIndex = 0;
+    } else if (e.key === "End") {
+      nextIndex = rows.length - 1;
+    } else {
+      nextIndex = currentIndex + offsets[e.key];
+    }
+    const nextRow = rows[Math.max(0, Math.min(rows.length - 1, nextIndex))];
+    if (nextRow && nextRow !== row) {
+      e.preventDefault();
+      setFocusedSelectionKey(nextRow.dataset.selectionKey || "");
+      nextRow.focus({ preventScroll: true });
+      nextRow.scrollIntoView({ block: "nearest", inline: "nearest" });
+    }
+  }
+
   function renderFolderRow(folderItem) {
     const selectionKey = itemSelectionKey(folderItem);
     const folderDropActive = isActiveFolderDropTarget(dropHint, activeDropTarget, folderItem.path);
@@ -678,6 +698,8 @@ export function VaultFileList({
       isDragging: draggingFolderPath === folderItem.path,
       selectionKey,
       selected: selectedSet.has(selectionKey),
+      tabIndex: selectionKey === rovingFocusKey ? 0 : -1,
+      visualSize,
       onToggleSelect: (e) => handleToggleSelect(folderItem, "folder", e),
       onMore: (e) => openContextMenuForItem(e, folderItem, { select: false }),
       onSelect: (e) => onSelectItem && onSelectItem(folderItem, "folder", e, orderedItems),
@@ -697,6 +719,7 @@ export function VaultFileList({
       onEditChange: onInlineFolderNameChange,
       onEditCommit: onCommitInlineFolder,
       onEditCancel: onCancelInlineFolder,
+      onFocus: () => setFocusedSelectionKey(selectionKey),
     });
   }
 
@@ -717,6 +740,8 @@ export function VaultFileList({
       showSearchPath: Boolean(searchQuery && recursiveSearch),
       selectionKey,
       selected: selectedSet.has(selectionKey),
+      tabIndex: selectionKey === rovingFocusKey ? 0 : -1,
+      visualSize,
       draggingId,
       doubleClickDownload,
       busy: actions.busy,
@@ -740,6 +765,7 @@ export function VaultFileList({
       onEditChange: onInlineFolderNameChange,
       onEditCommit: onCommitInlineFolder,
       onEditCancel: onCancelInlineFolder,
+      onFocus: () => setFocusedSelectionKey(selectionKey),
     });
   }
 
@@ -750,6 +776,7 @@ export function VaultFileList({
     {
       className: classNames(
         "finder-browser",
+        `finder-view-${contentsView.mode}`,
         classIf(inArchive, "archived-scope"),
         classIf(uploadHover, "upload-hover"),
         classIf(browserDropActive, "drop-target"),
@@ -787,10 +814,20 @@ export function VaultFileList({
           ),
         ]),
         h("div", { className: "contents-toolbar" }, [
+          h(ContentsViewToolbarControls, {
+            allVisibleSelected,
+            key: "view-controls",
+            mode: contentsView.mode,
+            onSelectAllChange: handleSelectAllChange,
+            onSortChange,
+            sort,
+            visibleCount: visibleKeys.length,
+          }),
           h(
             "div",
             {
               className: "contents-search",
+              key: "search",
               onClick: (e) => e.stopPropagation(),
               onMouseDown: (e) => e.stopPropagation(),
             },
@@ -826,81 +863,40 @@ export function VaultFileList({
           ),
         ]),
       ]),
-      h(
-        "div",
-        {
-          className: "contents-table-head",
-          onClick: (e) => e.stopPropagation(),
-          onMouseDown: (e) => e.stopPropagation(),
-          ref: headerRef,
+      h(ContentsTableHeader, {
+        allVisibleSelected,
+        headerRef,
+        key: "table-header",
+        mode: contentsView.mode,
+        onSelectAllChange: handleSelectAllChange,
+        onSortChange,
+        resizeHandlers: {
+          end: endColumnResize,
+          move: moveColumnResize,
+          start: beginColumnResize,
         },
-        [
-          h(
-            "label",
-            { className: "contents-select-all", key: "select-all", title: "Select all visible" },
-            h("input", {
-              "aria-label": allVisibleSelected
-                ? "Deselect all visible items"
-                : "Select all visible items",
-              checked: allVisibleSelected,
-              className: "contents-select-checkbox",
-              disabled: visibleKeys.length === 0,
-              onChange: handleSelectAllChange,
-              type: "checkbox",
-            })
-          ),
-          h(
-            ContentsHeaderCell,
-            {
-              columnKey: NAME_COLUMN.key,
-              key: NAME_COLUMN.key,
-              onResizeEnd: endColumnResize,
-              onResizeMove: moveColumnResize,
-              onResizeStart: beginColumnResize,
-              resizeHandle: COLUMN_RESIZE_HANDLES.name,
-            },
-            h(ContentsSortButton, {
-              column: NAME_COLUMN,
-              onSortChange,
-              sort,
-            })
-          ),
-          ...DETAIL_SORT_COLUMNS.map((column) =>
-            h(
-              ContentsHeaderCell,
-              {
-                columnKey: column.className,
-                key: column.key,
-                onResizeEnd: endColumnResize,
-                onResizeMove: moveColumnResize,
-                onResizeStart: beginColumnResize,
-                resizeHandle: COLUMN_RESIZE_HANDLES[column.className],
-              },
-              h(ContentsSortButton, {
-                column,
-                onSortChange,
-                sort,
-              })
-            )
-          ),
-          h("div", {
-            className: "contents-head-actions",
-            "data-column-key": "actions",
-            key: "actions",
-          }),
-        ]
-      ),
+        sort,
+        visibleCount: visibleKeys.length,
+      }),
       h(
         "div",
         {
-          className: classNames("file-list", marquee ? "selecting" : ""),
+          "aria-label": "Folder contents",
+          "aria-multiselectable": "true",
+          className: classNames(
+            "file-list",
+            `contents-view-${contentsView.mode}`,
+            marquee ? "selecting" : ""
+          ),
           onClickCapture: handleMarqueeClickCapture,
           onDragStartCapture: handleMarqueeDragStartCapture,
+          onKeyDown: handleCollectionKeyDown,
           onPointerCancel: finishMarquee,
           onPointerDown: handleMarqueePointerDown,
           onPointerMove: handleMarqueePointerMove,
           onPointerUp: finishMarquee,
           ref: fileListRef,
+          role: "grid",
         },
         [
           createDraft
@@ -913,6 +909,7 @@ export function VaultFileList({
                 editing: true,
                 editValue: inlineFolderDraft.value,
                 isDraft: true,
+                visualSize,
                 onOpen: () => {},
                 onDropEnter: () => {},
                 onDrop: () => {},
@@ -951,21 +948,29 @@ export function VaultFileList({
       h(
         "div",
         {
-          className: "contents-selection-readout",
+          className: "contents-statusbar",
           onClick: (e) => e.stopPropagation(),
           onMouseDown: (e) => e.stopPropagation(),
         },
         [
-          h(
-            "span",
-            { className: "selection-count", key: "count" },
-            `${selectedItems.length} selected`
-          ),
-          h(
-            "span",
-            { key: "meta" },
-            `${selectedFiles.length} files · ${selectedFolders.length} folders · ${selectedSizeDisplay}`
-          ),
+          h("div", { className: "contents-selection-readout", key: "selection" }, [
+            h(
+              "span",
+              { className: "selection-count", key: "count" },
+              `${selectedItems.length} selected`
+            ),
+            h(
+              "span",
+              { key: "meta" },
+              `${selectedFiles.length} files · ${selectedFolders.length} folders · ${selectedSizeDisplay}`
+            ),
+          ]),
+          h(ViewModeControl, {
+            disabled: Boolean(inlineFolderDraft || dragActive),
+            key: "view-mode",
+            onChange: requestContentsView,
+            view: contentsView,
+          }),
         ]
       ),
     ]

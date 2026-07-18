@@ -21,6 +21,7 @@ import {
   faArrowRight,
   faArrowUp,
   faAtom,
+  faBars,
   faBezierCurve,
   faBolt,
   faBookOpen,
@@ -59,8 +60,16 @@ import {
   faExplosion,
   faDownload,
   faFile,
+  faFileAudio,
   faFileArrowDown,
   faFileArrowUp,
+  faFileCode,
+  faFileCsv,
+  faFileImage,
+  faFileLines,
+  faFilePdf,
+  faFileVideo,
+  faFileZipper,
   faFilm,
   faFire,
   faFlaskVial,
@@ -321,8 +330,16 @@ const utilityIcons = new Map([
   ["download", iconEntry(faDownload)],
   ["ellipsis", iconEntry(faEllipsis)],
   ["file", iconEntry(faFile)],
+  ["file-audio", iconEntry(faFileAudio)],
+  ["file-code", iconEntry(faFileCode)],
+  ["file-csv", iconEntry(faFileCsv)],
   ["file-download", iconEntry(faFileArrowDown)],
+  ["file-image", iconEntry(faFileImage)],
+  ["file-lines", iconEntry(faFileLines)],
+  ["file-pdf", iconEntry(faFilePdf)],
   ["file-upload", iconEntry(faFileArrowUp)],
+  ["file-video", iconEntry(faFileVideo)],
+  ["file-zipper", iconEntry(faFileZipper)],
   ["folder-tree", iconEntry(faFolderTree)],
   ["gear", iconEntry(faGear)],
   ["info", iconEntry(faCircleInfo)],
@@ -336,6 +353,9 @@ const utilityIcons = new Map([
   ["shield", iconEntry(faShield)],
   ["upload", iconEntry(faUpload)],
   ["warning", iconEntry(faTriangleExclamation)],
+  ["view-details", iconEntry(faListCheck)],
+  ["view-icons", iconEntry(faTableCells)],
+  ["view-list", iconEntry(faBars)],
 ]);
 
 export const iconLibrary = folderIconEntries;
@@ -348,6 +368,7 @@ export function findIconEntry(iconId, fallback = "folder") {
     iconsById.get(iconId) ||
     utilityIcons.get(iconId) ||
     iconsById.get(fallback) ||
+    utilityIcons.get(fallback) ||
     iconEntry(faFolder)
   );
 }

@@ -8,6 +8,9 @@ import {
   SEARCH_DEBOUNCE_MS,
   contentsScopeAffectedByUpload,
 } from "./vaultResourceBounds.js";
+import { usePreviewResolver } from "./usePreviewResolver.js";
+
+export { mergeResolvedDocumentVisuals, previewResolveDocuments } from "./usePreviewResolver.js";
 
 const { useCallback, useEffect, useMemo, useRef, useState } = React;
 
@@ -325,6 +328,12 @@ export function useVaultResources({
   ]);
 
   const docs = useMemo(() => displayedContents.documents || [], [displayedContents.documents]);
+  const { previewDocumentsSignature, resolveDisplayedPreviews } = usePreviewResolver({
+    apiFetch,
+    contentsCache,
+    documents: docs,
+    setContents,
+  });
   const subfolders = useMemo(() => displayedContents.folders || [], [displayedContents.folders]);
   const sidebarChildren = useMemo(() => sidebar.folder_children || {}, [sidebar.folder_children]);
   const sidebarMetadata = useMemo(() => sidebar.folder_metadata || {}, [sidebar.folder_metadata]);
@@ -888,6 +897,9 @@ export function useVaultResources({
           setError("Could not refresh document.")
         );
       }
+      if (resources.has("previews")) {
+        resolveDisplayedPreviews({ force: true });
+      }
     }
 
     function queueRefresh(resources) {
@@ -943,6 +955,7 @@ export function useVaultResources({
     fetchSidebar,
     invalidateContentsCache,
     invalidateSidebar,
+    resolveDisplayedPreviews,
     setError,
     showNotice,
   ]);
@@ -956,6 +969,13 @@ export function useVaultResources({
     },
     [abortForegroundContentsRequest, prefetchScheduler]
   );
+
+  useEffect(() => {
+    if (!previewDocumentsSignature) {
+      return;
+    }
+    resolveDisplayedPreviews();
+  }, [previewDocumentsSignature, resolveDisplayedPreviews]);
 
   return {
     docs,

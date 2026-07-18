@@ -63,6 +63,8 @@ export function FileRow({
   showSearchPath = false,
   selectionKey = "",
   selected,
+  tabIndex = 0,
+  visualSize = 24,
   draggingId,
   onToggleSelect,
   onDownload,
@@ -79,6 +81,7 @@ export function FileRow({
   onEditChange,
   onEditCommit,
   onEditCancel,
+  onFocus,
 }) {
   const inputRef = useRef(null);
   const committingRef = useRef(false);
@@ -157,11 +160,15 @@ export function FileRow({
         editing ? "editing" : ""
       ),
       "data-selection-key": selectionKey || undefined,
+      "aria-selected": Boolean(selected),
       draggable: !editing && selected,
+      role: "row",
+      tabIndex: editing ? undefined : tabIndex,
       onClick: editing ? undefined : onSelect,
       onDoubleClick: editing || !doubleClickDownload ? undefined : () => onOpen(doc),
       onDragStart: editing ? undefined : (e) => onDragStart(e, doc.id),
       onDragEnd: editing ? undefined : onDragEnd,
+      onFocus,
       onContextMenu: (e) => {
         e.preventDefault();
         e.stopPropagation();
@@ -172,22 +179,31 @@ export function FileRow({
           onContextMenu(e);
         }
       },
+      onKeyDown: editing
+        ? undefined
+        : (e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              onOpen(doc);
+            }
+          },
     },
     [
       h(
         "div",
-        { className: "file-cell icon" },
+        { className: "file-cell icon", role: "gridcell" },
         h(RowSelectionIcon, {
           disabled: editing,
           fileName: doc.name,
+          item: doc,
           kind: "file",
           label: selected ? `Deselect ${doc.name}` : `Select ${doc.name}`,
           onSelect: onToggleSelect,
           selected,
-          size: 12,
+          size: visualSize,
         })
       ),
-      h("div", { className: "file-cell main" }, [
+      h("div", { className: "file-cell main", role: "gridcell" }, [
         editing
           ? h("input", {
               ref: inputRef,
@@ -222,20 +238,20 @@ export function FileRow({
                 : null,
             ]),
       ]),
-      h("div", { className: "file-cell meta" }, [
+      h("div", { className: "file-cell meta", role: "gridcell" }, [
         h("div", { className: "muted tiny" }, formatDate(doc.modified_at, "No modifications yet")),
       ]),
       h(
         "div",
-        { className: "file-cell user" },
+        { className: "file-cell user", role: "gridcell" },
         h("span", { className: "muted tiny" }, doc.latest_by || "-")
       ),
       h(
         "div",
-        { className: "file-cell size" },
+        { className: "file-cell size", role: "gridcell" },
         h("span", { className: "muted tiny" }, doc.size_display || "-")
       ),
-      h("div", { className: "file-cell status-col" }, [
+      h("div", { className: "file-cell status-col", role: "gridcell" }, [
         onOpenDetails
           ? h(
               "button",
@@ -277,7 +293,7 @@ export function FileRow({
             })
           : h("span", { "aria-hidden": "true", className: "status-empty status-ttl" }),
       ]),
-      h("div", { className: "file-cell row-actions" }, [
+      h("div", { className: "file-cell row-actions", role: "gridcell" }, [
         h(
           "button",
           {

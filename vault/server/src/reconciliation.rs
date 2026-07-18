@@ -213,9 +213,15 @@ async fn load_reconciliation_state(
             .fetch_all(pool)
             .await?,
     );
+    let preview_blob_ids = id_set(
+        sqlx::query_scalar::<_, i64>("SELECT blob_id FROM preview_renditions")
+            .fetch_all(pool)
+            .await?,
+    );
     let referenced_blob_ids = document_blob_ids
         .union(&export_blob_ids)
         .copied()
+        .chain(preview_blob_ids)
         .collect::<HashSet<_>>();
     let all_blobs = sqlx::query_as::<_, BlobRecord>(
         "SELECT id, hash_algo, hash, size_bytes FROM blobs ORDER BY id",
@@ -624,6 +630,9 @@ async fn delete_unreferenced_multipart_part(
                           OR EXISTS(
                               SELECT 1 FROM export_artifacts a WHERE a.blob_id = l.blob_id
                           )
+                          OR EXISTS(
+                              SELECT 1 FROM preview_renditions p WHERE p.blob_id = l.blob_id
+                          )
                       )
                 )
             ",
@@ -689,6 +698,7 @@ async fn restore_missing_local_locations(
               AND (
                     EXISTS (SELECT 1 FROM document_versions v WHERE v.blob_id = b.id)
                     OR EXISTS (SELECT 1 FROM export_artifacts a WHERE a.blob_id = b.id)
+                    OR EXISTS (SELECT 1 FROM preview_renditions p WHERE p.blob_id = b.id)
                   )
             ",
         )

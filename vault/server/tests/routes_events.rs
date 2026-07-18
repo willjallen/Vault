@@ -73,8 +73,7 @@ async fn first_sse_chunk(response: axum::response::Response) -> String {
     String::from_utf8(item.to_vec()).expect("utf8 sse")
 }
 
-const FULL_STATE_EVENT_RESOURCES_JSON: &str =
-    r#"["admin","contents","document_detail","my_edits","preferences","settings","sidebar"]"#;
+const FULL_STATE_EVENT_RESOURCES_JSON: &str = r#"["admin","contents","document_detail","my_edits","preferences","previews","settings","sidebar"]"#;
 
 #[tokio::test]
 async fn state_event_compaction_keeps_one_marker_and_a_bounded_replay_suffix() {

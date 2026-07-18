@@ -8,12 +8,13 @@ const h = React.createElement;
 export function Icon({
   className = "",
   color = "",
+  fallbackIcon = "folder",
   fixedWidth = false,
   icon,
   label = "",
   size = 16,
 }) {
-  const entry = findIconEntry(icon);
+  const entry = findIconEntry(icon, fallbackIcon);
   const baseAttrs = {
     "aria-hidden": label ? undefined : "true",
     "aria-label": label || undefined,

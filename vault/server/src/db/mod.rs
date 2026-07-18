@@ -46,6 +46,8 @@ pub async fn reset(pool: &DbPool) -> anyhow::Result<Vec<String>> {
             .await?;
     for table in [
         "share_links",
+        "preview_renditions",
+        "preview_jobs",
         "export_artifacts",
         "export_jobs",
         "upload_parts",
@@ -76,9 +78,20 @@ pub async fn reset(pool: &DbPool) -> anyhow::Result<Vec<String>> {
 async fn init_schema(pool: &DbPool) -> anyhow::Result<()> {
     let existing_tables = user_table_names(pool).await?;
     if existing_tables.is_empty() {
-        let mut tx = pool.begin().await?;
-        apply_schema_statements(&mut tx).await?;
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        apply_baseline_schema_statements(&mut tx).await?;
+        apply_migration_1(&mut tx).await?;
         tx.commit().await?;
+    } else if !existing_tables.contains("schema_migrations") {
+        // This is the only unversioned shape Vault knows how to migrate. Validate
+        // the complete metadata graph before adding anything so a partially
+        // upgraded, hand-edited, or future schema is never guessed at.
+        validate_unversioned_schema_exact(pool).await?;
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        apply_migration_1(&mut tx).await?;
+        tx.commit().await?;
+    } else {
+        validate_migration_history(pool).await?;
     }
 
     validate_schema(pool).await?;
@@ -90,9 +103,48 @@ async fn init_schema(pool: &DbPool) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn apply_schema_statements(tx: &mut Transaction<'_, Sqlite>) -> anyhow::Result<()> {
+async fn apply_baseline_schema_statements(tx: &mut Transaction<'_, Sqlite>) -> anyhow::Result<()> {
     for statement in schema::STATEMENTS {
         tx.execute(*statement).await?;
+    }
+    Ok(())
+}
+
+async fn apply_migration_1(tx: &mut Transaction<'_, Sqlite>) -> anyhow::Result<()> {
+    for statement in schema::MIGRATION_1_STATEMENTS {
+        tx.execute(*statement).await?;
+    }
+    Ok(())
+}
+
+async fn validate_migration_history(pool: &DbPool) -> anyhow::Result<()> {
+    let rows = sqlx::query_as::<_, (i64, String)>(
+        "SELECT version, name FROM schema_migrations ORDER BY version",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|_| schema_incompatible("schema_migrations cannot be read"))?;
+    if rows
+        != vec![(
+            schema::CURRENT_SCHEMA_VERSION,
+            "content previews".to_string(),
+        )]
+    {
+        return Err(schema_incompatible(format!(
+            "unsupported migration history {rows:?}",
+        )));
+    }
+    Ok(())
+}
+
+async fn validate_unversioned_schema_exact(pool: &DbPool) -> anyhow::Result<()> {
+    let expected_pool = expected_unversioned_schema_pool().await?;
+    let expected = schema_metadata(&expected_pool).await?;
+    let live = schema_metadata(pool).await?;
+    if live != expected {
+        return Err(schema_incompatible(
+            "unversioned schema does not exactly match the supported baseline",
+        ));
     }
     Ok(())
 }
@@ -109,12 +161,13 @@ struct TableMetadata {
     named_indexes: BTreeMap<String, IndexMetadata>,
     unique_constraints: BTreeSet<Vec<String>>,
     foreign_keys: BTreeSet<ForeignKeyMetadata>,
-    has_check_constraints: bool,
+    check_constraints_sql: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ColumnMetadata {
-    type_family: String,
+    declared_type: String,
+    default_value: Option<String>,
     not_null: bool,
     primary_key_position: i64,
 }
@@ -182,7 +235,7 @@ async fn validate_schema(pool: &DbPool) -> anyhow::Result<()> {
                 "foreign key mismatch for table {table_name}",
             )));
         }
-        if live_table.has_check_constraints != expected_table.has_check_constraints {
+        if live_table.check_constraints_sql != expected_table.check_constraints_sql {
             return Err(schema_incompatible(format!(
                 "check constraint mismatch for table {table_name}",
             )));
@@ -222,7 +275,24 @@ async fn expected_schema_pool() -> anyhow::Result<DbPool> {
         .connect_with(options)
         .await?;
     let mut tx = pool.begin().await?;
-    apply_schema_statements(&mut tx).await?;
+    apply_baseline_schema_statements(&mut tx).await?;
+    apply_migration_1(&mut tx).await?;
+    tx.commit().await?;
+    Ok(pool)
+}
+
+async fn expected_unversioned_schema_pool() -> anyhow::Result<DbPool> {
+    let options = SqliteConnectOptions::from_str("sqlite::memory:")?
+        .foreign_keys(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Normal)
+        .busy_timeout(Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS));
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await?;
+    let mut tx = pool.begin().await?;
+    apply_baseline_schema_statements(&mut tx).await?;
     tx.commit().await?;
     Ok(pool)
 }
@@ -273,13 +343,13 @@ async fn table_metadata(pool: &DbPool, table_name: &str) -> anyhow::Result<Table
     let columns = column_metadata(pool, table_name).await?;
     let (named_indexes, unique_constraints) = index_metadata(pool, table_name).await?;
     let foreign_keys = foreign_key_metadata(pool, table_name).await?;
-    let has_check_constraints = table_has_check_constraints(pool, table_name).await?;
+    let check_constraints_sql = table_check_constraints_sql(pool, table_name).await?;
     Ok(TableMetadata {
         columns,
         named_indexes,
         unique_constraints,
         foreign_keys,
-        has_check_constraints,
+        check_constraints_sql,
     })
 }
 
@@ -297,7 +367,10 @@ async fn column_metadata(
         columns.insert(
             name,
             ColumnMetadata {
-                type_family: sqlite_type_family(&declared_type),
+                declared_type: normalize_sql(&declared_type),
+                default_value: row
+                    .try_get::<Option<String>, _>("dflt_value")?
+                    .map(|value| normalize_sql(&value)),
                 not_null: row.try_get::<i64, _>("notnull")? != 0,
                 primary_key_position: row.try_get::<i64, _>("pk")?,
             },
@@ -392,7 +465,7 @@ async fn foreign_key_metadata(
     Ok(foreign_keys)
 }
 
-async fn table_has_check_constraints(pool: &DbPool, table_name: &str) -> anyhow::Result<bool> {
+async fn table_check_constraints_sql(pool: &DbPool, table_name: &str) -> anyhow::Result<String> {
     let create_sql: Option<String> =
         sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?")
             .bind(table_name)
@@ -400,28 +473,13 @@ async fn table_has_check_constraints(pool: &DbPool, table_name: &str) -> anyhow:
             .await?
             .flatten();
     let normalized = create_sql.as_deref().map(normalize_sql).unwrap_or_default();
-    Ok(normalized.contains(" check ") || normalized.contains(" check("))
-}
-
-fn sqlite_type_family(declared_type: &str) -> String {
-    let upper = declared_type.trim().to_ascii_uppercase();
-    if upper.contains("INT") || upper.contains("BOOL") {
-        "integer".to_string()
-    } else if upper.contains("CHAR")
-        || upper.contains("CLOB")
-        || upper.contains("TEXT")
-        || upper.contains("JSON")
-        || upper.contains("DATE")
-        || upper.contains("TIME")
-    {
-        "text".to_string()
-    } else if upper.contains("BLOB") {
-        "blob".to_string()
-    } else if upper.contains("REAL") || upper.contains("FLOA") || upper.contains("DOUB") {
-        "real".to_string()
-    } else {
-        "numeric".to_string()
-    }
+    Ok(
+        if normalized.contains(" check ") || normalized.contains(" check(") {
+            normalized
+        } else {
+            String::new()
+        },
+    )
 }
 
 fn normalize_sql(sql: &str) -> String {

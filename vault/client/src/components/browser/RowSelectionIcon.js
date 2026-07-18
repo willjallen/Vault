@@ -1,4 +1,4 @@
-import { FileIcon } from "../common/FileIcon.js";
+import { AssetVisual } from "../common/AssetVisual.js";
 import { classNames } from "../../lib/utils.js";
 
 const h = React.createElement;
@@ -8,6 +8,7 @@ export function RowSelectionIcon({
   disabled = false,
   fileName = "",
   folderIcon = "",
+  item = null,
   interactive = true,
   kind,
   label,
@@ -15,7 +16,11 @@ export function RowSelectionIcon({
   selected = false,
   size,
 }) {
-  const icon = h(FileIcon, { color, fileName, folderIcon, kind, size });
+  const icon = h(AssetVisual, {
+    desiredSize: size,
+    item: item || { color, icon: folderIcon, name: fileName, type: kind },
+    kind,
+  });
 
   if (!interactive) {
     return h(

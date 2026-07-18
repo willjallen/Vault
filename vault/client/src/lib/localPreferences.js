@@ -1,8 +1,10 @@
 import { normalizeFolderName } from "./utils.js";
+import { DEFAULT_CONTENTS_VIEW, normalizeContentsView } from "./contentsView.js";
 
 export const LOCAL_PREFERENCES_STORAGE_KEY = "vault.localPreferences";
 const LOCAL_PREFERENCE_DEFAULTS = {
   contentsColumnWidths: null,
+  contentsView: DEFAULT_CONTENTS_VIEW,
   lastFolder: "",
 };
 
@@ -28,6 +30,7 @@ export function readLocalPreferences() {
   return {
     ...LOCAL_PREFERENCE_DEFAULTS,
     ...stored,
+    contentsView: normalizeContentsView(stored.contentsView),
     lastFolder: normalizeFolderName(stored.lastFolder || ""),
   };
 }
@@ -36,6 +39,9 @@ export function readLocalPreference(key, fallback = "") {
   const preferences = readLocalPreferences();
   if (key === "contentsColumnWidths") {
     return preferences.contentsColumnWidths || fallback;
+  }
+  if (key === "contentsView") {
+    return preferences.contentsView || normalizeContentsView(fallback);
   }
   if (key === "lastFolder") {
     return preferences.lastFolder;
@@ -50,6 +56,8 @@ export function writeLocalPreference(key, value) {
     next.lastFolder = normalizeFolderName(value || "");
   } else if (key === "contentsColumnWidths") {
     next.contentsColumnWidths = value;
+  } else if (key === "contentsView") {
+    next.contentsView = normalizeContentsView(value);
   } else {
     return readLocalPreferences();
   }

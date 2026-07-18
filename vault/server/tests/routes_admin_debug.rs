@@ -442,7 +442,7 @@ async fn dev_database_reset_preserves_monotonic_state_event_ids_with_a_refresh_m
     assert_eq!(marker.1, "state.compacted");
     assert_eq!(
         marker.2,
-        r#"["admin","contents","document_detail","my_edits","preferences","settings","sidebar"]"#,
+        r#"["admin","contents","document_detail","my_edits","preferences","previews","settings","sidebar"]"#,
     );
 
     let next_event_id = sqlx::query(

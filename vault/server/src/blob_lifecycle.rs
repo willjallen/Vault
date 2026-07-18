@@ -298,6 +298,85 @@ pub async fn collect_unreferenced_blobs(
     collect_unreferenced_blobs_with_limit(pool, storage, DEFAULT_BLOB_GC_LIMIT).await
 }
 
+/// Drops derived-cache metadata once no document version references its source.
+///
+/// A rendition can deduplicate to the exact same blob as its source. Releasing
+/// the cache metadata before normal liveness checks prevents that strong output
+/// reference from keeping an otherwise orphaned source alive forever.
+async fn release_orphaned_preview_jobs(
+    pool: &SqlitePool,
+    source_blob_ids: Option<&[i64]>,
+    limit: i64,
+) -> Result<Vec<i64>, BlobLifecycleError> {
+    let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let source_blob_ids = if let Some(source_blob_ids) = source_blob_ids {
+        let mut seen = HashSet::new();
+        source_blob_ids
+            .iter()
+            .copied()
+            .filter(|blob_id| seen.insert(*blob_id))
+            .collect::<Vec<_>>()
+    } else {
+        sqlx::query_scalar::<_, i64>(
+            r"
+            SELECT DISTINCT pj.source_blob_id
+            FROM preview_jobs pj
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM document_versions v
+                WHERE v.blob_id = pj.source_blob_id
+            )
+            ORDER BY pj.source_blob_id
+            LIMIT ?
+            ",
+        )
+        .bind(limit)
+        .fetch_all(&mut *transaction)
+        .await?
+    };
+    let mut released_blob_ids = Vec::new();
+    for source_blob_id in source_blob_ids {
+        let rendition_blob_ids = sqlx::query_scalar::<_, i64>(
+            r"
+            SELECT DISTINCT pr.blob_id
+            FROM preview_jobs pj
+            JOIN preview_renditions pr ON pr.preview_job_id = pj.id
+            WHERE pj.source_blob_id = ?
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM document_versions v
+                  WHERE v.blob_id = pj.source_blob_id
+              )
+            ",
+        )
+        .bind(source_blob_id)
+        .fetch_all(&mut *transaction)
+        .await?;
+        let deleted = sqlx::query(
+            r"
+            DELETE FROM preview_jobs
+            WHERE source_blob_id = ?
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM document_versions v
+                  WHERE v.blob_id = preview_jobs.source_blob_id
+              )
+            ",
+        )
+        .bind(source_blob_id)
+        .execute(&mut *transaction)
+        .await?;
+        if deleted.rows_affected() > 0 {
+            released_blob_ids.push(source_blob_id);
+            released_blob_ids.extend(rendition_blob_ids);
+        }
+    }
+    transaction.commit().await?;
+    released_blob_ids.sort_unstable();
+    released_blob_ids.dedup();
+    Ok(released_blob_ids)
+}
+
 // Keep candidate interleaving, bounded-run accounting, and result ordering in one audit surface.
 #[allow(clippy::too_many_lines)]
 pub async fn collect_unreferenced_blobs_with_limit(
@@ -306,6 +385,7 @@ pub async fn collect_unreferenced_blobs_with_limit(
     limit: i64,
 ) -> Result<BlobGcResult, BlobLifecycleError> {
     let limit = limit.clamp(1, MAX_BLOB_GC_LIMIT);
+    let released_preview_blob_ids = release_orphaned_preview_jobs(pool, None, limit).await?;
     let maintenance_ids = sqlx::query_scalar::<_, i64>(
         r"
         SELECT DISTINCT l.blob_id
@@ -338,6 +418,9 @@ pub async fn collect_unreferenced_blobs_with_limit(
               )
           AND NOT EXISTS (
                   SELECT 1 FROM export_artifacts a WHERE a.blob_id = b.id
+              )
+          AND NOT EXISTS (
+                  SELECT 1 FROM preview_renditions p WHERE p.blob_id = b.id
               )
           AND NOT EXISTS (
                   SELECT 1
@@ -375,9 +458,20 @@ pub async fn collect_unreferenced_blobs_with_limit(
     .bind(limit)
     .fetch_all(pool)
     .await?;
-    let mut candidate_ids = Vec::with_capacity(maintenance_ids.len() + orphan_ids.len());
-    for index in 0..maintenance_ids.len().max(orphan_ids.len()) {
+    let mut candidate_ids = Vec::with_capacity(
+        maintenance_ids.len() + orphan_ids.len() + released_preview_blob_ids.len(),
+    );
+    for index in 0..maintenance_ids
+        .len()
+        .max(orphan_ids.len())
+        .max(released_preview_blob_ids.len())
+    {
         if let Some(blob_id) = maintenance_ids.get(index)
+            && !candidate_ids.contains(blob_id)
+        {
+            candidate_ids.push(*blob_id);
+        }
+        if let Some(blob_id) = released_preview_blob_ids.get(index)
             && !candidate_ids.contains(blob_id)
         {
             candidate_ids.push(*blob_id);
@@ -404,7 +498,13 @@ pub(crate) async fn collect_unreferenced_blob_candidates(
     storage: &dyn BlobStorageBackend,
     candidate_ids: &[i64],
 ) -> Result<BlobGcResult, BlobLifecycleError> {
-    collect_blob_candidates(pool, storage, candidate_ids, None).await
+    let released_preview_blob_ids =
+        release_orphaned_preview_jobs(pool, Some(candidate_ids), i64::MAX).await?;
+    let mut all_candidate_ids =
+        Vec::with_capacity(candidate_ids.len() + released_preview_blob_ids.len());
+    all_candidate_ids.extend_from_slice(candidate_ids);
+    all_candidate_ids.extend(released_preview_blob_ids);
+    collect_blob_candidates(pool, storage, &all_candidate_ids, None).await
 }
 
 /// Reserves and collects a backend object that currently has no lifecycle metadata.
@@ -745,6 +845,9 @@ async fn delete_blob_if_empty_in_tx(
                   SELECT 1 FROM export_artifacts a WHERE a.blob_id = blobs.id
               )
           AND NOT EXISTS (
+                  SELECT 1 FROM preview_renditions p WHERE p.blob_id = blobs.id
+              )
+          AND NOT EXISTS (
                   SELECT 1 FROM blob_locations l WHERE l.blob_id = blobs.id
               )
         ",
@@ -840,8 +943,10 @@ async fn blob_is_referenced_in_tx(
         SELECT 1
         WHERE EXISTS (SELECT 1 FROM document_versions WHERE blob_id = ?)
            OR EXISTS (SELECT 1 FROM export_artifacts WHERE blob_id = ?)
+           OR EXISTS (SELECT 1 FROM preview_renditions WHERE blob_id = ?)
         ",
     )
+    .bind(blob_id)
     .bind(blob_id)
     .bind(blob_id)
     .fetch_optional(&mut **transaction)

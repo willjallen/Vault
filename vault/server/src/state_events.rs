@@ -16,6 +16,7 @@ const FULL_STATE_EVENT_RESOURCES: &[&str] = &[
     "document_detail",
     "my_edits",
     "preferences",
+    "previews",
     "settings",
     "sidebar",
 ];

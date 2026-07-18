@@ -50,6 +50,93 @@ async fn initializes_sqlite_schema_with_root_folders() {
         .await
         .expect("root count");
     assert_eq!(roots, 2);
+
+    let migration_version: i64 = sqlx::query_scalar("SELECT version FROM schema_migrations")
+        .fetch_one(&pool)
+        .await
+        .expect("migration version");
+    assert_eq!(migration_version, 1);
+}
+
+#[tokio::test]
+async fn exact_unversioned_schema_is_migrated_without_losing_data() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let db_path = temp_dir.path().join("vault.db");
+    initialize_valid_database(&db_path).await;
+
+    let raw = raw_pool(&db_path).await;
+    sqlx::query("DROP TABLE preview_renditions")
+        .execute(&raw)
+        .await
+        .expect("drop preview renditions");
+    sqlx::query("DROP TABLE preview_jobs")
+        .execute(&raw)
+        .await
+        .expect("drop preview jobs");
+    sqlx::query("DROP TABLE schema_migrations")
+        .execute(&raw)
+        .await
+        .expect("drop migration marker");
+    sqlx::query("INSERT INTO vault_settings (key, value) VALUES ('keep', 'me')")
+        .execute(&raw)
+        .await
+        .expect("preserved data");
+    raw.close().await;
+
+    let pool = db::connect(&db_path).await.expect("migrate baseline");
+    let value: String = sqlx::query_scalar("SELECT value FROM vault_settings WHERE key = 'keep'")
+        .fetch_one(&pool)
+        .await
+        .expect("preserved setting");
+    assert_eq!(value, "me");
+    let version: i64 = sqlx::query_scalar("SELECT version FROM schema_migrations")
+        .fetch_one(&pool)
+        .await
+        .expect("migration version");
+    assert_eq!(version, 1);
+    let preview_tables: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('preview_jobs', 'preview_renditions')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("preview tables");
+    assert_eq!(preview_tables, 2);
+}
+
+#[tokio::test]
+async fn nonexact_unversioned_schema_is_rejected_before_migration() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let db_path = temp_dir.path().join("vault.db");
+    initialize_valid_database(&db_path).await;
+
+    let raw = raw_pool(&db_path).await;
+    sqlx::query("DROP TABLE preview_renditions")
+        .execute(&raw)
+        .await
+        .expect("drop preview renditions");
+    sqlx::query("DROP TABLE preview_jobs")
+        .execute(&raw)
+        .await
+        .expect("drop preview jobs");
+    sqlx::query("DROP TABLE schema_migrations")
+        .execute(&raw)
+        .await
+        .expect("drop migration marker");
+    sqlx::query("CREATE TABLE unknown_extension (id INTEGER PRIMARY KEY)")
+        .execute(&raw)
+        .await
+        .expect("unknown extension");
+    raw.close().await;
+
+    assert_startup_rejected(&db_path, "nonexact baseline should reject").await;
+    let raw = raw_pool(&db_path).await;
+    let migration_table_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'",
+    )
+    .fetch_one(&raw)
+    .await
+    .expect("migration table count");
+    assert_eq!(migration_table_count, 0);
 }
 
 #[tokio::test]
@@ -508,6 +595,7 @@ async fn foreign_key_drift_is_rejected_on_startup() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn nullability_type_and_check_constraint_drift_are_rejected_on_startup() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let nullable_path = temp_dir.path().join("nullable.db");
@@ -551,7 +639,7 @@ async fn nullability_type_and_check_constraint_drift_are_rejected_on_startup() {
         r"
         CREATE TABLE folder_events (
             id INTEGER PRIMARY KEY,
-            folder_id TEXT NOT NULL REFERENCES folders(id) ON DELETE CASCADE,
+            folder_id BIGINT NOT NULL REFERENCES folders(id) ON DELETE CASCADE,
             event_type TEXT NOT NULL,
             actor TEXT,
             actor_name TEXT,
@@ -569,6 +657,36 @@ async fn nullability_type_and_check_constraint_drift_are_rejected_on_startup() {
         .expect("folder index");
     raw.close().await;
     assert_startup_rejected(&wrong_type_path, "wrong column type should reject").await;
+
+    let wrong_default_path = temp_dir.path().join("wrong-default.db");
+    initialize_valid_database(&wrong_default_path).await;
+    let raw = raw_pool(&wrong_default_path).await;
+    sqlx::query("DROP TABLE folder_events")
+        .execute(&raw)
+        .await
+        .expect("drop folder events");
+    sqlx::query(
+        r"
+        CREATE TABLE folder_events (
+            id INTEGER PRIMARY KEY,
+            folder_id INTEGER NOT NULL REFERENCES folders(id) ON DELETE CASCADE,
+            event_type TEXT NOT NULL,
+            actor TEXT,
+            actor_name TEXT,
+            message TEXT,
+            created_at TEXT NOT NULL DEFAULT '1970-01-01 00:00:00'
+        )
+        ",
+    )
+    .execute(&raw)
+    .await
+    .expect("recreate with wrong default");
+    sqlx::query("CREATE INDEX ix_folder_events_folder_id ON folder_events(folder_id)")
+        .execute(&raw)
+        .await
+        .expect("folder index");
+    raw.close().await;
+    assert_startup_rejected(&wrong_default_path, "wrong column default should reject").await;
 
     let check_path = temp_dir.path().join("check.db");
     initialize_valid_database(&check_path).await;
@@ -594,6 +712,41 @@ async fn nullability_type_and_check_constraint_drift_are_rejected_on_startup() {
     .expect("recreate with check constraint");
     raw.close().await;
     assert_startup_rejected(&check_path, "unexpected check should reject").await;
+
+    let changed_check_path = temp_dir.path().join("changed-check.db");
+    initialize_valid_database(&changed_check_path).await;
+    let raw = raw_pool(&changed_check_path).await;
+    sqlx::query("PRAGMA writable_schema = ON")
+        .execute(&raw)
+        .await
+        .expect("enable writable schema");
+    sqlx::query(
+        r"
+        UPDATE sqlite_master
+        SET sql = replace(sql, '''failed''))', '''failed'', ''paused''))')
+        WHERE type = 'table' AND name = 'preview_jobs'
+        ",
+    )
+    .execute(&raw)
+    .await
+    .expect("change preview status check");
+    sqlx::query("PRAGMA writable_schema = OFF")
+        .execute(&raw)
+        .await
+        .expect("disable writable schema");
+    let changed_sql: String = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'preview_jobs'",
+    )
+    .fetch_one(&raw)
+    .await
+    .expect("changed preview table sql");
+    assert!(changed_sql.contains("paused"));
+    raw.close().await;
+    assert_startup_rejected(
+        &changed_check_path,
+        "changed check expression should reject",
+    )
+    .await;
 }
 
 #[tokio::test]

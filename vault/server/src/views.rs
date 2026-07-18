@@ -21,6 +21,7 @@ use crate::folders::{
     get_folder_by_path_read, join_path, normalize_folder,
 };
 use crate::preferences::{PreferenceError, preferences_for_user};
+use crate::previews::{self, PreviewError, VisualPayload, VisualSource};
 use crate::site_settings::{SiteSettingsError, site_settings_for_db};
 use crate::version::app_version;
 
@@ -240,6 +241,8 @@ pub enum ViewError {
     #[error(transparent)]
     Document(#[from] DocumentError),
     #[error(transparent)]
+    Preview(#[from] PreviewError),
+    #[error(transparent)]
     Database(#[from] sqlx::Error),
 }
 
@@ -366,6 +369,7 @@ pub struct DocumentRowPayload {
     pub expires_at: Option<String>,
     pub expiry_action: Option<String>,
     pub access: AccessPayload,
+    pub visual: VisualPayload,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -410,6 +414,8 @@ struct DocumentViewRow {
     latest_message: Option<String>,
     version_number: Option<i64>,
     size_bytes: Option<i64>,
+    source_blob_id: Option<i64>,
+    mime_type: Option<String>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -583,6 +589,7 @@ struct FavoriteDocumentContext<'a> {
     locks: &'a HashMap<i64, DocumentLockRow>,
     folder_levels: &'a HashMap<i64, i64>,
     user_group_ids: &'a HashSet<String>,
+    visuals: &'a HashMap<i64, VisualPayload>,
 }
 
 pub async fn build_sidebar_payload(
@@ -902,6 +909,11 @@ async fn contents_document_page(
         .map(|(document, _)| document.id)
         .collect::<Vec<_>>();
     let locks = active_locks_by_document_ids(context.pool, &document_ids).await?;
+    let visuals = document_visuals(
+        context.pool,
+        page.rows.iter().map(|(document, level)| (document, *level)),
+    )
+    .await?;
     let rows = page
         .rows
         .iter()
@@ -914,6 +926,7 @@ async fn contents_document_page(
                 path,
                 *level,
                 locks.get(&document.id),
+                visuals.get(&document.id),
             ))
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -1288,7 +1301,9 @@ async fn scoped_document_page_rows(
             v.committed_by_name,
             v.message AS latest_message,
             v.version_number,
-            b.size_bytes
+            b.size_bytes,
+            v.blob_id AS source_blob_id,
+            v.mime_type
         FROM documents d
         LEFT JOIN document_versions v ON v.document_id = d.id AND v.id = d.current_version_id
         LEFT JOIN blobs b ON b.id = v.blob_id
@@ -1476,6 +1491,21 @@ pub async fn build_my_edits_payload(
         .collect::<HashMap<_, _>>();
     let levels = folder_access_levels(pool, &folder_ids, user).await?;
     let user_group_ids = user_group_ids(pool, user).await?;
+    let mut visual_levels = Vec::new();
+    for doc in &docs {
+        let Some(folder) = folder_by_id.get(&doc.folder_id) else {
+            continue;
+        };
+        let level = document_access_level_for_view(
+            doc,
+            folder,
+            levels.get(&doc.folder_id).copied().unwrap_or(0),
+            user,
+            &user_group_ids,
+        )?;
+        visual_levels.push((doc, level));
+    }
+    let visuals = document_visuals(pool, visual_levels).await?;
     let mut rows = Vec::new();
 
     for doc in docs {
@@ -1496,7 +1526,14 @@ pub async fn build_my_edits_payload(
             continue;
         }
         let doc_folder_path = folder_path_from_cache(folder, &path_cache)?;
-        let row = document_row_payload(&doc, folder, &doc_folder_path, level, Some(lock))?;
+        let row = document_row_payload(
+            &doc,
+            folder,
+            &doc_folder_path,
+            level,
+            Some(lock),
+            visuals.get(&doc.id),
+        )?;
         rows.push((row.path.to_lowercase(), row));
     }
 
@@ -1537,7 +1574,15 @@ pub async fn build_document_detail_payload(
     };
     let doc_folder_path = folder_path_from_cache(folder, &path_cache)?;
     let locks = active_locks_by_document(pool).await?;
-    let row = document_row_payload(&doc, folder, &doc_folder_path, level, locks.get(&doc.id))?;
+    let visuals = document_visuals(pool, [(&doc, level)]).await?;
+    let row = document_row_payload(
+        &doc,
+        folder,
+        &doc_folder_path,
+        level,
+        locks.get(&doc.id),
+        visuals.get(&doc.id),
+    )?;
     let versions = document_history_items(pool, doc.id).await?;
     Ok(DocumentDetailPayload { row, versions })
 }
@@ -1570,7 +1615,15 @@ pub async fn build_share_document_payload(
     };
     let doc_folder_path = folder_path_from_cache(folder, &path_cache)?;
     let locks = active_locks_by_document(pool).await?;
-    let row = document_row_payload(&doc, folder, &doc_folder_path, level, locks.get(&doc.id))?;
+    let visuals = document_visuals(pool, [(&doc, level)]).await?;
+    let row = document_row_payload(
+        &doc,
+        folder,
+        &doc_folder_path,
+        level,
+        locks.get(&doc.id),
+        visuals.get(&doc.id),
+    )?;
     Ok(Some((doc_folder_path, row)))
 }
 
@@ -1847,6 +1900,7 @@ pub async fn build_preferences_payload(
     Ok(preferences)
 }
 
+#[allow(clippy::too_many_lines)]
 async fn resolved_favorite_items(
     pool: &SqlitePool,
     user: &UserContext,
@@ -1912,6 +1966,24 @@ async fn resolved_favorite_items(
         .map(|document| (document.id, document))
         .collect::<HashMap<_, _>>();
     let locks = active_locks_by_document_ids(pool, &favorite_document_ids).await?;
+    let mut visual_levels = Vec::new();
+    for document in &documents {
+        let Some(folder) = folder_by_id.get(&document.folder_id) else {
+            continue;
+        };
+        let level = document_access_level_for_view(
+            document,
+            folder,
+            document_levels
+                .get(&document.folder_id)
+                .copied()
+                .unwrap_or(0),
+            user,
+            &user_group_ids,
+        )?;
+        visual_levels.push((document, level));
+    }
+    let visuals = document_visuals(pool, visual_levels).await?;
     let document_context = FavoriteDocumentContext {
         user,
         documents: &document_by_id,
@@ -1920,6 +1992,7 @@ async fn resolved_favorite_items(
         locks: &locks,
         folder_levels: &document_levels,
         user_group_ids: &user_group_ids,
+        visuals: &visuals,
     };
     let mut resolved = Vec::new();
 
@@ -2030,6 +2103,7 @@ fn favorite_document_payload(
         &doc_folder_path,
         level,
         context.locks.get(&doc.id),
+        context.visuals.get(&doc.id),
     )?)?;
     if let Some(object) = value.as_object_mut() {
         object.insert("type".to_string(), json!("document"));
@@ -2190,6 +2264,7 @@ fn document_row_payload(
     doc_folder: &str,
     level: i64,
     lock: Option<&DocumentLockRow>,
+    visual: Option<&VisualPayload>,
 ) -> Result<DocumentRowPayload, ViewError> {
     if current_version_metadata_is_inconsistent(doc) {
         return Err(ViewError::InconsistentDocumentVersion);
@@ -2240,7 +2315,33 @@ fn document_row_payload(
         expires_at: payload_timestamp(doc.expires_at.as_deref()),
         expiry_action: doc.expiry_action.clone(),
         access: access_payload(level),
+        visual: visual.cloned().unwrap_or_else(|| VisualPayload {
+            icon_key: previews::semantic_icon_key(&doc.name, doc.mime_type.as_deref()),
+            preview: None,
+        }),
     })
+}
+
+async fn document_visuals<'a, I>(
+    pool: &SqlitePool,
+    documents: I,
+) -> Result<HashMap<i64, VisualPayload>, ViewError>
+where
+    I: IntoIterator<Item = (&'a DocumentViewRow, i64)>,
+{
+    let documents = documents.into_iter().collect::<Vec<_>>();
+    let sources = documents
+        .iter()
+        .map(|(document, level)| VisualSource {
+            document_id: document.id,
+            name: &document.name,
+            version_id: document.latest_version_id.as_deref(),
+            blob_id: document.source_blob_id,
+            mime_type: document.mime_type.as_deref(),
+            can_read: *level >= 2,
+        })
+        .collect::<Vec<_>>();
+    Ok(previews::visual_payloads(pool, &sources).await?)
 }
 
 fn current_version_metadata_is_inconsistent(doc: &DocumentViewRow) -> bool {
@@ -2300,7 +2401,9 @@ async fn document_view_rows(pool: &SqlitePool) -> Result<Vec<DocumentViewRow>, V
             v.committed_by_name,
             v.message AS latest_message,
             v.version_number,
-            b.size_bytes
+            b.size_bytes,
+            v.blob_id AS source_blob_id,
+            v.mime_type
         FROM documents d
         LEFT JOIN document_versions v
             ON v.document_id = d.id AND v.id = d.current_version_id
@@ -2347,7 +2450,9 @@ async fn document_view_rows_by_ids(
             v.committed_by_name,
             v.message AS latest_message,
             v.version_number,
-            b.size_bytes
+            b.size_bytes,
+            v.blob_id AS source_blob_id,
+            v.mime_type
         FROM documents d
         LEFT JOIN document_versions v
             ON v.document_id = d.id AND v.id = d.current_version_id
@@ -2393,7 +2498,9 @@ async fn document_view_row_by_id(
             v.committed_by_name,
             v.message AS latest_message,
             v.version_number,
-            b.size_bytes
+            b.size_bytes,
+            v.blob_id AS source_blob_id,
+            v.mime_type
         FROM documents d
         LEFT JOIN document_versions v
             ON v.document_id = d.id AND v.id = d.current_version_id

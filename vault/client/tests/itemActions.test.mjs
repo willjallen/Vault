@@ -15,7 +15,21 @@ const bundled = await build({
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(bundled.outputFiles[0].text).toString(
   "base64"
 )}`;
-const { folderToItem } = await import(moduleUrl);
+const { docToItem, folderToItem } = await import(moduleUrl);
+
+test("document items preserve the namespaced visual descriptor", () => {
+  const visual = {
+    icon_key: "file",
+    preview: {
+      recipe: "raster-v1",
+      status: "pending",
+      variants: [],
+      version_id: "version-1",
+    },
+  };
+  assert.equal(docToItem({ id: 7, name: "asset.png", visual }).visual, visual);
+  assert.equal(docToItem({ id: 8, name: "fallback.txt" }).visual, null);
+});
 
 test("folder items preserve only an explicit empty-folder delete capability", () => {
   assert.equal(

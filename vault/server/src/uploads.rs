@@ -36,6 +36,7 @@ use crate::folders::{
     get_or_create_folder_path_in_tx, join_path, normalize_folder, parse_public_folder_path,
     require_write_for_folder_path,
 };
+use crate::previews::enqueue_preview_job_in_tx;
 use crate::state_events::state_event_resources_json;
 use crate::storage::{
     BlobStorageBackend, BlobWriteKind, STORAGE_MULTIPART_MAX_PARTS, StorageError, StoredBlob,
@@ -1740,6 +1741,7 @@ async fn create_document_version_in_tx(
     .bind(version.created_via)
     .execute(&mut **transaction)
     .await?;
+    enqueue_preview_job_in_tx(transaction, version.blob_id).await?;
     sqlx::query(
         r"
         UPDATE documents

@@ -51,8 +51,10 @@ function folderRowAttributes({
   onDropLeave,
   onOpen,
   onSelect,
+  onFocus,
   selected,
   selectionKey,
+  tabIndex,
 }) {
   return {
     className: classNames(
@@ -65,9 +67,11 @@ function folderRowAttributes({
       editing ? "editing" : ""
     ),
     "data-selection-key": selectionKey || undefined,
+    "aria-selected": Boolean(selected),
     ...folderDropAttributes({ editing, folder, isDraft, isDropTarget }),
     draggable: !editing && !isDraft && selected,
-    tabIndex: editing ? undefined : 0,
+    role: "row",
+    tabIndex: editing ? undefined : tabIndex,
     onClick: editing ? undefined : onSelect,
     onDoubleClick: editing || isDraft ? undefined : onOpen,
     onKeyDown: editing
@@ -105,6 +109,7 @@ function folderRowAttributes({
       }
     },
     onDrop: editing ? undefined : onDrop,
+    onFocus,
   };
 }
 
@@ -118,7 +123,7 @@ function folderNameCell({
   isArchived,
   onEditChange,
 }) {
-  return h("div", { className: "file-cell main" }, [
+  return h("div", { className: "file-cell main", role: "gridcell" }, [
     editing
       ? h("input", {
           ref: inputRef,
@@ -148,7 +153,7 @@ function folderNameCell({
 }
 
 function folderStatusCell(retention) {
-  return h("div", { className: "file-cell status-col" }, [
+  return h("div", { className: "file-cell status-col", role: "gridcell" }, [
     h("span", { className: "status-pill subtle status-version" }, "Folder"),
     h("span", {
       "aria-hidden": "true",
@@ -172,7 +177,7 @@ function folderStatusCell(retention) {
 function folderActionsCell({ folder, isDraft, onMore, stopRowAction }) {
   return h(
     "div",
-    { className: "file-cell row-actions" },
+    { className: "file-cell row-actions", role: "gridcell" },
     isDraft
       ? null
       : h(
@@ -196,6 +201,8 @@ export function FolderRow({
   isDraft,
   selectionKey = "",
   selected,
+  tabIndex = 0,
+  visualSize = 24,
   isDropTarget,
   isDragging,
   onToggleSelect,
@@ -211,6 +218,7 @@ export function FolderRow({
   onEditChange,
   onEditCommit,
   onEditCancel,
+  onFocus,
 }) {
   const inputRef = useRef(null);
   const committingRef = useRef(false);
@@ -229,10 +237,12 @@ export function FolderRow({
     onDrop,
     onDropEnter,
     onDropLeave,
+    onFocus,
     onOpen,
     onSelect,
     selected,
     selectionKey,
+    tabIndex,
   });
 
   useEffect(() => {
@@ -277,17 +287,18 @@ export function FolderRow({
   return h("div", rowAttributes, [
     h(
       "div",
-      { className: "file-cell icon" },
+      { className: "file-cell icon", role: "gridcell" },
       h(RowSelectionIcon, {
         color: folder.color,
         disabled: editing,
         folderIcon: folder.icon,
+        item: folder,
         interactive: !isDraft,
         kind: "folder",
         label: selected ? `Deselect ${folder.name}` : `Select ${folder.name}`,
         onSelect: onToggleSelect,
         selected,
-        size: 12,
+        size: visualSize,
       })
     ),
     folderNameCell({
@@ -302,17 +313,17 @@ export function FolderRow({
     }),
     h(
       "div",
-      { className: "file-cell meta" },
+      { className: "file-cell meta", role: "gridcell" },
       h("span", { className: "muted tiny" }, formatDate(folder.modified_at))
     ),
     h(
       "div",
-      { className: "file-cell user" },
+      { className: "file-cell user", role: "gridcell" },
       h("span", { className: "muted tiny" }, folder.latest_by || "-")
     ),
     h(
       "div",
-      { className: "file-cell size" },
+      { className: "file-cell size", role: "gridcell" },
       h("span", { className: "muted tiny" }, folder.size_display || "0 B")
     ),
     folderStatusCell(retention),

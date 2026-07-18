@@ -38,6 +38,10 @@ async fn main() -> anyhow::Result<()> {
     assets::validate_static_assets(&config.static_dir).await?;
     let listener = TcpListener::bind(bind_addr).await?;
     let state = AppState::new(config, auth, db, storage);
+    state
+        .preview_execution
+        .start(state.db.clone(), state.storage.clone(), 2)
+        .await?;
     let document_sweep = documents::sweep_expired_documents(&state.db, 250).await?;
     transfers::cleanup_upload_session_resources(
         &state.upload_hash_coordinator,
@@ -70,6 +74,7 @@ async fn main() -> anyhow::Result<()> {
     spawn_ttl_sweeper(state.clone(), transfers_path.clone());
 
     let export_execution = state.export_execution.clone();
+    let preview_execution = state.preview_execution.clone();
     let app = http::network_router(state);
 
     tracing::info!(%bind_addr, "vault rust server listening");
@@ -114,6 +119,7 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     export_execution.shutdown_dispatcher().await;
+    preview_execution.shutdown().await;
     server_result?;
     Ok(())
 }

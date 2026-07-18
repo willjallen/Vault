@@ -2,6 +2,8 @@
 
 pub const SQLITE_BUSY_TIMEOUT_MS: u64 = 30_000;
 
+pub const CURRENT_SCHEMA_VERSION: i64 = 1;
+
 pub const STATEMENTS: &[&str] = &[
     r#"
     CREATE TABLE IF NOT EXISTS folders (
@@ -310,4 +312,55 @@ pub const STATEMENTS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS ix_share_links_code ON share_links(code)",
     "CREATE INDEX IF NOT EXISTS ix_share_links_document ON share_links(document_id)",
     "CREATE INDEX IF NOT EXISTS ix_share_links_folder ON share_links(folder_id)",
+];
+
+/// The first forward migration. `STATEMENTS` intentionally remains the exact
+/// unversioned schema shipped before migrations existed so startup can validate
+/// that shape before making any additive change.
+pub const MIGRATION_1_STATEMENTS: &[&str] = &[
+    r#"
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+        version INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+    "#,
+    r#"
+    CREATE TABLE IF NOT EXISTS preview_jobs (
+        id INTEGER PRIMARY KEY,
+        source_blob_id INTEGER NOT NULL REFERENCES blobs(id) ON DELETE CASCADE,
+        recipe TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'queued'
+            CHECK (status IN ('queued', 'running', 'ready', 'unsupported', 'failed')),
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        lease_token TEXT,
+        lease_expires_at TEXT,
+        next_attempt_at TEXT,
+        last_error_code TEXT,
+        last_error_detail TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        completed_at TEXT,
+        last_accessed_at TEXT,
+        CONSTRAINT uq_preview_job_source_recipe UNIQUE (source_blob_id, recipe)
+    )
+    "#,
+    "CREATE INDEX IF NOT EXISTS ix_preview_jobs_dispatch ON preview_jobs(status, next_attempt_at, lease_expires_at, id)",
+    "CREATE INDEX IF NOT EXISTS ix_preview_jobs_source_blob ON preview_jobs(source_blob_id)",
+    r#"
+    CREATE TABLE IF NOT EXISTS preview_renditions (
+        id INTEGER PRIMARY KEY,
+        preview_job_id INTEGER NOT NULL REFERENCES preview_jobs(id) ON DELETE CASCADE,
+        variant TEXT NOT NULL,
+        blob_id INTEGER NOT NULL REFERENCES blobs(id),
+        mime_type TEXT NOT NULL,
+        width INTEGER NOT NULL,
+        height INTEGER NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        CONSTRAINT uq_preview_rendition_variant UNIQUE (preview_job_id, variant)
+    )
+    "#,
+    "CREATE INDEX IF NOT EXISTS ix_preview_renditions_job ON preview_renditions(preview_job_id)",
+    "CREATE INDEX IF NOT EXISTS ix_preview_renditions_blob ON preview_renditions(blob_id)",
+    "INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (1, 'content previews')",
 ];

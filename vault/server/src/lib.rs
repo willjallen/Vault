@@ -10,6 +10,7 @@ pub mod folders;
 pub mod http;
 pub mod oidc;
 pub mod preferences;
+pub mod previews;
 pub mod reconciliation;
 pub mod redirects;
 pub mod shares;

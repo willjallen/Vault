@@ -57,7 +57,13 @@ const bundled = await build({
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(
   bundled.outputFiles.at(0).text
 ).toString("base64")}`;
-const { mergeContentsPage, mergeSidebarPage, useVaultResources } = await import(moduleUrl);
+const {
+  mergeContentsPage,
+  mergeResolvedDocumentVisuals,
+  mergeSidebarPage,
+  previewResolveDocuments,
+  useVaultResources,
+} = await import(moduleUrl);
 
 const boundsSourceUrl = new URL("../src/lib/vaultResourceBounds.js", import.meta.url);
 const boundsBundle = await build({
@@ -142,6 +148,68 @@ function cachePage(index) {
     recursive: false,
   };
 }
+
+test("preview resolve batches only pending and failed stable document-version pairs", () => {
+  const pendingVisual = {
+    preview: { status: "pending", variants: [], version_id: "version-1" },
+  };
+  assert.deepEqual(
+    previewResolveDocuments([
+      { id: 7, visual: pendingVisual },
+      { id: 7, visual: pendingVisual },
+      {
+        id: 8,
+        visual: { preview: { status: "failed", variants: [], version_id: "version-2" } },
+      },
+      {
+        id: 9,
+        visual: { preview: { status: "ready", variants: [], version_id: "version-3" } },
+      },
+      {
+        id: 10,
+        visual: { preview: { status: "unsupported", variants: [], version_id: "version-4" } },
+      },
+      { id: 11, visual: { icon_key: "file" } },
+      { id: 12, visual: { preview: { status: "pending", variants: [] } } },
+    ]),
+    [
+      { document_id: 7, version_id: "version-1" },
+      { document_id: 8, version_id: "version-2" },
+    ]
+  );
+});
+
+test("resolved previews merge only while the requested version is current", () => {
+  const pending = {
+    id: 7,
+    visual: { preview: { status: "pending", variants: [], version_id: "version-1" } },
+  };
+  const changed = {
+    id: 8,
+    visual: { preview: { status: "pending", variants: [], version_id: "version-2" } },
+  };
+  const readyVisual = {
+    icon_key: "image",
+    preview: {
+      status: "ready",
+      variants: [{ url: "/preview", width: 128 }],
+      version_id: "version-1",
+    },
+  };
+  const merged = mergeResolvedDocumentVisuals(
+    [pending, changed],
+    [
+      { document_id: 7, visual: readyVisual },
+      { document_id: 8, visual: readyVisual },
+    ],
+    [
+      { document_id: 7, version_id: "version-1" },
+      { document_id: 8, version_id: "stale-version" },
+    ]
+  );
+  assert.equal(merged[0].visual, readyVisual);
+  assert.equal(merged[1], changed);
+});
 
 async function flushMicrotasks() {
   await Promise.resolve();

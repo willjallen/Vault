@@ -32,14 +32,14 @@ use crate::auth::{
 };
 use crate::blob_lifecycle::{
     BlobLifecycleError, PendingBlobPublication, begin_blob_publication,
-    collect_unreferenced_blobs_with_limit,
+    collect_unreferenced_blob_candidates, collect_unreferenced_blobs_with_limit,
 };
 use crate::config::Config;
 use crate::db::DbPool;
 use crate::documents::{
     ClientMeta, DocumentError, VersionDownload, archive_document, archive_folder,
     checkout_version_download, current_version_download, delete_document_forever,
-    document_access_level, document_folder_path, lock_document, move_document,
+    document_access_level, document_folder_path, document_for_read, lock_document, move_document,
     record_checkout_event_and_lock, record_download_event, rename_document, restore_document,
     sweep_expired_documents, try_fetch_document_by_id, unlock_document, version_download_by_id,
 };
@@ -56,6 +56,7 @@ use crate::folders::{
 };
 use crate::oidc::{self, CallbackRequest, OidcError};
 use crate::preferences::{PreferenceError, update_preferences_for_user};
+use crate::previews::{self, PreviewError, PreviewExecutionContext};
 use crate::reconciliation::{self, ReconciliationError};
 use crate::redirects::safe_redirect;
 use crate::shares::{self, CreateShareLinkRequest, CreateShareLinkResponse, ShareError};
@@ -90,6 +91,8 @@ const APP_SHELL_CACHE_CONTROL: &str = "no-store, max-age=0";
 const STATIC_IMMUTABLE_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 const STATIC_REVALIDATE_CACHE_CONTROL: &str = "no-cache";
 const DEFAULT_DOWNLOAD_CONCURRENCY_LIMIT: usize = 64;
+const DEFAULT_PREVIEW_CONCURRENCY_LIMIT: usize = 32;
+const MAX_PREVIEW_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 const IDENTITY_HEADER_NAMES: [&str; 4] = [
     "remote-user",
     "remote-name",
@@ -116,10 +119,12 @@ pub struct AppState {
     pub storage: SharedBlobStorage,
     pub local_storage_maintenance: LocalBlobStorage,
     pub export_execution: Arc<ExportExecutionContext>,
+    pub preview_execution: Arc<PreviewExecutionContext>,
     pub upload_hash_coordinator: uploads::UploadHashCoordinator,
     pub transfer_maintenance: transfers::TransferMaintenanceCoordinator,
     upload_part_locks: Arc<AsyncMutex<HashSet<String>>>,
     download_slots: Arc<Semaphore>,
+    preview_slots: Arc<Semaphore>,
 }
 
 impl AppState {
@@ -146,6 +151,7 @@ impl AppState {
         let export_execution = Arc::new(ExportExecutionContext::new(export_runtime_settings(
             &config,
         )));
+        let preview_execution = Arc::new(PreviewExecutionContext::new());
         let local_storage_maintenance =
             LocalBlobStorage::new(config.objects_path(), &config.storage_prefix);
         Self {
@@ -155,10 +161,12 @@ impl AppState {
             storage,
             local_storage_maintenance,
             export_execution,
+            preview_execution,
             upload_hash_coordinator: uploads::UploadHashCoordinator::new(),
             transfer_maintenance: transfers::TransferMaintenanceCoordinator::default(),
             upload_part_locks: Arc::new(AsyncMutex::new(HashSet::new())),
             download_slots: Arc::new(Semaphore::new(download_limit.max(1))),
+            preview_slots: Arc::new(Semaphore::new(DEFAULT_PREVIEW_CONCURRENCY_LIMIT)),
         }
     }
 }
@@ -341,6 +349,11 @@ fn document_transfer_routes() -> Router<AppState> {
         )
         .route("/api/my-edits", get(api_my_edits))
         .route("/api/documents/{doc_id}/detail", get(api_document_detail))
+        .route("/api/previews/resolve", post(api_resolve_previews))
+        .route(
+            "/api/documents/{doc_id}/versions/{version_id}/previews/{recipe}/{variant}",
+            get(download_document_preview),
+        )
         .route("/api/download", post(api_download_items))
         .route("/api/exports", post(api_create_export_job))
         .route(
@@ -1629,6 +1642,7 @@ async fn api_complete_upload_session(
         &state.upload_hash_coordinator,
     )
     .await?;
+    state.preview_execution.notify_jobs();
     notify_state_event_committed();
     Ok(Json(payload))
 }
@@ -1753,6 +1767,113 @@ async fn download_document_version(
     record_download_event(&state.db, &download, &user, &client_meta(&headers), false).await?;
     notify_state_event_committed();
     Ok(response)
+}
+
+async fn api_resolve_previews(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<previews::ResolvePreviewRequest>,
+) -> Result<Json<previews::ResolvePreviewResponse>, ApiError> {
+    let user = current_user(&state, &headers).await?;
+    let authorized = previews::authorize_resolve_sources(&state.db, &user, &payload).await?;
+    let source_blob_ids = authorized
+        .iter()
+        .map(|source| source.blob_id)
+        .collect::<Vec<_>>();
+    if previews::enqueue_preview_jobs(&state.db, &source_blob_ids).await? > 0 {
+        state.preview_execution.notify_jobs();
+    }
+    let sources = authorized
+        .iter()
+        .map(|source| previews::VisualSource {
+            document_id: source.document_id,
+            name: &source.name,
+            version_id: Some(&source.version_id),
+            blob_id: Some(source.blob_id),
+            mime_type: source.mime_type.as_deref(),
+            can_read: true,
+        })
+        .collect::<Vec<_>>();
+    let visuals = previews::visual_payloads(&state.db, &sources).await?;
+    Ok(Json(previews::ResolvePreviewResponse {
+        documents: authorized
+            .into_iter()
+            .filter_map(|source| {
+                visuals.get(&source.document_id).cloned().map(|visual| {
+                    previews::ResolvedPreviewDocument {
+                        document_id: source.document_id,
+                        visual,
+                    }
+                })
+            })
+            .collect(),
+    }))
+}
+
+async fn download_document_preview(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((doc_id, version_id, recipe, variant)): Path<(i64, String, String, String)>,
+) -> Result<Response, ApiError> {
+    let user = current_user(&state, &headers).await?;
+    // Authorization is intentionally first. Do not use the download lookup
+    // here: a valid derived preview remains serviceable when the source blob's
+    // active-backend location is temporarily unavailable.
+    document_for_read(&state.db, doc_id, &user).await?;
+    let source_blob_id = sqlx::query_scalar::<_, i64>(
+        "SELECT blob_id FROM document_versions WHERE document_id = ? AND id = ?",
+    )
+    .bind(doc_id)
+    .bind(&version_id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or(DocumentError::VersionNotFound)?;
+    let rendition =
+        match previews::rendition_for_source(&state.db, source_blob_id, &recipe, &variant).await {
+            Ok(rendition) => rendition,
+            Err(error @ PreviewError::RenditionNotFound)
+                if previews::is_supported_preview_rendition(&recipe, &variant) =>
+            {
+                if previews::enqueue_preview_job(&state.db, source_blob_id).await? {
+                    state.preview_execution.notify_changed();
+                    state.preview_execution.notify_jobs();
+                }
+                return Err(error.into());
+            }
+            Err(error) => return Err(error.into()),
+        };
+    let response = preview_download_response(&state, &rendition, &headers).await;
+    if matches!(
+        &response,
+        Err(ApiError::Storage(
+            StorageError::NotFound | StorageError::ContentMismatch
+        ))
+    ) {
+        match previews::requeue_rendition_blob(&state.db, source_blob_id, &recipe, &variant).await {
+            Ok(Some(blob_id)) => {
+                if let Err(error) = collect_unreferenced_blob_candidates(
+                    &state.db,
+                    state.storage.as_ref(),
+                    &[blob_id],
+                )
+                .await
+                {
+                    tracing::warn!(
+                        ?error,
+                        blob_id,
+                        "failed to collect unavailable preview blob"
+                    );
+                }
+                state.preview_execution.notify_changed();
+                state.preview_execution.notify_jobs();
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(?error, "failed to requeue unavailable preview rendition");
+            }
+        }
+    }
+    response
 }
 
 async fn api_lock_items(
@@ -2610,6 +2731,108 @@ async fn version_download_response(
     Ok(response)
 }
 
+async fn preview_download_response(
+    state: &AppState,
+    rendition: &previews::PreviewRenditionDownload,
+    headers: &HeaderMap,
+) -> Result<Response, ApiError> {
+    let size = u64::try_from(rendition.size_bytes)
+        .map_err(|_| ApiError::Storage(StorageError::ContentMismatch))?;
+    if size == 0
+        || size > MAX_PREVIEW_RESPONSE_BYTES
+        || !rendition.hash_algo.eq_ignore_ascii_case("sha256")
+        || rendition.mime_type != "image/webp"
+    {
+        return Err(ApiError::Storage(StorageError::ContentMismatch));
+    }
+    let etag = format!(
+        "\"{}-{}-{}\"",
+        rendition.hash_algo, rendition.hash, rendition.size_bytes
+    );
+    if single_header_value(headers, header::IF_NONE_MATCH.as_str())
+        .ok()
+        .flatten()
+        .is_some_and(|value| value.trim() == etag)
+    {
+        let mut response = StatusCode::NOT_MODIFIED.into_response();
+        insert_header(response.headers_mut(), header::ETAG, &etag);
+        insert_header(
+            response.headers_mut(),
+            header::CACHE_CONTROL,
+            "private, no-cache",
+        );
+        return Ok(response);
+    }
+    let locations = rendition.locations(&state.db).await?;
+    if locations.is_empty() {
+        return Err(ApiError::Storage(StorageError::NotFound));
+    }
+    let _permit = Arc::clone(&state.preview_slots)
+        .try_acquire_owned()
+        .map_err(|_| {
+            ApiError::ServiceUnavailable(
+                "Download capacity is currently exhausted; retry shortly".to_string(),
+            )
+        })?;
+    let mut body = open_ranked_location_stream(
+        state.storage.as_ref(),
+        &locations,
+        BlobReadRange {
+            expected_size: size,
+            offset: 0,
+            length: size,
+        },
+    )
+    .await
+    .map_err(preview_storage_error)?;
+    let capacity =
+        usize::try_from(size).map_err(|_| ApiError::Storage(StorageError::ContentMismatch))?;
+    let mut bytes = Vec::with_capacity(capacity);
+    while let Some(frame) = body.next().await {
+        let frame = frame.map_err(preview_storage_error)?;
+        let next_length = bytes
+            .len()
+            .checked_add(frame.len())
+            .ok_or(ApiError::Storage(StorageError::ContentMismatch))?;
+        if frame.is_empty() || next_length > capacity {
+            return Err(ApiError::Storage(StorageError::ContentMismatch));
+        }
+        bytes.extend_from_slice(&frame);
+    }
+    if bytes.len() != capacity || !sha256_hex(&bytes).eq_ignore_ascii_case(&rendition.hash) {
+        return Err(ApiError::Storage(StorageError::ContentMismatch));
+    }
+    let mut response = Response::new(Body::from(bytes));
+    insert_header(
+        response.headers_mut(),
+        header::CONTENT_TYPE,
+        &rendition.mime_type,
+    );
+    insert_header(
+        response.headers_mut(),
+        header::CONTENT_LENGTH,
+        &size.to_string(),
+    );
+    insert_header(response.headers_mut(), header::CONTENT_ENCODING, "identity");
+    insert_header(response.headers_mut(), header::ETAG, &etag);
+    insert_header(
+        response.headers_mut(),
+        header::CACHE_CONTROL,
+        "private, no-cache",
+    );
+    Ok(response)
+}
+
+fn preview_storage_error(error: StorageError) -> ApiError {
+    match error {
+        StorageError::Busy => ApiError::ServiceUnavailable(
+            "Preview is currently completing a lifecycle operation; retry shortly".to_string(),
+        ),
+        StorageError::InvalidRange => ApiError::Storage(StorageError::ContentMismatch),
+        error => ApiError::Storage(error),
+    }
+}
+
 fn limit_download_stream(
     source: BlobByteStream,
     permit: OwnedSemaphorePermit,
@@ -3303,6 +3526,7 @@ fn debug_allowed_resources(resources: &[String]) -> Vec<String> {
         "document_detail",
         "my_edits",
         "preferences",
+        "previews",
         "settings",
         "sidebar",
     ];
@@ -3399,6 +3623,7 @@ async fn insert_debug_document_version_and_event(
     .bind(name)
     .execute(&mut **transaction)
     .await?;
+    previews::enqueue_preview_job_in_tx(transaction, blob_id).await?;
     sqlx::query(
         r"
         UPDATE documents
@@ -3446,6 +3671,7 @@ enum ApiError {
     NotFound(String),
     Oidc(OidcError),
     Preference(PreferenceError),
+    Preview(PreviewError),
     Reconciliation(ReconciliationError),
     RangeNotSatisfiable { content_range: String },
     Settings(SiteSettingsError),
@@ -3491,6 +3717,12 @@ impl From<AdminError> for ApiError {
 impl From<PreferenceError> for ApiError {
     fn from(error: PreferenceError) -> Self {
         Self::Preference(error)
+    }
+}
+
+impl From<PreviewError> for ApiError {
+    fn from(error: PreviewError) -> Self {
+        Self::Preview(error)
     }
 }
 
@@ -3644,6 +3876,9 @@ fn api_error_status_detail(error: ApiError) -> (StatusCode, String) {
         ApiError::Preference(error) | ApiError::View(ViewError::Preferences(error)) => {
             preference_error_response(error)
         }
+        ApiError::Preview(error) | ApiError::View(ViewError::Preview(error)) => {
+            preview_error_response(error)
+        }
         ApiError::Reconciliation(error) => reconciliation_error_response(error),
         ApiError::Settings(error) => site_settings_error_response(error),
         ApiError::Share(error) => share_error_response(error),
@@ -3691,6 +3926,33 @@ fn state_event_error_response(error: &StateEventError) -> (StatusCode, String) {
         StatusCode::INTERNAL_SERVER_ERROR,
         "Internal server error".to_string(),
     )
+}
+
+fn preview_error_response(error: PreviewError) -> (StatusCode, String) {
+    match error {
+        PreviewError::TooManyDocuments => (
+            StatusCode::BAD_REQUEST,
+            "Preview resolve accepts at most 200 documents".to_string(),
+        ),
+        PreviewError::InvalidResolveRequest => (
+            StatusCode::BAD_REQUEST,
+            "Preview resolve documents must be unique and valid".to_string(),
+        ),
+        PreviewError::DocumentNotFound | PreviewError::RenditionNotFound => {
+            (StatusCode::NOT_FOUND, "Preview not found".to_string())
+        }
+        PreviewError::InsufficientDocumentAccess => (
+            StatusCode::FORBIDDEN,
+            "Insufficient document access".to_string(),
+        ),
+        error => {
+            tracing::error!(?error, "preview request failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Preview is unavailable".to_string(),
+            )
+        }
+    }
 }
 
 fn asset_error_response(error: AssetError) -> (StatusCode, String) {

@@ -1656,6 +1656,7 @@ fn assert_document_row_payload_shape(document_row: &Value, document_id: i64) {
             "size_bytes",
             "size_display",
             "version_count",
+            "visual",
         ],
     );
     assert_object_keys(&document_row["access"], &["read", "visible", "write"]);
@@ -1681,6 +1682,14 @@ fn assert_document_row_payload_shape(document_row: &Value, document_id: i64) {
     assert_eq!(document_row["created_by_name"], "Admin");
     assert_eq!(document_row["size_bytes"], 6);
     assert_eq!(document_row["size_display"], "6 B");
+    assert_eq!(document_row["visual"]["icon_key"], "file-lines");
+    assert_eq!(document_row["visual"]["preview"]["status"], "pending");
+    assert_eq!(document_row["visual"]["preview"]["recipe"], "raster-v1");
+    assert_eq!(document_row["visual"]["preview"]["variants"], json!([]));
+    assert_eq!(
+        document_row["visual"]["preview"]["version_id"],
+        format!("display-version-{document_id}"),
+    );
     assert_eq!(
         document_row["download_url"],
         format!("/documents/{document_id}/versions/display-version-{document_id}/download"),

@@ -1724,6 +1724,168 @@ async fn download_routes_reject_truncated_stored_blob_bytes() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn preview_download_detects_same_length_corruption_and_requeues_the_job() {
+    let (state, _temp_dir) = test_state().await;
+    let readers = create_group(&state.db, "readers").await;
+    let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
+        .await
+        .expect("root");
+    add_folder_permission(&state.db, root.id, readers, true, true, false)
+        .await
+        .expect("reader root");
+    let project = get_or_create_folder_path(&state.db, Some("Project"))
+        .await
+        .expect("project");
+    let document_id = insert_stored_versioned_document(
+        &state.db,
+        &state.storage,
+        project.id,
+        b"source bytes",
+        "source.png",
+    )
+    .await;
+    let source_blob_id: i64 = sqlx::query_scalar(
+        "SELECT blob_id FROM document_versions WHERE document_id = ? AND id = 'stored-version-one'",
+    )
+    .bind(document_id)
+    .fetch_one(&state.db)
+    .await
+    .expect("source blob");
+    let preview_bytes = b"preview-good";
+    let stored = state
+        .storage
+        .put_bytes(preview_bytes)
+        .await
+        .expect("stored preview");
+    let preview_blob_id =
+        sqlx::query("INSERT INTO blobs (hash_algo, hash, size_bytes) VALUES (?, ?, ?)")
+            .bind(&stored.hash_algo)
+            .bind(&stored.digest)
+            .bind(i64::try_from(stored.size_bytes).expect("preview size"))
+            .execute(&state.db)
+            .await
+            .expect("preview blob")
+            .last_insert_rowid();
+    sqlx::query(
+        "INSERT INTO blob_locations (blob_id, backend, bucket, object_key) VALUES (?, ?, ?, ?)",
+    )
+    .bind(preview_blob_id)
+    .bind(&stored.backend)
+    .bind(&stored.bucket)
+    .bind(&stored.object_key)
+    .execute(&state.db)
+    .await
+    .expect("preview location");
+    let job_id = sqlx::query(
+        "INSERT INTO preview_jobs (source_blob_id, recipe, status) VALUES (?, 'raster-v1', 'ready')",
+    )
+    .bind(source_blob_id)
+    .execute(&state.db)
+    .await
+    .expect("preview job")
+    .last_insert_rowid();
+    sqlx::query(
+        r"
+        INSERT INTO preview_renditions
+            (preview_job_id, variant, blob_id, mime_type, width, height)
+        VALUES (?, 'small', ?, 'image/webp', 12, 12)
+        ",
+    )
+    .bind(job_id)
+    .bind(preview_blob_id)
+    .execute(&state.db)
+    .await
+    .expect("preview rendition");
+    tokio::fs::write(
+        state.config.objects_path().join(&stored.object_key),
+        b"preview-evil",
+    )
+    .await
+    .expect("corrupt preview with equal-length bytes");
+    let pool = state.db.clone();
+    let app = http::router(state);
+
+    let response = app
+        .oneshot(authed_get(
+            &format!(
+                "/api/documents/{document_id}/versions/stored-version-one/previews/raster-v1/small"
+            ),
+            "reader",
+            "readers",
+        ))
+        .await
+        .expect("corrupt preview response");
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let payload = response_json(response).await;
+    assert_eq!(payload["detail"], "Blob content does not match metadata");
+    let job_state: (String, i64) =
+        sqlx::query_as("SELECT status, attempt_count FROM preview_jobs WHERE id = ?")
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .expect("requeued job");
+    assert_eq!(job_state, ("queued".to_string(), 0));
+    let rendition_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM preview_renditions WHERE preview_job_id = ?")
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .expect("rendition count");
+    assert_eq!(rendition_count, 0);
+}
+
+#[tokio::test]
+async fn a_pruned_preview_url_recreates_its_missing_job() {
+    let (state, _temp_dir) = test_state().await;
+    let readers = create_group(&state.db, "readers").await;
+    let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
+        .await
+        .expect("root");
+    add_folder_permission(&state.db, root.id, readers, true, true, false)
+        .await
+        .expect("reader root");
+    let project = get_or_create_folder_path(&state.db, Some("Project"))
+        .await
+        .expect("project");
+    let document_id = insert_stored_versioned_document(
+        &state.db,
+        &state.storage,
+        project.id,
+        b"source bytes",
+        "source.png",
+    )
+    .await;
+    let pool = state.db.clone();
+    let app = http::router(state);
+
+    let response = app
+        .oneshot(authed_get(
+            &format!(
+                "/api/documents/{document_id}/versions/stored-version-one/previews/raster-v1/small"
+            ),
+            "reader",
+            "readers",
+        ))
+        .await
+        .expect("stale preview response");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let queued_jobs: i64 = sqlx::query_scalar(
+        r"
+        SELECT COUNT(*)
+        FROM preview_jobs pj
+        JOIN document_versions v ON v.blob_id = pj.source_blob_id
+        WHERE v.document_id = ? AND pj.recipe = 'raster-v1' AND pj.status = 'queued'
+        ",
+    )
+    .bind(document_id)
+    .fetch_one(&pool)
+    .await
+    .expect("queued preview job");
+    assert_eq!(queued_jobs, 1);
+}
+
+#[tokio::test]
 async fn checkout_document_returns_pinned_download_locks_and_records_event() {
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;

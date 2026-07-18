@@ -33,6 +33,7 @@ export function docToItem(doc) {
     size_display: doc.size_display || "",
     download_url: doc.download_url || "",
     type: "document",
+    visual: doc.visual || null,
     version_count: doc.version_count || 0,
     versions: doc.versions || [],
   };

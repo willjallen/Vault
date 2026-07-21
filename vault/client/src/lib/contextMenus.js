@@ -253,6 +253,11 @@ export function buildPageMenuItems(actions) {
       disabled: actions.busy || inArchive,
     },
     {
+      label: "Upload folder",
+      action: actions.handleUploadFolderClick,
+      disabled: actions.busy || inArchive,
+    },
+    {
       label: "New folder",
       action: () => actions.beginCreateFolder(currentFolder),
       disabled: actions.busy || actions.creatingFolder || inArchive,

@@ -1,4 +1,4 @@
-import { readDroppedUploadTree } from "./droppedEntries.js";
+import { readDroppedUploadTree, readSelectedUploadTree } from "./droppedEntries.js";
 import { createFolderRequestOptions } from "./folderRequests.js";
 import { uploadFileBatch, uploadFileTree } from "./uploadActions.js";
 
@@ -10,9 +10,16 @@ export function createUploadHandlers({
   setError,
   setUploadHover,
   targetFolder = "",
+  uploadFolderInput,
   uploadInput,
   uploadWithProgress,
 }) {
+  function resetInput(inputRef) {
+    if (inputRef?.current) {
+      inputRef.current.value = "";
+    }
+  }
+
   async function handleUpload(files, destination = targetFolder) {
     try {
       return await uploadFileBatch({
@@ -29,9 +36,7 @@ export function createUploadHandlers({
       return null;
     } finally {
       setUploadHover(false);
-      if (uploadInput.current) {
-        uploadInput.current.value = "";
-      }
+      resetInput(uploadInput);
     }
   }
 
@@ -47,9 +52,9 @@ export function createUploadHandlers({
     return response.json();
   }
 
-  async function handleUploadDrop(dataTransfer, destination = targetFolder) {
+  async function handleUploadTree(readTree, destination) {
     try {
-      const tree = await readDroppedUploadTree(dataTransfer);
+      const tree = await readTree();
       return await uploadFileTree({
         blocked,
         createFolder: createDroppedFolder,
@@ -68,5 +73,17 @@ export function createUploadHandlers({
     }
   }
 
-  return { handleUpload, handleUploadDrop };
+  function handleUploadDrop(dataTransfer, destination = targetFolder) {
+    return handleUploadTree(() => readDroppedUploadTree(dataTransfer), destination);
+  }
+
+  async function handleUploadFolder(files, destination = targetFolder) {
+    try {
+      return await handleUploadTree(() => readSelectedUploadTree(files), destination);
+    } finally {
+      resetInput(uploadFolderInput);
+    }
+  }
+
+  return { handleUpload, handleUploadDrop, handleUploadFolder };
 }

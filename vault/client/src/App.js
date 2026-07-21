@@ -8,6 +8,7 @@ import { TransferDock } from "./components/TransferDock.js";
 import { ContextMenu } from "./components/browser/ContextMenu.js";
 import { FileDetailsModal } from "./components/browser/FileDetailsModal.js";
 import { MoveDialog } from "./components/browser/MoveDialog.js";
+import { UploadInputs } from "./components/browser/UploadInputs.js";
 import {
   buildMyEditMenuItems,
   buildPageMenuItems,
@@ -83,6 +84,7 @@ export function App({ initial }) {
     normalizeSiteSettings(initialBootstrap.settings)
   );
   const uploadInput = useRef(null);
+  const uploadFolderInput = useRef(null);
   const versionUploadInput = useRef(null);
   const versionUploadDoc = useRef(null);
   const versionUploadOptions = useRef({});
@@ -532,7 +534,7 @@ export function App({ initial }) {
     }
   }
 
-  const { handleUpload, handleUploadDrop } = createUploadHandlers({
+  const { handleUpload, handleUploadDrop, handleUploadFolder } = createUploadHandlers({
     apiFetch,
     blocked: shareResolving,
     fileScheduler: uploadFileScheduler,
@@ -540,6 +542,7 @@ export function App({ initial }) {
     setError,
     setUploadHover,
     targetFolder: folder,
+    uploadFolderInput,
     uploadInput,
     uploadWithProgress,
   });
@@ -681,9 +684,11 @@ export function App({ initial }) {
   }
 
   function handleUploadClick() {
-    if (uploadInput.current) {
-      uploadInput.current.click();
-    }
+    uploadInput.current?.click();
+  }
+
+  function handleUploadFolderClick() {
+    uploadFolderInput.current?.click();
   }
 
   const handleShareItem = useShareActions({ apiFetch, setError, showNotice });
@@ -740,6 +745,7 @@ export function App({ initial }) {
       handleUnarchive,
       handleUnlockItems,
       handleUploadClick,
+      handleUploadFolderClick,
       openFolderProperties,
       openFileDetails,
       handleView,
@@ -933,12 +939,11 @@ export function App({ initial }) {
           onNewFolderNameChange: setMoveNewFolderName,
         })
       : null,
-    h("input", {
-      type: "file",
-      ref: uploadInput,
-      className: "hidden-input",
-      multiple: true,
-      onChange: (e) => handleUpload(e.target.files),
+    h(UploadInputs, {
+      fileInputRef: uploadInput,
+      folderInputRef: uploadFolderInput,
+      onFiles: handleUpload,
+      onFolder: handleUploadFolder,
     }),
     h("input", {
       type: "file",

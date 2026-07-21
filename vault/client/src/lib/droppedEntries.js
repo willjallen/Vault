@@ -116,7 +116,10 @@ function capturedDropRoots(dataTransfer) {
   return listItems(dataTransfer?.files).map((file) => ({ file }));
 }
 
-async function readCapturedDropRoots(roots) {
+async function readCapturedDropRoots(
+  roots,
+  emptyMessage = "No readable files or folders were found in this drop."
+) {
   const tree = { directories: [], files: [] };
   const selectedDirectories = new Set();
   for (const root of roots) {
@@ -127,9 +130,16 @@ async function readCapturedDropRoots(roots) {
     }
   }
   if (!tree.directories.length && !tree.files.length) {
-    throw new Error("No readable files or folders were found in this drop.");
+    throw new Error(emptyMessage);
   }
   return tree;
+}
+
+export function readSelectedUploadTree(files) {
+  return readCapturedDropRoots(
+    listItems(files).map((file) => ({ file })),
+    "No readable files were found in the selected folder."
+  );
 }
 
 // Capture entry handles synchronously while the browser's drag data store is readable.

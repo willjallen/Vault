@@ -45,6 +45,32 @@ function directoryEntry(name, children) {
   };
 }
 
+test("the native file picker uploads multiple files and resets for repeat selection", async () => {
+  const uploadInput = { current: { value: "selected" } };
+  const uploads = [];
+  const { handleUpload } = createUploadHandlers({
+    apiFetch: async () => ({ json: async () => ({}), ok: true }),
+    refresh: async () => {},
+    setError: () => {},
+    setUploadHover: () => {},
+    uploadInput,
+    uploadWithProgress: async (options) => {
+      uploads.push(options);
+      return { id: uploads.length };
+    },
+  });
+  const files = [new File(["one"], "one.txt"), new File(["two"], "two.txt")];
+
+  const result = await handleUpload(files);
+
+  assert.deepEqual(
+    uploads.map(({ file }) => file.name),
+    ["one.txt", "two.txt"]
+  );
+  assert.equal(result.succeeded, 2);
+  assert.equal(uploadInput.current.value, "");
+});
+
 test("a browser-style directory drop creates its tree and uploads only real files", async () => {
   const empty = directoryEntry("Empty", []);
   const nested = directoryEntry("Nested", [fileEntry("asset.txt", "asset")]);
@@ -64,7 +90,6 @@ test("a browser-style directory drop creates its tree and uploads only real file
     setError: (message) => errors.push(message),
     setUploadHover: (value) => uploadHover.push(value),
     targetFolder: "Shared/Incoming",
-    uploadInput: { current: null },
     uploadWithProgress: async (options) => {
       uploads.push(options);
       return { id: 99 };
@@ -116,4 +141,42 @@ test("a browser-style directory drop creates its tree and uploads only real file
   assert.deepEqual(uploadHover, [false]);
   assert.equal(result.succeeded, 1);
   assert.equal(result.foldersCreated, 3);
+});
+
+test("a folder picker selection creates folders and uploads files to their relative paths", async () => {
+  const selected = new File(["selected"], "selected.txt");
+  Object.defineProperty(selected, "webkitRelativePath", {
+    value: "Bundle/Nested/selected.txt",
+  });
+  const requests = [];
+  const uploads = [];
+  const folderInput = { current: { value: "Bundle" } };
+  const { handleUploadFolder } = createUploadHandlers({
+    apiFetch: async (_url, options) => {
+      requests.push(options.body.toString());
+      return { json: async () => ({}), ok: true };
+    },
+    refresh: async () => {},
+    setError: () => {},
+    setUploadHover: () => {},
+    targetFolder: "Incoming",
+    uploadFolderInput: folderInput,
+    uploadWithProgress: async (options) => {
+      uploads.push(options);
+      return { id: 1 };
+    },
+  });
+
+  const result = await handleUploadFolder([selected]);
+
+  assert.deepEqual(requests, [
+    "folder=Incoming%2FBundle&exist_ok=true",
+    "folder=Incoming%2FBundle%2FNested&exist_ok=true",
+  ]);
+  assert.equal(uploads.length, 1);
+  assert.equal(uploads[0].file, selected);
+  assert.equal(uploads[0].folder, "Incoming/Bundle/Nested");
+  assert.equal(result.succeeded, 1);
+  assert.equal(result.foldersCreated, 2);
+  assert.equal(folderInput.current.value, "");
 });

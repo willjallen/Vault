@@ -15,7 +15,7 @@ const bundled = await build({
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(
   bundled.outputFiles.at(0).text
 ).toString("base64")}`;
-const { readDroppedUploadTree } = await import(moduleUrl);
+const { readDroppedUploadTree, readSelectedUploadTree } = await import(moduleUrl);
 
 function fileEntry(name, contents = name) {
   const file = new File([contents], name, { type: "application/octet-stream" });
@@ -135,19 +135,26 @@ test("mixed file and folder roots preserve top-level order and hierarchy", async
   );
 });
 
-test("file-list fallback preserves webkitRelativePath folder structure", async () => {
+test("folder picker files preserve their webkitRelativePath folder structure", async () => {
   const loose = new File(["loose"], "loose.txt");
   const selected = new File(["selected"], "selected.txt");
   Object.defineProperty(selected, "webkitRelativePath", {
     value: "Bundle/Nested/selected.txt",
   });
 
-  const tree = await readDroppedUploadTree({ files: [loose, selected] });
+  const tree = await readSelectedUploadTree([loose, selected]);
 
   assert.deepEqual(tree.directories, ["Bundle", "Bundle/Nested"]);
   assert.deepEqual(
     tree.files.map(({ relativePath }) => relativePath),
     ["loose.txt", "Bundle/Nested/selected.txt"]
+  );
+});
+
+test("an unreadable empty fallback selection reports the folder-picker boundary", async () => {
+  await assert.rejects(
+    readSelectedUploadTree([]),
+    /No readable files were found in the selected folder\./
   );
 });
 

@@ -243,16 +243,22 @@ test("picker capability keeps a single Download menu action", () => {
 });
 
 test("page upload stays available during another background upload", () => {
+  const selected = [];
   const items = buildPageMenuItems({
     beginCreateFolder: () => {},
     busy: false,
     creatingFolder: false,
     folder: "",
-    handleUploadClick: () => {},
+    handleUploadClick: () => selected.push("file"),
+    handleUploadFolderClick: () => selected.push("folder"),
     uploading: true,
   });
 
   assert.equal(items.find((item) => item.label === "Upload file")?.disabled, false);
+  assert.equal(items.find((item) => item.label === "Upload folder")?.disabled, false);
+  items.find((item) => item.label === "Upload file").action();
+  items.find((item) => item.label === "Upload folder").action();
+  assert.deepEqual(selected, ["file", "folder"]);
 });
 
 test("page actions remain disabled during foreground busy operations", () => {
@@ -262,8 +268,10 @@ test("page actions remain disabled during foreground busy operations", () => {
     creatingFolder: false,
     folder: "",
     handleUploadClick: () => {},
+    handleUploadFolderClick: () => {},
   });
 
   assert.equal(items.find((item) => item.label === "Upload file")?.disabled, true);
+  assert.equal(items.find((item) => item.label === "Upload folder")?.disabled, true);
   assert.equal(items.find((item) => item.label === "New folder")?.disabled, true);
 });

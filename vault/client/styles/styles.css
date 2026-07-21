@@ -5202,6 +5202,11 @@ input[type="file"]::file-selector-button:hover {
   white-space: nowrap;
 }
 
+.transfer-row.grouped .transfer-stage {
+  font-weight: 650;
+  text-transform: none;
+}
+
 .transfer-meta {
   min-width: 0;
   overflow: hidden;

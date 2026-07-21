@@ -1,14 +1,9 @@
 import { useTransfers } from "./useTransfers.js";
 import { normalizeSiteSettings } from "./siteSettings.js";
 import { authRedirectUrl } from "./authRedirects.js";
+import { normalizedAuthFetchError } from "./authFetchErrors.js";
 
 const { useCallback, useMemo, useRef } = React;
-
-function connectionError() {
-  const error = new Error("Lost connection to the server.");
-  error.status = 0;
-  return error;
-}
 
 export function useAuthFetch({ initialBootstrap, requestConfirm, showNotice }) {
   const baseDomain =
@@ -68,10 +63,7 @@ export function useAuthFetch({ initialBootstrap, requestConfirm, showNotice }) {
         }
         return res;
       } catch (err) {
-        if (err.status === 401) {
-          throw err;
-        }
-        throw connectionError();
+        throw normalizedAuthFetchError(err);
       }
     },
     [redirectToLogin]

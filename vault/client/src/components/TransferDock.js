@@ -18,6 +18,13 @@ function formatEta(seconds) {
   return `${minutes}m ${String(remainingSeconds).padStart(2, "0")}s left`;
 }
 
+function errorTransferTitle(transfer) {
+  if (transfer.grouped && transfer.succeededItems > 0) {
+    return transfer.kind === "upload" ? "Upload incomplete" : "Download incomplete";
+  }
+  return transfer.kind === "upload" ? "Upload failed" : "Download failed";
+}
+
 export function transferTitle(transfer) {
   if (transfer.status === "browser-managed") {
     return "Download started";
@@ -32,7 +39,10 @@ export function transferTitle(transfer) {
     return "Cancelling";
   }
   if (transfer.status === "error") {
-    return transfer.kind === "upload" ? "Upload failed" : "Download failed";
+    return errorTransferTitle(transfer);
+  }
+  if (transfer.kind === "upload" && transfer.grouped) {
+    return "Uploading";
   }
   if (transfer.kind === "upload" && transfer.stage === "verifying") {
     return "Verifying upload";
@@ -58,9 +68,19 @@ export function transferTitle(transfer) {
   return transfer.kind === "upload" ? "Uploading" : "Downloading";
 }
 
+function groupedUploadStageLabel(transfer) {
+  if (transfer.currentItem) {
+    return transfer.currentItem;
+  }
+  return transfer.stage === "creating-folders" ? "Creating folders" : "Upload";
+}
+
 export function transferStageLabel(transfer) {
   if (transfer.status === "browser-managed") {
     return "Browser download";
+  }
+  if (transfer.kind === "upload" && transfer.grouped) {
+    return groupedUploadStageLabel(transfer);
   }
   if (transfer.kind === "upload" && transfer.stage === "verifying") {
     return "Server verification";
@@ -152,6 +172,41 @@ function hasKnownTotal(transfer) {
   return Number.isFinite(total) && total >= 0;
 }
 
+function transferItemCount(transfer) {
+  const count = Number(transfer.totalItems);
+  return Number.isFinite(count) && count > 0 ? Math.floor(count) : null;
+}
+
+function transferItemLabel(count) {
+  return `${count} ${count === 1 ? "item" : "items"}`;
+}
+
+function groupedItemProgress(transfer) {
+  const totalItems = transferItemCount(transfer);
+  if (!totalItems) {
+    return "";
+  }
+  if (transfer.status === "complete") {
+    return transferItemLabel(totalItems);
+  }
+  const processed = Number.isFinite(Number(transfer.processedItems))
+    ? Math.max(0, Math.min(totalItems, Math.floor(Number(transfer.processedItems))))
+    : 0;
+  return `${processed} of ${transferItemLabel(totalItems)}`;
+}
+
+function groupedTransferMeta(transfer) {
+  const itemProgress = groupedItemProgress(transfer);
+  if (transfer.status === "complete") {
+    const size = hasKnownTotal(transfer) ? `${formatBytes(transfer.total)} complete` : "Complete";
+    return [itemProgress, size].filter(Boolean).join(" - ");
+  }
+  const active = activeTransferMeta(transfer);
+  return (
+    [itemProgress, active === "Starting" ? "" : active].filter(Boolean).join(" - ") || "Starting"
+  );
+}
+
 function serverFinalizingMeta(transfer) {
   const noProgress = noProgressMeta(transfer);
   const pieces = noProgress ? [noProgress] : [];
@@ -207,7 +262,11 @@ export function transferMeta(transfer) {
     return transfer.error || "Transfer failed";
   }
   if (transfer.status === "complete") {
-    return transfer.total ? `${formatBytes(transfer.total)} complete` : "Complete";
+    return transfer.grouped
+      ? groupedTransferMeta(transfer)
+      : transfer.total
+        ? `${formatBytes(transfer.total)} complete`
+        : "Complete";
   }
   if (transfer.kind === "download" && transfer.stage === "finalizing") {
     return transfer.total ? `${formatBytes(transfer.total)} received` : "Finalizing";
@@ -218,6 +277,10 @@ export function transferMeta(transfer) {
   const resumeMeta = uploadResumeMeta(transfer);
   if (resumeMeta) {
     return resumeMeta;
+  }
+
+  if (transfer.grouped) {
+    return groupedTransferMeta(transfer);
   }
 
   return activeTransferMeta(transfer);
@@ -231,15 +294,25 @@ function TransferIcon({ kind }) {
   );
 }
 
+export function transferCanCancel(transfer) {
+  return transfer.status === "active" && (transfer.grouped || transfer.stage !== "verifying");
+}
+
 function TransferRow({ onCancel, transfer }) {
   const percent =
     transfer.percent !== null && transfer.percent !== undefined ? `${transfer.percent}%` : "100%";
   const phase = transfer.phase || "visible";
-  const canCancel = transfer.status === "active" && transfer.stage !== "verifying";
+  const canCancel = transferCanCancel(transfer);
   return h(
     "div",
     {
-      className: classNames("transfer-row", transfer.kind, transfer.status, `phase-${phase}`),
+      className: classNames(
+        "transfer-row",
+        transfer.kind,
+        transfer.status,
+        transfer.grouped ? "grouped" : "",
+        `phase-${phase}`
+      ),
     },
     [
       h(TransferIcon, { kind: transfer.kind, key: "icon" }),

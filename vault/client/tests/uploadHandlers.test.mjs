@@ -47,17 +47,27 @@ function directoryEntry(name, children) {
 
 test("the native file picker uploads multiple files and resets for repeat selection", async () => {
   const uploadInput = { current: { value: "selected" } };
+  const operations = [];
   const uploads = [];
   const { handleUpload } = createUploadHandlers({
     apiFetch: async () => ({ json: async () => ({}), ok: true }),
+    beginUploadOperation: (metadata) => {
+      const operation = { finishes: [], metadata };
+      operations.push(operation);
+      return {
+        fail: (error) => assert.fail(error.message),
+        finish: (summary) => operation.finishes.push(summary),
+        upload: async (options) => {
+          uploads.push(options);
+          return { id: uploads.length };
+        },
+      };
+    },
     refresh: async () => {},
     setError: () => {},
     setUploadHover: () => {},
     uploadInput,
-    uploadWithProgress: async (options) => {
-      uploads.push(options);
-      return { id: uploads.length };
-    },
+    uploadWithProgress: async () => assert.fail("child popup uploader was used"),
   });
   const files = [new File(["one"], "one.txt"), new File(["two"], "two.txt")];
 
@@ -68,6 +78,9 @@ test("the native file picker uploads multiple files and resets for repeat select
     ["one.txt", "two.txt"]
   );
   assert.equal(result.succeeded, 2);
+  assert.equal(operations.length, 1);
+  assert.deepEqual(operations[0].metadata.files, files);
+  assert.equal(operations[0].finishes.length, 1);
   assert.equal(uploadInput.current.value, "");
 });
 
@@ -150,33 +163,61 @@ test("a folder picker selection creates folders and uploads files to their relat
   });
   const requests = [];
   const uploads = [];
+  const operationEvents = [];
+  const operationFinishes = [];
+  const operationMetadata = [];
+  const controller = new AbortController();
   const folderInput = { current: { value: "Bundle" } };
   const { handleUploadFolder } = createUploadHandlers({
     apiFetch: async (_url, options) => {
-      requests.push(options.body.toString());
+      requests.push({ body: options.body.toString(), signal: options.signal });
       return { json: async () => ({}), ok: true };
+    },
+    beginUploadOperation: (metadata) => {
+      operationMetadata.push(metadata);
+      return {
+        fail: (error) => assert.fail(error.message),
+        finish: (summary) => operationFinishes.push(summary),
+        folderFinished: (path) => operationEvents.push(["finished", path]),
+        folderStarted: (path) => operationEvents.push(["started", path]),
+        signal: controller.signal,
+        upload: async (options) => {
+          uploads.push(options);
+          return { id: 1 };
+        },
+      };
     },
     refresh: async () => {},
     setError: () => {},
     setUploadHover: () => {},
     targetFolder: "Incoming",
     uploadFolderInput: folderInput,
-    uploadWithProgress: async (options) => {
-      uploads.push(options);
-      return { id: 1 };
-    },
+    uploadWithProgress: async () => assert.fail("child popup uploader was used"),
   });
 
   const result = await handleUploadFolder([selected]);
 
-  assert.deepEqual(requests, [
-    "folder=Incoming%2FBundle&exist_ok=true",
-    "folder=Incoming%2FBundle%2FNested&exist_ok=true",
-  ]);
+  assert.deepEqual(
+    requests.map(({ body }) => body),
+    ["folder=Incoming%2FBundle&exist_ok=true", "folder=Incoming%2FBundle%2FNested&exist_ok=true"]
+  );
+  assert.equal(
+    requests.every(({ signal }) => signal === controller.signal),
+    true
+  );
   assert.equal(uploads.length, 1);
   assert.equal(uploads[0].file, selected);
   assert.equal(uploads[0].folder, "Incoming/Bundle/Nested");
   assert.equal(result.succeeded, 1);
   assert.equal(result.foldersCreated, 2);
+  assert.equal(operationMetadata.length, 1);
+  assert.deepEqual(operationMetadata[0].folders, ["Bundle", "Bundle/Nested"]);
+  assert.deepEqual(operationEvents, [
+    ["started", "Bundle"],
+    ["finished", "Bundle"],
+    ["started", "Bundle/Nested"],
+    ["finished", "Bundle/Nested"],
+  ]);
+  assert.equal(operationFinishes.length, 1);
   assert.equal(folderInput.current.value, "");
 });

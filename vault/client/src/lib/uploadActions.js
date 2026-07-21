@@ -57,6 +57,50 @@ function relativeFileFolder(relativePath) {
     .join("/");
 }
 
+function beginTreeUploadOperation(beginUploadOperation, entries, directories) {
+  return beginUploadOperation
+    ? beginUploadOperation({
+        files: entries.map((entry) => entry.file),
+        folders: directories,
+      })
+    : null;
+}
+
+function throwIfUploadOperationCancelled(operation) {
+  if (operation?.signal?.aborted) {
+    const error = new Error("Upload operation cancelled");
+    error.cancelled = true;
+    throw error;
+  }
+}
+
+async function createUploadTreeFolders({
+  createFolder,
+  directories,
+  operation,
+  state,
+  targetFolder,
+}) {
+  for (const relativePath of directories) {
+    throwIfUploadOperationCancelled(operation);
+    operation?.folderStarted?.(relativePath);
+    await createFolder(joinedFolderPath(targetFolder, relativePath), {
+      signal: operation?.signal,
+    });
+    state.created += 1;
+    operation?.folderFinished?.(relativePath);
+    throwIfUploadOperationCancelled(operation);
+  }
+}
+
+function failUploadOperation(operation, error) {
+  operation?.fail?.(error);
+}
+
+function treeNeedsErrorRefresh(foldersCreated, operation) {
+  return foldersCreated > 0 || operation?.signal?.aborted === true;
+}
+
 export class UploadFileScheduler {
   constructor(concurrency = DEFAULT_UPLOAD_FILE_CONCURRENCY) {
     this.activeCount = 0;
@@ -138,15 +182,18 @@ function failedUploadMessage(failures) {
 }
 
 export async function uploadFileBatch({
+  beginUploadOperation,
   blocked = false,
   blockedReason = "",
   concurrency = DEFAULT_UPLOAD_FILE_CONCURRENCY,
   files,
+  operationName = "",
   refresh,
   scheduler: fileScheduler,
   setError,
   targetFolder = "",
   targetFolderForFile,
+  uploadOperation,
   uploadWithProgress,
 }) {
   const pendingFiles = uploadFiles(files);
@@ -169,57 +216,73 @@ export async function uploadFileBatch({
 
   setError("");
   const uploadScheduler = fileScheduler || new UploadFileScheduler(concurrency);
-  const outcomePromises = pendingFiles.map((file, index) => {
-    const destination = targetFolderForFile
-      ? String(targetFolderForFile(file, index) || "")
-      : targetFolder || "";
-    const uploadName = normalizedUploadFileName(file);
-    const key = uploadName ? JSON.stringify([destination, uploadName]) : "";
-    return uploadScheduler
-      .run(
-        () =>
-          uploadWithProgress({
-            file,
-            folder: destination,
-            mode: "create",
-            name: file.name,
-            size: file.size,
-          }),
-        {
-          duplicateMessage: `A file named ${uploadName || "this name"} is already queued for ${destination || "Vault"}.`,
-          key,
-        }
-      )
-      .then((value) =>
-        value?.cancelled
-          ? { file, status: "cancelled", value }
-          : { file, status: "fulfilled", value }
-      )
-      .catch((reason) => ({ file, reason, status: "rejected" }));
-  });
-  const orderedOutcomes = await Promise.all(outcomePromises);
+  const operation =
+    uploadOperation || beginUploadOperation?.({ files: pendingFiles, name: operationName });
+  const ownsOperation = Boolean(operation && !uploadOperation);
+  const upload = operation?.upload || uploadWithProgress;
+  try {
+    const outcomePromises = pendingFiles.map((file, index) => {
+      const destination = targetFolderForFile
+        ? String(targetFolderForFile(file, index) || "")
+        : targetFolder || "";
+      const uploadName = normalizedUploadFileName(file);
+      const key = uploadName ? JSON.stringify([destination, uploadName]) : "";
+      return uploadScheduler
+        .run(
+          () =>
+            upload({
+              file,
+              folder: destination,
+              mode: "create",
+              name: file.name,
+              size: file.size,
+            }),
+          {
+            duplicateMessage: `A file named ${uploadName || "this name"} is already queued for ${destination || "Vault"}.`,
+            key,
+          }
+        )
+        .then((value) =>
+          value?.cancelled
+            ? { file, status: "cancelled", value }
+            : { file, status: "fulfilled", value }
+        )
+        .catch((reason) => ({ file, reason, status: "rejected" }));
+    });
+    const orderedOutcomes = await Promise.all(outcomePromises);
 
-  const succeeded = orderedOutcomes.filter((outcome) => outcome.status === "fulfilled").length;
-  const cancelled = orderedOutcomes.filter((outcome) => outcome.status === "cancelled").length;
-  const failures = orderedOutcomes.filter((outcome) => outcome.status === "rejected");
-  if (succeeded > 0) {
-    await refresh(targetFolder || "", { invalidateContents: true });
-  }
-  if (failures.length) {
-    setError(failedUploadMessage(failures));
-  }
+    const succeeded = orderedOutcomes.filter((outcome) => outcome.status === "fulfilled").length;
+    const cancelled = orderedOutcomes.filter((outcome) => outcome.status === "cancelled").length;
+    const failures = orderedOutcomes.filter((outcome) => outcome.status === "rejected");
+    if (succeeded > 0) {
+      await refresh(targetFolder || "", { invalidateContents: true });
+    }
+    if (failures.length) {
+      setError(failedUploadMessage(failures));
+    }
 
-  return {
-    attempted: pendingFiles.length,
-    blocked: 0,
-    cancelled,
-    failed: failures.length,
-    outcomes: orderedOutcomes,
-    succeeded,
-  };
+    const result = {
+      attempted: pendingFiles.length,
+      blocked: 0,
+      cancelled,
+      failed: failures.length,
+      outcomes: orderedOutcomes,
+      succeeded,
+    };
+    if (ownsOperation) {
+      operation.finish(result);
+    }
+    return result;
+  } catch (error) {
+    if (ownsOperation) {
+      operation.fail(error);
+    }
+    throw error;
+  }
 }
 
 export async function uploadFileTree({
+  beginUploadOperation,
   blocked = false,
   blockedReason = "",
   concurrency = DEFAULT_UPLOAD_FILE_CONCURRENCY,
@@ -250,13 +313,22 @@ export async function uploadFileTree({
     };
   }
 
+  const operation = beginTreeUploadOperation(beginUploadOperation, entries, directories);
+  const folderState = { created: 0 };
+
   try {
-    for (const relativePath of directories) {
-      await createFolder(joinedFolderPath(targetFolder, relativePath));
-      foldersCreated += 1;
-    }
+    await createUploadTreeFolders({
+      createFolder,
+      directories,
+      operation,
+      state: folderState,
+      targetFolder,
+    });
+    foldersCreated = folderState.created;
   } catch (error) {
-    if (foldersCreated > 0) {
+    foldersCreated = folderState.created;
+    failUploadOperation(operation, error);
+    if (treeNeedsErrorRefresh(foldersCreated, operation)) {
       await refresh(targetFolder || "", { sidebar: true });
     }
     throw error;
@@ -273,22 +345,31 @@ export async function uploadFileTree({
       targetFolder,
       targetFolderForFile: (_file, index) =>
         joinedFolderPath(targetFolder, relativeFileFolder(entries.at(index)?.relativePath)),
+      uploadOperation: operation,
       uploadWithProgress,
     });
   } catch (error) {
-    if (foldersCreated > 0) {
+    failUploadOperation(operation, error);
+    if (treeNeedsErrorRefresh(foldersCreated, operation)) {
       await refresh(targetFolder || "", { sidebar: true });
     }
     throw error;
   }
 
   if (foldersCreated > 0 || result.succeeded > 0) {
-    await refresh(targetFolder || "", { sidebar: foldersCreated > 0 });
+    try {
+      await refresh(targetFolder || "", { sidebar: foldersCreated > 0 });
+    } catch (error) {
+      failUploadOperation(operation, error);
+      throw error;
+    }
   }
-  return {
+  const finalResult = {
     ...result,
     foldersBlocked: 0,
     foldersCreated,
     foldersRequested: directories.length,
   };
+  operation?.finish?.(finalResult);
+  return finalResult;
 }

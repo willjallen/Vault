@@ -81,6 +81,62 @@ test("batch uploads use bounded default concurrency and refresh once after succe
   );
 });
 
+test("separate hundred-file actions create separate operation popups, never one per file", async () => {
+  const batches = [
+    filesWithNames(Array.from({ length: 100 }, (_, index) => `a-${index}.bin`)),
+    filesWithNames(["b-1.bin", "b-2.bin"]),
+  ];
+  const operations = [];
+
+  function beginUploadOperation(metadata) {
+    const record = { failures: [], finishes: [], metadata, uploads: [] };
+    operations.push(record);
+    return {
+      fail: (error) => record.failures.push(error),
+      finish: (result) => record.finishes.push(result),
+      upload: async ({ file }) => {
+        record.uploads.push(file);
+        await nextTurn();
+        return { id: file.name };
+      },
+    };
+  }
+
+  const results = await Promise.all(
+    batches.map((files) =>
+      uploadFileBatch({
+        beginUploadOperation,
+        files,
+        refresh: async () => {},
+        setError: () => {},
+        uploadWithProgress: async () => assert.fail("child popup uploader was used"),
+      })
+    )
+  );
+
+  assert.equal(operations.length, 2);
+  assert.deepEqual(
+    operations.map((operation) => operation.metadata.files.length),
+    [100, 2]
+  );
+  assert.deepEqual(
+    operations.map((operation) => operation.uploads.length),
+    [100, 2]
+  );
+  assert.equal(
+    operations.every((operation) => operation.finishes.length === 1),
+    true
+  );
+  assert.equal(
+    operations.every((operation) => operation.failures.length === 0),
+    true
+  );
+  assert.deepEqual(
+    results.map((result) => result.succeeded),
+    [100, 2]
+  );
+});
+
 test("batch uploads hard-cap caller-requested concurrency", async () => {
   const files = filesWithNames(Array.from({ length: 12 }, (_, index) => `capped-${index + 1}.bin`));
   let active = 0;
@@ -404,10 +460,25 @@ test("folder trees create parents first and upload same-named files into relativ
   const second = new File(["second"], "same.txt", { type: "text/plain" });
   const empty = new File([], "empty.txt", { type: "text/plain" });
   const createdFolders = [];
+  const operation = { failures: [], finished: [], folderEvents: [], metadata: null };
   const refreshes = [];
   const uploads = [];
 
   const result = await uploadFileTree({
+    beginUploadOperation: (metadata) => {
+      operation.metadata = metadata;
+      return {
+        fail: (error) => operation.failures.push(error),
+        finish: (summary) => operation.finished.push(summary),
+        folderFinished: (path) => operation.folderEvents.push(["finished", path]),
+        folderStarted: (path) => operation.folderEvents.push(["started", path]),
+        upload: async (options) => {
+          uploads.push(options);
+          await nextTurn();
+          return { id: `${options.folder}/${options.file.name}` };
+        },
+      };
+    },
     createFolder: async (path) => createdFolders.push(path),
     refresh: async (...args) => refreshes.push(args),
     scheduler: new UploadFileScheduler(2),
@@ -421,11 +492,7 @@ test("folder trees create parents first and upload same-named files into relativ
         { file: empty, relativePath: "Package/empty.txt" },
       ],
     },
-    uploadWithProgress: async (options) => {
-      uploads.push(options);
-      await nextTurn();
-      return { id: `${options.folder}/${options.file.name}` };
-    },
+    uploadWithProgress: async () => assert.fail("folder children created their own popup"),
   });
 
   assert.deepEqual(createdFolders, [
@@ -461,6 +528,25 @@ test("folder trees create parents first and upload same-named files into relativ
     ]
   );
   assert.deepEqual(refreshes, [["Shared/Incoming", { sidebar: true }]]);
+  assert.deepEqual(operation.metadata.files, [first, second, empty]);
+  assert.deepEqual(operation.metadata.folders, [
+    "Package",
+    "Package/Empty",
+    "Package/One",
+    "Package/Two",
+  ]);
+  assert.deepEqual(operation.folderEvents, [
+    ["started", "Package"],
+    ["finished", "Package"],
+    ["started", "Package/Empty"],
+    ["finished", "Package/Empty"],
+    ["started", "Package/One"],
+    ["finished", "Package/One"],
+    ["started", "Package/Two"],
+    ["finished", "Package/Two"],
+  ]);
+  assert.equal(operation.finished.length, 1);
+  assert.equal(operation.failures.length, 0);
   assert.equal(result.attempted, 3);
   assert.equal(result.failed, 0);
   assert.equal(result.succeeded, 3);
@@ -525,6 +611,50 @@ test("a blocked folder tree performs no folder or file mutations", async () => {
   assert.equal(result.blocked, 1);
   assert.equal(result.foldersBlocked, 1);
   assert.deepEqual(errors.messages, ["Wait for the destination folder to finish loading."]);
+});
+
+test("cancelling a folder operation stops the remaining tree before file uploads", async () => {
+  const controller = new AbortController();
+  const createdFolders = [];
+  const failures = [];
+  const refreshes = [];
+  let uploads = 0;
+
+  await assert.rejects(
+    uploadFileTree({
+      beginUploadOperation: () => ({
+        fail: (error) => failures.push(error),
+        finish: () => assert.fail("cancelled tree completed"),
+        folderFinished: () => {},
+        folderStarted: () => {},
+        signal: controller.signal,
+        upload: async () => {
+          uploads += 1;
+          return {};
+        },
+      }),
+      createFolder: async (path, { signal }) => {
+        assert.equal(signal, controller.signal);
+        createdFolders.push(path);
+        controller.abort();
+      },
+      refresh: async (...args) => refreshes.push(args),
+      setError: () => {},
+      targetFolder: "Shared/Incoming",
+      tree: {
+        directories: ["Folder", "Folder/Sub", "Folder/Sub/Remaining"],
+        files: [{ file: new File(["payload"], "file.txt"), relativePath: "Folder/file.txt" }],
+      },
+      uploadWithProgress: async () => assert.fail("child popup uploader was used"),
+    }),
+    /Upload operation cancelled/
+  );
+
+  assert.deepEqual(createdFolders, ["Shared/Incoming/Folder"]);
+  assert.deepEqual(refreshes, [["Shared/Incoming", { sidebar: true }]]);
+  assert.equal(failures.length, 1);
+  assert.equal(failures[0].cancelled, true);
+  assert.equal(uploads, 0);
 });
 
 test("a partial folder creation failure refreshes the visible hierarchy and starts no files", async () => {

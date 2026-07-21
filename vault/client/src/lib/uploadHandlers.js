@@ -4,6 +4,7 @@ import { uploadFileBatch, uploadFileTree } from "./uploadActions.js";
 
 export function createUploadHandlers({
   apiFetch,
+  beginUploadOperation,
   blocked = false,
   fileScheduler,
   refresh,
@@ -23,6 +24,7 @@ export function createUploadHandlers({
   async function handleUpload(files, destination = targetFolder) {
     try {
       return await uploadFileBatch({
+        beginUploadOperation,
         blocked,
         files,
         refresh,
@@ -40,11 +42,9 @@ export function createUploadHandlers({
     }
   }
 
-  async function createDroppedFolder(folderPath) {
-    const response = await apiFetch(
-      "/folders",
-      createFolderRequestOptions(folderPath, { allowExisting: true })
-    );
+  async function createDroppedFolder(folderPath, { signal } = {}) {
+    const request = createFolderRequestOptions(folderPath, { allowExisting: true });
+    const response = await apiFetch("/folders", { ...request, signal });
     if (!response.ok) {
       const detail = await response.json().catch(() => ({}));
       throw new Error(detail.detail || `Could not create folder ${folderPath}.`);
@@ -56,6 +56,7 @@ export function createUploadHandlers({
     try {
       const tree = await readTree();
       return await uploadFileTree({
+        beginUploadOperation,
         blocked,
         createFolder: createDroppedFolder,
         refresh,

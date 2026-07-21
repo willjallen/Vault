@@ -6,12 +6,25 @@ import {
 } from "./transferClient.js";
 import * as browserDownload from "./browserDownload.js";
 import { confirmNativeDownload } from "./downloadGuidance.js";
+import { createUploadOperation, describeUploadOperation } from "./uploadOperation.js";
 
 const { useCallback, useEffect, useRef, useState } = React;
 
 const COMPLETE_HOLD_MS = 1400;
 const ERROR_HOLD_MS = 10_000;
 const EXIT_MS = 260;
+
+function operationSummaryPatch(summary = {}) {
+  return {
+    cancelledItems: summary.cancelled || 0,
+    failedItems: summary.failed || 0,
+    processedItems: summary.processedItems ?? null,
+    succeededItems: summary.succeeded || 0,
+    totalFiles: summary.totalFiles ?? null,
+    totalFolders: summary.totalFolders ?? null,
+    totalItems: summary.totalItems ?? null,
+  };
+}
 
 export function useTransfers({
   customDownloadsEnabled = false,
@@ -66,7 +79,7 @@ export function useTransfers({
   );
 
   const createTransfer = useCallback(
-    (kind, displayName, size) => {
+    (kind, displayName, size, details = {}) => {
       const id = nextId.current;
       nextId.current += 1;
       const controller = new AbortController();
@@ -76,6 +89,7 @@ export function useTransfers({
         {
           bytesPerSecond: 0,
           createdAt: null,
+          ...details,
           etaSeconds: null,
           id,
           kind,
@@ -120,12 +134,14 @@ export function useTransfers({
         loaded: progress.loaded,
         noProgressSeconds: progress.noProgressSeconds || 0,
         percent: progress.percent,
-        processedItems: progress.processedItems ?? null,
+        ...(progress.processedItems === undefined
+          ? {}
+          : { processedItems: progress.processedItems ?? null }),
         resumedBytes: progress.resumedBytes || null,
         serverStatus: progress.serverStatus || null,
         stage: progress.stage || "transfer",
         total: progress.total,
-        totalItems: progress.totalItems ?? null,
+        ...(progress.totalItems === undefined ? {} : { totalItems: progress.totalItems ?? null }),
         updatedAt: progress.updatedAt || null,
       });
     },
@@ -133,9 +149,10 @@ export function useTransfers({
   );
 
   const failTransfer = useCallback(
-    (id, err) => {
+    (id, err, patch = {}) => {
       controllers.current.delete(id);
       updateTransfer(id, {
+        ...patch,
         error: err.message || "Transfer failed",
         etaSeconds: null,
         phase: "visible",
@@ -166,9 +183,10 @@ export function useTransfers({
   );
 
   const markTransferCancelled = useCallback(
-    (id) => {
+    (id, patch = {}) => {
       controllers.current.delete(id);
       updateTransfer(id, {
+        ...patch,
         etaSeconds: null,
         phase: "visible",
         status: "cancelled",
@@ -184,10 +202,16 @@ export function useTransfers({
       updateTransfer(id, {
         etaSeconds: null,
         loaded: result.size || result.total || null,
+        ...(result.processedItems === undefined
+          ? {}
+          : { processedItems: result.processedItems ?? null }),
         phase: "completing",
         percent: 100,
         status: "complete",
         total: result.size || result.total || null,
+        ...(result.totalFiles === undefined ? {} : { totalFiles: result.totalFiles ?? null }),
+        ...(result.totalFolders === undefined ? {} : { totalFolders: result.totalFolders ?? null }),
+        ...(result.totalItems === undefined ? {} : { totalItems: result.totalItems ?? null }),
       });
       schedule(() => {
         updateTransfer(id, { phase: "complete" });
@@ -220,6 +244,33 @@ export function useTransfers({
     }
     setGuidanceDismissed(true);
   }, [saveDownloadLocationGuidanceDismissed]);
+
+  const beginUploadOperation = useCallback(
+    (metadata = {}) => {
+      const descriptor = describeUploadOperation(metadata);
+      const { id, signal } = createTransfer(
+        "upload",
+        descriptor.name,
+        descriptor.totalBytes,
+        descriptor
+      );
+      return createUploadOperation({
+        descriptor,
+        isCancellation: (error) => error instanceof TransferCancelledError || error?.cancelled,
+        onCancelled: (summary) => markTransferCancelled(id, operationSummaryPatch(summary)),
+        onComplete: (summary) =>
+          completeTransfer(id, {
+            ...operationSummaryPatch(summary),
+            size: descriptor.totalBytes,
+          }),
+        onError: (error, summary) => failTransfer(id, error, operationSummaryPatch(summary)),
+        onProgress: (progress) => updateTransfer(id, progress),
+        runUpload: uploadFileResumable,
+        signal,
+      });
+    },
+    [completeTransfer, createTransfer, failTransfer, markTransferCancelled, updateTransfer]
+  );
 
   const uploadWithProgress = useCallback(
     async ({ file, folder, mode, documentId, note, renameToUpload, name: displayName, size }) => {
@@ -266,7 +317,13 @@ export function useTransfers({
           return { cancelled: true, status: 0 };
         }
       }
-      const { id, signal } = createTransfer("download", displayName || "Download", size || null);
+      const exportItems = Array.from(exportPayload?.items || []);
+      const { id, signal } = createTransfer("download", displayName || "Download", size || null, {
+        grouped: Boolean(exportPayload),
+        totalFiles: exportItems.filter((item) => item?.type === "document").length || null,
+        totalFolders: exportItems.filter((item) => item?.type === "folder").length || null,
+        totalItems: exportItems.length || null,
+      });
       try {
         const result = exportPayload
           ? await exportAndDownload({
@@ -316,6 +373,7 @@ export function useTransfers({
   );
 
   return {
+    beginUploadOperation,
     cancelTransfer,
     downloadWithProgress,
     transfers,

@@ -15,7 +15,25 @@ const bundled = await build({
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(bundled.outputFiles[0].text).toString(
   "base64"
 )}`;
-const { docToItem, folderToItem } = await import(moduleUrl);
+const { createBulkActionHandlers, docToItem, folderToItem } = await import(moduleUrl);
+
+function bulkHandlers(downloadWithProgress) {
+  return createBulkActionHandlers({
+    apiFetch: async () => ({ json: async () => ({}), ok: true }),
+    clearAllSelections: () => {},
+    docs: [],
+    downloadWithProgress,
+    folder: "",
+    refresh: async () => {},
+    requestConfirm: async () => true,
+    selectedDoc: null,
+    setBusy: () => {},
+    setDraggingFolderPath: () => {},
+    setDraggingId: () => {},
+    setDropHint: () => {},
+    setError: () => {},
+  });
+}
 
 test("document items preserve the namespaced visual descriptor", () => {
   const visual = {
@@ -45,4 +63,36 @@ test("folder items preserve only an explicit empty-folder delete capability", ()
     false
   );
   assert.equal(folderToItem({ id: 4, path: "Unknown", size_bytes: 0 }).can_delete_empty, false);
+});
+
+test("each multi-item download action creates one export operation", async () => {
+  const downloads = [];
+  const handlers = bulkHandlers(async (options) => {
+    downloads.push(options);
+    return { status: 200 };
+  });
+  const firstSelection = [
+    { id: 1, name: "one.txt", type: "document" },
+    { id: 2, name: "two.txt", type: "document" },
+    { id: 3, name: "Folder", path: "Folder", type: "folder" },
+  ];
+  const secondSelection = [
+    { id: 4, name: "four.txt", type: "document" },
+    { id: 5, name: "five.txt", type: "document" },
+  ];
+
+  await Promise.all([
+    handlers.handleDownloadSelection(firstSelection),
+    handlers.handleDownloadSelection(secondSelection),
+  ]);
+
+  assert.equal(downloads.length, 2);
+  assert.deepEqual(
+    downloads.map((download) => download.exportPayload.items.length),
+    [3, 2]
+  );
+  assert.equal(
+    downloads.every((download) => download.name === "vault-download.zip"),
+    true
+  );
 });

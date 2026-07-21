@@ -152,6 +152,7 @@ export function App({ initial }) {
 
   const {
     apiFetch,
+    beginUploadOperation,
     cancelTransfer,
     downloadWithProgress,
     logoutUrl,
@@ -536,6 +537,7 @@ export function App({ initial }) {
 
   const { handleUpload, handleUploadDrop, handleUploadFolder } = createUploadHandlers({
     apiFetch,
+    beginUploadOperation,
     blocked: shareResolving,
     fileScheduler: uploadFileScheduler,
     refresh: refreshAfterUpload,

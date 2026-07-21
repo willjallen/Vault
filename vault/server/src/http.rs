@@ -49,10 +49,10 @@ use crate::exports::{
 };
 use crate::folders::{
     CreatedFolderPayload, DeletedFolderPayload, FolderError, FolderPermissionUpdate,
-    FolderRetentionUpdate, create_folder_path, delete_empty_folder,
-    get_or_create_folder_path_in_tx, move_folder, rename_folder, resolve_visible_folder_by_id,
-    resolve_visible_folder_by_path, update_folder_permissions, update_folder_properties,
-    update_folder_retention,
+    FolderRetentionUpdate, create_folder_path, delete_empty_folder, get_folder_by_path,
+    get_or_create_folder_path_in_tx, move_folder, normalize_folder, rename_folder,
+    require_folder_write_access, resolve_visible_folder_by_id, resolve_visible_folder_by_path,
+    update_folder_permissions, update_folder_properties, update_folder_retention,
 };
 use crate::oidc::{self, CallbackRequest, OidcError};
 use crate::preferences::{PreferenceError, update_preferences_for_user};
@@ -743,6 +743,8 @@ struct PreferencesResponse {
 #[derive(Debug, Deserialize)]
 struct CreateFolderForm {
     folder: String,
+    #[serde(default)]
+    exist_ok: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -866,8 +868,27 @@ async fn create_folder(
     Form(form): Form<CreateFolderForm>,
 ) -> Result<Json<CreatedFolderPayload>, ApiError> {
     let user = current_user(&state, &headers).await?;
-    let payload = create_folder_path(&state.db, &form.folder, &user).await?;
-    notify_state_event_committed();
+    let (payload, created) = match create_folder_path(&state.db, &form.folder, &user).await {
+        Ok(payload) => (payload, true),
+        Err(FolderError::FolderAlreadyExists) if form.exist_ok => {
+            let normalized = normalize_folder(Some(&form.folder))?;
+            let existing = get_folder_by_path(&state.db, Some(&normalized))
+                .await?
+                .ok_or(FolderError::FolderNotFound)?;
+            require_folder_write_access(&state.db, existing.id, &user).await?;
+            (
+                CreatedFolderPayload {
+                    folder: normalized,
+                    id: existing.id,
+                },
+                false,
+            )
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if created {
+        notify_state_event_committed();
+    }
     Ok(Json(payload))
 }
 

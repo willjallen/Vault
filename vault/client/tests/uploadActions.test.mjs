@@ -15,7 +15,7 @@ const bundled = await build({
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(
   bundled.outputFiles.at(0).text
 ).toString("base64")}`;
-const { UploadFileScheduler, uploadFileBatch } = await import(moduleUrl);
+const { UploadFileScheduler, uploadFileBatch, uploadFileTree } = await import(moduleUrl);
 
 function filesWithNames(names) {
   return names.map((name) => new File([name], name, { type: "application/octet-stream" }));
@@ -397,4 +397,165 @@ test("a sustained upload stream compacts consumed scheduler entries", async () =
   assert.ok(maxBackingEntries <= 66, `scheduler retained ${maxBackingEntries} queue entries`);
   assert.equal(scheduler.queue.length, 0);
   assert.equal(scheduler.queuedCount, 0);
+});
+
+test("folder trees create parents first and upload same-named files into relative folders", async () => {
+  const first = new File(["first"], "same.txt", { type: "text/plain" });
+  const second = new File(["second"], "same.txt", { type: "text/plain" });
+  const empty = new File([], "empty.txt", { type: "text/plain" });
+  const createdFolders = [];
+  const refreshes = [];
+  const uploads = [];
+
+  const result = await uploadFileTree({
+    createFolder: async (path) => createdFolders.push(path),
+    refresh: async (...args) => refreshes.push(args),
+    scheduler: new UploadFileScheduler(2),
+    setError: () => {},
+    targetFolder: "Shared/Incoming",
+    tree: {
+      directories: ["Package/Two", "Package/Empty", "Package", "Package/One", "Package"],
+      files: [
+        { file: first, relativePath: "Package/One/same.txt" },
+        { file: second, relativePath: "Package/Two/same.txt" },
+        { file: empty, relativePath: "Package/empty.txt" },
+      ],
+    },
+    uploadWithProgress: async (options) => {
+      uploads.push(options);
+      await nextTurn();
+      return { id: `${options.folder}/${options.file.name}` };
+    },
+  });
+
+  assert.deepEqual(createdFolders, [
+    "Shared/Incoming/Package",
+    "Shared/Incoming/Package/Empty",
+    "Shared/Incoming/Package/One",
+    "Shared/Incoming/Package/Two",
+  ]);
+  assert.deepEqual(
+    uploads.map(({ file, folder, mode, name, size }) => ({ file, folder, mode, name, size })),
+    [
+      {
+        file: first,
+        folder: "Shared/Incoming/Package/One",
+        mode: "create",
+        name: "same.txt",
+        size: 5,
+      },
+      {
+        file: second,
+        folder: "Shared/Incoming/Package/Two",
+        mode: "create",
+        name: "same.txt",
+        size: 6,
+      },
+      {
+        file: empty,
+        folder: "Shared/Incoming/Package",
+        mode: "create",
+        name: "empty.txt",
+        size: 0,
+      },
+    ]
+  );
+  assert.deepEqual(refreshes, [["Shared/Incoming", { sidebar: true }]]);
+  assert.equal(result.attempted, 3);
+  assert.equal(result.failed, 0);
+  assert.equal(result.succeeded, 3);
+  assert.equal(result.foldersBlocked, 0);
+  assert.equal(result.foldersCreated, 4);
+  assert.equal(result.foldersRequested, 4);
+});
+
+test("an empty dropped folder is created and refreshed without inventing a file", async () => {
+  const createdFolders = [];
+  const refreshes = [];
+  let uploads = 0;
+
+  const result = await uploadFileTree({
+    createFolder: async (path) => createdFolders.push(path),
+    refresh: async (...args) => refreshes.push(args),
+    setError: () => {},
+    targetFolder: "Shared/Incoming",
+    tree: { directories: ["Empty"], files: [] },
+    uploadWithProgress: async () => {
+      uploads += 1;
+    },
+  });
+
+  assert.deepEqual(createdFolders, ["Shared/Incoming/Empty"]);
+  assert.deepEqual(refreshes, [["Shared/Incoming", { sidebar: true }]]);
+  assert.equal(uploads, 0);
+  assert.equal(result.attempted, 0);
+  assert.equal(result.succeeded, 0);
+  assert.equal(result.foldersCreated, 1);
+});
+
+test("a blocked folder tree performs no folder or file mutations", async () => {
+  const errors = nonemptyErrors();
+  let creates = 0;
+  let refreshes = 0;
+  let uploads = 0;
+  const file = new File(["payload"], "file.txt");
+
+  const result = await uploadFileTree({
+    blocked: true,
+    createFolder: async () => {
+      creates += 1;
+    },
+    refresh: async () => {
+      refreshes += 1;
+    },
+    setError: errors.setError,
+    targetFolder: "Shared/Incoming",
+    tree: {
+      directories: ["Folder"],
+      files: [{ file, relativePath: "Folder/file.txt" }],
+    },
+    uploadWithProgress: async () => {
+      uploads += 1;
+    },
+  });
+
+  assert.equal(creates, 0);
+  assert.equal(uploads, 0);
+  assert.equal(refreshes, 0);
+  assert.equal(result.blocked, 1);
+  assert.equal(result.foldersBlocked, 1);
+  assert.deepEqual(errors.messages, ["Wait for the destination folder to finish loading."]);
+});
+
+test("a partial folder creation failure refreshes the visible hierarchy and starts no files", async () => {
+  const createdFolders = [];
+  const refreshes = [];
+  let uploads = 0;
+  const file = new File(["payload"], "file.txt");
+
+  await assert.rejects(
+    uploadFileTree({
+      createFolder: async (path) => {
+        if (path.endsWith("/Folder/Sub")) {
+          throw new Error("Folder creation refused");
+        }
+        createdFolders.push(path);
+      },
+      refresh: async (...args) => refreshes.push(args),
+      setError: () => {},
+      targetFolder: "Shared/Incoming",
+      tree: {
+        directories: ["Folder/Sub", "Folder"],
+        files: [{ file, relativePath: "Folder/Sub/file.txt" }],
+      },
+      uploadWithProgress: async () => {
+        uploads += 1;
+      },
+    }),
+    /Folder creation refused/
+  );
+
+  assert.deepEqual(createdFolders, ["Shared/Incoming/Folder"]);
+  assert.deepEqual(refreshes, [["Shared/Incoming", { sidebar: true }]]);
+  assert.equal(uploads, 0);
 });

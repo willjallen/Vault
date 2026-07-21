@@ -566,6 +566,66 @@ async fn create_folder_rejects_archive_duplicate_and_missing_write_access() {
 }
 
 #[tokio::test]
+async fn idempotent_folder_create_requires_write_access_and_returns_existing_folder() {
+    let (state, _temp_dir) = test_state().await;
+    let writers = create_group(&state.db, "writers").await;
+    let readers = create_group(&state.db, "readers").await;
+    let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
+        .await
+        .expect("root");
+    add_folder_permission(&state.db, root.id, writers, true, true, true)
+        .await
+        .expect("writer root");
+    add_folder_permission(&state.db, root.id, readers, true, true, false)
+        .await
+        .expect("reader root");
+    let app = http::router(state);
+
+    let created = app
+        .clone()
+        .oneshot(authed_form_post(
+            "/folders",
+            "writer",
+            "writers",
+            "folder=Project",
+        ))
+        .await
+        .expect("create response");
+    assert_eq!(created.status(), StatusCode::OK);
+    let created_json = response_json(created).await;
+
+    let idempotent = app
+        .clone()
+        .oneshot(authed_form_post(
+            "/folders",
+            "writer",
+            "writers",
+            "folder=Project&exist_ok=true",
+        ))
+        .await
+        .expect("idempotent create response");
+    let idempotent_status = idempotent.status();
+    let idempotent_json = response_json(idempotent).await;
+    assert_eq!(idempotent_status, StatusCode::OK);
+    assert_eq!(idempotent_json["folder"], "Project");
+    assert_eq!(idempotent_json["id"], created_json["id"]);
+
+    let read_only = app
+        .oneshot(authed_form_post(
+            "/folders",
+            "reader",
+            "readers",
+            "folder=Project&exist_ok=true",
+        ))
+        .await
+        .expect("idempotent read-only create response");
+    let read_only_status = read_only.status();
+    let read_only_json = response_json(read_only).await;
+    assert_eq!(read_only_status, StatusCode::FORBIDDEN);
+    assert_eq!(read_only_json["detail"], "Insufficient folder access");
+}
+
+#[tokio::test]
 async fn sidebar_exposes_only_visible_root_children() {
     let (state, _temp_dir) = test_state().await;
     let viewers = create_group(&state.db, "viewers").await;

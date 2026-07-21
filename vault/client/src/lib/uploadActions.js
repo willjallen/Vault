@@ -30,6 +30,33 @@ function normalizedUploadFileName(file) {
     .trim();
 }
 
+function folderDepth(path) {
+  return String(path || "")
+    .split("/")
+    .filter(Boolean).length;
+}
+
+function orderedDirectoryPaths(paths) {
+  return [...new Set((paths || []).map((path) => String(path || "")).filter(Boolean))].sort(
+    (left, right) => folderDepth(left) - folderDepth(right) || left.localeCompare(right)
+  );
+}
+
+function joinedFolderPath(parentFolder, child) {
+  if (!parentFolder) {
+    return child || "";
+  }
+  return child ? `${parentFolder}/${child}` : parentFolder;
+}
+
+function relativeFileFolder(relativePath) {
+  return String(relativePath || "")
+    .split("/")
+    .filter(Boolean)
+    .slice(0, -1)
+    .join("/");
+}
+
 export class UploadFileScheduler {
   constructor(concurrency = DEFAULT_UPLOAD_FILE_CONCURRENCY) {
     this.activeCount = 0;
@@ -119,6 +146,7 @@ export async function uploadFileBatch({
   scheduler: fileScheduler,
   setError,
   targetFolder = "",
+  targetFolderForFile,
   uploadWithProgress,
 }) {
   const pendingFiles = uploadFiles(files);
@@ -140,9 +168,11 @@ export async function uploadFileBatch({
   }
 
   setError("");
-  const destination = targetFolder || "";
   const uploadScheduler = fileScheduler || new UploadFileScheduler(concurrency);
-  const outcomePromises = pendingFiles.map((file) => {
+  const outcomePromises = pendingFiles.map((file, index) => {
+    const destination = targetFolderForFile
+      ? String(targetFolderForFile(file, index) || "")
+      : targetFolder || "";
     const uploadName = normalizedUploadFileName(file);
     const key = uploadName ? JSON.stringify([destination, uploadName]) : "";
     return uploadScheduler
@@ -186,5 +216,79 @@ export async function uploadFileBatch({
     failed: failures.length,
     outcomes: orderedOutcomes,
     succeeded,
+  };
+}
+
+export async function uploadFileTree({
+  blocked = false,
+  blockedReason = "",
+  concurrency = DEFAULT_UPLOAD_FILE_CONCURRENCY,
+  createFolder,
+  refresh,
+  scheduler: fileScheduler,
+  setError,
+  targetFolder = "",
+  tree,
+  uploadWithProgress,
+}) {
+  const directories = orderedDirectoryPaths(tree?.directories);
+  const entries = Array.from(tree?.files || []).filter((entry) => entry?.file);
+  let foldersCreated = 0;
+  const normalizedBlockedReason = String(blockedReason || "").trim();
+  if (blocked || normalizedBlockedReason) {
+    setError(normalizedBlockedReason || "Wait for the destination folder to finish loading.");
+    return {
+      attempted: 0,
+      blocked: entries.length,
+      cancelled: 0,
+      failed: 0,
+      foldersBlocked: directories.length,
+      foldersCreated: 0,
+      foldersRequested: directories.length,
+      outcomes: new Array(entries.length),
+      succeeded: 0,
+    };
+  }
+
+  try {
+    for (const relativePath of directories) {
+      await createFolder(joinedFolderPath(targetFolder, relativePath));
+      foldersCreated += 1;
+    }
+  } catch (error) {
+    if (foldersCreated > 0) {
+      await refresh(targetFolder || "", { sidebar: true });
+    }
+    throw error;
+  }
+
+  let result;
+  try {
+    result = await uploadFileBatch({
+      concurrency,
+      files: entries.map((entry) => entry.file),
+      refresh: async () => {},
+      scheduler: fileScheduler,
+      setError,
+      targetFolder,
+      targetFolderForFile: (_file, index) =>
+        joinedFolderPath(targetFolder, relativeFileFolder(entries.at(index)?.relativePath)),
+      uploadWithProgress,
+    });
+  } catch (error) {
+    if (foldersCreated > 0) {
+      await refresh(targetFolder || "", { sidebar: true });
+    }
+    throw error;
+  }
+
+  if (foldersCreated > 0 || result.succeeded > 0) {
+    await refresh(targetFolder || "", { sidebar: foldersCreated > 0 });
+  }
+  return {
+    ...result,
+    foldersBlocked: 0,
+    foldersCreated,
+    foldersRequested: directories.length,
   };
 }

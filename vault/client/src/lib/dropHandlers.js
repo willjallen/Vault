@@ -41,8 +41,12 @@ function selectionHasFolders(items) {
   return items.some((item) => item.type === "folder");
 }
 
-function filesFromDrop(dropEvent) {
-  return Array.from(dropEvent.dataTransfer?.files || []);
+function hasExternalFiles(dropEvent) {
+  const dataTransfer = dropEvent.dataTransfer;
+  return Boolean(
+    (dataTransfer?.types && Array.from(dataTransfer.types).includes("Files")) ||
+    dataTransfer?.files?.length
+  );
 }
 
 function handleSelectionDrop({
@@ -168,9 +172,8 @@ function handleFileDrop({
   isPreview,
   setDropHint,
   setUploadHover,
-  handleUpload,
+  handleUploadDrop,
 }) {
-  const files = filesFromDrop(dropEvent);
   dropEvent.preventDefault();
   if (isPreview) {
     setDropHint(targetFolder);
@@ -179,7 +182,7 @@ function handleFileDrop({
   }
   setDropHint(null);
   setUploadHover(false);
-  return handleUpload(files, targetFolder || "");
+  return handleUploadDrop(dropEvent.dataTransfer, targetFolder || "");
 }
 
 function handleDocDrop({
@@ -234,7 +237,7 @@ export function createDropHandlers({
   handleRenameFolder,
   handleArchiveItems,
   handleMoveSelection,
-  handleUpload,
+  handleUploadDrop,
   handleMove,
   handleArchive,
   setDraggingId,
@@ -281,18 +284,14 @@ export function createDropHandlers({
       });
       return;
     }
-    const hasFiles =
-      dropEvent.dataTransfer &&
-      dropEvent.dataTransfer.files &&
-      dropEvent.dataTransfer.files.length > 0;
-    if (hasFiles) {
+    if (hasExternalFiles(dropEvent)) {
       return handleFileDrop({
         targetFolder,
         dropEvent,
         isPreview,
         setDropHint,
         setUploadHover,
-        handleUpload,
+        handleUploadDrop,
       });
     }
     const doc = getDocFromDrag(dropEvent, docs);
@@ -348,11 +347,10 @@ export function createDropHandlers({
       });
       return;
     }
-    const files = filesFromDrop(canvasEvent);
-    if (files.length) {
+    if (hasExternalFiles(canvasEvent)) {
       setDropHint(null);
       setUploadHover(false);
-      return handleUpload(files, target);
+      return handleUploadDrop(canvasEvent.dataTransfer, target);
     }
     const doc = getDocFromDrag(canvasEvent, docs);
     if (!doc) {

@@ -57,7 +57,7 @@ function dropHandlers(overrides = {}) {
     handleMove: () => {},
     handleMoveSelection: () => {},
     handleRenameFolder: () => {},
-    handleUpload: () => {},
+    handleUploadDrop: () => {},
     setDraggingFolderPath: () => {},
     setDraggingId: () => {},
     setDropHint: () => {},
@@ -75,13 +75,13 @@ function uploadFiles() {
   ];
 }
 
-test("dropping multiple files on a folder forwards every file in order", () => {
+test("dropping external items on a folder forwards the intact data transfer", () => {
   const files = uploadFiles();
   const uploads = [];
   const event = dropEventFor(files);
   const handlers = dropHandlers({
-    handleUpload: (droppedFiles, targetFolder) => {
-      uploads.push({ droppedFiles, targetFolder });
+    handleUploadDrop: (dataTransfer, targetFolder) => {
+      uploads.push({ dataTransfer, targetFolder });
     },
   });
 
@@ -89,18 +89,17 @@ test("dropping multiple files on a folder forwards every file in order", () => {
 
   assert.equal(event.prevented, 1);
   assert.equal(uploads.length, 1);
-  assert.equal(Array.isArray(uploads[0].droppedFiles), true);
-  assert.deepEqual(uploads[0].droppedFiles, files);
+  assert.equal(uploads[0].dataTransfer, event.dataTransfer);
   assert.equal(uploads[0].targetFolder, "Shared/Review");
 });
 
-test("dropping multiple files on the canvas targets the current shared folder", () => {
+test("dropping external items on the canvas targets the current shared folder", () => {
   const files = uploadFiles();
   const uploads = [];
   const event = dropEventFor(files);
   const handlers = dropHandlers({
-    handleUpload: (droppedFiles, targetFolder) => {
-      uploads.push({ droppedFiles, targetFolder });
+    handleUploadDrop: (dataTransfer, targetFolder) => {
+      uploads.push({ dataTransfer, targetFolder });
     },
   });
 
@@ -108,7 +107,22 @@ test("dropping multiple files on the canvas targets the current shared folder", 
 
   assert.equal(event.prevented, 1);
   assert.equal(uploads.length, 1);
-  assert.equal(Array.isArray(uploads[0].droppedFiles), true);
-  assert.deepEqual(uploads[0].droppedFiles, files);
+  assert.equal(uploads[0].dataTransfer, event.dataTransfer);
   assert.equal(uploads[0].targetFolder, "Shared/Incoming");
+});
+
+test("folder drop previews use the Files type while browser file data is protected", () => {
+  const uploadHover = [];
+  const dropHints = [];
+  const event = dropEventFor([]);
+  const handlers = dropHandlers({
+    setDropHint: (value) => dropHints.push(value),
+    setUploadHover: (value) => uploadHover.push(value),
+  });
+
+  handlers.handleDropOnFolder("Shared/Review", event, true);
+
+  assert.equal(event.prevented, 1);
+  assert.deepEqual(dropHints, ["Shared/Review"]);
+  assert.deepEqual(uploadHover, [true]);
 });

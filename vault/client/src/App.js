@@ -38,7 +38,8 @@ import {
   useShareLinkResolution,
 } from "./lib/shareLinks.js";
 import { useAuthFetch } from "./lib/useAuthFetch.js";
-import { UploadFileScheduler, uploadFileBatch } from "./lib/uploadActions.js";
+import { UploadFileScheduler } from "./lib/uploadActions.js";
+import { createUploadHandlers } from "./lib/uploadHandlers.js";
 import { useFolderNavigation } from "./lib/useFolderNavigation.js";
 import { useFavoritePreferenceActions } from "./lib/useFavoritePreferenceActions.js";
 import { useMoveDialog } from "./lib/useMoveDialog.js";
@@ -531,27 +532,17 @@ export function App({ initial }) {
     }
   }
 
-  async function handleUpload(files, targetFolder = folder) {
-    try {
-      return await uploadFileBatch({
-        blocked: shareResolving,
-        files,
-        refresh: refreshAfterUpload,
-        scheduler: uploadFileScheduler,
-        setError,
-        targetFolder,
-        uploadWithProgress,
-      });
-    } catch (err) {
-      setError(err.message || "Upload failed. Please try again.");
-      return null;
-    } finally {
-      setUploadHover(false);
-      if (uploadInput.current) {
-        uploadInput.current.value = "";
-      }
-    }
-  }
+  const { handleUpload, handleUploadDrop } = createUploadHandlers({
+    apiFetch,
+    blocked: shareResolving,
+    fileScheduler: uploadFileScheduler,
+    refresh: refreshAfterUpload,
+    setError,
+    setUploadHover,
+    targetFolder: folder,
+    uploadInput,
+    uploadWithProgress,
+  });
 
   const {
     handleArchive,
@@ -647,7 +638,7 @@ export function App({ initial }) {
     handleArchiveFolder,
     handleMoveSelection,
     handleRenameFolder,
-    handleUpload,
+    handleUploadDrop,
     handleMove,
     handleArchive,
     setDraggingId,

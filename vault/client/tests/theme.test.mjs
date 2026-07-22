@@ -1,7 +1,8 @@
 import { Buffer } from "node:buffer";
-import { readFile } from "node:fs/promises";
 import assert from "node:assert/strict";
 import test from "node:test";
+
+import { build } from "esbuild";
 
 globalThis.React = {
   useCallback: () => {},
@@ -10,8 +11,16 @@ globalThis.React = {
 };
 
 const sourceUrl = new URL("../src/lib/theme.js", import.meta.url);
-const source = await readFile(sourceUrl, "utf8");
-const moduleUrl = `data:text/javascript;base64,${Buffer.from(source).toString("base64")}`;
+const bundle = await build({
+  bundle: true,
+  entryPoints: [sourceUrl.pathname],
+  format: "esm",
+  platform: "node",
+  write: false,
+});
+const moduleUrl = `data:text/javascript;base64,${Buffer.from(
+  bundle.outputFiles.at(0).text
+).toString("base64")}`;
 const { normalizeUserPreferences } = await import(moduleUrl);
 
 test("boolean preferences accept only real booleans", () => {
@@ -40,4 +49,16 @@ test("boolean preference strings fall back to defaults", () => {
   assert.equal(normalized.alternateRows, false);
   assert.equal(normalized.doubleClickDownload, false);
   assert.equal(normalized.downloadLocationGuidanceDismissed, false);
+});
+
+test("synced contents views are normalized by folder path", () => {
+  const normalized = normalizeUserPreferences({
+    contentsViewByFolder: {
+      "Projects/Alpha": { iconSize: 112, mode: "icons", version: 99 },
+    },
+  });
+
+  assert.deepEqual(normalized.contentsViewByFolder, {
+    "Projects/Alpha": { iconSize: 112, mode: "icons", version: 1 },
+  });
 });

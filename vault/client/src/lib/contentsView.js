@@ -1,4 +1,5 @@
-export const CONTENTS_VIEW_STORAGE_KEY = "contentsView";
+import { normalizeFolderName } from "./utils.js";
+
 export const CONTENTS_VIEW_VERSION = 1;
 export const CONTENTS_VIEW_MODES = Object.freeze({
   DETAILS: "details",
@@ -48,6 +49,31 @@ export function normalizeContentsView(value) {
     iconSize: clampContentsIconSize(candidate.iconSize),
     mode,
     version: CONTENTS_VIEW_VERSION,
+  };
+}
+
+export function normalizeContentsViewByFolder(value) {
+  const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  return Object.fromEntries(
+    Object.entries(source)
+      .filter(([, view]) => view && typeof view === "object" && !Array.isArray(view))
+      .map(([folder, view]) => [normalizeFolderName(folder), normalizeContentsView(view)])
+  );
+}
+
+export function contentsViewForFolder(value, folder) {
+  const views = normalizeContentsViewByFolder(value);
+  const path = normalizeFolderName(folder);
+  return Object.prototype.hasOwnProperty.call(views, path)
+    ? // eslint-disable-next-line security/detect-object-injection
+      views[path]
+    : DEFAULT_CONTENTS_VIEW;
+}
+
+export function setContentsViewForFolder(value, folder, view) {
+  return {
+    ...normalizeContentsViewByFolder(value),
+    [normalizeFolderName(folder)]: normalizeContentsView(view),
   };
 }
 

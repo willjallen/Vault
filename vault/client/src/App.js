@@ -165,9 +165,11 @@ export function App({ initial }) {
   });
   const {
     alternateRows,
+    contentsViewByFolder,
     doubleClickDownload,
     favoriteItems,
     handleAlternateRowsChange,
+    handleContentsViewChange,
     handleDoubleClickDownloadChange,
     handleFavoriteItemsChange,
     handleOpenFoldersOnClickChange,
@@ -866,6 +868,7 @@ export function App({ initial }) {
       selectedId,
       contentsItems,
       contentsSort,
+      contentsViewByFolder,
       contentsSelection,
       folderItems: folderPaneItems,
       folderSelection,
@@ -904,6 +907,7 @@ export function App({ initial }) {
       onSearchQueryChange: setSearchQuery,
       onRecursiveSearchChange: setRecursiveSearch,
       onContentsSortChange: handleContentsSortChange,
+      onContentsViewChange: handleContentsViewChange,
       onClearSelection: clearAllSelections,
       onContentsMarqueeSelectionChange: handleContentsMarqueeSelectionChange,
       onOpenDoc: handleView,

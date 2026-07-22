@@ -3,6 +3,7 @@ use sqlx::SqlitePool;
 use thiserror::Error;
 
 use crate::auth::UserContext;
+use crate::folders::normalize_folder;
 use crate::state_events::record_state_event_in_tx;
 
 const SIDEBAR_SECTION_KEYS: [&str; 4] = ["folders", "favorites", "editing", "archive"];
@@ -10,6 +11,12 @@ const MIN_SIDEBAR_SECTION_SIZE: i64 = 32;
 const MAX_SIDEBAR_SECTION_SIZE: i64 = 4000;
 const MIN_SIDEBAR_SECTION_SIZE_F64: f64 = 32.0;
 const MAX_SIDEBAR_SECTION_SIZE_F64: f64 = 4000.0;
+const CONTENTS_VIEW_VERSION: i64 = 1;
+const DEFAULT_CONTENTS_ICON_SIZE: i64 = 80;
+const MIN_CONTENTS_ICON_SIZE: i64 = 56;
+const MAX_CONTENTS_ICON_SIZE: i64 = 176;
+const MIN_CONTENTS_ICON_SIZE_F64: f64 = 56.0;
+const MAX_CONTENTS_ICON_SIZE_F64: f64 = 176.0;
 
 #[derive(Debug, Error)]
 pub enum PreferenceError {
@@ -123,6 +130,10 @@ pub fn normalize_user_preferences(raw: &Value) -> Value {
         "sidebarSectionCollapsed".to_string(),
         clean_sidebar_section_collapsed(raw_object.get("sidebarSectionCollapsed")),
     );
+    normalized.insert(
+        "contentsViewByFolder".to_string(),
+        clean_contents_view_by_folder(raw_object.get("contentsViewByFolder")),
+    );
 
     Value::Object(normalized)
 }
@@ -170,6 +181,9 @@ pub fn clean_user_preference_patch(raw: &Value) -> Result<Map<String, Value>, Pr
             "sidebarSectionCollapsed" => {
                 cleaned.insert(key.clone(), clean_sidebar_section_collapsed_strict(value)?);
             }
+            "contentsViewByFolder" => {
+                cleaned.insert(key.clone(), clean_contents_view_by_folder_strict(value)?);
+            }
             _ => return Err(invalid_patch(format!("Unknown preference: {key}"))),
         }
     }
@@ -179,8 +193,18 @@ pub fn clean_user_preference_patch(raw: &Value) -> Result<Map<String, Value>, Pr
 #[must_use]
 pub fn merge_user_preferences(existing: &Value, patch: Map<String, Value>) -> Value {
     let mut merged = normalize_user_preferences(existing);
+    let mut patch = patch;
+    let contents_view_patch = patch.remove("contentsViewByFolder");
     if let Some(object) = merged.as_object_mut() {
         object.extend(patch);
+        if let Some(Value::Object(entries)) = contents_view_patch {
+            let target = object
+                .entry("contentsViewByFolder".to_string())
+                .or_insert_with(|| Value::Object(Map::new()));
+            if let Some(target_entries) = target.as_object_mut() {
+                target_entries.extend(entries);
+            }
+        }
     }
     normalize_user_preferences(&merged)
 }
@@ -205,7 +229,104 @@ fn default_preferences() -> Map<String, Value> {
             "sidebarSectionCollapsed".to_string(),
             clean_sidebar_section_collapsed(None),
         ),
+        ("contentsViewByFolder".to_string(), json!({})),
     ])
+}
+
+fn clean_contents_view_by_folder(raw: Option<&Value>) -> Value {
+    let Some(entries) = raw.and_then(Value::as_object) else {
+        return json!({});
+    };
+    Value::Object(
+        entries
+            .iter()
+            .filter_map(|(path, view)| {
+                let normalized_path = normalize_folder(Some(path)).ok()?;
+                if normalized_path != *path {
+                    return None;
+                }
+                clean_contents_view(view).map(|view| (path.clone(), view))
+            })
+            .collect(),
+    )
+}
+
+fn clean_contents_view_by_folder_strict(raw: &Value) -> Result<Value, PreferenceError> {
+    let Some(entries) = raw.as_object() else {
+        return Err(invalid_patch("contentsViewByFolder must be an object"));
+    };
+    let mut cleaned = Map::new();
+    for (path, view) in entries {
+        let normalized_path = normalize_folder(Some(path))
+            .map_err(|_| invalid_patch("Contents view folder path is invalid"))?;
+        if normalized_path != *path {
+            return Err(invalid_patch("Contents view folder path must be canonical"));
+        }
+        cleaned.insert(path.clone(), clean_contents_view_strict(view)?);
+    }
+    Ok(Value::Object(cleaned))
+}
+
+fn clean_contents_view(raw: &Value) -> Option<Value> {
+    let view = raw.as_object()?;
+    let mode = view
+        .get("mode")
+        .and_then(Value::as_str)
+        .filter(|mode| matches!(*mode, "details" | "list" | "icons"))
+        .unwrap_or("details");
+    let icon_size = view
+        .get("iconSize")
+        .and_then(contents_icon_size_value)
+        .unwrap_or(DEFAULT_CONTENTS_ICON_SIZE);
+    Some(json!({
+        "mode": mode,
+        "iconSize": icon_size,
+        "version": CONTENTS_VIEW_VERSION,
+    }))
+}
+
+fn clean_contents_view_strict(raw: &Value) -> Result<Value, PreferenceError> {
+    let Some(view) = raw.as_object() else {
+        return Err(invalid_patch("Contents views must be objects"));
+    };
+    for key in view.keys() {
+        if !matches!(key.as_str(), "mode" | "iconSize" | "version") {
+            return Err(invalid_patch(format!("Unknown contents view field: {key}")));
+        }
+    }
+    let Some(mode) = view
+        .get("mode")
+        .and_then(Value::as_str)
+        .filter(|mode| matches!(*mode, "details" | "list" | "icons"))
+    else {
+        return Err(invalid_patch("Invalid contents view mode"));
+    };
+    let Some(icon_size) = view.get("iconSize").and_then(contents_icon_size_value) else {
+        return Err(invalid_patch("Contents view iconSize must be numeric"));
+    };
+    Ok(json!({
+        "mode": mode,
+        "iconSize": icon_size,
+        "version": CONTENTS_VIEW_VERSION,
+    }))
+}
+
+fn contents_icon_size_value(raw: &Value) -> Option<i64> {
+    if let Some(value) = raw.as_i64() {
+        return Some(value.clamp(MIN_CONTENTS_ICON_SIZE, MAX_CONTENTS_ICON_SIZE));
+    }
+    if let Some(value) = raw.as_u64() {
+        return Some(
+            i64::try_from(value)
+                .unwrap_or(i64::MAX)
+                .clamp(MIN_CONTENTS_ICON_SIZE, MAX_CONTENTS_ICON_SIZE),
+        );
+    }
+    let rounded = raw
+        .as_f64()?
+        .round()
+        .clamp(MIN_CONTENTS_ICON_SIZE_F64, MAX_CONTENTS_ICON_SIZE_F64);
+    format!("{rounded:.0}").parse::<i64>().ok()
 }
 
 fn clean_favorite_items(raw: Option<&Value>) -> Value {

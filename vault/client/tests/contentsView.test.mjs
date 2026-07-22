@@ -21,32 +21,15 @@ const {
   MAX_CONTENTS_ICON_SIZE,
   MIN_CONTENTS_ICON_SIZE,
   VIEW_WHEEL_HYSTERESIS,
+  contentsViewForFolder,
   contentsViewFromSlider,
   contentsViewSliderValue,
+  normalizeContentsViewByFolder,
   normalizeContentsView,
   normalizeWheelDelta,
+  setContentsViewForFolder,
   stepContentsViewWithWheel,
 } = await import(moduleUrl);
-
-const storedPreferences = new Map();
-globalThis.window = {
-  localStorage: {
-    getItem: (key) => storedPreferences.get(key) || null,
-    setItem: (key, value) => storedPreferences.set(key, value),
-  },
-};
-const preferencesSourceUrl = new URL("../src/lib/localPreferences.js", import.meta.url);
-const preferencesBundle = await build({
-  bundle: true,
-  entryPoints: [preferencesSourceUrl.pathname],
-  format: "esm",
-  platform: "node",
-  write: false,
-});
-const preferencesModuleUrl = `data:text/javascript;base64,${Buffer.from(
-  preferencesBundle.outputFiles.at(0).text
-).toString("base64")}`;
-const { readLocalPreference, writeLocalPreference } = await import(preferencesModuleUrl);
 
 test("contents view preferences normalize invalid and out-of-range values", () => {
   assert.deepEqual(normalizeContentsView({ iconSize: 999, mode: "unknown", version: 99 }), {
@@ -91,11 +74,36 @@ test("wheel delta normalization handles line and page modes", () => {
   assert.equal(normalizeWheelDelta(2, 2, 500), 1000);
 });
 
-test("contents view preferences persist only normalized semantic state", () => {
-  writeLocalPreference("contentsView", { iconSize: 91, mode: CONTENTS_VIEW_MODES.ICONS });
-  assert.deepEqual(readLocalPreference("contentsView"), {
+test("contents views are normalized and isolated by folder path", () => {
+  const views = setContentsViewForFolder({}, "Projects/Alpha", {
+    iconSize: 91,
+    mode: CONTENTS_VIEW_MODES.ICONS,
+  });
+
+  assert.deepEqual(contentsViewForFolder(views, "Projects/Alpha"), {
     iconSize: 91,
     mode: CONTENTS_VIEW_MODES.ICONS,
     version: CONTENTS_VIEW_VERSION,
   });
+  assert.deepEqual(contentsViewForFolder(views, "Projects/Beta"), {
+    iconSize: 80,
+    mode: CONTENTS_VIEW_MODES.DETAILS,
+    version: CONTENTS_VIEW_VERSION,
+  });
+});
+
+test("contents view maps normalize malformed entries and canonical folder keys", () => {
+  assert.deepEqual(
+    normalizeContentsViewByFolder({
+      "/Projects/Alpha/": { iconSize: 999, mode: CONTENTS_VIEW_MODES.ICONS },
+      ignored: null,
+    }),
+    {
+      "Projects/Alpha": {
+        iconSize: MAX_CONTENTS_ICON_SIZE,
+        mode: CONTENTS_VIEW_MODES.ICONS,
+        version: CONTENTS_VIEW_VERSION,
+      },
+    }
+  );
 });

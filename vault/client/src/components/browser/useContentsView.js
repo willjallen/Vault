@@ -1,9 +1,8 @@
 import {
-  CONTENTS_VIEW_STORAGE_KEY,
+  contentsViewForFolder,
   normalizeContentsView,
   sameContentsView,
 } from "../../lib/contentsView.js";
-import { readLocalPreference, writeLocalPreference } from "../../lib/localPreferences.js";
 import {
   applyLayoutSnapshot,
   captureLayoutSnapshot,
@@ -12,17 +11,63 @@ import {
 
 const { useCallback, useEffect, useLayoutEffect, useRef, useState } = React;
 
-export function useContentsView({ interactionRef, listRef, locked }) {
+export function useContentsView({
+  contentsViewByFolder,
+  folder,
+  interactionRef,
+  listRef,
+  locked,
+  onContentsViewChange,
+}) {
   const layoutFrameRef = useRef(null);
   const layoutSnapshotRef = useRef(null);
   const pendingViewRef = useRef(null);
   const pendingViewRenderRef = useRef(false);
+  const pendingViewSaveRef = useRef(null);
+  const viewSaveTimerRef = useRef(null);
   const viewCommitTimerRef = useRef(null);
-  const [contentsView, setContentsView] = useState(() =>
-    normalizeContentsView(readLocalPreference(CONTENTS_VIEW_STORAGE_KEY))
-  );
+  const folderRef = useRef(folder || "");
+  const onContentsViewChangeRef = useRef(onContentsViewChange);
+  const synchronizedFolderRef = useRef(folder || "");
+  const savedContentsView = contentsViewForFolder(contentsViewByFolder, folder);
+  const [contentsView, setContentsView] = useState(savedContentsView);
   const contentsViewRef = useRef(contentsView);
   const committedViewRef = useRef(contentsView);
+  folderRef.current = folder || "";
+  onContentsViewChangeRef.current = onContentsViewChange;
+
+  const flushContentsViewSave = useCallback(() => {
+    if (viewSaveTimerRef.current) {
+      window.clearTimeout(viewSaveTimerRef.current);
+      viewSaveTimerRef.current = null;
+    }
+    const pending = pendingViewSaveRef.current;
+    pendingViewSaveRef.current = null;
+    if (pending && onContentsViewChangeRef.current) {
+      onContentsViewChangeRef.current(pending.folder, pending.view);
+    }
+  }, []);
+
+  const scheduleContentsViewSave = useCallback(
+    (next, options = {}) => {
+      if (pendingViewSaveRef.current && pendingViewSaveRef.current.folder !== folderRef.current) {
+        flushContentsViewSave();
+      }
+      pendingViewSaveRef.current = {
+        folder: folderRef.current,
+        view: normalizeContentsView(next),
+      };
+      if (options.commit) {
+        flushContentsViewSave();
+        return;
+      }
+      if (viewSaveTimerRef.current) {
+        window.clearTimeout(viewSaveTimerRef.current);
+      }
+      viewSaveTimerRef.current = window.setTimeout(flushContentsViewSave, 220);
+    },
+    [flushContentsViewSave]
+  );
 
   const commitLiveContentsView = useCallback(() => {
     if (viewCommitTimerRef.current) {
@@ -47,9 +92,13 @@ export function useContentsView({ interactionRef, listRef, locked }) {
       if (sameContentsView(current, next)) {
         if (options.commit) {
           commitLiveContentsView();
+          if (pendingViewSaveRef.current) {
+            flushContentsViewSave();
+          }
         }
         return;
       }
+      scheduleContentsViewSave(next, options);
       const animateLayout = shouldAnimateLayoutChange(current, next);
       if (!layoutSnapshotRef.current) {
         layoutSnapshotRef.current = captureLayoutSnapshot(listRef.current, animateLayout);
@@ -93,8 +142,48 @@ export function useContentsView({ interactionRef, listRef, locked }) {
         }, 180);
       }
     },
-    [commitLiveContentsView, interactionRef, listRef, locked]
+    [
+      commitLiveContentsView,
+      flushContentsViewSave,
+      interactionRef,
+      listRef,
+      locked,
+      scheduleContentsViewSave,
+    ]
   );
+
+  useLayoutEffect(() => {
+    const next = contentsViewForFolder(contentsViewByFolder, folder);
+    const folderChanged = synchronizedFolderRef.current !== (folder || "");
+    const pending = pendingViewSaveRef.current;
+    if (
+      !folderChanged &&
+      pending?.folder === (folder || "") &&
+      sameContentsView(contentsViewRef.current, pending.view)
+    ) {
+      return;
+    }
+    if (!folderChanged && sameContentsView(contentsViewRef.current, next)) {
+      return;
+    }
+    if (folderChanged) {
+      if (layoutFrameRef.current) {
+        window.cancelAnimationFrame(layoutFrameRef.current);
+        layoutFrameRef.current = null;
+      }
+      if (viewCommitTimerRef.current) {
+        window.clearTimeout(viewCommitTimerRef.current);
+        viewCommitTimerRef.current = null;
+      }
+      pendingViewRef.current = null;
+      pendingViewRenderRef.current = false;
+      layoutSnapshotRef.current = null;
+    }
+    synchronizedFolderRef.current = folder || "";
+    contentsViewRef.current = next;
+    committedViewRef.current = next;
+    setContentsView(next);
+  }, [contentsViewByFolder, folder]);
 
   useLayoutEffect(() => {
     contentsViewRef.current = contentsView;
@@ -105,13 +194,6 @@ export function useContentsView({ interactionRef, listRef, locked }) {
     applyLayoutSnapshot(listRef.current, snapshot);
   }, [contentsView, listRef]);
 
-  useEffect(() => {
-    const timer = window.setTimeout(() => {
-      writeLocalPreference(CONTENTS_VIEW_STORAGE_KEY, contentsView);
-    }, 220);
-    return () => window.clearTimeout(timer);
-  }, [contentsView]);
-
   useEffect(
     () => () => {
       if (layoutFrameRef.current) {
@@ -119,6 +201,9 @@ export function useContentsView({ interactionRef, listRef, locked }) {
       }
       if (viewCommitTimerRef.current) {
         window.clearTimeout(viewCommitTimerRef.current);
+      }
+      if (viewSaveTimerRef.current) {
+        window.clearTimeout(viewSaveTimerRef.current);
       }
     },
     []

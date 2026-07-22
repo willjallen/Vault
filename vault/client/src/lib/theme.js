@@ -1,7 +1,9 @@
+import { normalizeContentsViewByFolder, setContentsViewForFolder } from "./contentsView.js";
+
 export const THEME_OPTIONS = ["system", "light", "dark"];
 export const PALETTE_OPTIONS = ["cozy", "winui"];
 
-const { useCallback, useEffect, useState } = React;
+const { useCallback, useEffect, useRef, useState } = React;
 const USER_PREFERENCE_DEFAULTS = {
   themePreference: "system",
   palettePreference: "cozy",
@@ -9,6 +11,7 @@ const USER_PREFERENCE_DEFAULTS = {
   alternateRows: false,
   doubleClickDownload: false,
   downloadLocationGuidanceDismissed: false,
+  contentsViewByFolder: {},
   favoriteItems: [],
   sidebarSectionSizes: {
     folders: 180,
@@ -189,6 +192,7 @@ export function normalizeUserPreferences(value) {
       source.downloadLocationGuidanceDismissed,
       USER_PREFERENCE_DEFAULTS.downloadLocationGuidanceDismissed
     ),
+    contentsViewByFolder: normalizeContentsViewByFolder(source.contentsViewByFolder),
     favoriteItems: normalizeFavoriteItems(source.favoriteItems),
     sidebarSectionSizes: normalizeSidebarSectionSizes(source.sidebarSectionSizes),
     sidebarSectionCollapsed: normalizeSidebarSectionCollapsed(source.sidebarSectionCollapsed),
@@ -298,6 +302,21 @@ export function useAppearancePreferences({ apiFetch, initialPreferences } = {}) 
   const [userPreferences, setUserPreferences] = useState(() =>
     resolveInitialUserPreferences(initialPreferences)
   );
+  const contentsViewPendingRef = useRef(new Map());
+  const contentsViewRevisionRef = useRef(0);
+  const contentsViewSaveChainRef = useRef(Promise.resolve(null));
+
+  const reconcileSavedPreferences = useCallback((savedPreferences) => {
+    let contentsViewByFolder = savedPreferences.contentsViewByFolder;
+    contentsViewPendingRef.current.forEach((pending) => {
+      contentsViewByFolder = setContentsViewForFolder(
+        contentsViewByFolder,
+        pending.folder,
+        pending.view
+      );
+    });
+    return normalizeUserPreferences({ ...savedPreferences, contentsViewByFolder });
+  }, []);
 
   useEffect(() => {
     applyUserPreferences(userPreferences);
@@ -319,27 +338,26 @@ export function useAppearancePreferences({ apiFetch, initialPreferences } = {}) 
 
   const updatePreference = useCallback(
     (patch) => {
-      const nextPreferences = normalizeUserPreferences({ ...userPreferences, ...patch });
-      setUserPreferences(nextPreferences);
+      setUserPreferences((current) => normalizeUserPreferences({ ...current, ...patch }));
       patchUserPreferences(apiFetch, patch)
         .then((savedPreferences) => {
           if (savedPreferences) {
-            setUserPreferences(savedPreferences);
+            setUserPreferences(reconcileSavedPreferences(savedPreferences));
           }
         })
         .catch(() => {});
     },
-    [apiFetch, userPreferences]
+    [apiFetch, reconcileSavedPreferences]
   );
 
   const refreshUserPreferences = useCallback(() => {
     return fetchUserPreferences(apiFetch).then((savedPreferences) => {
       if (savedPreferences) {
-        setUserPreferences(savedPreferences);
+        setUserPreferences(reconcileSavedPreferences(savedPreferences));
       }
       return savedPreferences;
     });
-  }, [apiFetch]);
+  }, [apiFetch, reconcileSavedPreferences]);
 
   const handleThemePreferenceChange = useCallback(
     (preference) => updatePreference({ themePreference: preference }),
@@ -371,6 +389,51 @@ export function useAppearancePreferences({ apiFetch, initialPreferences } = {}) 
     [updatePreference]
   );
 
+  const handleContentsViewChange = useCallback(
+    (folder, view) => {
+      const contentsViewPatch = setContentsViewForFolder({}, folder, view);
+      const [[folderPath, normalizedView]] = Object.entries(contentsViewPatch);
+      contentsViewRevisionRef.current += 1;
+      const revision = contentsViewRevisionRef.current;
+      contentsViewPendingRef.current.set(folderPath, {
+        folder: folderPath,
+        revision,
+        view: normalizedView,
+      });
+      setUserPreferences((current) =>
+        normalizeUserPreferences({
+          ...current,
+          contentsViewByFolder: setContentsViewForFolder(
+            current.contentsViewByFolder,
+            folder,
+            view
+          ),
+        })
+      );
+      const save = contentsViewSaveChainRef.current
+        .catch(() => null)
+        .then(() => patchUserPreferences(apiFetch, { contentsViewByFolder: contentsViewPatch }));
+      contentsViewSaveChainRef.current = save;
+      save
+        .then((savedPreferences) => {
+          const pending = contentsViewPendingRef.current.get(folderPath);
+          if (pending?.revision === revision) {
+            contentsViewPendingRef.current.delete(folderPath);
+          }
+          if (savedPreferences) {
+            setUserPreferences(reconcileSavedPreferences(savedPreferences));
+          }
+        })
+        .catch(() => {
+          const pending = contentsViewPendingRef.current.get(folderPath);
+          if (pending?.revision === revision) {
+            contentsViewPendingRef.current.delete(folderPath);
+          }
+        });
+    },
+    [apiFetch, reconcileSavedPreferences]
+  );
+
   const handleSidebarSectionSizesChange = useCallback(
     (preference) => updatePreference({ sidebarSectionSizes: preference }),
     [updatePreference]
@@ -387,9 +450,11 @@ export function useAppearancePreferences({ apiFetch, initialPreferences } = {}) 
 
   return {
     alternateRows: userPreferences.alternateRows,
+    contentsViewByFolder: userPreferences.contentsViewByFolder,
     doubleClickDownload: userPreferences.doubleClickDownload,
     favoriteItems: userPreferences.favoriteItems,
     handleAlternateRowsChange,
+    handleContentsViewChange,
     handleDoubleClickDownloadChange,
     handleFavoriteItemsChange,
     handleOpenFoldersOnClickChange,

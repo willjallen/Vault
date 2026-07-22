@@ -179,6 +179,10 @@ fn preference_patch(folder_id: i64, document_id: i64) -> Value {
             "alternateRows": true,
             "doubleClickDownload": true,
             "downloadLocationGuidanceDismissed": true,
+            "contentsViewByFolder": {
+                "": {"mode": "details", "iconSize": 80, "version": 1},
+                "Art": {"mode": "icons", "iconSize": 112, "version": 1}
+            },
             "favoriteItems": [
                 {"type": "folder", "id": folder_id},
                 {"type": "document", "id": document_id},
@@ -209,6 +213,9 @@ fn assert_enriched_preferences(preferences: &Value, folder_id: i64, document_id:
     assert_eq!(preferences["alternateRows"], true);
     assert_eq!(preferences["doubleClickDownload"], true);
     assert_eq!(preferences["downloadLocationGuidanceDismissed"], true);
+    assert_eq!(preferences["contentsViewByFolder"][""]["mode"], "details");
+    assert_eq!(preferences["contentsViewByFolder"]["Art"]["mode"], "icons");
+    assert_eq!(preferences["contentsViewByFolder"]["Art"]["iconSize"], 112);
     assert_eq!(favorites.len(), 2);
     assert_eq!(favorites[0]["type"], "folder");
     assert_eq!(favorites[0]["id"], folder_id);
@@ -262,6 +269,7 @@ async fn preferences_get_returns_defaults() {
         false,
     );
     assert_eq!(json["preferences"]["favoriteItems"], json!([]));
+    assert_eq!(json["preferences"]["contentsViewByFolder"], json!({}));
     assert_eq!(json["preferences"]["sidebarSectionSizes"]["folders"], 180);
     assert_eq!(json["preferences"]["sidebarSectionSizes"]["favorites"], 95);
     assert_eq!(
@@ -321,6 +329,10 @@ async fn preferences_patch_persists_canonical_ids_and_returns_enriched_favorites
         ]),
     );
     assert!(stored["favoriteItems"][0].get("path").is_none());
+    assert_eq!(
+        stored["contentsViewByFolder"]["Art"],
+        json!({"mode": "icons", "iconSize": 112, "version": 1})
+    );
     let state_event = sqlx::query_as::<_, (String, String)>(
         "SELECT event_type, resources FROM state_events ORDER BY id DESC LIMIT 1",
     )
@@ -401,6 +413,58 @@ async fn preferences_patch_allows_missing_preferences_as_noop() {
     let json = response_json(response).await;
 
     assert_eq!(json["preferences"]["themePreference"], "light");
+}
+
+#[tokio::test]
+async fn preferences_patch_merges_contents_views_by_folder_path() {
+    let (state, _temp_dir) = test_state().await;
+    let app = http::router(state);
+
+    let first = app
+        .clone()
+        .oneshot(authed_patch(
+            "/api/preferences",
+            "artist",
+            "artists",
+            &json!({
+                "preferences": {
+                    "contentsViewByFolder": {
+                        "": {"mode": "list", "iconSize": 80, "version": 1}
+                    }
+                }
+            }),
+        ))
+        .await
+        .expect("first response");
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let second = app
+        .oneshot(authed_patch(
+            "/api/preferences",
+            "artist",
+            "artists",
+            &json!({
+                "preferences": {
+                    "contentsViewByFolder": {
+                        "Projects/Alpha": {"mode": "icons", "iconSize": 999, "version": 1}
+                    }
+                }
+            }),
+        ))
+        .await
+        .expect("second response");
+    let status = second.status();
+    let json = response_json(second).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        json["preferences"]["contentsViewByFolder"][""],
+        json!({"mode": "list", "iconSize": 80, "version": 1})
+    );
+    assert_eq!(
+        json["preferences"]["contentsViewByFolder"]["Projects/Alpha"],
+        json!({"mode": "icons", "iconSize": 176, "version": 1})
+    );
 }
 
 #[tokio::test]
@@ -930,6 +994,22 @@ async fn preferences_patch_rejects_invalid_payloads_without_changing_existing_va
         (
             json!({"preferences": {"sidebarSectionCollapsed": {"favorites": "yes"}}}),
             "favorites sidebar collapsed state must be a boolean",
+        ),
+        (
+            json!({"preferences": {"contentsViewByFolder": []}}),
+            "contentsViewByFolder must be an object",
+        ),
+        (
+            json!({"preferences": {"contentsViewByFolder": {"/Art": {"mode": "list", "iconSize": 80}}}}),
+            "Contents view folder path must be canonical",
+        ),
+        (
+            json!({"preferences": {"contentsViewByFolder": {"Art": {"mode": "tiles", "iconSize": 80}}}}),
+            "Invalid contents view mode",
+        ),
+        (
+            json!({"preferences": {"contentsViewByFolder": {"Art": {"mode": "icons", "iconSize": "large"}}}}),
+            "Contents view iconSize must be numeric",
         ),
     ];
 

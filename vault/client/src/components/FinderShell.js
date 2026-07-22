@@ -36,6 +36,7 @@ function resolveFavoriteBeforeKey(evt, zone) {
 export function FinderShell({
   folder,
   breadcrumbs,
+  contentsViewByFolder,
   myEdits,
   folderChildren,
   favoriteItems,
@@ -79,6 +80,7 @@ export function FinderShell({
   onSearchQueryChange,
   onRecursiveSearchChange,
   onContentsSortChange,
+  onContentsViewChange,
   onClearSelection,
   onContentsMarqueeSelectionChange,
   loadMoreContents,
@@ -290,6 +292,7 @@ export function FinderShell({
       ),
       h(VaultFileList, {
         folder,
+        contentsViewByFolder,
         subfolders,
         files,
         currentUser,
@@ -315,6 +318,7 @@ export function FinderShell({
         onSearchQueryChange,
         onRecursiveSearchChange,
         onSortChange: onContentsSortChange,
+        onContentsViewChange,
         onBackgroundClick: onClearSelection,
         onMarqueeSelectionChange: onContentsMarqueeSelectionChange,
         loadMoreContents,

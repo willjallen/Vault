@@ -160,6 +160,7 @@ function fileListState({
 
 export function VaultFileList({
   folder,
+  contentsViewByFolder,
   subfolders,
   files,
   currentUser,
@@ -185,6 +186,7 @@ export function VaultFileList({
   onSearchQueryChange,
   onRecursiveSearchChange,
   onSortChange,
+  onContentsViewChange,
   onBackgroundClick,
   onMarqueeSelectionChange,
   loadMoreContents,
@@ -216,9 +218,12 @@ export function VaultFileList({
   const [focusedSelectionKey, setFocusedSelectionKey] = useState("");
   const [marquee, setMarquee] = useState(null);
   const { contentsView, requestContentsView } = useContentsView({
+    contentsViewByFolder,
+    folder,
     interactionRef: resizeDragRef,
     listRef: fileListRef,
     locked: Boolean(inlineFolderDraft || dragActive),
+    onContentsViewChange,
   });
   const {
     allVisibleSelected,

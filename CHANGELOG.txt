@@ -2,96 +2,83 @@
 
 Unreleased
 
-feat: Sync each folder path's Details, List, and resizable Icons view preference across sessions and devices.
-feat: Show changelog-backed What's New notes once per release, sync each user's acknowledgement across devices, and provide a development reset action.
+feat: Remember each folder's selected view and icon size across sessions and devices.
+feat: Add a changelog-backed What's New window that appears once per release.
 
 
 ========================================================================
 
 v2.0.0
 
-feat: Add persistent Details, List, and resizable Icons views with responsive compact sorting, selection controls, marquee selection, and lock badges.
-feat: Generate durable JPEG, PNG, and WebP thumbnail renditions with responsive source selection, background retries, invalidation, and cache cleanup.
-feat: Group each single or bulk upload and download action into one independently cancellable transfer popup with aggregate progress while preserving simultaneous operations.
-feat: Add separate native Upload file and Upload folder actions and reconstruct selected folder paths recursively.
-feat: Add Lock and Unlock to file context menus, including administrator unlocks and lock-owner explanations.
-feat: Permanently delete empty writable unarchived leaf folders while preserving archive actions for nonempty folders.
-fix: Make local blob publication power-loss durable and reconciliation race-safe, fail over between copies, and reclaim orphaned storage.
-fix: Make resumable uploads content-bound and restart-safe, guard terminal transfer states, isolate failures, and clean abandoned staging.
-fix: Enforce proxy trust and issuer-bound OIDC admins, strengthen rotatable signing roots, and keep auth reads read-only.
-fix: Require same-origin POSTs for checkout and logout and reject unsafe authentication redirects.
-fix: Hide inaccessible folder paths and serialize changes that could remove the final administrator.
-fix: Require HTTPS for S3-compatible endpoints except through an explicit loopback development opt-in.
-fix: Serialize archive, permanent-delete, and retention workflows with atomic audit and state-event bookkeeping.
-fix: Complete bulk exports containing empty files, isolate worker failures, and show queue, item, activity, and finalization progress.
-fix: Upload all files from picker and drag-and-drop selections to the chosen folder or share with bounded concurrency.
-fix: Traverse complete dropped-folder trees and create nested and empty folders idempotently instead of uploading detected directories as zero-byte files.
-fix: Remove cancelled uploads from the shared queue immediately and preserve authentication failures through grouped results so expired sessions redirect correctly.
-fix: Reject noncanonical database schemas at startup without modifying them.
-fix: Separate process liveness from database and storage readiness for container health checks.
-perf: Paginate large repository views and bound browser caches, background work, and server event history.
-perf: Stream large downloads and ZIP export compression with bounded memory and cap export dispatch.
-build: Update vulnerable transitive frontend development dependencies to patched releases.
-test: Add canonical large-transfer and concurrent-user performance benchmarks without a production benchmark sink.
-ci: Enforce RustSec and OSV dependency advisory checks in the repository gate.
-docs: Remove superseded audit and Rust rewrite working documents.
+feat: Add Details, List, and resizable Icons views with compact sorting, marquee selection, and lock indicators.
+feat: Add durable, responsive thumbnails for JPEG, PNG, and WebP files.
+feat: Add cancellable progress popups for simultaneous uploads and downloads, including recursive folder uploads.
+feat: Add file Lock and Unlock actions with administrator overrides and lock-owner details.
+feat: Allow permanent deletion of empty writable folders.
+fix: Make local file storage power-loss durable and recover safely from missing or orphaned blob copies.
+fix: Make resumable uploads content-bound and restart-safe, including cancellation and abandoned-session cleanup.
+fix: Upload complete picker and drag-and-drop selections with bounded concurrency while preserving nested and empty folders.
+fix: Make bulk exports handle empty files and individual failures reliably, with clearer progress.
+fix: Harden proxy and OIDC trust, signing-key rotation, cross-site request protection, and authentication redirects.
+fix: Require HTTPS for S3-compatible storage except explicit loopback development endpoints.
+fix: Prevent removal of the final administrator.
+fix: Hide folder paths users cannot access.
+fix: Make archive, permanent-delete, and retention changes atomic with their audit records and live updates.
+fix: Reject incompatible database schemas without mutation and separate process, database, and storage health checks.
+perf: Paginate large repositories and bound browser caches, background work, and server event history.
+perf: Stream large downloads and ZIP exports with bounded memory and concurrency.
+build: Patch vulnerable frontend development dependencies.
+ci: Enforce RustSec and OSV dependency audits.
+test: Add large-transfer and concurrent-user performance benchmarks.
 
 
 ========================================================================
 
 v1.3.2
 
-fix: Enable capability-based File System Access downloads by default while preserving automatic native download fallback for unsupported browsers.
+fix: Enable File System Access downloads by default where supported, with automatic native fallback.
 
 
 ========================================================================
 
 v1.3.1
 
-fix: Route the single Download action by effective browser capability and the site gate, preserving system file selection where File System Access is available and using the native download manager otherwise.
-perf: Replace range probes, parallel client segments, and large write queues with one authenticated, backpressured download stream.
-fix: Explain native download-location behavior until the user dismisses the guidance through their synced Vault preferences.
+fix: Use a save-location picker for downloads where configured and supported, with native download fallback.
+fix: Explain native download-location behavior until dismissed.
+perf: Stream downloads over one authenticated, backpressured connection.
 
 
 ========================================================================
 
 v1.3.0
 
-fix: Set frontend cache headers so deployments fetch the current app shell while content-addressed assets remain safely cacheable.
-fix: Make upload resume explicit by discarding zero-byte stored sessions, resuming only committed parts for the same selected file, and showing resume state in the UI.
-build: Centralize release version metadata on the VERSION file and publish Docker images from semantic version tags plus latest.
+fix: Resume uploads only from committed parts and clearly show resumed transfers.
+fix: Refresh app shells after deployments while retaining long-lived content-addressed asset caching.
+build: Publish Docker images from semantic version tags and centralize version metadata in VERSION.
 
 
 ========================================================================
 
 v1.2.0
 
-fix: Harden resumable upload parts with browser-wide concurrency limits, per-part timeouts, and retries for transport-shaped upload failures.
-fix: Prevent failed or stalled upload part requests from leaving concurrent uploads permanently blocked.
-docs: Update Docker release defaults for v1.2.0.
+fix: Prevent stalled resumable uploads with browser-wide concurrency limits, per-part timeouts, and retries.
 
 
 ========================================================================
 
 v1.1.0
 
-feat: Rewrite the application backend in Rust with an Axum/SQLx service that preserves the existing API and single-container deployment contract.
-feat: Port authentication, OIDC, security headers, gzip, admin/debug tooling, bootstrap metadata, preferences, site settings, and live state events to the Rust runtime.
-feat: Port folder browsing, document metadata, version history, locks, checkouts, archive/restore, favorites, sharing, retention, uploads, downloads, and export workflows to Rust.
-feat: Add Rust-native resumable transfer sessions, transfer cleanup, folder export jobs, ZIP64 archive support, and local/S3/R2 object storage handling.
-docs: Document the Rust rewrite and update Docker release defaults for v1.1.0.
+feat: Rewrite Vault's backend in Rust with Axum and SQLx while preserving its API, feature set, and single-container deployment.
+feat: Add Rust-native resumable transfers, ZIP64 exports, and local, S3, and R2 storage.
 
 
 ========================================================================
 
 v1.0.1
 
-fix: Harden SQLite event streaming under concurrent use by moving state-event database reads off the ASGI event loop.
-fix: Wake idle SSE clients from committed state-change notifications instead of per-client polling.
-fix: Align SQLite busy timeout and SQLAlchemy pool configuration for the single-container deployment profile.
-fix: Keep file extensions out of the default rename selection unless the user explicitly edits them.
-fix: Show Remove from Favorites when a selected item is opened from the Favorites context menu.
-fix: Prevent archived files from being renamed in the UI, inline rename flow, and rename API.
+fix: Improve concurrent live updates with commit-driven SSE notifications and tuned SQLite connection handling.
+fix: Preserve file extensions during rename and prevent renaming archived files.
+fix: Show Remove from Favorites from the Favorites context menu.
 
 
 ========================================================================
@@ -105,12 +92,12 @@ Initial release
 
 feat:     A new feature.
 fix:      A bug fix.
+perf:     A performance improvement.
 docs:     Documentation changes.
-style:    Code style changes (formatting, missing semicolons, etc.).
-refactor: Code refactoring (neither fixes a bug nor adds a feature).
-test:     Adding or updating tests.
-chore:    Routine tasks like updating dependencies or build tools.
-build:    Changes affecting the build system or external dependencies.
-ci:       Changes to CI configuration files or scripts.
-perf:     Performance improvements.
-revert:   Reverting a previous commit.
+build:    Build system or dependency changes.
+ci:       Continuous integration changes.
+test:     Test coverage or infrastructure changes.
+refactor: Code refactoring that does not add a feature or fix a bug.
+style:    Code style changes.
+chore:    Routine maintenance.
+revert:   Reverting a previous change.

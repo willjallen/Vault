@@ -445,19 +445,39 @@ fn canonical_transfer_harness_uses_valid_security_configuration() {
 }
 
 #[test]
-fn semver_tag_workflow_builds_and_publishes_versioned_and_latest_ghcr_image() {
+fn repository_gate_runs_for_branches_pull_requests_and_release_tags() {
+    let workflow = root_file(".github/workflows/ci.yml");
+
+    assert!(workflow.contains("name: Repository gate"));
+    assert!(workflow.contains("  pull_request:"));
+    assert!(workflow.contains("  workflow_call:"));
+    assert!(workflow.contains("rustup toolchain install 1.95"));
+    assert!(workflow.contains("npm --prefix vault/client ci"));
+    assert!(workflow.contains("pre-commit==4.6.0"));
+    assert!(workflow.contains("pre-commit run --all-files --config .pre-commit-config.yaml"));
+}
+
+#[test]
+fn semver_tag_workflow_gates_smoke_tests_and_publishes_the_same_image() {
     let workflow = root_file(".github/workflows/docker-image.yml");
 
     assert!(workflow.contains("      - \"v*.*.*\""));
     assert!(workflow.contains("      - \"[0-9]*.[0-9]*.[0-9]*\""));
     assert!(workflow.contains("Validate semantic version tag"));
+    assert!(workflow.contains("Verify tag matches VERSION"));
+    assert!(workflow.contains("uses: ./.github/workflows/ci.yml"));
     assert!(workflow.contains("ghcr.io/${GITHUB_REPOSITORY,,}"));
     assert!(workflow.contains("docker/login-action@v3"));
     assert!(workflow.contains("docker/metadata-action@v5"));
     assert!(workflow.contains("docker/build-push-action@v6"));
-    assert!(workflow.contains("push: true"));
+    assert!(workflow.contains("load: true"));
+    assert!(workflow.contains("Smoke test release image"));
+    assert!(workflow.contains("Publish tested image"));
+    assert!(workflow.contains("docker push \"${tag}\""));
     assert!(workflow.contains("type=semver,pattern={{version}}"));
-    assert!(workflow.contains("type=raw,value=latest"));
+    assert!(
+        workflow.contains("type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}")
+    );
     assert!(!workflow.contains("VAULT_VERSION"));
     assert!(!workflow.contains("type=semver,pattern={{major}}.{{minor}}"));
     assert!(!workflow.contains("type=semver,pattern={{major}}"));

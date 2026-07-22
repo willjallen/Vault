@@ -342,6 +342,65 @@ test("overlapping batches share one global scheduler concurrency bound", async (
   assert.deepEqual(refreshes.sort(), ["Shared/First", "Shared/Second"]);
 });
 
+test("cancelling a queued operation settles before an earlier upload releases the scheduler", async () => {
+  const scheduler = new UploadFileScheduler(1);
+  let releaseEarlierUpload;
+  const earlierUpload = scheduler.run(
+    () =>
+      new Promise((resolve) => {
+        releaseEarlierUpload = resolve;
+      })
+  );
+  await nextTurn();
+
+  const controller = new AbortController();
+  const files = filesWithNames(["queued-a.txt", "queued-b.txt"]);
+  const finishes = [];
+  let queuedUploadsStarted = 0;
+  let cancelledResult;
+  const cancelledBatch = uploadFileBatch({
+    beginUploadOperation: () => ({
+      fail: (error) => assert.fail(error.message),
+      finish: (result) => finishes.push(result),
+      signal: controller.signal,
+      upload: async () => {
+        queuedUploadsStarted += 1;
+        return {};
+      },
+    }),
+    files,
+    refresh: async () => {},
+    scheduler,
+    setError: () => {},
+    uploadWithProgress: async () => assert.fail("child popup uploader was used"),
+  }).then((result) => {
+    cancelledResult = result;
+    return result;
+  });
+
+  controller.abort();
+  await nextTurn();
+
+  assert.equal(queuedUploadsStarted, 0);
+  assert.equal(cancelledResult.cancelled, files.length);
+  assert.equal(cancelledResult.failed, 0);
+  assert.equal(finishes.length, 1);
+  assert.equal(scheduler.queuedCount, 0);
+
+  const retry = uploadFileBatch({
+    files: [files[0]],
+    refresh: async () => {},
+    scheduler,
+    setError: () => {},
+    uploadWithProgress: async () => ({ id: "retry" }),
+  });
+  releaseEarlierUpload();
+  await earlierUpload;
+
+  assert.equal((await cancelledBatch).cancelled, files.length);
+  assert.equal((await retry).succeeded, 1);
+});
+
 test("a batch rejects later duplicate normalized names before starting them", async () => {
   const first = new File(["first"], "report.txt", { type: "text/plain" });
   const duplicate = new File(["duplicate"], "staging\\report.txt ", { type: "text/plain" });

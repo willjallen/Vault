@@ -101,6 +101,24 @@ function treeNeedsErrorRefresh(foldersCreated, operation) {
   return foldersCreated > 0 || operation?.signal?.aborted === true;
 }
 
+function queuedUploadCancellation(fileScheduler, operation) {
+  const signal = operation?.signal;
+  if (!signal) {
+    return { dispose: () => {}, group: null, settleIfAborted: () => {} };
+  }
+  const cancel = () => fileScheduler.cancelQueued(signal);
+  signal.addEventListener("abort", cancel, { once: true });
+  return {
+    dispose: () => signal.removeEventListener("abort", cancel),
+    group: signal,
+    settleIfAborted: () => {
+      if (signal.aborted) {
+        cancel();
+      }
+    },
+  };
+}
+
 export class UploadFileScheduler {
   constructor(concurrency = DEFAULT_UPLOAD_FILE_CONCURRENCY) {
     this.activeCount = 0;
@@ -114,7 +132,10 @@ export class UploadFileScheduler {
     return this.queue.length - this.nextQueueIndex;
   }
 
-  run(task, { duplicateMessage = "This file is already queued for upload.", key = "" } = {}) {
+  run(
+    task,
+    { duplicateMessage = "This file is already queued for upload.", group = null, key = "" } = {}
+  ) {
     if (key && this.reservedKeys.has(key)) {
       return Promise.reject(new Error(duplicateMessage));
     }
@@ -122,9 +143,31 @@ export class UploadFileScheduler {
       this.reservedKeys.add(key);
     }
     return new Promise((resolve, reject) => {
-      this.queue.push({ key, reject, resolve, task });
+      this.queue.push({ group, key, reject, resolve, task });
       this.drain();
     });
+  }
+
+  cancelQueued(group, value = { cancelled: true, status: 0 }) {
+    if (!group) {
+      return 0;
+    }
+    const remaining = [];
+    let cancelled = 0;
+    for (let index = this.nextQueueIndex; index < this.queue.length; index += 1) {
+      const entry = this.queue.at(index);
+      if (entry.group !== group) {
+        remaining.push(entry);
+        continue;
+      }
+      this.releaseReservation(entry);
+      entry.resolve(value);
+      cancelled += 1;
+    }
+    this.queue = remaining;
+    this.nextQueueIndex = 0;
+    this.drain();
+    return cancelled;
   }
 
   drain() {
@@ -158,11 +201,15 @@ export class UploadFileScheduler {
   }
 
   finish(entry) {
+    this.releaseReservation(entry);
+    this.activeCount -= 1;
+    this.drain();
+  }
+
+  releaseReservation(entry) {
     if (entry.key) {
       this.reservedKeys.delete(entry.key);
     }
-    this.activeCount -= 1;
-    this.drain();
   }
 }
 
@@ -220,6 +267,7 @@ export async function uploadFileBatch({
     uploadOperation || beginUploadOperation?.({ files: pendingFiles, name: operationName });
   const ownsOperation = Boolean(operation && !uploadOperation);
   const upload = operation?.upload || uploadWithProgress;
+  const queueCancellation = queuedUploadCancellation(uploadScheduler, operation);
   try {
     const outcomePromises = pendingFiles.map((file, index) => {
       const destination = targetFolderForFile
@@ -239,6 +287,7 @@ export async function uploadFileBatch({
             }),
           {
             duplicateMessage: `A file named ${uploadName || "this name"} is already queued for ${destination || "Vault"}.`,
+            group: queueCancellation.group,
             key,
           }
         )
@@ -249,6 +298,7 @@ export async function uploadFileBatch({
         )
         .catch((reason) => ({ file, reason, status: "rejected" }));
     });
+    queueCancellation.settleIfAborted();
     const orderedOutcomes = await Promise.all(outcomePromises);
 
     const succeeded = orderedOutcomes.filter((outcome) => outcome.status === "fulfilled").length;
@@ -278,6 +328,8 @@ export async function uploadFileBatch({
       operation.fail(error);
     }
     throw error;
+  } finally {
+    queueCancellation.dispose();
   }
 }
 

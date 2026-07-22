@@ -2,20 +2,28 @@
 
 Unreleased
 
+feat: Add persistent Details, List, and resizable Icons views with responsive compact sorting, selection controls, marquee selection, and lock badges.
+feat: Generate durable JPEG, PNG, and WebP thumbnail renditions with responsive source selection, background retries, invalidation, and cache cleanup.
+feat: Group each single or bulk upload and download action into one independently cancellable transfer popup with aggregate progress while preserving simultaneous operations.
+feat: Add separate native Upload file and Upload folder actions and reconstruct selected folder paths recursively.
+feat: Add Lock and Unlock to file context menus, including administrator unlocks and lock-owner explanations.
 feat: Permanently delete empty writable unarchived leaf folders while preserving archive actions for nonempty folders.
-fix: Upload all files from picker and drag-and-drop selections to the chosen folder or share with bounded concurrency.
-fix: Complete bulk exports containing empty files, isolate worker failures, and show queue, item, activity, and finalization progress.
-fix: Make resumable uploads content-bound and restart-safe, guard terminal transfer states, isolate failures, and clean abandoned staging.
-fix: Serialize archive, permanent-delete, and retention workflows with atomic audit and state-event bookkeeping.
 fix: Make local blob publication power-loss durable and reconciliation race-safe, fail over between copies, and reclaim orphaned storage.
-perf: Stream large downloads and ZIP export compression with bounded memory and cap export dispatch.
-perf: Paginate large repository views and bound browser caches, background work, and server event history.
+fix: Make resumable uploads content-bound and restart-safe, guard terminal transfer states, isolate failures, and clean abandoned staging.
 fix: Enforce proxy trust and issuer-bound OIDC admins, strengthen rotatable signing roots, and keep auth reads read-only.
 fix: Require same-origin POSTs for checkout and logout and reject unsafe authentication redirects.
 fix: Hide inaccessible folder paths and serialize changes that could remove the final administrator.
 fix: Require HTTPS for S3-compatible endpoints except through an explicit loopback development opt-in.
-fix: Separate process liveness from database and storage readiness for container health checks.
+fix: Serialize archive, permanent-delete, and retention workflows with atomic audit and state-event bookkeeping.
+fix: Complete bulk exports containing empty files, isolate worker failures, and show queue, item, activity, and finalization progress.
+fix: Upload all files from picker and drag-and-drop selections to the chosen folder or share with bounded concurrency.
+fix: Traverse complete dropped-folder trees and create nested and empty folders idempotently instead of uploading detected directories as zero-byte files.
+fix: Remove cancelled uploads from the shared queue immediately and preserve authentication failures through grouped results so expired sessions redirect correctly.
 fix: Reject noncanonical database schemas at startup without modifying them.
+fix: Separate process liveness from database and storage readiness for container health checks.
+perf: Paginate large repository views and bound browser caches, background work, and server event history.
+perf: Stream large downloads and ZIP export compression with bounded memory and cap export dispatch.
+build: Update vulnerable transitive frontend development dependencies to patched releases.
 test: Add canonical large-transfer and concurrent-user performance benchmarks without a production benchmark sink.
 ci: Enforce RustSec and OSV dependency advisory checks in the repository gate.
 docs: Remove superseded audit and Rust rewrite working documents.

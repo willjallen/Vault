@@ -162,3 +162,56 @@ test("partial failures settle once with a concise aggregate error", async () => 
   assert.match(errors[0][0].message, /1 of 2 files failed: network unavailable/);
   assert.equal(errors[0][1].processedItems, 2);
 });
+
+test("an authorization failure aborts siblings and survives operation aggregation", async () => {
+  const files = filesWithSizes([2, 3]);
+  const controller = new AbortController();
+  const errors = [];
+  const descriptor = describeUploadOperation({ files });
+  const operation = createUploadOperation({
+    abort: () => controller.abort(),
+    descriptor,
+    onCancelled: () => assert.fail("authorization failure was reported as cancellation"),
+    onComplete: () => assert.fail("authorization failure completed"),
+    onError: (...args) => errors.push(args),
+    onProgress: () => {},
+    runUpload: ({ file, signal }) => {
+      if (file === files[0]) {
+        return Promise.reject(Object.assign(new Error("authentication required"), { status: 401 }));
+      }
+      return new Promise((_resolve, reject) => {
+        signal.addEventListener(
+          "abort",
+          () => reject(Object.assign(new Error("cancelled"), { cancelled: true })),
+          { once: true }
+        );
+      });
+    },
+    signal: controller.signal,
+  });
+
+  const outcomes = await Promise.all(
+    files.map((file) =>
+      operation
+        .upload({ file })
+        .then((value) => ({ status: value.cancelled ? "cancelled" : "fulfilled", value }))
+        .catch((reason) => ({ reason, status: "rejected" }))
+    )
+  );
+  operation.finish({
+    attempted: files.length,
+    cancelled: outcomes.filter((outcome) => outcome.status === "cancelled").length,
+    failed: outcomes.filter((outcome) => outcome.status === "rejected").length,
+    outcomes,
+    succeeded: 0,
+  });
+
+  assert.equal(controller.signal.aborted, true);
+  assert.deepEqual(
+    outcomes.map((outcome) => outcome.status),
+    ["rejected", "cancelled"]
+  );
+  assert.equal(errors.length, 1);
+  assert.equal(errors[0][0].status, 401);
+  assert.match(errors[0][0].message, /authentication required/);
+});

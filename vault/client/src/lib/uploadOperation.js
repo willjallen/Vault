@@ -49,11 +49,15 @@ export function describeUploadOperation({ files, folders, name: requestedName = 
 
 function operationFailure(summary, descriptor) {
   const failures = listed(summary?.outcomes).filter((outcome) => outcome?.status === "rejected");
-  const detail = String(failures[0]?.reason?.message || "").trim();
+  const primaryFailure = failures.find((failure) => failure?.reason?.status === 401) || failures[0];
+  const detail = String(primaryFailure?.reason?.message || "").trim();
   const failed = finiteNonnegative(summary?.failed) || failures.length;
   const attempted = finiteNonnegative(summary?.attempted) || descriptor.totalFiles;
   const error = new Error(`${failed} of ${attempted} files failed${detail ? `: ${detail}` : ""}`);
   error.failedItems = failed;
+  if (primaryFailure?.reason?.status !== undefined) {
+    error.status = primaryFailure.reason.status;
+  }
   return error;
 }
 
@@ -143,6 +147,7 @@ function createProgressTracker(descriptor, onProgress) {
 }
 
 export function createUploadOperation({
+  abort,
   descriptor,
   isCancellation = (error) => Boolean(error?.cancelled),
   onCancelled,
@@ -170,7 +175,12 @@ export function createUploadOperation({
       return result;
     } catch (error) {
       tracker.fileFinished(fileId, false);
-      if (signal.aborted || isCancellation(error)) {
+      const cancelled = isCancellation(error);
+      if (!signal.aborted && !cancelled && error?.status === 401) {
+        abort?.();
+        throw error;
+      }
+      if (signal.aborted || cancelled) {
         return { cancelled: true, status: 0 };
       }
       throw error;
@@ -210,10 +220,10 @@ export function createUploadOperation({
       }
       settled = true;
       const final = finalSummary(summary);
-      if (finiteNonnegative(summary?.cancelled) > 0) {
-        onCancelled(final);
-      } else if (finiteNonnegative(summary?.failed) > 0) {
+      if (finiteNonnegative(summary?.failed) > 0) {
         onError(operationFailure(summary, descriptor), final);
+      } else if (finiteNonnegative(summary?.cancelled) > 0) {
+        onCancelled(final);
       } else {
         onComplete(final);
       }

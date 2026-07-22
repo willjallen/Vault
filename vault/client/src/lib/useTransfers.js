@@ -114,7 +114,7 @@ export function useTransfers({
           )
         );
       }, 16);
-      return { id, signal: controller.signal };
+      return { abort: () => controller.abort(), id, signal: controller.signal };
     },
     [schedule]
   );
@@ -248,13 +248,14 @@ export function useTransfers({
   const beginUploadOperation = useCallback(
     (metadata = {}) => {
       const descriptor = describeUploadOperation(metadata);
-      const { id, signal } = createTransfer(
+      const { abort, id, signal } = createTransfer(
         "upload",
         descriptor.name,
         descriptor.totalBytes,
         descriptor
       );
       return createUploadOperation({
+        abort,
         descriptor,
         isCancellation: (error) => error instanceof TransferCancelledError || error?.cancelled,
         onCancelled: (summary) => markTransferCancelled(id, operationSummaryPatch(summary)),

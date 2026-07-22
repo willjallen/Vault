@@ -1,6 +1,6 @@
 ========================================================================
 
-Unreleased
+v2.1.0
 
 feat: Remember each folder's selected view and icon size across sessions and devices.
 feat: Add a changelog-backed What's New window that appears once per release.

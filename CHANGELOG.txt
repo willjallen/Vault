@@ -1,6 +1,6 @@
 ========================================================================
 
-Unreleased
+v2.0.0
 
 feat: Add persistent Details, List, and resizable Icons views with responsive compact sorting, selection controls, marquee selection, and lock badges.
 feat: Generate durable JPEG, PNG, and WebP thumbnail renditions with responsive source selection, background retries, invalidation, and cache cleanup.

@@ -118,6 +118,13 @@ pub fn normalize_user_preferences(raw: &Value) -> Value {
             normalized.insert(key.to_string(), json!(value));
         }
     }
+    if let Some(version) = raw_object
+        .get("whatsNewAcknowledgedVersion")
+        .and_then(Value::as_str)
+        .filter(|version| is_valid_acknowledged_version(version))
+    {
+        normalized.insert("whatsNewAcknowledgedVersion".to_string(), json!(version));
+    }
     normalized.insert(
         "favoriteItems".to_string(),
         clean_favorite_items(raw_object.get("favoriteItems")),
@@ -172,6 +179,17 @@ pub fn clean_user_preference_patch(raw: &Value) -> Result<Map<String, Value>, Pr
                 };
                 cleaned.insert(key.clone(), json!(value));
             }
+            "whatsNewAcknowledgedVersion" => {
+                let Some(version) = value
+                    .as_str()
+                    .filter(|version| is_valid_acknowledged_version(version))
+                else {
+                    return Err(invalid_patch(
+                        "whatsNewAcknowledgedVersion must be a valid version",
+                    ));
+                };
+                cleaned.insert(key.clone(), json!(version));
+            }
             "favoriteItems" => {
                 cleaned.insert(key.clone(), clean_favorite_items_strict(value)?);
             }
@@ -220,6 +238,7 @@ fn default_preferences() -> Map<String, Value> {
             "downloadLocationGuidanceDismissed".to_string(),
             json!(false),
         ),
+        ("whatsNewAcknowledgedVersion".to_string(), json!("")),
         ("favoriteItems".to_string(), json!([])),
         (
             "sidebarSectionSizes".to_string(),
@@ -231,6 +250,17 @@ fn default_preferences() -> Map<String, Value> {
         ),
         ("contentsViewByFolder".to_string(), json!({})),
     ])
+}
+
+fn is_valid_acknowledged_version(version: &str) -> bool {
+    if version.is_empty() {
+        return true;
+    }
+    version.len() <= 64
+        && version.as_bytes().first().is_some_and(u8::is_ascii_digit)
+        && version
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+'))
 }
 
 fn clean_contents_view_by_folder(raw: Option<&Value>) -> Value {

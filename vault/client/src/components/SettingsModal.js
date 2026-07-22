@@ -669,6 +669,7 @@ function SectionPanel({
   onDoubleClickDownloadChange,
   onOpenFoldersOnClickChange,
   onPalettePreferenceChange,
+  onResetWhatsNew,
   onSiteSettingsChange,
   onThemePreferenceChange,
   openFoldersOnClick,
@@ -681,7 +682,7 @@ function SectionPanel({
   }
 
   if (activeSection === "debug") {
-    return h(DebugPanel, { apiFetch, onDebugError });
+    return h(DebugPanel, { apiFetch, onDebugError, onResetWhatsNew });
   }
 
   if (activeSection === "files") {
@@ -785,6 +786,7 @@ export function SettingsModal({
   onOpenFoldersOnClickChange,
   onSiteSettingsChange,
   onPalettePreferenceChange,
+  onResetWhatsNew,
   onThemePreferenceChange,
   openFoldersOnClick = true,
   palettePreference = "cozy",
@@ -908,6 +910,7 @@ export function SettingsModal({
             onDoubleClickDownloadChange,
             onOpenFoldersOnClickChange,
             onPalettePreferenceChange,
+            onResetWhatsNew,
             onSiteSettingsChange,
             onThemePreferenceChange,
             openFoldersOnClick,

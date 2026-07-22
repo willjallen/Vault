@@ -3,6 +3,7 @@
 Unreleased
 
 feat: Sync each folder path's Details, List, and resizable Icons view preference across sessions and devices.
+feat: Show changelog-backed What's New notes once per release, sync each user's acknowledgement across devices, and provide a development reset action.
 
 
 ========================================================================

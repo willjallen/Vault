@@ -179,6 +179,7 @@ fn preference_patch(folder_id: i64, document_id: i64) -> Value {
             "alternateRows": true,
             "doubleClickDownload": true,
             "downloadLocationGuidanceDismissed": true,
+            "whatsNewAcknowledgedVersion": "2.0.0",
             "contentsViewByFolder": {
                 "": {"mode": "details", "iconSize": 80, "version": 1},
                 "Art": {"mode": "icons", "iconSize": 112, "version": 1}
@@ -213,6 +214,7 @@ fn assert_enriched_preferences(preferences: &Value, folder_id: i64, document_id:
     assert_eq!(preferences["alternateRows"], true);
     assert_eq!(preferences["doubleClickDownload"], true);
     assert_eq!(preferences["downloadLocationGuidanceDismissed"], true);
+    assert_eq!(preferences["whatsNewAcknowledgedVersion"], "2.0.0");
     assert_eq!(preferences["contentsViewByFolder"][""]["mode"], "details");
     assert_eq!(preferences["contentsViewByFolder"]["Art"]["mode"], "icons");
     assert_eq!(preferences["contentsViewByFolder"]["Art"]["iconSize"], 112);
@@ -268,6 +270,7 @@ async fn preferences_get_returns_defaults() {
         json["preferences"]["downloadLocationGuidanceDismissed"],
         false,
     );
+    assert_eq!(json["preferences"]["whatsNewAcknowledgedVersion"], "");
     assert_eq!(json["preferences"]["favoriteItems"], json!([]));
     assert_eq!(json["preferences"]["contentsViewByFolder"], json!({}));
     assert_eq!(json["preferences"]["sidebarSectionSizes"]["folders"], 180);
@@ -1010,6 +1013,10 @@ async fn preferences_patch_rejects_invalid_payloads_without_changing_existing_va
         (
             json!({"preferences": {"contentsViewByFolder": {"Art": {"mode": "icons", "iconSize": "large"}}}}),
             "Contents view iconSize must be numeric",
+        ),
+        (
+            json!({"preferences": {"whatsNewAcknowledgedVersion": "not a version"}}),
+            "whatsNewAcknowledgedVersion must be a valid version",
         ),
     ];
 

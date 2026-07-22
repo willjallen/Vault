@@ -21,7 +21,7 @@ const bundle = await build({
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(
   bundle.outputFiles.at(0).text
 ).toString("base64")}`;
-const { normalizeUserPreferences } = await import(moduleUrl);
+const { normalizeAcknowledgedVersion, normalizeUserPreferences } = await import(moduleUrl);
 
 test("boolean preferences accept only real booleans", () => {
   const normalized = normalizeUserPreferences({
@@ -61,4 +61,11 @@ test("synced contents views are normalized by folder path", () => {
   assert.deepEqual(normalized.contentsViewByFolder, {
     "Projects/Alpha": { iconSize: 112, mode: "icons", version: 1 },
   });
+});
+
+test("acknowledged What's New versions accept only compact release identifiers", () => {
+  assert.equal(normalizeAcknowledgedVersion("2.1.0"), "2.1.0");
+  assert.equal(normalizeAcknowledgedVersion("2.1.0-rc.1"), "2.1.0-rc.1");
+  assert.equal(normalizeAcknowledgedVersion("not a version"), "");
+  assert.equal(normalizeUserPreferences({}).whatsNewAcknowledgedVersion, "");
 });

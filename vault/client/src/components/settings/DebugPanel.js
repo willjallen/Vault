@@ -18,7 +18,7 @@ function DebugActionButton({ disabled, icon, label, onClick, tone = "" }) {
   );
 }
 
-export function DebugPanel({ apiFetch, onDebugError }) {
+export function DebugPanel({ apiFetch, onDebugError, onResetWhatsNew }) {
   const [pendingAction, setPendingAction] = useState("");
   const [result, setResult] = useState(null);
 
@@ -76,6 +76,11 @@ export function DebugPanel({ apiFetch, onDebugError }) {
     runDebugRequest("Reset database", "/api/admin/debug/reset-database");
   }, [runDebugRequest]);
 
+  const resetWhatsNew = useCallback(() => {
+    onResetWhatsNew?.();
+    completeAction("Reset What's New", { acknowledgement: "cleared" });
+  }, [completeAction, onResetWhatsNew]);
+
   const disabled = Boolean(pendingAction);
   const errorButtons = [
     ["Client error", "warning", showClientError],
@@ -126,6 +131,7 @@ export function DebugPanel({ apiFetch, onDebugError }) {
     ],
   ];
   const utilityButtons = [
+    ["Show What's New", "rocket", resetWhatsNew],
     [
       "Seed sample file",
       "seedling",

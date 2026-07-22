@@ -24,6 +24,23 @@ function normalizeNotice(input, fallbackDuration) {
   };
 }
 
+export function noticesForState(notice, busy) {
+  return [
+    ...(notice ? [notice] : []),
+    ...(busy
+      ? [
+          {
+            dismissible: false,
+            id: "busy",
+            kind: "busy",
+            phase: "visible",
+            title: "Working",
+          },
+        ]
+      : []),
+  ];
+}
+
 export function useNotifications(defaultDuration = DEFAULT_NOTICE_MS) {
   const [notice, setNotice] = useState(null);
   const noticeId = useRef(1);

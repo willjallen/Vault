@@ -12,7 +12,7 @@ FROM rust:1.95-slim-bookworm AS rust-builder
 
 WORKDIR /build
 
-COPY Cargo.toml Cargo.lock VERSION ./
+COPY Cargo.toml Cargo.lock VERSION CHANGELOG.txt ./
 COPY vault/server ./vault/server
 RUN cargo build --release -p vault-server
 

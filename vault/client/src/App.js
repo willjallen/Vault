@@ -5,6 +5,7 @@ import { FolderPropertiesModal } from "./components/FolderPropertiesModal.js";
 import { NotificationDock } from "./components/NotificationDock.js";
 import { SettingsModal } from "./components/SettingsModal.js";
 import { TransferDock } from "./components/TransferDock.js";
+import { WhatsNew } from "./components/WhatsNewModal.js";
 import { ContextMenu } from "./components/browser/ContextMenu.js";
 import { FileDetailsModal } from "./components/browser/FileDetailsModal.js";
 import { MoveDialog } from "./components/browser/MoveDialog.js";
@@ -44,7 +45,7 @@ import { createUploadHandlers } from "./lib/uploadHandlers.js";
 import { useFolderNavigation } from "./lib/useFolderNavigation.js";
 import { useFavoritePreferenceActions } from "./lib/useFavoritePreferenceActions.js";
 import { useMoveDialog } from "./lib/useMoveDialog.js";
-import { useNotifications } from "./lib/useNotifications.js";
+import { noticesForState, useNotifications } from "./lib/useNotifications.js";
 import { normalizeSiteSettings } from "./lib/siteSettings.js";
 import { useAppearancePreferences } from "./lib/theme.js";
 import { useVaultResources } from "./lib/useVaultResources.js";
@@ -177,12 +178,14 @@ export function App({ initial }) {
     handleSidebarLayoutChange,
     handleSidebarSectionSizesChange,
     handleThemePreferenceChange,
+    handleWhatsNewAcknowledgedVersionChange,
     openFoldersOnClick,
     palettePreference,
     refreshUserPreferences,
     sidebarSectionCollapsed,
     sidebarSectionSizes,
     themePreference,
+    whatsNewAcknowledgedVersion,
   } = useAppearancePreferences({
     apiFetch,
     initialPreferences: initialBootstrap.preferences,
@@ -833,20 +836,7 @@ export function App({ initial }) {
     setContextMenu({ x: evt.clientX, y: evt.clientY, items });
   }
 
-  const notices = [
-    ...(notice ? [notice] : []),
-    ...(busy
-      ? [
-          {
-            dismissible: false,
-            id: "busy",
-            kind: "busy",
-            phase: "visible",
-            title: "Working",
-          },
-        ]
-      : []),
-  ];
+  const notices = noticesForState(notice, busy);
 
   return h(
     React.Fragment,
@@ -973,6 +963,7 @@ export function App({ initial }) {
           onClose: closeSettings,
           onDebugError: setError,
           onPalettePreferenceChange: handlePalettePreferenceChange,
+          onResetWhatsNew: () => handleWhatsNewAcknowledgedVersionChange(""),
           onSiteSettingsChange: setSiteSettings,
           onThemePreferenceChange: handleThemePreferenceChange,
           openFoldersOnClick,
@@ -998,6 +989,12 @@ export function App({ initial }) {
           onClose: closeFileDetails,
         })
       : null,
+    h(WhatsNew, {
+      acknowledgedVersion: whatsNewAcknowledgedVersion,
+      currentVersion: initialBootstrap.version,
+      onAcknowledge: handleWhatsNewAcknowledgedVersionChange,
+      releaseNotes: initialBootstrap.release_notes,
+    }),
     h(ConfirmToast, { request: confirmRequest, onResolve: resolveConfirm }),
     contextMenu ? h(ContextMenu, { menu: contextMenu, onClose: closeContextMenu }) : null
   );

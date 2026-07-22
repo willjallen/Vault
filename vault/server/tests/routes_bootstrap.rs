@@ -253,6 +253,12 @@ async fn bootstrap_returns_runtime_user_preferences_settings_and_current_folder(
     assert_eq!(json["dev_mode"], false);
     assert_eq!(json["site_name"], "Test Vault");
     assert_eq!(json["version"], app_version());
+    assert_eq!(json["release_notes"][0]["version"], app_version());
+    assert!(
+        json["release_notes"][0]["entries"]
+            .as_array()
+            .is_some_and(|entries| !entries.is_empty())
+    );
     assert_eq!(json["current_folder"], "Project");
     assert_eq!(json["user"]["subject"], "artist");
     assert_eq!(json["preferences"]["themePreference"], "system");

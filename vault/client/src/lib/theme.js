@@ -11,6 +11,7 @@ const USER_PREFERENCE_DEFAULTS = {
   alternateRows: false,
   doubleClickDownload: false,
   downloadLocationGuidanceDismissed: false,
+  whatsNewAcknowledgedVersion: "",
   contentsViewByFolder: {},
   favoriteItems: [],
   sidebarSectionSizes: {
@@ -58,6 +59,16 @@ function normalizeBooleanPreference(value, fallback) {
     return false;
   }
   return fallback;
+}
+
+export function normalizeAcknowledgedVersion(value) {
+  if (typeof value !== "string" || value.length > 64) {
+    return "";
+  }
+  if (value === "") {
+    return value;
+  }
+  return /^[0-9][0-9A-Za-z.+-]*$/u.test(value) ? value : "";
 }
 
 function hasControlCharacters(value) {
@@ -192,6 +203,7 @@ export function normalizeUserPreferences(value) {
       source.downloadLocationGuidanceDismissed,
       USER_PREFERENCE_DEFAULTS.downloadLocationGuidanceDismissed
     ),
+    whatsNewAcknowledgedVersion: normalizeAcknowledgedVersion(source.whatsNewAcknowledgedVersion),
     contentsViewByFolder: normalizeContentsViewByFolder(source.contentsViewByFolder),
     favoriteItems: normalizeFavoriteItems(source.favoriteItems),
     sidebarSectionSizes: normalizeSidebarSectionSizes(source.sidebarSectionSizes),
@@ -384,6 +396,11 @@ export function useAppearancePreferences({ apiFetch, initialPreferences } = {}) 
     [updatePreference]
   );
 
+  const handleWhatsNewAcknowledgedVersionChange = useCallback(
+    (version) => updatePreference({ whatsNewAcknowledgedVersion: version }),
+    [updatePreference]
+  );
+
   const handleFavoriteItemsChange = useCallback(
     (preference) => updatePreference({ favoriteItems: preference }),
     [updatePreference]
@@ -462,12 +479,14 @@ export function useAppearancePreferences({ apiFetch, initialPreferences } = {}) 
     handleSidebarLayoutChange,
     handleSidebarSectionSizesChange,
     handleThemePreferenceChange,
+    handleWhatsNewAcknowledgedVersionChange,
     openFoldersOnClick: userPreferences.openFoldersOnClick,
     palettePreference: userPreferences.palettePreference,
     refreshUserPreferences,
     sidebarSectionCollapsed: userPreferences.sidebarSectionCollapsed,
     sidebarSectionSizes: userPreferences.sidebarSectionSizes,
     themePreference: userPreferences.themePreference,
+    whatsNewAcknowledgedVersion: userPreferences.whatsNewAcknowledgedVersion,
     userPreferences,
   };
 }

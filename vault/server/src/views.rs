@@ -23,7 +23,7 @@ use crate::folders::{
 use crate::preferences::{PreferenceError, preferences_for_user};
 use crate::previews::{self, PreviewError, VisualPayload, VisualSource};
 use crate::site_settings::{SiteSettingsError, site_settings_for_db};
-use crate::version::app_version;
+use crate::version::{ReleaseNotesSection, app_version, changelog_release_notes};
 
 const SIZE_UNITS: [(&str, i128); 4] = [
     ("KB", 1024),
@@ -264,6 +264,7 @@ pub struct BootstrapPayload {
     pub preferences: Value,
     pub settings: Value,
     pub version: String,
+    pub release_notes: Vec<ReleaseNotesSection>,
     pub current_folder: String,
 }
 
@@ -716,6 +717,7 @@ pub async fn build_bootstrap_payload(
         preferences: build_preferences_payload(pool, user).await?,
         settings: site_settings_for_db(pool).await?,
         version: app_version().to_string(),
+        release_notes: changelog_release_notes(),
         current_folder: normalized_request,
     })
 }

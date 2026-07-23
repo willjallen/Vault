@@ -16,12 +16,13 @@ use crate::documents::{
 };
 use crate::folders::{
     ARCHIVE_ROOT, ARCHIVE_ROOT_KEY, FolderError, FolderRecord, VAULT_ROOT_KEY, all_folders,
-    build_folder_path_cache, empty_folder_delete_eligible_ids, ensure_root_folders,
-    folder_access_level, folder_access_levels, folder_path_from_cache, get_folder_by_path,
-    get_folder_by_path_read, join_path, normalize_folder,
+    build_folder_path_cache, empty_folder_delete_eligible_ids, folder_access_level,
+    folder_access_levels, folder_path_from_cache, get_folder_by_path, get_folder_by_path_read,
+    join_path, load_root_folders, normalize_folder,
 };
 use crate::preferences::{PreferenceError, preferences_for_user};
 use crate::previews::{self, PreviewError, VisualPayload, VisualSource};
+use crate::root_folders::VAULT_PUBLIC_NAME;
 use crate::site_settings::{SiteSettingsError, site_settings_for_db};
 use crate::version::{ReleaseNotesSection, app_version, changelog_release_notes};
 
@@ -696,7 +697,7 @@ pub async fn build_bootstrap_payload(
     config: &crate::config::Config,
     folder: &str,
 ) -> Result<BootstrapPayload, ViewError> {
-    ensure_root_folders(pool).await?;
+    load_root_folders(pool).await?;
     let normalized_request = normalize_folder(Some(folder))?;
     let Some(current_folder) = get_folder_by_path_read(pool, &normalized_request).await? else {
         return Err(ViewError::FolderNotFound);
@@ -709,7 +710,7 @@ pub async fn build_bootstrap_payload(
         base_domain: auth.base_domain.clone(),
         dev_mode: auth.dev_mode,
         site_name: if config.site_name.trim().is_empty() {
-            "Vault".to_string()
+            VAULT_PUBLIC_NAME.to_string()
         } else {
             config.site_name.trim().to_string()
         },
@@ -1669,7 +1670,7 @@ pub async fn build_folder_properties_payload(
     path: &str,
     user: &UserContext,
 ) -> Result<Value, ViewError> {
-    ensure_root_folders(pool).await?;
+    load_root_folders(pool).await?;
     let normalized_request = normalize_folder(Some(path))?;
     let Some(folder) = get_folder_by_path(pool, Some(&normalized_request)).await? else {
         return Err(ViewError::FolderNotFound);
@@ -2192,7 +2193,7 @@ fn folder_summary_payload(
             .rsplit('/')
             .next()
             .filter(|name| !name.is_empty())
-            .unwrap_or("Vault")
+            .unwrap_or(VAULT_PUBLIC_NAME)
             .to_string(),
         color: folder.color.clone().unwrap_or_default(),
         icon: folder.icon.clone().unwrap_or_default(),

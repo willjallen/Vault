@@ -2899,6 +2899,105 @@ async fn rename_folder_rejects_root_duplicate_and_cycle() {
 }
 
 #[tokio::test]
+async fn folder_mutations_reject_reserved_root_names_and_preserve_restartability() {
+    let (state, _temp_dir) = test_state().await;
+    let writers = create_group(&state.db, "writers").await;
+    let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
+        .await
+        .expect("root");
+    add_folder_permission(&state.db, root.id, writers, true, true, true)
+        .await
+        .expect("writer root");
+    let top_level = get_or_create_folder_path(&state.db, Some("Top Level"))
+        .await
+        .expect("top-level source");
+    let project = get_or_create_folder_path(&state.db, Some("Project"))
+        .await
+        .expect("project");
+    let nested_archive = get_or_create_folder_path(&state.db, Some("Project/Archive"))
+        .await
+        .expect("nested Archive remains valid");
+    let db_path = state.config.db_path();
+    let pool = state.db.clone();
+    let app = http::router(state);
+
+    for response in [
+        app.clone()
+            .oneshot(authed_json_post(
+                "/api/rename",
+                "writer",
+                "writers",
+                &json!({
+                    "items": [{"type": "folder", "id": top_level.id}],
+                    "name": "Archive"
+                }),
+            ))
+            .await
+            .expect("reserved rename response"),
+        app.oneshot(authed_json_post(
+            "/api/move",
+            "writer",
+            "writers",
+            &json!({
+                "items": [{"type": "folder", "id": nested_archive.id}],
+                "destination_folder": ""
+            }),
+        ))
+        .await
+        .expect("reserved move response"),
+    ] {
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        assert_eq!(payload["ok"], json!([]));
+        assert_eq!(
+            payload["failed"][0]["detail"],
+            "That folder name is reserved at the Vault root"
+        );
+    }
+
+    let unchanged: Vec<(i64, String, i64)> =
+        sqlx::query_as("SELECT id, name, parent_id FROM folders WHERE id IN (?, ?) ORDER BY id")
+            .bind(top_level.id)
+            .bind(nested_archive.id)
+            .fetch_all(&pool)
+            .await
+            .expect("unchanged folders");
+    assert_eq!(
+        unchanged,
+        [
+            (top_level.id, "Top Level".to_string(), root.id),
+            (nested_archive.id, "Archive".to_string(), project.id)
+        ]
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM folder_events")
+            .fetch_one(&pool)
+            .await
+            .expect("folder event count"),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM state_events")
+            .fetch_one(&pool)
+            .await
+            .expect("state event count"),
+        0
+    );
+    db::readiness_check(&pool)
+        .await
+        .expect("rejected mutations preserve readiness");
+    pool.close().await;
+
+    let restarted = db::connect(&db_path)
+        .await
+        .expect("rejected mutations preserve restartability");
+    db::readiness_check(&restarted)
+        .await
+        .expect("restarted database remains ready");
+    restarted.close().await;
+}
+
+#[tokio::test]
 async fn rename_folder_rejects_locked_descendant_without_mutating() {
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;

@@ -2,7 +2,7 @@ use std::collections::{HashSet, VecDeque};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
@@ -35,7 +35,7 @@ use crate::blob_lifecycle::{
     collect_unreferenced_blob_candidates, collect_unreferenced_blobs_with_limit,
 };
 use crate::config::Config;
-use crate::db::DbPool;
+use crate::db::{self, DbPool};
 use crate::documents::{
     ClientMeta, DocumentError, VersionDownload, archive_document, archive_folder,
     checkout_version_download, current_version_download, delete_document_forever,
@@ -110,6 +110,9 @@ const FORWARDED_HEADER_NAMES: [&str; 7] = [
 ];
 static DEBUG_EVENT_STREAM_GENERATION: AtomicI64 = AtomicI64::new(0);
 static DEBUG_EVENT_STREAM_RETRY_MS: AtomicI64 = AtomicI64::new(3000);
+const READINESS_UNKNOWN: u8 = 0;
+const READINESS_HEALTHY: u8 = 1;
+const READINESS_UNHEALTHY: u8 = 2;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -122,6 +125,7 @@ pub struct AppState {
     pub preview_execution: Arc<PreviewExecutionContext>,
     pub upload_hash_coordinator: uploads::UploadHashCoordinator,
     pub transfer_maintenance: transfers::TransferMaintenanceCoordinator,
+    database_readiness_state: Arc<AtomicU8>,
     upload_part_locks: Arc<AsyncMutex<HashSet<String>>>,
     download_slots: Arc<Semaphore>,
     preview_slots: Arc<Semaphore>,
@@ -164,6 +168,7 @@ impl AppState {
             preview_execution,
             upload_hash_coordinator: uploads::UploadHashCoordinator::new(),
             transfer_maintenance: transfers::TransferMaintenanceCoordinator::default(),
+            database_readiness_state: Arc::new(AtomicU8::new(READINESS_UNKNOWN)),
             upload_part_locks: Arc::new(AsyncMutex::new(HashSet::new())),
             download_slots: Arc::new(Semaphore::new(download_limit.max(1))),
             preview_slots: Arc::new(Semaphore::new(DEFAULT_PREVIEW_CONCURRENCY_LIMIT)),
@@ -631,13 +636,49 @@ fn static_asset_cache_control(path: &str) -> &'static str {
 }
 
 async fn api_health(State(state): State<AppState>) -> (StatusCode, Json<HealthPayload>) {
-    let database = tokio::time::timeout(
-        READINESS_CHECK_TIMEOUT,
-        sqlx::query_scalar::<_, i64>("SELECT 1").fetch_one(&state.db),
-    );
+    let database = tokio::time::timeout(READINESS_CHECK_TIMEOUT, db::readiness_check(&state.db));
     let storage = tokio::time::timeout(READINESS_CHECK_TIMEOUT, state.storage.readiness_check());
     let (database, storage) = tokio::join!(database, storage);
-    let database = matches!(database, Ok(Ok(1)));
+    let database = match database {
+        Ok(Ok(())) => {
+            let previous = state
+                .database_readiness_state
+                .swap(READINESS_HEALTHY, Ordering::AcqRel);
+            if previous == READINESS_UNHEALTHY {
+                tracing::info!(
+                    event = "database_readiness_restored",
+                    "database readiness recovered"
+                );
+            }
+            true
+        }
+        Ok(Err(error)) => {
+            let previous = state
+                .database_readiness_state
+                .swap(READINESS_UNHEALTHY, Ordering::AcqRel);
+            if previous != READINESS_UNHEALTHY {
+                tracing::error!(
+                    event = "database_readiness_failed",
+                    reason = %error,
+                    "database readiness validation failed"
+                );
+            }
+            false
+        }
+        Err(_) => {
+            let previous = state
+                .database_readiness_state
+                .swap(READINESS_UNHEALTHY, Ordering::AcqRel);
+            if previous != READINESS_UNHEALTHY {
+                tracing::error!(
+                    event = "database_readiness_failed",
+                    reason = "timeout",
+                    "database readiness validation timed out"
+                );
+            }
+            false
+        }
+    };
     let storage = matches!(storage, Ok(Ok(())));
     let ok = database && storage;
     let status = if ok {
@@ -2530,6 +2571,9 @@ fn folder_action_error_detail(error: FolderError) -> Result<String, ApiError> {
         }
         FolderError::FolderNameRequired => Ok("Folder name is required".to_string()),
         FolderError::InvalidFolderName => Ok("Invalid folder name".to_string()),
+        FolderError::ReservedRootFolderName => {
+            Ok("That folder name is reserved at the Vault root".to_string())
+        }
         FolderError::TargetFolderAlreadyExists => {
             Ok("A folder already exists at that path".to_string())
         }
@@ -4308,6 +4352,7 @@ fn transfer_maintenance_error_response(error: TransferMaintenanceError) -> (Stat
     }
 }
 
+#[allow(clippy::too_many_lines)] // Keep every FolderError status/message mapping exhaustive and colocated.
 fn folder_error_response(error: FolderError) -> (StatusCode, String) {
     match error {
         FolderError::FolderPathRequired => (
@@ -4332,6 +4377,10 @@ fn folder_error_response(error: FolderError) -> (StatusCode, String) {
         FolderError::InvalidFolderName => {
             (StatusCode::BAD_REQUEST, "Invalid folder name".to_string())
         }
+        FolderError::ReservedRootFolderName => (
+            StatusCode::BAD_REQUEST,
+            "That folder name is reserved at the Vault root".to_string(),
+        ),
         FolderError::CannotMoveRootFolder => (
             StatusCode::BAD_REQUEST,
             "Cannot move a root folder".to_string(),

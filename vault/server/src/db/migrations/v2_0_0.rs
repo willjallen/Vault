@@ -1,10 +1,56 @@
 #![allow(clippy::needless_raw_string_hashes)]
 
-pub const SQLITE_BUSY_TIMEOUT_MS: u64 = 30_000;
+use futures_util::future::BoxFuture;
+use sqlx::{Executor, Sqlite, Transaction};
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 1;
+use super::super::invariants::{self, RootInvariantDefinition, RootNameAlias};
+use super::BaselineDefinition;
 
-pub const STATEMENTS: &[&str] = &[
+const BASELINE_MIGRATION_VERSION: i64 = 1;
+const BASELINE_TARGET_VERSION: &str = "2.0.0";
+const BASELINE_MIGRATION_NAME: &str = "content previews";
+const VAULT_ROOT_KEY: &str = "vault";
+const VAULT_ROOT_NAME: &str = "";
+const LEGACY_VAULT_ROOT_NAME: &str = "Vault";
+
+pub const BASELINE: BaselineDefinition = BaselineDefinition {
+    migration_version: BASELINE_MIGRATION_VERSION,
+    target_version: BASELINE_TARGET_VERSION,
+    migration_name: BASELINE_MIGRATION_NAME,
+    install: install_boxed,
+    validate: validate_boxed,
+};
+
+/// Root metadata emitted by the released v2.0.0 binary.
+///
+/// These values are intentionally pinned here instead of referring to the
+/// current application's definitions. A future migration may change current
+/// root behavior without changing this historical bootstrap contract.
+const ROOT_FOLDERS: [RootInvariantDefinition; 2] = [
+    RootInvariantDefinition {
+        key: VAULT_ROOT_KEY,
+        stored_name: VAULT_ROOT_NAME,
+        public_path_prefix: "",
+        allows_folder_descendants: true,
+    },
+    RootInvariantDefinition {
+        key: "archive",
+        stored_name: "Archive",
+        public_path_prefix: "Archive",
+        allows_folder_descendants: false,
+    },
+];
+const SUPPORTED_SOURCE_ROOT_NAME_ALIASES: &[RootNameAlias] = &[RootNameAlias {
+    root_key: VAULT_ROOT_KEY,
+    stored_name: LEGACY_VAULT_ROOT_NAME,
+}];
+
+/// Exact schema emitted by Vault v2.0.0, the oldest supported migration source.
+///
+/// This is a bootstrap baseline, not an executable upgrade target. New
+/// databases install it and then traverse the same v2.1.0-and-later migration
+/// chain as upgraded v2.0.0 databases.
+const SCHEMA_STATEMENTS: &[&str] = &[
     r#"
     CREATE TABLE IF NOT EXISTS folders (
         id INTEGER PRIMARY KEY,
@@ -312,12 +358,6 @@ pub const STATEMENTS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS ix_share_links_code ON share_links(code)",
     "CREATE INDEX IF NOT EXISTS ix_share_links_document ON share_links(document_id)",
     "CREATE INDEX IF NOT EXISTS ix_share_links_folder ON share_links(folder_id)",
-];
-
-/// The first forward migration. `STATEMENTS` intentionally remains the exact
-/// unversioned schema shipped before migrations existed so startup can validate
-/// that shape before making any additive change.
-pub const MIGRATION_1_STATEMENTS: &[&str] = &[
     r#"
     CREATE TABLE IF NOT EXISTS schema_migrations (
         version INTEGER PRIMARY KEY,
@@ -362,5 +402,49 @@ pub const MIGRATION_1_STATEMENTS: &[&str] = &[
     "#,
     "CREATE INDEX IF NOT EXISTS ix_preview_renditions_job ON preview_renditions(preview_job_id)",
     "CREATE INDEX IF NOT EXISTS ix_preview_renditions_blob ON preview_renditions(blob_id)",
-    "INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (1, 'content previews')",
 ];
+
+async fn install(tx: &mut Transaction<'_, Sqlite>) -> anyhow::Result<()> {
+    for statement in SCHEMA_STATEMENTS {
+        tx.execute(*statement).await?;
+    }
+    insert_root_folders(tx).await?;
+    sqlx::query("INSERT INTO schema_migrations (version, name) VALUES (?, ?)")
+        .bind(BASELINE_MIGRATION_VERSION)
+        .bind(BASELINE_MIGRATION_NAME)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+async fn insert_root_folders(tx: &mut Transaction<'_, Sqlite>) -> anyhow::Result<()> {
+    for root in ROOT_FOLDERS {
+        sqlx::query(
+            r"
+            INSERT INTO folders (root_key, parent_id, name, is_root)
+            VALUES (?, NULL, ?, 1)
+            ",
+        )
+        .bind(root.key)
+        .bind(root.stored_name)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
+async fn validate_source(tx: &mut Transaction<'_, Sqlite>) -> anyhow::Result<()> {
+    invariants::validate(tx, &ROOT_FOLDERS, SUPPORTED_SOURCE_ROOT_NAME_ALIASES).await
+}
+
+fn install_boxed<'borrow>(
+    tx: &'borrow mut Transaction<'_, Sqlite>,
+) -> BoxFuture<'borrow, anyhow::Result<()>> {
+    Box::pin(install(tx))
+}
+
+fn validate_boxed<'borrow>(
+    tx: &'borrow mut Transaction<'_, Sqlite>,
+) -> BoxFuture<'borrow, anyhow::Result<()>> {
+    Box::pin(validate_source(tx))
+}

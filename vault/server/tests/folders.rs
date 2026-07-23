@@ -400,7 +400,7 @@ async fn visible_folder_resolver_conceals_hidden_and_missing_folders() {
 }
 
 #[tokio::test]
-async fn visible_folder_resolver_rejects_broken_ancestry_after_access_check() {
+async fn visible_folder_resolver_reports_visible_broken_ancestry_after_access_check() {
     let pool = test_pool().await;
     let viewers = create_group(&pool, "viewers").await;
     let detached_id = sqlx::query(
@@ -415,23 +415,42 @@ async fn visible_folder_resolver_rejects_broken_ancestry_after_access_check() {
         .expect("detached view access");
 
     assert!(
-        resolve_visible_folder_by_id(&pool, detached_id, &user(&["viewers"], false))
+        resolve_visible_folder_by_id(&pool, detached_id, &user(&["outsiders"], false))
             .await
-            .expect("resolve detached folder")
+            .expect("hidden malformed folder remains concealed")
             .is_none()
     );
-    assert!(
-        resolve_visible_folder_by_id(&pool, detached_id, &user(&[], true))
-            .await
-            .expect("admin resolves detached folder")
-            .is_none()
-    );
+    let viewer_error = resolve_visible_folder_by_id(&pool, detached_id, &user(&["viewers"], false))
+        .await
+        .expect_err("visible detached folder must report an invariant failure");
+    assert!(matches!(viewer_error, FolderError::InvalidStoredHierarchy));
+    let admin_error = resolve_visible_folder_by_id(&pool, detached_id, &user(&[], true))
+        .await
+        .expect_err("admin-visible detached folder must report an invariant failure");
+    assert!(matches!(admin_error, FolderError::InvalidStoredHierarchy));
     assert!(
         resolve_visible_folder_by_path(&pool, "Detached", &user(&[], true))
             .await
             .expect("admin resolves detached folder path")
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn visible_folder_resolver_rejects_a_nonbinary_fake_root() {
+    let pool = test_pool().await;
+    let fake_root_id = sqlx::query(
+        "INSERT INTO folders (root_key, parent_id, name, is_root) VALUES ('vault', NULL, '', 2)",
+    )
+    .execute(&pool)
+    .await
+    .expect("nonbinary fake root")
+    .last_insert_rowid();
+
+    let error = resolve_visible_folder_by_id(&pool, fake_root_id, &user(&[], true))
+        .await
+        .expect_err("nonbinary fake root must not resolve as canonical ancestry");
+    assert!(matches!(error, FolderError::InvalidStoredHierarchy));
 }
 
 #[tokio::test]

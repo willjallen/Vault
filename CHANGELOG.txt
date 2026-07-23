@@ -4,6 +4,9 @@ v2.1.0
 
 feat: Remember each folder's selected view and icon size across sessions and devices.
 feat: Add a changelog-backed What's New window that appears once per release.
+fix: Apply guarded, ordered database migrations from the v2.0.0 baseline and normalize legacy Vault roots before folder mutations are served.
+refactor: Centralize schema and data transitions in immutable per-version Rust migration modules with semantic startup validation.
+test: Generate pinned v2.0.0 compatibility databases at test time and gate upgrades with rollback checks and user-level folder mutation routes.
 
 
 ========================================================================

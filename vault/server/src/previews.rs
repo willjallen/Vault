@@ -914,27 +914,6 @@ pub async fn authorize_resolve_sources(
     Ok(authorized)
 }
 
-pub async fn backfill_current_version_jobs(
-    pool: &SqlitePool,
-    limit: i64,
-) -> Result<u64, PreviewError> {
-    Ok(sqlx::query(
-        r"
-        INSERT OR IGNORE INTO preview_jobs (source_blob_id, recipe, status)
-        SELECT DISTINCT v.blob_id, ?, 'queued'
-        FROM documents d
-        JOIN document_versions v ON v.document_id = d.id AND v.id = d.current_version_id
-        ORDER BY v.blob_id
-        LIMIT ?
-        ",
-    )
-    .bind(PREVIEW_RECIPE)
-    .bind(limit.clamp(1, 100_000))
-    .execute(pool)
-    .await?
-    .rows_affected())
-}
-
 pub async fn recover_interrupted_jobs(pool: &SqlitePool) -> Result<u64, PreviewError> {
     Ok(sqlx::query(
         r"

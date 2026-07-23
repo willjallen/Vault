@@ -190,6 +190,218 @@ async fn readiness_checks_database_and_storage_without_leaving_probe_artifacts()
 }
 
 #[tokio::test]
+async fn readiness_rejects_noncanonical_root_metadata_without_repairing_it() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let config = test_config(temp_dir.path());
+    let local_storage = LocalBlobStorage::new(config.objects_path(), &config.storage_prefix);
+    local_storage
+        .ensure()
+        .await
+        .expect("startup storage ensure");
+    let storage = Arc::new(ReadinessStorage::new(ReadinessBehavior::Local(
+        local_storage,
+    )));
+    let state = test_state(config, storage.clone()).await;
+    let db = state.db.clone();
+
+    let update =
+        sqlx::query("UPDATE folders SET name = 'Vault' WHERE root_key = 'vault' AND is_root = 1")
+            .execute(&db)
+            .await
+            .expect("make primary root metadata noncanonical");
+    assert_eq!(update.rows_affected(), 1);
+
+    let app = http::router(state);
+    let (liveness_status, liveness_body) =
+        get(app.clone(), "/health", Duration::from_secs(1)).await;
+    let (readiness_status, readiness_body) = get(app, "/api/health", Duration::from_secs(3)).await;
+
+    assert_eq!(liveness_status, StatusCode::OK);
+    assert_eq!(liveness_body, b"ok");
+    assert_eq!(readiness_status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        json_body(&readiness_body),
+        json!({
+            "ok": false,
+            "database": false,
+            "storage": true,
+            "storage_backend": "local"
+        })
+    );
+    assert_eq!(storage.check_count(), 1);
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT name FROM folders WHERE root_key = 'vault' AND is_root = 1",
+        )
+        .fetch_one(&db)
+        .await
+        .expect("read primary root after readiness probe"),
+        "Vault",
+        "readiness must not repair invalid persisted metadata"
+    );
+}
+
+#[tokio::test]
+async fn readiness_rejects_cross_root_hierarchy_without_repairing_it() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let config = test_config(temp_dir.path());
+    let local_storage = LocalBlobStorage::new(config.objects_path(), &config.storage_prefix);
+    local_storage
+        .ensure()
+        .await
+        .expect("startup storage ensure");
+    let storage = Arc::new(ReadinessStorage::new(ReadinessBehavior::Local(
+        local_storage,
+    )));
+    let state = test_state(config, storage.clone()).await;
+    let db = state.db.clone();
+
+    let insert = sqlx::query(
+        r"
+        INSERT INTO folders (root_key, parent_id, name, is_root)
+        SELECT 'archive', id, 'cross-root-readiness-probe', 0
+        FROM folders
+        WHERE root_key = 'vault' AND is_root = 1
+        ",
+    )
+    .execute(&db)
+    .await
+    .expect("insert cross-root hierarchy");
+    assert_eq!(insert.rows_affected(), 1);
+
+    let (status, body) = get(http::router(state), "/api/health", Duration::from_secs(3)).await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        json_body(&body),
+        json!({
+            "ok": false,
+            "database": false,
+            "storage": true,
+            "storage_backend": "local"
+        })
+    );
+    assert_eq!(storage.check_count(), 1);
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT root_key FROM folders WHERE name = 'cross-root-readiness-probe'",
+        )
+        .fetch_one(&db)
+        .await
+        .expect("read cross-root folder after readiness probe"),
+        "archive",
+        "readiness must not repair invalid folder ancestry"
+    );
+}
+
+#[tokio::test]
+async fn readiness_rejects_nonbinary_root_flag_without_repairing_it() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let (state, storage) = test_state_with_ready_storage(temp_dir.path()).await;
+    let db = state.db.clone();
+
+    let update =
+        sqlx::query("UPDATE folders SET is_root = 2 WHERE root_key = 'vault' AND is_root = 1")
+            .execute(&db)
+            .await
+            .expect("make primary root flag nonbinary");
+    assert_eq!(update.rows_affected(), 1);
+
+    assert_semantic_readiness_failure(state, &storage).await;
+
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT is_root FROM folders WHERE root_key = 'vault'")
+            .fetch_one(&db)
+            .await
+            .expect("read primary root flag after readiness probe"),
+        2,
+        "readiness must not repair an invalid root flag"
+    );
+}
+
+#[tokio::test]
+async fn readiness_rejects_archive_descendant_without_repairing_it() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let (state, storage) = test_state_with_ready_storage(temp_dir.path()).await;
+    let db = state.db.clone();
+
+    let folder_id = sqlx::query(
+        r"
+        INSERT INTO folders (root_key, parent_id, name, is_root)
+        SELECT 'archive', id, 'archive-descendant-readiness-probe', 0
+        FROM folders
+        WHERE root_key = 'archive' AND is_root = 1
+        ",
+    )
+    .execute(&db)
+    .await
+    .expect("insert archive descendant")
+    .last_insert_rowid();
+    let row_before = sqlx::query_as::<_, (String, Option<i64>, String, i64)>(
+        "SELECT root_key, parent_id, name, is_root FROM folders WHERE id = ?",
+    )
+    .bind(folder_id)
+    .fetch_one(&db)
+    .await
+    .expect("read archive descendant before readiness probe");
+
+    assert_semantic_readiness_failure(state, &storage).await;
+
+    assert_eq!(
+        sqlx::query_as::<_, (String, Option<i64>, String, i64)>(
+            "SELECT root_key, parent_id, name, is_root FROM folders WHERE id = ?",
+        )
+        .bind(folder_id)
+        .fetch_one(&db)
+        .await
+        .expect("read archive descendant after readiness probe"),
+        row_before,
+        "readiness must not mutate an invalid archive descendant"
+    );
+}
+
+#[tokio::test]
+async fn readiness_rejects_vault_archive_name_collision_without_repairing_it() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let (state, storage) = test_state_with_ready_storage(temp_dir.path()).await;
+    let db = state.db.clone();
+
+    let folder_id = sqlx::query(
+        r"
+        INSERT INTO folders (root_key, parent_id, name, is_root)
+        SELECT 'vault', id, 'Archive', 0
+        FROM folders
+        WHERE root_key = 'vault' AND is_root = 1
+        ",
+    )
+    .execute(&db)
+    .await
+    .expect("insert direct Vault child named Archive")
+    .last_insert_rowid();
+    let row_before = sqlx::query_as::<_, (String, Option<i64>, String, i64)>(
+        "SELECT root_key, parent_id, name, is_root FROM folders WHERE id = ?",
+    )
+    .bind(folder_id)
+    .fetch_one(&db)
+    .await
+    .expect("read Vault child before readiness probe");
+
+    assert_semantic_readiness_failure(state, &storage).await;
+
+    assert_eq!(
+        sqlx::query_as::<_, (String, Option<i64>, String, i64)>(
+            "SELECT root_key, parent_id, name, is_root FROM folders WHERE id = ?",
+        )
+        .bind(folder_id)
+        .fetch_one(&db)
+        .await
+        .expect("read Vault child after readiness probe"),
+        row_before,
+        "readiness must not mutate a Vault child that collides with Archive"
+    );
+}
+
+#[tokio::test]
 async fn readiness_reports_database_failure_without_leaking_details() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let config = test_config(temp_dir.path());
@@ -406,6 +618,41 @@ fn test_config(data_dir: &Path) -> Config {
 async fn test_state(config: Config, storage: SharedBlobStorage) -> AppState {
     let db = db::connect(&config.db_path()).await.expect("db");
     AppState::new(config, AuthSettings::default(), db, storage)
+}
+
+async fn test_state_with_ready_storage(data_dir: &Path) -> (AppState, Arc<ReadinessStorage>) {
+    let config = test_config(data_dir);
+    let local_storage = LocalBlobStorage::new(config.objects_path(), &config.storage_prefix);
+    local_storage
+        .ensure()
+        .await
+        .expect("startup storage ensure");
+    let storage = Arc::new(ReadinessStorage::new(ReadinessBehavior::Local(
+        local_storage,
+    )));
+    let state = test_state(config, storage.clone()).await;
+    (state, storage)
+}
+
+async fn assert_semantic_readiness_failure(state: AppState, storage: &ReadinessStorage) {
+    let app = http::router(state);
+    let (liveness_status, liveness_body) =
+        get(app.clone(), "/health", Duration::from_secs(1)).await;
+    let (readiness_status, readiness_body) = get(app, "/api/health", Duration::from_secs(3)).await;
+
+    assert_eq!(liveness_status, StatusCode::OK);
+    assert_eq!(liveness_body, b"ok");
+    assert_eq!(readiness_status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        json_body(&readiness_body),
+        json!({
+            "ok": false,
+            "database": false,
+            "storage": true,
+            "storage_backend": "local"
+        })
+    );
+    assert_eq!(storage.check_count(), 1);
 }
 
 async fn get(app: axum::Router, path: &str, deadline: Duration) -> (StatusCode, Vec<u8>) {

@@ -6,11 +6,15 @@ use sqlx::{FromRow, QueryBuilder, Sqlite, SqlitePool, Transaction};
 use thiserror::Error;
 
 use crate::auth::UserContext;
+use crate::root_folders::{
+    ARCHIVE_ROOT as ARCHIVE_ROOT_DEFINITION, ROOT_FOLDERS,
+    child_name_conflicts_with_root_namespace, definition as root_definition,
+};
 use crate::state_events::{record_state_event_in_tx, state_event_resources_json};
 
-pub const ARCHIVE_ROOT: &str = "Archive";
-pub const VAULT_ROOT_KEY: &str = "vault";
-pub const ARCHIVE_ROOT_KEY: &str = "archive";
+pub use crate::root_folders::{ARCHIVE_ROOT_KEY, VAULT_ROOT_KEY};
+
+pub const ARCHIVE_ROOT: &str = ARCHIVE_ROOT_DEFINITION.public_path_prefix;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicFolderPath {
@@ -90,6 +94,8 @@ pub enum FolderError {
     FolderNameRequired,
     #[error("invalid folder name")]
     InvalidFolderName,
+    #[error("folder name is reserved at the Vault root")]
+    ReservedRootFolderName,
     #[error("cannot move a root folder")]
     CannotMoveRootFolder,
     #[error("cannot delete a root folder")]
@@ -130,6 +136,8 @@ pub enum FolderError {
     WriteRequiresReadAndView,
     #[error("read permission requires view permission")]
     ReadRequiresView,
+    #[error("stored folder hierarchy violates an application invariant")]
+    InvalidStoredHierarchy,
     #[error(transparent)]
     Database(#[from] sqlx::Error),
 }
@@ -194,17 +202,24 @@ pub fn normalize_folder(folder: Option<&str>) -> Result<String, FolderError> {
 
 pub fn parse_public_folder_path(path: Option<&str>) -> Result<PublicFolderPath, FolderError> {
     let normalized = normalize_folder(path)?;
-    if normalized == ARCHIVE_ROOT {
-        return Ok(PublicFolderPath {
-            root_key: ARCHIVE_ROOT_KEY.to_string(),
-            relative_path: String::new(),
-        });
-    }
-    if let Some(relative) = normalized.strip_prefix(&format!("{ARCHIVE_ROOT}/")) {
-        return Ok(PublicFolderPath {
-            root_key: ARCHIVE_ROOT_KEY.to_string(),
-            relative_path: relative.to_string(),
-        });
+    for definition in ROOT_FOLDERS {
+        if definition.public_path_prefix.is_empty() {
+            continue;
+        }
+        if normalized == definition.public_path_prefix {
+            return Ok(PublicFolderPath {
+                root_key: definition.key.to_string(),
+                relative_path: String::new(),
+            });
+        }
+        if let Some(relative) =
+            normalized.strip_prefix(&format!("{}/", definition.public_path_prefix))
+        {
+            return Ok(PublicFolderPath {
+                root_key: definition.key.to_string(),
+                relative_path: relative.to_string(),
+            });
+        }
     }
     Ok(PublicFolderPath {
         root_key: VAULT_ROOT_KEY.to_string(),
@@ -214,16 +229,13 @@ pub fn parse_public_folder_path(path: Option<&str>) -> Result<PublicFolderPath, 
 
 pub fn public_folder_path(root_key: &str, relative_path: &str) -> Result<String, FolderError> {
     let relative = normalize_folder(Some(relative_path))?;
-    match root_key {
-        ARCHIVE_ROOT_KEY => {
-            if relative.is_empty() {
-                Ok(ARCHIVE_ROOT.to_string())
-            } else {
-                Ok(join_path(&[ARCHIVE_ROOT, &relative]))
-            }
-        }
-        VAULT_ROOT_KEY => Ok(relative),
-        _ => Err(FolderError::UnknownRootKey),
+    let definition = root_definition(root_key).ok_or(FolderError::UnknownRootKey)?;
+    if definition.public_path_prefix.is_empty() {
+        Ok(relative)
+    } else if relative.is_empty() {
+        Ok(definition.public_path_prefix.to_string())
+    } else {
+        Ok(join_path(&[definition.public_path_prefix, &relative]))
     }
 }
 
@@ -256,25 +268,10 @@ pub async fn get_root_folder(
     pool: &SqlitePool,
     root_key: &str,
 ) -> Result<FolderRecord, FolderError> {
-    let name = root_name(root_key)?;
-    let insert_result = sqlx::query(
-        r"
-        INSERT OR IGNORE INTO folders (root_key, parent_id, name, is_root)
-        VALUES (?, NULL, ?, 1)
-        ",
-    )
-    .bind(root_key)
-    .bind(name)
-    .execute(pool)
-    .await?;
-    let root = fetch_root_folder(pool, root_key).await?;
-    if insert_result.rows_affected() > 0 {
-        ensure_root_permissions_for_existing_groups(pool, root.id).await?;
-    }
-    Ok(root)
+    fetch_root_folder(pool, root_key).await
 }
 
-pub async fn ensure_root_folders(
+pub async fn load_root_folders(
     pool: &SqlitePool,
 ) -> Result<HashMap<String, FolderRecord>, FolderError> {
     let vault = get_root_folder(pool, VAULT_ROOT_KEY).await?;
@@ -851,6 +848,11 @@ async fn move_or_rename_folder(
     let mut transaction = pool.begin().await?;
     let target_parent =
         get_or_create_folder_path_in_tx(&mut transaction, &destination_path).await?;
+    if target_parent.is_root
+        && child_name_conflicts_with_root_namespace(&target_parent.root_key, &target_name)
+    {
+        return Err(FolderError::ReservedRootFolderName);
+    }
     match find_child_folder_in_tx(&mut transaction, target_parent.id, &target_name).await? {
         Some(existing) if existing.id != source.id => {
             return Err(FolderError::TargetFolderAlreadyExists);
@@ -952,8 +954,9 @@ pub async fn folder_path_by_id(pool: &SqlitePool, folder_id: i64) -> Result<Stri
 /// Resolves an existing, viewable folder and its canonical public path from one
 /// database snapshot.
 ///
-/// Missing folders, folders hidden from the user, and folders whose ancestry
-/// cannot produce a valid public path are intentionally indistinguishable.
+/// Missing folders and folders hidden from the user are intentionally
+/// indistinguishable. Invalid visible ancestry is reported internally as a
+/// stored-hierarchy failure without exposing the path in the error.
 pub async fn resolve_visible_folder_by_id(
     pool: &SqlitePool,
     folder_id: i64,
@@ -1252,13 +1255,17 @@ pub async fn add_folder_permission(
 }
 
 async fn fetch_root_folder(pool: &SqlitePool, root_key: &str) -> Result<FolderRecord, FolderError> {
-    Ok(sqlx::query_as::<_, FolderRecord>(&format!(
-        "{} WHERE root_key = ? AND is_root = 1",
+    let definition = root_definition(root_key).ok_or(FolderError::UnknownRootKey)?;
+    let root = sqlx::query_as::<_, FolderRecord>(&format!(
+        "{} WHERE root_key = ? AND is_root = 1 AND parent_id IS NULL",
         folder_select_sql()
     ))
     .bind(root_key)
-    .fetch_one(pool)
-    .await?)
+    .fetch_optional(pool)
+    .await?
+    .ok_or(FolderError::InvalidStoredHierarchy)?;
+    validate_root_record(&root, definition)?;
+    Ok(root)
 }
 
 async fn fetch_folder_by_id(pool: &SqlitePool, id: i64) -> Result<FolderRecord, FolderError> {
@@ -1274,13 +1281,31 @@ async fn fetch_root_folder_in_tx(
     transaction: &mut Transaction<'_, Sqlite>,
     root_key: &str,
 ) -> Result<FolderRecord, FolderError> {
-    Ok(sqlx::query_as::<_, FolderRecord>(&format!(
-        "{} WHERE root_key = ? AND is_root = 1",
+    let definition = root_definition(root_key).ok_or(FolderError::UnknownRootKey)?;
+    let root = sqlx::query_as::<_, FolderRecord>(&format!(
+        "{} WHERE root_key = ? AND is_root = 1 AND parent_id IS NULL",
         folder_select_sql()
     ))
     .bind(root_key)
-    .fetch_one(&mut **transaction)
-    .await?)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(FolderError::InvalidStoredHierarchy)?;
+    validate_root_record(&root, definition)?;
+    Ok(root)
+}
+
+fn validate_root_record(
+    root: &FolderRecord,
+    definition: crate::root_folders::RootFolderDefinition,
+) -> Result<(), FolderError> {
+    if root.root_key != definition.key
+        || !root.is_root
+        || root.parent_id.is_some()
+        || root.name != definition.stored_name
+    {
+        return Err(FolderError::InvalidStoredHierarchy);
+    }
+    Ok(())
 }
 
 async fn fetch_folder_by_id_in_tx(
@@ -1316,16 +1341,18 @@ async fn find_public_folder_by_path_in_tx(
         return Ok(None);
     }
     let Some(mut current) = sqlx::query_as::<_, FolderRecord>(&format!(
-        "{} WHERE root_key = ? AND is_root = 1 AND parent_id IS NULL AND name = ?",
+        "{} WHERE root_key = ? AND is_root = 1 AND parent_id IS NULL",
         folder_select_sql()
     ))
     .bind(&parsed.root_key)
-    .bind(root_name(&parsed.root_key)?)
     .fetch_optional(&mut **transaction)
     .await?
     else {
-        return Ok(None);
+        return Err(FolderError::InvalidStoredHierarchy);
     };
+    if current.name != root_name(&parsed.root_key)? {
+        return Err(FolderError::InvalidStoredHierarchy);
+    }
     if parsed.relative_path.is_empty() {
         return Ok(Some(current));
     }
@@ -1516,43 +1543,50 @@ async fn strict_public_folder_path_in_tx(
     let target_id = target.id;
     let target_root_key = target.root_key.clone();
     let mut current = target;
-    let mut names = Vec::new();
+    let mut names = Vec::<String>::new();
     let mut visited = HashSet::new();
 
     loop {
         if !visited.insert(current.id) || current.root_key != target_root_key {
-            return Ok(None);
+            return Err(FolderError::InvalidStoredHierarchy);
         }
         if current.is_root {
+            let Some(definition) = root_definition(&target_root_key) else {
+                return Err(FolderError::InvalidStoredHierarchy);
+            };
+            let canonical_root = fetch_root_folder_in_tx(transaction, &target_root_key).await?;
+            if current.id != canonical_root.id {
+                return Err(FolderError::InvalidStoredHierarchy);
+            }
             if current.parent_id.is_some()
-                || root_name(&target_root_key).ok() != Some(current.name.as_str())
-                || target_root_key == ARCHIVE_ROOT_KEY && !names.is_empty()
+                || definition.stored_name != current.name
+                || !definition.allows_folder_descendants && !names.is_empty()
             {
-                return Ok(None);
+                return Err(FolderError::InvalidStoredHierarchy);
             }
             names.reverse();
-            if target_root_key == VAULT_ROOT_KEY
-                && names.first().is_some_and(|name| name == ARCHIVE_ROOT)
-            {
-                return Ok(None);
+            if names.first().is_some_and(|name| {
+                child_name_conflicts_with_root_namespace(&target_root_key, name)
+            }) {
+                return Err(FolderError::InvalidStoredHierarchy);
             }
-            return Ok(public_folder_path(&target_root_key, &names.join("/"))
-                .ok()
-                .map(|path| (target_id, path)));
+            let path = public_folder_path(&target_root_key, &names.join("/"))
+                .map_err(|_| FolderError::InvalidStoredHierarchy)?;
+            return Ok(Some((target_id, path)));
         }
 
         let Some(normalized_name) = normalize_folder_item_name(&current.name).ok() else {
-            return Ok(None);
+            return Err(FolderError::InvalidStoredHierarchy);
         };
         if normalized_name != current.name {
-            return Ok(None);
+            return Err(FolderError::InvalidStoredHierarchy);
         }
         names.push(current.name);
         let Some(parent_id) = current.parent_id else {
-            return Ok(None);
+            return Err(FolderError::InvalidStoredHierarchy);
         };
         let Some(parent) = find_folder_by_id_in_tx(transaction, parent_id).await? else {
-            return Ok(None);
+            return Err(FolderError::InvalidStoredHierarchy);
         };
         current = parent;
     }
@@ -1852,23 +1886,6 @@ fn folder_is_archive(folder: &FolderRecord) -> bool {
     folder.root_key == ARCHIVE_ROOT_KEY
 }
 
-async fn ensure_root_permissions_for_existing_groups(
-    pool: &SqlitePool,
-    folder_id: i64,
-) -> Result<(), FolderError> {
-    sqlx::query(
-        r"
-        INSERT OR IGNORE INTO folder_permissions
-            (folder_id, group_id, can_view, can_read, can_write)
-        SELECT ?, id, 1, 1, 1 FROM vault_groups
-        ",
-    )
-    .bind(folder_id)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
 fn user_group_names(user: &UserContext) -> HashSet<String> {
     user.groups
         .iter()
@@ -1985,11 +2002,9 @@ fn folder_access_levels_sql() -> &'static str {
 }
 
 fn root_name(root_key: &str) -> Result<&'static str, FolderError> {
-    match root_key {
-        VAULT_ROOT_KEY => Ok(""),
-        ARCHIVE_ROOT_KEY => Ok("Archive"),
-        _ => Err(FolderError::UnknownRootKey),
-    }
+    root_definition(root_key)
+        .map(|definition| definition.stored_name)
+        .ok_or(FolderError::UnknownRootKey)
 }
 
 fn has_control_char(value: &str) -> bool {

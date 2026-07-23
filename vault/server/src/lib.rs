@@ -13,6 +13,7 @@ pub mod preferences;
 pub mod previews;
 pub mod reconciliation;
 pub mod redirects;
+pub mod root_folders;
 pub mod shares;
 pub mod site_settings;
 pub mod state_events;

@@ -1105,7 +1105,7 @@ async fn sync_vault_groups(
             continue;
         }
         let group_id = ensure_group(tx, group_name).await?;
-        ensure_group_root_permissions(tx, group_id).await?;
+        sync_group_root_permissions(tx, group_id).await?;
         target_group_ids.insert(group_id);
     }
 
@@ -1155,7 +1155,7 @@ async fn ensure_group(
     Ok(result.last_insert_rowid())
 }
 
-async fn ensure_group_root_permissions(
+async fn sync_group_root_permissions(
     tx: &mut Transaction<'_, Sqlite>,
     group_id: i64,
 ) -> Result<(), AuthError> {

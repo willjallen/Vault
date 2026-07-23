@@ -51,15 +51,16 @@ async fn initializes_sqlite_schema_with_root_folders() {
         .expect("root count");
     assert_eq!(roots, 2);
 
-    let migration_version: i64 = sqlx::query_scalar("SELECT version FROM schema_migrations")
-        .fetch_one(&pool)
-        .await
-        .expect("migration version");
-    assert_eq!(migration_version, 1);
+    let migration_versions: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM schema_migrations ORDER BY version")
+            .fetch_all(&pool)
+            .await
+            .expect("migration versions");
+    assert_eq!(migration_versions, [1, 2]);
 }
 
 #[tokio::test]
-async fn exact_unversioned_schema_is_migrated_without_losing_data() {
+async fn unversioned_pre_v2_schema_is_rejected_without_mutation() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let db_path = temp_dir.path().join("vault.db");
     initialize_valid_database(&db_path).await;
@@ -83,24 +84,29 @@ async fn exact_unversioned_schema_is_migrated_without_losing_data() {
         .expect("preserved data");
     raw.close().await;
 
-    let pool = db::connect(&db_path).await.expect("migrate baseline");
+    assert_startup_rejected(&db_path, "pre-v2 schema should reject").await;
+
+    let pool = raw_pool(&db_path).await;
     let value: String = sqlx::query_scalar("SELECT value FROM vault_settings WHERE key = 'keep'")
         .fetch_one(&pool)
         .await
         .expect("preserved setting");
     assert_eq!(value, "me");
-    let version: i64 = sqlx::query_scalar("SELECT version FROM schema_migrations")
-        .fetch_one(&pool)
-        .await
-        .expect("migration version");
-    assert_eq!(version, 1);
     let preview_tables: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('preview_jobs', 'preview_renditions')",
     )
     .fetch_one(&pool)
     .await
     .expect("preview tables");
-    assert_eq!(preview_tables, 2);
+    assert_eq!(preview_tables, 0);
+    let migration_tables: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("migration table");
+    assert_eq!(migration_tables, 0);
+    pool.close().await;
 }
 
 #[tokio::test]
@@ -162,6 +168,35 @@ async fn incompatible_existing_schema_is_rejected_without_dropping_data() {
         .await
         .expect("existing row");
     assert_eq!(path, "keep-me");
+    raw.close().await;
+}
+
+#[tokio::test]
+async fn view_only_database_is_not_mistaken_for_an_empty_database() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let db_path = temp_dir.path().join("vault.db");
+    let raw = raw_pool(&db_path).await;
+    sqlx::query("CREATE VIEW existing_view AS SELECT 1 AS value")
+        .execute(&raw)
+        .await
+        .expect("create existing view");
+    raw.close().await;
+
+    assert_startup_rejected(&db_path, "view-only database should reject").await;
+
+    let raw = raw_pool(&db_path).await;
+    let view_value: i64 = sqlx::query_scalar("SELECT value FROM existing_view")
+        .fetch_one(&raw)
+        .await
+        .expect("existing view remains");
+    assert_eq!(view_value, 1);
+    let vault_tables: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'folders'",
+    )
+    .fetch_one(&raw)
+    .await
+    .expect("folders table count");
+    assert_eq!(vault_tables, 0);
     raw.close().await;
 }
 
@@ -747,6 +782,37 @@ async fn nullability_type_and_check_constraint_drift_are_rejected_on_startup() {
         "changed check expression should reject",
     )
     .await;
+
+    let literal_case_path = temp_dir.path().join("literal-case.db");
+    initialize_valid_database(&literal_case_path).await;
+    let raw = raw_pool(&literal_case_path).await;
+    sqlx::query("PRAGMA writable_schema = ON")
+        .execute(&raw)
+        .await
+        .expect("enable writable schema");
+    sqlx::query(
+        r"
+        UPDATE sqlite_master
+        SET sql = replace(sql, '''queued''', '''QUEUED''')
+        WHERE type = 'table' AND name = 'preview_jobs'
+        ",
+    )
+    .execute(&raw)
+    .await
+    .expect("change preview status literal case");
+    sqlx::query("PRAGMA writable_schema = OFF")
+        .execute(&raw)
+        .await
+        .expect("disable writable schema");
+    let changed_sql: String = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'preview_jobs'",
+    )
+    .fetch_one(&raw)
+    .await
+    .expect("changed literal-case preview table sql");
+    assert!(changed_sql.contains("'QUEUED'"));
+    raw.close().await;
+    assert_startup_rejected(&literal_case_path, "case-changed SQL literal should reject").await;
 }
 
 #[tokio::test]

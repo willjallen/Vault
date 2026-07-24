@@ -1633,6 +1633,7 @@ async fn api_upload_session_part(
         session_id: &session_id,
         part_number,
         headers: part_headers,
+        body_idle_timeout: uploads::DEFAULT_UPLOAD_PART_BODY_IDLE_TIMEOUT,
     };
     let stream = request.into_body().into_data_stream();
     let _part_lock = UploadPartLock::acquire(
@@ -4132,6 +4133,7 @@ fn upload_error_response(error: UploadError) -> (StatusCode, String) {
             StatusCode::BAD_REQUEST,
             "Upload failed while reading request body".to_string(),
         ),
+        UploadError::UploadPartBodyIdleTimeout => upload_part_body_idle_timeout_response(),
         error @ (UploadError::UploadChecksumMismatch
         | UploadError::UploadIntegrityExpectationRequired
         | UploadError::UploadIntegrityDigestInvalid
@@ -4165,6 +4167,13 @@ fn upload_error_response(error: UploadError) -> (StatusCode, String) {
             )
         }
     }
+}
+
+fn upload_part_body_idle_timeout_response() -> (StatusCode, String) {
+    (
+        StatusCode::REQUEST_TIMEOUT,
+        "Upload part stopped receiving request-body data".to_string(),
+    )
 }
 
 fn upload_limit_error_response(error: &UploadError) -> (StatusCode, String) {

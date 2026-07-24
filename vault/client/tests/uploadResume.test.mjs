@@ -552,6 +552,100 @@ test("throwing upload progress callbacks cannot fail or strand an upload", async
   assert.equal(result.body.version, "version-progress");
 });
 
+test("a lost part response survives a control-path outage without retransmission", async () => {
+  const file = makeFile(4);
+  const sha256 = await sha256Blob(file.slice(0, 4));
+  const activeSession = await sessionPayload(file, {
+    chunk_size: 4,
+    id: "lost-part-response",
+    part_count: 1,
+    size_bytes: file.size,
+  });
+  const committedSession = {
+    ...activeSession,
+    uploaded_bytes: 4,
+    uploaded_parts: [{ offset: 0, part_number: 1, sha256, size_bytes: 4 }],
+  };
+  installLocalStorage();
+  const requests = [];
+  globalThis.XMLHttpRequest = class LostResponseXMLHttpRequest {
+    constructor() {
+      this.headers = {};
+      this.responseText = "";
+      this.status = 0;
+      this.upload = {};
+    }
+
+    abort() {
+      this.onabort?.();
+    }
+
+    open(method, url) {
+      this.method = method;
+      this.url = url;
+    }
+
+    send(chunk) {
+      requests.push(this);
+      queueMicrotask(() => {
+        this.upload.onprogress?.({ loaded: chunk.size });
+        this.onerror?.();
+      });
+    }
+
+    setRequestHeader(name, value) {
+      this.headers[name.toLowerCase()] = value;
+    }
+  };
+  const fetches = [];
+  let reconciliationReads = 0;
+  globalThis.fetch = async (url, options = {}) => {
+    fetches.push(`${options.method || "GET"} ${url}`);
+    if (String(url).startsWith("/health?")) {
+      return jsonResponse({ ok: true });
+    }
+    if (url === "/api/uploads" && options.method === "POST") {
+      return jsonResponse(activeSession);
+    }
+    if (url === "/api/uploads/lost-part-response" && !options.method) {
+      reconciliationReads += 1;
+      if (reconciliationReads === 1) {
+        throw new TypeError("Vault is temporarily unreachable");
+      }
+      return jsonResponse(committedSession);
+    }
+    if (url === "/api/uploads/lost-part-response/status" && !options.method) {
+      return jsonResponse(committedSession);
+    }
+    if (url === "/api/uploads/lost-part-response/complete" && options.method === "POST") {
+      return jsonResponse({ id: 7, path: file.name, version: "reconciled-part" });
+    }
+    throw new Error(`unexpected fetch ${options.method || "GET"} ${url}`);
+  };
+  const progress = [];
+
+  const result = await uploadFileResumable({
+    file,
+    onProgress: (value) => progress.push(value),
+    signal: new AbortController().signal,
+  });
+
+  assert.equal(requests.length, 1);
+  assert.equal(reconciliationReads, 2);
+  assert.equal(result.body.version, "reconciled-part");
+  assert.ok(fetches.includes("GET /api/uploads/lost-part-response"));
+  assert.ok(progress.some((value) => value.stage === "reconnecting"));
+  assert.ok(
+    progress.some(
+      (value) =>
+        value.stage === "reconciling" &&
+        value.committedBytes === 0 &&
+        value.inFlightBytes === 0 &&
+        value.loaded === 0
+    )
+  );
+});
+
 test("upload resumes a stored session only after committed parts exist", async () => {
   const file = makeFile(8);
   const firstPartSha256 = await sha256Blob(file.slice(0, 4));

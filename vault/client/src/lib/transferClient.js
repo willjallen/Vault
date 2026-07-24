@@ -1,4 +1,6 @@
-import * as browserDownload from "./browserDownload.js";
+export { downloadUrl, exportAndDownload } from "./downloadClient.js";
+export { TransferCancelledError } from "./transferCore.js";
+
 import {
   sha256Blob,
   uploadContentFingerprint,
@@ -8,9 +10,11 @@ import {
 } from "./fileIntegrity.js";
 import {
   createUploadCancellation,
+  currentUploadInFlightBytes,
   currentUploadLoadedBytes,
   reportUploadProgress,
   runUploadWorkers,
+  shouldRetryUploadPart,
   uploadPart,
   uploadParallelismForLatency,
 } from "./uploadPartPolicy.js";
@@ -30,106 +34,17 @@ import {
   validateInMemoryCompletionManifest,
   waitForUploadSessionTransition as pollUploadSessionTransition,
 } from "./uploadStatusPolicy.js";
-import { createExportProgressTracker, trackExportJobProgress } from "./exportStatusPolicy.js";
-const EXPORT_POLL_MS = 900;
+import {
+  TransferCancelledError,
+  isAbortError,
+  progressFromValues,
+  requestJson,
+  throwIfAborted,
+  waitFor,
+} from "./transferCore.js";
+
 const PROGRESS_TICK_MS = 80;
-const SERVER_PROGRESS_RATE_MIN_BYTES = 1024 * 1024;
-
-export class TransferCancelledError extends Error {
-  constructor(message = "Transfer cancelled") {
-    super(message);
-    this.cancelled = true;
-    this.name = "TransferCancelledError";
-  }
-}
-
-function parseJson(value) {
-  if (!value) {
-    return {};
-  }
-  try {
-    return JSON.parse(value);
-  } catch {
-    return {};
-  }
-}
-
-function errorFromText(text, responseStatus, fallback) {
-  const parsed = parseJson(text);
-  const detail = parsed.detail || fallback;
-  const error = new Error(detail);
-  error.detail = parsed.detail || "";
-  error.responseText = text || "";
-  error.status = responseStatus;
-  return error;
-}
-
-async function errorFromResponse(response, fallback) {
-  const text = await response.text().catch(() => "");
-  return errorFromText(text, response.status, fallback);
-}
-
-function progressFromValues(loaded, total, startedAt, options = {}) {
-  const elapsedSeconds = Math.max((performance.now() - startedAt) / 1000, 0.01);
-  const suppressRate =
-    options.noProgressSeconds > 0 ||
-    (options.stage === "preparing" && loaded > 0 && loaded < SERVER_PROGRESS_RATE_MIN_BYTES);
-  const bytesPerSecond = suppressRate ? 0 : loaded / elapsedSeconds;
-  const finalizing = options.stage === "finalizing" || options.stage === "server-finalizing";
-  const etaSeconds =
-    total && bytesPerSecond > 0 && loaded < total && !finalizing && !suppressRate
-      ? (total - loaded) / bytesPerSecond
-      : null;
-  return {
-    bytesPerSecond: finalizing ? 0 : bytesPerSecond,
-    createdAt: options.createdAt || null,
-    etaSeconds,
-    lengthComputable: Boolean(total),
-    loaded,
-    noProgressSeconds: options.noProgressSeconds || 0,
-    percent: total ? Math.min(100, Math.max(0, (loaded / total) * 100)) : null,
-    processedItems: options.processedItems ?? null,
-    resumedBytes: options.resumedBytes || null,
-    serverStatus: options.serverStatus || null,
-    stage: options.stage || "transfer",
-    total,
-    totalItems: options.totalItems ?? null,
-    updatedAt: options.updatedAt || null,
-  };
-}
-
-function byteLength(value) {
-  return value?.byteLength || value?.size || value?.length || 0;
-}
-
-function isAbortError(error) {
-  return error?.name === "AbortError" || error?.cancelled;
-}
-
-function throwIfAborted(signal) {
-  if (signal?.aborted) {
-    throw new TransferCancelledError();
-  }
-}
-
-function waitFor(delay, signal) {
-  throwIfAborted(signal);
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      signal?.removeEventListener("abort", onAbort);
-      resolve();
-    }, delay);
-    function onAbort() {
-      clearTimeout(timer);
-      signal?.removeEventListener("abort", onAbort);
-      reject(new TransferCancelledError());
-    }
-    signal?.addEventListener("abort", onAbort, { once: true });
-    if (signal?.aborted) {
-      onAbort();
-    }
-  });
-}
+const UPLOAD_RECONCILIATION_REQUEST_TIMEOUT_MS = 15 * 1000;
 
 async function measureUploadControlLatency(signal) {
   throwIfAborted(signal);
@@ -158,22 +73,6 @@ async function resolveUploadParallelism(signal) {
   return uploadParallelismForLatency(controlRttMs);
 }
 
-async function requestJson(url, options = {}, fallback = "Request failed") {
-  let response;
-  try {
-    response = await fetch(url, { credentials: "include", ...options });
-  } catch (error) {
-    if (isAbortError(error)) {
-      throw new TransferCancelledError();
-    }
-    throw error;
-  }
-  if (!response.ok) {
-    throw await errorFromResponse(response, fallback);
-  }
-  return response.json();
-}
-
 async function existingUploadSession(sessionId, signal) {
   try {
     return await requestJson(`/api/uploads/${sessionId}`, { signal }, "Upload session not found");
@@ -182,6 +81,35 @@ async function existingUploadSession(sessionId, signal) {
       return null;
     }
     throw error;
+  }
+}
+
+async function existingUploadSessionForReconciliation(sessionId, signal) {
+  throwIfAborted(signal);
+  const controller = new AbortController();
+  let timedOut = false;
+  const abortFromCaller = () => controller.abort();
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, UPLOAD_RECONCILIATION_REQUEST_TIMEOUT_MS);
+  signal?.addEventListener("abort", abortFromCaller, { once: true });
+  try {
+    return await existingUploadSession(sessionId, controller.signal);
+  } catch (error) {
+    if (signal?.aborted) {
+      throw new TransferCancelledError();
+    }
+    if (timedOut) {
+      const timeoutError = new Error("Vault did not answer the upload status request");
+      timeoutError.networkError = true;
+      timeoutError.timeout = true;
+      throw timeoutError;
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", abortFromCaller);
   }
 }
 
@@ -236,19 +164,20 @@ async function completeUploadSession(session, { partManifestSha256, sha256 = nul
   );
 }
 
-function pollUploadVerification({ sessionId, signal, onProgress, isDone }) {
+function pollUploadVerification({ fileSize, sessionId, signal, onProgress, isDone }) {
   const startedAt = performance.now();
   return pollUploadVerificationStatus({
     isDone,
     onVerification: (verification) =>
       reportUploadProgress(
         onProgress,
-        progressFromValues(
-          verification.processed_bytes || 0,
-          verification.total_bytes || null,
-          startedAt,
-          { stage: "verifying" }
-        )
+        progressFromValues(fileSize, fileSize, startedAt, {
+          committedBytes: fileSize,
+          inFlightBytes: 0,
+          stage: "verifying",
+          verificationLoaded: verification.processed_bytes || 0,
+          verificationTotal: verification.total_bytes || null,
+        })
       ),
     readStatus: existingUploadSessionStatus,
     sessionId,
@@ -292,6 +221,90 @@ function expectedUploadPart(fileSize, chunkSize, partNumber) {
     offset,
     size: Math.max(0, Math.min(chunkSize, fileSize - offset)),
   };
+}
+
+function matchingCommittedUploadPart(current, partNumber, expected, sha256) {
+  const part = (current?.uploaded_parts || []).find(
+    (candidate) => Number(candidate?.part_number) === partNumber
+  );
+  if (!part) {
+    return null;
+  }
+  if (Number(part.offset) !== expected.offset || Number(part.size_bytes) !== expected.size) {
+    const error = new Error("Vault reported conflicting content for a retried upload part.");
+    error.status = 409;
+    throw error;
+  }
+  if (part.sha256 == null) {
+    return null;
+  }
+  if (part.sha256 !== sha256) {
+    const error = new Error("Vault reported conflicting content for a retried upload part.");
+    error.status = 409;
+    throw error;
+  }
+  return part;
+}
+
+async function reconcileUploadPartAfterFailure({
+  attempt,
+  expected,
+  file,
+  key,
+  maxAttempts,
+  onState,
+  partNumber,
+  resumeIdentitySha256,
+  session,
+  sha256,
+  signal,
+}) {
+  let retryDelayMs = 1000;
+  while (true) {
+    throwIfAborted(signal);
+    let current;
+    try {
+      current = await existingUploadSessionForReconciliation(session.id, signal);
+    } catch (error) {
+      if (isAbortError(error)) {
+        throw error;
+      }
+      if (!shouldRetryUploadPart(error)) {
+        throw error;
+      }
+      onState({
+        attempt,
+        maxAttempts,
+        partNumber,
+        retryDelayMs,
+        stage: "reconnecting",
+      });
+      await waitFor(retryDelayMs, signal);
+      retryDelayMs = Math.min(30_000, retryDelayMs * 2);
+      continue;
+    }
+
+    if (!current) {
+      const error = new Error("The upload session expired while reconnecting.");
+      error.status = 410;
+      throw error;
+    }
+    if (!uploadSessionLayoutMatchesFile(current, file, resumeIdentitySha256)) {
+      throw new Error("The upload session changed while reconnecting.");
+    }
+    const committed = matchingCommittedUploadPart(current, partNumber, expected, sha256);
+    if (committed) {
+      rememberUploadSession(key, current);
+      return committed;
+    }
+    if (current.status !== "active") {
+      const error = new Error(`Upload session is ${current.status}.`);
+      error.status = 409;
+      throw error;
+    }
+    rememberUploadSession(key, current);
+    return null;
+  }
 }
 
 function activeUploadSessionMatchesFile(session, file, resumeIdentitySha256) {
@@ -541,9 +554,9 @@ export async function uploadFileResumable({
       renameToUpload,
     });
     resumeIdentitySha256 = await uploadResumeIdentitySha256(key, uploadSignal);
-    // Upload session sizing is path-sensitive. Low-latency clients should not
-    // pay for high request fanout, but stream-limited clients need enough active
-    // PUTs to fill their uplink. The server uses this hint to choose chunk size.
+    // Upload session sizing is path-sensitive. Use modest fanout on paths that
+    // have not demonstrated low latency; the server also uses this hint when it
+    // chooses the session's immutable chunk layout.
     const uploadParallelism = await resolveUploadParallelism(uploadSignal);
     const resolved = await resolveUploadSession({
       documentId,
@@ -567,13 +580,37 @@ export async function uploadFileResumable({
     const uploadedParts = new Map(
       (session.uploaded_parts || []).map((part) => [part.part_number, part])
     );
-    let completedBytes = [...uploadedParts.values()].reduce(
+    let committedBytes = [...uploadedParts.values()].reduce(
       (total, part) => total + part.size_bytes,
       0
     );
-    const resumedBytes = resumedSession ? completedBytes : 0;
+    const resumedBytes = resumedSession ? committedBytes : 0;
     const activeParts = new Map();
     let lastProgressEmittedAt = 0;
+
+    function activeUploadPresentation() {
+      const priorities = {
+        "awaiting-ack": 1,
+        retrying: 2,
+        stalled: 3,
+        reconciling: 4,
+        reconnecting: 5,
+      };
+      let selected = null;
+      for (const part of activeParts.values()) {
+        if (!selected || (priorities[part.stage] || 0) > (priorities[selected.stage] || 0)) {
+          selected = part;
+        }
+      }
+      return {
+        attempt: selected?.attempt ?? null,
+        maxAttempts: selected?.maxAttempts ?? null,
+        noProgressSeconds: selected?.noProgressSeconds || 0,
+        retryDelayMs: selected?.retryDelayMs || null,
+        stage: selected?.stage || "uploading",
+        waitingForAcknowledgement: Boolean(selected?.waitingForAcknowledgement),
+      };
+    }
 
     function emitUploadProgress(options = {}) {
       const now = performance.now();
@@ -581,19 +618,22 @@ export async function uploadFileResumable({
         return;
       }
       lastProgressEmittedAt = now;
+      const inFlightBytes = currentUploadInFlightBytes(activeParts);
       reportUploadProgress(
         onProgress,
         progressFromValues(
           currentUploadLoadedBytes({
             activeParts,
-            completedBytes,
+            completedBytes: committedBytes,
             fileSize: file.size,
           }),
           file.size,
           startedAt,
           {
+            committedBytes,
+            inFlightBytes,
             resumedBytes,
-            stage: "uploading",
+            ...activeUploadPresentation(),
           }
         )
       );
@@ -612,11 +652,25 @@ export async function uploadFileResumable({
       emitUploadProgress({ force: Boolean(options.reset) });
     }
 
+    function updateActivePartState(partNumber, state) {
+      const current = activeParts.get(partNumber);
+      if (!current) {
+        return;
+      }
+      activeParts.set(partNumber, {
+        ...current,
+        ...state,
+      });
+      emitUploadProgress({ force: true });
+    }
+
     emitUploadProgress({ force: true });
     if (resumedBytes > 0) {
       reportUploadProgress(
         onProgress,
-        progressFromValues(completedBytes, file.size, startedAt, {
+        progressFromValues(committedBytes, file.size, startedAt, {
+          committedBytes,
+          inFlightBytes: 0,
           resumedBytes,
           stage: "resuming",
         })
@@ -637,15 +691,54 @@ export async function uploadFileResumable({
           continue;
         }
         const sha256 = await sha256Blob(chunk, uploadSignal);
-        activeParts.set(partNumber, { loaded: 0, size: chunk.size });
+        const expected = { offset, size: chunk.size };
+        activeParts.set(partNumber, {
+          attempt: null,
+          loaded: 0,
+          maxAttempts: null,
+          size: chunk.size,
+          stage: "uploading",
+        });
         emitUploadProgress({ force: true });
         try {
           await uploadPart({
             chunk,
-            onAttemptStart: () => updateActivePartProgress(partNumber, 0, { reset: true }),
+            onAttemptStart: (state) => {
+              updateActivePartProgress(partNumber, 0, { reset: true });
+              updateActivePartState(partNumber, { ...state, stage: "uploading" });
+            },
             onProgress: (loaded) => updateActivePartProgress(partNumber, loaded),
+            onState: (state) => updateActivePartState(partNumber, state),
             offset,
             partNumber,
+            reconcileAfterFailure: async ({ attempt, maxAttempts }) => {
+              // XHR progress describes bytes handed to the transport, not
+              // durable server state. Once that request fails, discard its
+              // speculative contribution before asking Vault what committed.
+              updateActivePartProgress(partNumber, 0, { reset: true });
+              updateActivePartState(partNumber, {
+                attempt,
+                maxAttempts,
+                stage: "reconciling",
+              });
+              const committed = await reconcileUploadPartAfterFailure({
+                attempt,
+                expected,
+                file,
+                key,
+                maxAttempts,
+                onState: (state) => updateActivePartState(partNumber, state),
+                partNumber,
+                resumeIdentitySha256,
+                session,
+                sha256,
+                signal: uploadSignal,
+              });
+              if (committed) {
+                uploadedParts.set(partNumber, committed);
+              }
+              return Boolean(committed);
+            },
             session,
             sha256,
             signal: uploadSignal,
@@ -654,7 +747,7 @@ export async function uploadFileResumable({
           activeParts.delete(partNumber);
         }
         partDigests.set(partNumber, { sha256, size: chunk.size });
-        completedBytes += chunk.size;
+        committedBytes += chunk.size;
         emitUploadProgress({ force: true });
       }
     }
@@ -677,7 +770,11 @@ export async function uploadFileResumable({
     const verificationStartedAt = performance.now();
     reportUploadProgress(
       onProgress,
-      progressFromValues(0, file.size, verificationStartedAt, { stage: "verifying" })
+      progressFromValues(file.size, file.size, verificationStartedAt, {
+        committedBytes: file.size,
+        inFlightBytes: 0,
+        stage: "verifying",
+      })
     );
     let verificationDone = false;
     const verificationController = new AbortController();
@@ -688,6 +785,7 @@ export async function uploadFileResumable({
       uploadSignal.addEventListener("abort", abortVerification, { once: true });
     }
     const verificationPoll = pollUploadVerification({
+      fileSize: file.size,
       isDone: () => verificationDone,
       onProgress,
       sessionId: session.id,
@@ -717,261 +815,16 @@ export async function uploadFileResumable({
     forgetUploadSession(key);
     reportUploadProgress(
       onProgress,
-      progressFromValues(file.size, file.size, verificationStartedAt, { stage: "verifying" })
+      progressFromValues(file.size, file.size, verificationStartedAt, {
+        committedBytes: file.size,
+        inFlightBytes: 0,
+        stage: "verifying",
+      })
     );
     return { body: result, size: file.size, status: 200 };
   } catch (error) {
     return await handleFailure(error);
   } finally {
     cancellation.dispose();
-  }
-}
-
-function filenameFromDisposition(disposition) {
-  if (!disposition) {
-    return "";
-  }
-
-  const utfMatch = disposition.match(/filename\*=UTF-8''([^;]+)/i);
-  if (utfMatch) {
-    try {
-      return decodeURIComponent(utfMatch[1].replace(/"/g, "").trim());
-    } catch {
-      return utfMatch[1].replace(/"/g, "").trim();
-    }
-  }
-
-  const quotedMatch = disposition.match(/filename="([^"]+)"/i);
-  if (quotedMatch) {
-    return quotedMatch[1].trim();
-  }
-
-  const plainMatch = disposition.match(/filename=([^;]+)/i);
-  return plainMatch ? plainMatch[1].replace(/"/g, "").trim() : "";
-}
-
-function browserManagedDownload({
-  fallbackName,
-  fallbackTotal,
-  onProgress,
-  signal,
-  startedAt,
-  url,
-}) {
-  onProgress(progressFromValues(0, fallbackTotal, startedAt, { stage: "browser-handoff" }));
-  browserDownload.startBrowserDownload(url, fallbackName, signal);
-  return {
-    browserManaged: true,
-    filename: browserDownload.cleanDownloadName(fallbackName),
-    size: fallbackTotal || 0,
-    status: 202,
-  };
-}
-
-function totalFromDownloadResponse(response, fallbackTotal) {
-  const headerLength = Number(response.headers.get("Content-Length") || 0);
-  return Number.isFinite(headerLength) && headerLength > 0 ? headerLength : fallbackTotal;
-}
-
-function sameOriginDownloadUrl(url) {
-  if (typeof url !== "string" || !url) {
-    throw new Error("Download preparation did not return a URL.");
-  }
-  const resolvedUrl = new URL(url, window.location.href);
-  if (resolvedUrl.origin !== window.location.origin) {
-    throw new Error("Download URL must use the same origin as Vault.");
-  }
-  return url;
-}
-
-async function prepareDownloadUrl({ prepare, signal, url }) {
-  throwIfAborted(signal);
-  const preparedUrl = prepare ? await prepare(signal) : url;
-  throwIfAborted(signal);
-  return sameOriginDownloadUrl(preparedUrl);
-}
-
-async function cancelResponseBody(response) {
-  if (!response?.body || typeof response.body.cancel !== "function") {
-    return;
-  }
-  await response.body.cancel().catch(() => {});
-}
-
-async function streamResponseToFile({ response, writer, total, onProgress, signal, startedAt }) {
-  if (!response.body?.pipeThrough || typeof TransformStream !== "function") {
-    throw new Error("Streaming downloads are not supported by this browser.");
-  }
-  let loaded = 0;
-  let lastProgressEmittedAt = 0;
-
-  function emitDownloadProgress(stage = "downloading", options = {}) {
-    const now = performance.now();
-    if (!options.force && now - lastProgressEmittedAt < PROGRESS_TICK_MS) {
-      return;
-    }
-    lastProgressEmittedAt = now;
-    onProgress(progressFromValues(loaded, total, startedAt, { stage }));
-  }
-
-  const progressStream = new TransformStream({
-    transform(chunk, controller) {
-      throwIfAborted(signal);
-      loaded += byteLength(chunk);
-      emitDownloadProgress();
-      controller.enqueue(chunk);
-    },
-  });
-  onProgress(progressFromValues(0, total, startedAt, { stage: "downloading" }));
-  await response.body.pipeThrough(progressStream).pipeTo(writer, { signal });
-  emitDownloadProgress("finalizing", { force: true });
-  return loaded;
-}
-
-export async function downloadUrl({
-  url,
-  customDownloadsEnabled = false,
-  fallbackName = "download",
-  onProgress,
-  fallbackTotal = null,
-  signal,
-  writer: existingWriter = null,
-  prepare = null,
-}) {
-  const startedAt = performance.now();
-  let response = null;
-  let writer = existingWriter;
-  try {
-    throwIfAborted(signal);
-    onProgress(progressFromValues(0, fallbackTotal, startedAt, { stage: "starting" }));
-    const useBrowserDownload =
-      !browserDownload.canUseFileSystemDownloadWriter(customDownloadsEnabled);
-    if (!writer && useBrowserDownload) {
-      const browserPreparedUrl = await prepareDownloadUrl({ prepare, signal, url });
-      return browserManagedDownload({
-        fallbackName,
-        fallbackTotal,
-        onProgress,
-        signal,
-        startedAt,
-        url: browserPreparedUrl,
-      });
-    }
-    if (!writer) {
-      writer = await browserDownload.openFileSystemDownloadWriter(fallbackName, signal);
-    }
-    const preparedUrl = await prepareDownloadUrl({ prepare, signal, url });
-    response = await fetch(preparedUrl, { credentials: "include", signal });
-    if (!response.ok) {
-      throw await errorFromResponse(response, "Download failed");
-    }
-    const total = totalFromDownloadResponse(response, fallbackTotal);
-    const filename =
-      filenameFromDisposition(response.headers.get("Content-Disposition")) ||
-      fallbackName ||
-      "download";
-    const size = await streamResponseToFile({
-      onProgress,
-      response,
-      signal,
-      startedAt,
-      total,
-      writer,
-    });
-    writer = null;
-    return { filename, size: size || total || 0, status: response.status };
-  } catch (error) {
-    await cancelResponseBody(response);
-    if (writer) {
-      await writer.abort().catch(() => {});
-    }
-    if (signal?.aborted || isAbortError(error)) {
-      throw new TransferCancelledError();
-    }
-    throw error;
-  }
-}
-
-async function cancelExportJob(jobId) {
-  try {
-    await requestJson(`/api/exports/${jobId}`, { method: "DELETE" }, "Could not cancel export");
-  } catch {
-    // Cancellation cleanup is best-effort after the client has already aborted polling.
-  }
-}
-
-export async function exportAndDownload({
-  customDownloadsEnabled = false,
-  payload,
-  onProgress,
-  signal,
-  suggestedName = "vault-download.zip",
-}) {
-  const startedAt = performance.now();
-  let job = null;
-  let writer = null;
-  try {
-    onProgress(progressFromValues(0, null, startedAt, { stage: "starting" }));
-    if (browserDownload.canUseFileSystemDownloadWriter(customDownloadsEnabled)) {
-      writer = await browserDownload.openFileSystemDownloadWriter(suggestedName, signal);
-    }
-    job = await requestJson(
-      "/api/exports",
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-        signal,
-      },
-      "Could not start export"
-    );
-    const exportStartedAt = performance.now();
-    const progressTracker = createExportProgressTracker(exportStartedAt);
-    let current = job;
-    while (!["complete", "failed", "cancelled"].includes(current.status)) {
-      throwIfAborted(signal);
-      const serverProgress = trackExportJobProgress(current, progressTracker);
-      onProgress(
-        progressFromValues(serverProgress.loaded, serverProgress.total, exportStartedAt, {
-          ...serverProgress,
-          stage:
-            current.status === "queued"
-              ? "queued"
-              : current.status === "finalizing"
-                ? "server-finalizing"
-                : "preparing",
-        })
-      );
-      await waitFor(EXPORT_POLL_MS, signal);
-      current = await requestJson(`/api/exports/${job.id}`, { signal }, "Could not refresh export");
-    }
-    if (current.status === "cancelled") {
-      throw new TransferCancelledError("Export cancelled");
-    }
-    if (current.status !== "complete" || !current.download_url) {
-      throw new Error(current.error || `Export ${current.status}`);
-    }
-    const downloadWriter = writer;
-    writer = null;
-    return downloadUrl({
-      customDownloadsEnabled,
-      fallbackName: current.filename || suggestedName || "vault-download.zip",
-      fallbackTotal: current.size_bytes || current.total_bytes || null,
-      onProgress,
-      signal,
-      url: current.download_url,
-      writer: downloadWriter,
-    });
-  } catch (error) {
-    if (writer) {
-      await writer.abort().catch(() => {});
-    }
-    if (isAbortError(error)) {
-      if (job?.id) {
-        await cancelExportJob(job.id);
-      }
-      throw new TransferCancelledError();
-    }
-    throw error;
   }
 }

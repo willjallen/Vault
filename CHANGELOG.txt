@@ -1,5 +1,12 @@
 ========================================================================
 
+Unreleased
+
+fix: Make resumable uploads recover promptly from stalls and network interruptions while reporting only server-confirmed progress.
+
+
+========================================================================
+
 v2.1.0
 
 feat: Remember each folder's selected view and icon size across sessions and devices.

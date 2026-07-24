@@ -91,6 +91,55 @@ test("one operation aggregates folder and concurrent file progress before comple
   assert.equal(harness.progress.at(-1).percent, 100);
 });
 
+test("a retried part rolls aggregate progress back to server-committed bytes", async () => {
+  const file = filesWithSizes([10])[0];
+  const progress = [];
+  const operation = createUploadOperation({
+    descriptor: describeUploadOperation({ files: [file] }),
+    onCancelled: () => assert.fail("upload was cancelled"),
+    onComplete: () => {},
+    onError: (error) => assert.fail(error),
+    onProgress: (value) => progress.push(value),
+    runUpload: async ({ onProgress }) => {
+      onProgress({
+        committedBytes: 4,
+        inFlightBytes: 6,
+        loaded: 10,
+        stage: "awaiting-ack",
+        waitingForAcknowledgement: true,
+      });
+      onProgress({
+        attempt: 2,
+        committedBytes: 4,
+        inFlightBytes: 0,
+        loaded: 4,
+        maxAttempts: 3,
+        stage: "retrying",
+      });
+      onProgress({
+        committedBytes: 10,
+        inFlightBytes: 0,
+        loaded: 10,
+        stage: "uploading",
+      });
+      return { id: file.name };
+    },
+    signal: new AbortController().signal,
+  });
+
+  await operation.upload({ file });
+
+  const awaiting = progress.find((value) => value.stage === "awaiting-ack");
+  const retrying = progress.find((value) => value.stage === "retrying");
+  assert.equal(awaiting.committedBytes, 4);
+  assert.equal(awaiting.inFlightBytes, 6);
+  assert.equal(awaiting.percent, 99.9);
+  assert.equal(retrying.committedBytes, 4);
+  assert.equal(retrying.inFlightBytes, 0);
+  assert.equal(retrying.loaded, 4);
+  assert.equal(retrying.percent, 40);
+});
+
 test("aborting a bulk operation cancels every child and settles one operation popup", async () => {
   const files = filesWithSizes([2, 3, 4]);
   const controller = new AbortController();

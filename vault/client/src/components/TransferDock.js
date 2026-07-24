@@ -25,6 +25,50 @@ function errorTransferTitle(transfer) {
   return transfer.kind === "upload" ? "Upload failed" : "Download failed";
 }
 
+const ACTIVE_UPLOAD_TITLES = new Map([
+  ["awaiting-ack", "Awaiting Vault"],
+  ["reconnecting", "Reconnecting upload"],
+  ["reconciling", "Checking upload"],
+  ["retrying", "Retrying upload"],
+  ["stalled", "Upload stalled"],
+]);
+const ACTIVE_DOWNLOAD_TITLES = new Map([
+  ["finalizing", "Saving download"],
+  ["preparing", "Preparing download"],
+  ["server-finalizing", "Finalizing export"],
+  ["starting", "Starting download"],
+]);
+const DOWNLOAD_STAGE_LABELS = new Map([
+  ["finalizing", "File save"],
+  ["preparing", "Server export"],
+  ["server-finalizing", "Server finalization"],
+  ["starting", "Browser handoff"],
+]);
+
+function activeUploadTitle(transfer) {
+  const stageTitle = ACTIVE_UPLOAD_TITLES.get(transfer.stage);
+  if (stageTitle) {
+    return stageTitle;
+  }
+  if (transfer.grouped) {
+    return "Uploading";
+  }
+  if (transfer.stage === "verifying") {
+    return "Verifying upload";
+  }
+  if (transfer.resumedBytes > 0) {
+    return "Resuming upload";
+  }
+  return "Uploading";
+}
+
+function activeDownloadTitle(transfer) {
+  if (transfer.serverStatus === "queued") {
+    return "Waiting to prepare download";
+  }
+  return ACTIVE_DOWNLOAD_TITLES.get(transfer.stage) || "Downloading";
+}
+
 export function transferTitle(transfer) {
   if (transfer.status === "browser-managed") {
     return "Download started";
@@ -41,31 +85,7 @@ export function transferTitle(transfer) {
   if (transfer.status === "error") {
     return errorTransferTitle(transfer);
   }
-  if (transfer.kind === "upload" && transfer.grouped) {
-    return "Uploading";
-  }
-  if (transfer.kind === "upload" && transfer.stage === "verifying") {
-    return "Verifying upload";
-  }
-  if (transfer.kind === "upload" && transfer.resumedBytes > 0) {
-    return "Resuming upload";
-  }
-  if (transfer.kind === "download" && transfer.serverStatus === "queued") {
-    return "Waiting to prepare download";
-  }
-  if (transfer.kind === "download" && transfer.stage === "preparing") {
-    return "Preparing download";
-  }
-  if (transfer.kind === "download" && transfer.stage === "server-finalizing") {
-    return "Finalizing export";
-  }
-  if (transfer.kind === "download" && transfer.stage === "starting") {
-    return "Starting download";
-  }
-  if (transfer.kind === "download" && transfer.stage === "finalizing") {
-    return "Saving download";
-  }
-  return transfer.kind === "upload" ? "Uploading" : "Downloading";
+  return transfer.kind === "upload" ? activeUploadTitle(transfer) : activeDownloadTitle(transfer);
 }
 
 function groupedUploadStageLabel(transfer) {
@@ -75,24 +95,46 @@ function groupedUploadStageLabel(transfer) {
   return transfer.stage === "creating-folders" ? "Creating folders" : "Upload";
 }
 
-export function transferStageLabel(transfer) {
-  if (transfer.status === "browser-managed") {
-    return "Browser download";
+function uploadStageLabel(transfer) {
+  if (transfer.stage === "awaiting-ack") {
+    return "Awaiting server acknowledgment";
   }
-  if (transfer.kind === "upload" && transfer.grouped) {
+  if (transfer.stage === "stalled") {
+    return transfer.waitingForAcknowledgement
+      ? "Server acknowledgment stalled"
+      : "No upload progress";
+  }
+  if (transfer.stage === "reconciling") {
+    return "Checking secured parts";
+  }
+  if (transfer.stage === "reconnecting") {
+    return "Waiting for Vault";
+  }
+  if (transfer.stage === "retrying") {
+    const attempt = Number(transfer.attempt);
+    const maxAttempts = Number(transfer.maxAttempts);
+    if (Number.isFinite(attempt) && Number.isFinite(maxAttempts)) {
+      return `Retrying part - attempt ${attempt} of ${maxAttempts}`;
+    }
+    return "Retrying upload part";
+  }
+  if (transfer.grouped) {
     return groupedUploadStageLabel(transfer);
   }
-  if (transfer.kind === "upload" && transfer.stage === "verifying") {
+  if (transfer.stage === "verifying") {
     return "Server verification";
   }
-  if (transfer.kind === "upload" && transfer.stage === "resuming") {
+  if (transfer.stage === "resuming") {
     return "Previous upload found";
   }
-  if (transfer.kind === "download" && transfer.serverStatus === "queued") {
+  return "File upload";
+}
+
+function downloadStageLabel(transfer) {
+  if (transfer.serverStatus === "queued") {
     return "Export queued";
   }
   if (
-    transfer.kind === "download" &&
     transfer.serverStatus === "running" &&
     Number.isFinite(transfer.totalItems) &&
     transfer.totalItems > 0
@@ -103,19 +145,14 @@ export function transferStageLabel(transfer) {
     const itemNumber = Math.min(transfer.totalItems, processedItems + 1);
     return `Packaging item ${itemNumber} of ${transfer.totalItems}`;
   }
-  if (transfer.kind === "download" && transfer.stage === "preparing") {
-    return "Server export";
+  return DOWNLOAD_STAGE_LABELS.get(transfer.stage) || "Download";
+}
+
+export function transferStageLabel(transfer) {
+  if (transfer.status === "browser-managed") {
+    return "Browser download";
   }
-  if (transfer.kind === "download" && transfer.stage === "server-finalizing") {
-    return "Server finalization";
-  }
-  if (transfer.kind === "download" && transfer.stage === "starting") {
-    return "Browser handoff";
-  }
-  if (transfer.kind === "download" && transfer.stage === "finalizing") {
-    return "File save";
-  }
-  return transfer.kind === "upload" ? "File upload" : "Download";
+  return transfer.kind === "upload" ? uploadStageLabel(transfer) : downloadStageLabel(transfer);
 }
 
 function formatPercent(percent) {
@@ -125,7 +162,7 @@ function formatPercent(percent) {
   if (percent > 0 && percent < 1) {
     return "<1%";
   }
-  if (percent < 10 && percent % 1 !== 0) {
+  if (percent < 100 && percent % 1 !== 0) {
     return `${percent.toFixed(1)}%`;
   }
   return `${Math.floor(percent)}%`;
@@ -158,6 +195,9 @@ function noProgressMeta(transfer) {
   const seconds = Math.floor(Number(transfer.noProgressSeconds));
   if (!Number.isFinite(seconds) || seconds <= 0) {
     return "";
+  }
+  if (transfer.kind === "upload") {
+    return `Upload stalled for ${seconds}s`;
   }
   return transfer.serverStatus === "queued"
     ? `Waiting for worker for ${seconds}s`
@@ -218,7 +258,63 @@ function serverFinalizingMeta(transfer) {
   return pieces.join(" - ");
 }
 
+function hasUploadCommitProgress(transfer) {
+  return (
+    transfer.kind === "upload" &&
+    transfer.committedBytes !== null &&
+    transfer.committedBytes !== undefined &&
+    Number.isFinite(Number(transfer.committedBytes))
+  );
+}
+
+function uploadTransferMeta(transfer) {
+  const committedBytes = Math.max(0, Number(transfer.committedBytes) || 0);
+  const inFlightBytes = Math.max(0, Number(transfer.inFlightBytes) || 0);
+  const pieces = [];
+  const noProgress = noProgressMeta(transfer);
+  if (noProgress) {
+    pieces.push(noProgress);
+  }
+  if (hasKnownTotal(transfer)) {
+    const committedPercent = transfer.total
+      ? Math.min(100, Math.max(0, (committedBytes / transfer.total) * 100))
+      : 100;
+    pieces.push(`${formatPercent(committedPercent)} secured`);
+    pieces.push(
+      `${formatBytes(committedBytes, { emptyForZero: false })} of ${formatBytes(transfer.total, {
+        emptyForZero: false,
+      })}`
+    );
+  }
+  if (inFlightBytes > 0) {
+    const inFlightLabel =
+      transfer.stage === "awaiting-ack" ||
+      (transfer.stage === "stalled" && transfer.waitingForAcknowledgement)
+        ? "awaiting confirmation"
+        : "in flight";
+    pieces.push(`${formatBytes(inFlightBytes, { emptyForZero: false })} ${inFlightLabel}`);
+  }
+  if (!noProgress && transfer.bytesPerSecond > 0 && transfer.stage === "uploading") {
+    pieces.push(`${formatBytes(transfer.bytesPerSecond, { emptyForZero: false })}/s`);
+  }
+  if (transfer.stage === "retrying" && transfer.retryDelayMs > 0) {
+    pieces.push(`Retrying in ${Math.max(1, Math.ceil(transfer.retryDelayMs / 1000))}s`);
+  }
+  const resumeSuffix = uploadResumeSuffix(transfer);
+  if (resumeSuffix) {
+    pieces.push(resumeSuffix);
+  }
+  const eta = noProgress || transfer.stage !== "uploading" ? "" : formatEta(transfer.etaSeconds);
+  if (eta) {
+    pieces.push(eta);
+  }
+  return pieces.join(" - ") || "Starting";
+}
+
 function activeTransferMeta(transfer) {
+  if (hasUploadCommitProgress(transfer)) {
+    return uploadTransferMeta(transfer);
+  }
   const noProgress = noProgressMeta(transfer);
   const pieces = noProgress ? [noProgress] : [];
   if (transfer.percent !== null && transfer.percent !== undefined) {

@@ -139,6 +139,61 @@ test("grouped uploads show aggregate progress and the current item with little c
   assert.equal(transferCanCancel({ ...transfer, grouped: false, stage: "verifying" }), false);
 });
 
+test("uploads distinguish secured bytes from bytes awaiting acknowledgment", () => {
+  const transfer = {
+    bytesPerSecond: 100,
+    committedBytes: 917,
+    inFlightBytes: 83,
+    kind: "upload",
+    percent: 99.9,
+    stage: "awaiting-ack",
+    status: "active",
+    total: 1000,
+  };
+
+  assert.equal(transferTitle(transfer), "Awaiting Vault");
+  assert.equal(transferStageLabel(transfer), "Awaiting server acknowledgment");
+  assert.equal(
+    transferMeta(transfer),
+    "91.7% secured - 917 B of 1000 B - 83 B awaiting confirmation"
+  );
+});
+
+test("stalled and retrying uploads expose their state without preserving speculative progress", () => {
+  const transfer = {
+    attempt: 2,
+    committedBytes: 400,
+    inFlightBytes: 0,
+    kind: "upload",
+    maxAttempts: 3,
+    noProgressSeconds: 0,
+    retryDelayMs: 3000,
+    stage: "retrying",
+    status: "active",
+    total: 1000,
+  };
+
+  assert.equal(transferTitle(transfer), "Retrying upload");
+  assert.equal(transferStageLabel(transfer), "Retrying part - attempt 2 of 3");
+  assert.equal(transferMeta(transfer), "40% secured - 400 B of 1000 B - Retrying in 3s");
+
+  const stalled = {
+    ...transfer,
+    attempt: 1,
+    inFlightBytes: 600,
+    noProgressSeconds: 15,
+    retryDelayMs: null,
+    stage: "stalled",
+    waitingForAcknowledgement: true,
+  };
+  assert.equal(transferTitle(stalled), "Upload stalled");
+  assert.equal(transferStageLabel(stalled), "Server acknowledgment stalled");
+  assert.equal(
+    transferMeta(stalled),
+    "Upload stalled for 15s - 40% secured - 400 B of 1000 B - 600 B awaiting confirmation"
+  );
+});
+
 test("grouped completion and partial failure stay concise", () => {
   assert.equal(
     transferMeta({

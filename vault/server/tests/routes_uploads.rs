@@ -1,13 +1,14 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration as StdDuration;
 
 use async_trait::async_trait;
 use axum::body::{Body, Bytes, to_bytes};
 use axum::http::{Method, Request, StatusCode};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use futures_util::stream;
+use futures_util::{StreamExt, stream};
 use hmac::{Hmac, Mac};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -504,6 +505,52 @@ async fn create_upload_session_for_size(
         .expect("create upload session");
     assert_eq!(response.status(), StatusCode::OK);
     response_json(response).await
+}
+
+async fn create_direct_upload_session(state: &AppState, filename: &str, size_bytes: i64) -> String {
+    let user = writer_context();
+    uploads::create_upload_session(
+        &state.db,
+        &state.config.transfers_path(),
+        &state.auth.signing_keys,
+        UploadRuntimeSettings {
+            max_upload_bytes: state.config.max_upload_bytes,
+            transfer_chunk_bytes: state.config.transfer_chunk_bytes,
+            transfer_session_ttl_seconds: state.config.transfer_session_ttl_seconds,
+        },
+        CreateUploadRequest {
+            mode: "create".to_string(),
+            filename: filename.to_string(),
+            size_bytes,
+            mime_type: Some("application/octet-stream".to_string()),
+            folder: String::new(),
+            document_id: None,
+            note: None,
+            rename_to_upload: false,
+            client_upload_parallelism: Some(2),
+            resume_identity_sha256: None,
+        },
+        &user,
+        &ClientMeta {
+            ip: None,
+            user_agent: None,
+        },
+    )
+    .await
+    .expect("upload session")
+    .id
+}
+
+async fn upload_temp_file_exists(session_dir: &Path) -> bool {
+    let Ok(mut entries) = tokio::fs::read_dir(session_dir).await else {
+        return false;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if entry.file_name().to_string_lossy().contains(".part.tmp-") {
+            return true;
+        }
+    }
+    false
 }
 
 async fn upload_part_with_checksum_and_resume(
@@ -1519,6 +1566,110 @@ async fn upload_part_checksum_failure_leaves_no_part_or_canonical_metadata() {
 }
 
 #[tokio::test]
+async fn idle_upload_part_times_out_and_removes_its_partial_temp_file() {
+    const PART_SIZE: i64 = 8 * 1024 * 1024 + 1;
+    let (state, _temp_dir) =
+        test_state_with_upload_settings(5 * 1024 * 1024 * 1024, PART_SIZE, 86_400).await;
+    grant_writer_root(&state.db).await;
+    let transfers_path = state.config.transfers_path();
+    let session_id = create_direct_upload_session(&state, "idle-part.bin", PART_SIZE).await;
+    let body = stream::iter([Ok::<Bytes, std::io::Error>(Bytes::from_static(b"partial"))])
+        .chain(stream::pending());
+
+    let result = uploads::ingest_upload_part_for_owner(
+        &state.db,
+        UploadPartIngest {
+            transfers_path: &transfers_path,
+            session_id: &session_id,
+            part_number: 1,
+            headers: UploadPartHeaders {
+                offset: 0,
+                size: PART_SIZE,
+                sha256: None,
+            },
+            body_idle_timeout: StdDuration::from_millis(20),
+        },
+        &writer_context().id,
+        body,
+    )
+    .await;
+
+    assert!(matches!(
+        result,
+        Err(uploads::UploadError::UploadPartBodyIdleTimeout)
+    ));
+    let session_dir = transfers_path.join("uploads").join(session_id);
+    assert!(!upload_temp_file_exists(&session_dir).await);
+    assert!(!session_dir.join("00000001.part").exists());
+}
+
+#[tokio::test]
+async fn dropping_pending_upload_part_ingest_removes_its_partial_temp_file() {
+    const PART_SIZE: i64 = 8 * 1024 * 1024 + 1;
+    let (state, _temp_dir) =
+        test_state_with_upload_settings(5 * 1024 * 1024 * 1024, PART_SIZE, 86_400).await;
+    grant_writer_root(&state.db).await;
+    let transfers_path = state.config.transfers_path();
+    let session_id = create_direct_upload_session(&state, "cancelled-part.bin", PART_SIZE).await;
+    let session_dir = transfers_path.join("uploads").join(&session_id);
+    let pool = state.db.clone();
+    let owner_id = writer_context().id;
+    let ingest_transfers_path = transfers_path.clone();
+    let ingest_session_id = session_id.clone();
+    let upload = tokio::spawn(async move {
+        let body = stream::iter([Ok::<Bytes, std::io::Error>(Bytes::from_static(b"partial"))])
+            .chain(stream::pending());
+        uploads::ingest_upload_part_for_owner(
+            &pool,
+            UploadPartIngest {
+                transfers_path: &ingest_transfers_path,
+                session_id: &ingest_session_id,
+                part_number: 1,
+                headers: UploadPartHeaders {
+                    offset: 0,
+                    size: PART_SIZE,
+                    sha256: None,
+                },
+                body_idle_timeout: StdDuration::from_mins(1),
+            },
+            &owner_id,
+            body,
+        )
+        .await
+    });
+
+    for _ in 0..100 {
+        if upload_temp_file_exists(&session_dir).await {
+            break;
+        }
+        tokio::time::sleep(StdDuration::from_millis(10)).await;
+    }
+    assert!(
+        upload_temp_file_exists(&session_dir).await,
+        "pending ingest did not create its temporary part"
+    );
+
+    upload.abort();
+    assert!(
+        upload
+            .await
+            .expect_err("pending ingest should be cancelled")
+            .is_cancelled()
+    );
+    for _ in 0..100 {
+        if !upload_temp_file_exists(&session_dir).await {
+            break;
+        }
+        tokio::time::sleep(StdDuration::from_millis(10)).await;
+    }
+    assert!(
+        !upload_temp_file_exists(&session_dir).await,
+        "cancelled ingest left its temporary part behind"
+    );
+    assert!(!session_dir.join("00000001.part").exists());
+}
+
+#[tokio::test]
 async fn duplicate_part_upload_is_idempotent_but_conflicting_content_is_rejected() {
     let (state, _temp_dir) =
         test_state_with_upload_settings(5 * 1024 * 1024 * 1024, 4, 86_400).await;
@@ -1618,6 +1769,7 @@ async fn concurrent_part_promotion_does_not_overwrite_existing_part() {
                 size: 4,
                 sha256: Some(&first_sha),
             },
+            body_idle_timeout: uploads::DEFAULT_UPLOAD_PART_BODY_IDLE_TIMEOUT,
         },
         &user.id,
         stream::iter([Ok::<Bytes, std::io::Error>(Bytes::from_static(b"abcd"))]),
@@ -1633,6 +1785,7 @@ async fn concurrent_part_promotion_does_not_overwrite_existing_part() {
                 size: 4,
                 sha256: Some(&second_sha),
             },
+            body_idle_timeout: uploads::DEFAULT_UPLOAD_PART_BODY_IDLE_TIMEOUT,
         },
         &user.id,
         stream::iter([Ok::<Bytes, std::io::Error>(Bytes::from_static(b"wxyz"))]),
@@ -3302,6 +3455,7 @@ async fn directly_uploaded_session_with_fixed_parts(
                     size: i64::try_from(chunk.len()).expect("part size"),
                     sha256: Some(&part_digest),
                 },
+                body_idle_timeout: uploads::DEFAULT_UPLOAD_PART_BODY_IDLE_TIMEOUT,
             },
             &user.id,
             stream::iter([Ok::<Bytes, std::io::Error>(Bytes::copy_from_slice(chunk))]),

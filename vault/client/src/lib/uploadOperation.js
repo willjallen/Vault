@@ -69,31 +69,46 @@ function createProgressTracker(descriptor, onProgress) {
   let nextFileId = 1;
   let processedFiles = 0;
 
-  function emit(stage) {
+  function emit(stage, details = {}) {
     const active = [...activeFiles.values()];
-    const activeLoaded = active.reduce((total, file) => total + file.loaded, 0);
-    const loaded = Math.min(descriptor.totalBytes, completedBytes + activeLoaded);
+    const activeCommitted = active.reduce((total, file) => total + file.committedBytes, 0);
+    const activeInFlight = active.reduce((total, file) => total + file.inFlightBytes, 0);
+    const committedBytes = Math.min(descriptor.totalBytes, completedBytes + activeCommitted);
+    const inFlightBytes = Math.min(
+      Math.max(0, descriptor.totalBytes - committedBytes),
+      activeInFlight
+    );
+    const loaded = Math.min(descriptor.totalBytes, committedBytes + inFlightBytes);
     const bytesPerSecond = active.reduce((total, file) => total + file.bytesPerSecond, 0);
     const processedItems = completedFolders + processedFiles;
-    const percent = descriptor.totalBytes
+    const rawPercent = descriptor.totalBytes
       ? (loaded / descriptor.totalBytes) * 100
       : descriptor.totalItems
         ? (processedItems / descriptor.totalItems) * 100
         : null;
+    const percent =
+      rawPercent === 100 && committedBytes < descriptor.totalBytes ? 99.9 : rawPercent;
     onProgress({
+      attempt: details.attempt ?? null,
       bytesPerSecond,
+      committedBytes,
       currentItem,
       etaSeconds:
         bytesPerSecond > 0 ? Math.max(0, descriptor.totalBytes - loaded) / bytesPerSecond : null,
       grouped: descriptor.grouped,
+      inFlightBytes,
       loaded,
+      maxAttempts: details.maxAttempts ?? null,
+      noProgressSeconds: details.noProgressSeconds || 0,
       percent,
       processedItems,
+      retryDelayMs: details.retryDelayMs || null,
       stage,
       total: descriptor.totalBytes || null,
       totalFiles: descriptor.totalFiles,
       totalFolders: descriptor.totalFolders,
       totalItems: descriptor.totalItems,
+      waitingForAcknowledgement: Boolean(details.waitingForAcknowledgement),
     });
   }
 
@@ -103,7 +118,7 @@ function createProgressTracker(descriptor, onProgress) {
       if (!file) {
         return;
       }
-      completedBytes += completed ? file.size : file.loaded;
+      completedBytes += completed ? file.size : file.committedBytes;
       processedFiles += 1;
       activeFiles.delete(id);
       emit("uploading");
@@ -114,12 +129,27 @@ function createProgressTracker(descriptor, onProgress) {
         return;
       }
       currentItem = file.name;
+      const hasDurableProgress =
+        progress?.committedBytes !== null && progress?.committedBytes !== undefined;
+      const committedBytes = Math.min(
+        file.size,
+        hasDurableProgress
+          ? finiteNonnegative(progress.committedBytes)
+          : finiteNonnegative(progress?.loaded)
+      );
+      const inFlightBytes = hasDurableProgress
+        ? Math.min(
+            Math.max(0, file.size - committedBytes),
+            finiteNonnegative(progress?.inFlightBytes)
+          )
+        : 0;
       activeFiles.set(id, {
         ...file,
         bytesPerSecond: finiteNonnegative(progress?.bytesPerSecond),
-        loaded: Math.min(file.size, Math.max(file.loaded, finiteNonnegative(progress?.loaded))),
+        committedBytes,
+        inFlightBytes,
       });
-      emit(progress?.stage || "uploading");
+      emit(progress?.stage || "uploading", progress);
     },
     fileStarted(file) {
       const id = nextFileId;
@@ -127,7 +157,8 @@ function createProgressTracker(descriptor, onProgress) {
       currentItem = file?.name || "File";
       activeFiles.set(id, {
         bytesPerSecond: 0,
-        loaded: 0,
+        committedBytes: 0,
+        inFlightBytes: 0,
         name: currentItem,
         size: finiteNonnegative(file?.size),
       });

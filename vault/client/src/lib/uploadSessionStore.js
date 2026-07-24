@@ -128,6 +128,26 @@ export function storedUploadSessionId(key) {
   return readStoredUploadSessions().find((record) => record.key === key)?.sessionId || null;
 }
 
+export function storedUploadSessionRecords() {
+  return readStoredUploadSessions().map((record) => {
+    const identity = JSON.parse(record.key);
+    return {
+      ...record,
+      file: {
+        lastModified: Number(identity.file?.lastModified) || 0,
+        name: String(identity.file?.name || ""),
+        size: Math.max(0, Number(identity.file?.size) || 0),
+      },
+      target: {
+        documentId: identity.target?.documentId || null,
+        folder: String(identity.target?.folder || ""),
+        mode: String(identity.target?.mode || "create"),
+        renameToUpload: Boolean(identity.target?.renameToUpload),
+      },
+    };
+  });
+}
+
 export function committedUploadBytes(session) {
   if (Number.isFinite(session?.uploaded_bytes) && session.uploaded_bytes > 0) {
     return session.uploaded_bytes;

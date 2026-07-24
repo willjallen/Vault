@@ -87,13 +87,17 @@ export function useTransfers({
       setTransfers((current) => [
         ...current,
         {
+          attempt: null,
           bytesPerSecond: 0,
+          committedBytes: 0,
           createdAt: null,
           ...details,
           etaSeconds: null,
           id,
+          inFlightBytes: 0,
           kind,
           loaded: 0,
+          maxAttempts: null,
           name: displayName,
           noProgressSeconds: 0,
           percent: size ? 0 : null,
@@ -128,21 +132,27 @@ export function useTransfers({
   const updateProgress = useCallback(
     (id, progress) => {
       updateTransfer(id, {
+        attempt: progress.attempt ?? null,
         bytesPerSecond: progress.bytesPerSecond,
+        committedBytes: progress.committedBytes ?? null,
         createdAt: progress.createdAt || null,
         etaSeconds: progress.etaSeconds,
+        inFlightBytes: progress.inFlightBytes || 0,
         loaded: progress.loaded,
+        maxAttempts: progress.maxAttempts ?? null,
         noProgressSeconds: progress.noProgressSeconds || 0,
         percent: progress.percent,
         ...(progress.processedItems === undefined
           ? {}
           : { processedItems: progress.processedItems ?? null }),
         resumedBytes: progress.resumedBytes || null,
+        retryDelayMs: progress.retryDelayMs || null,
         serverStatus: progress.serverStatus || null,
         stage: progress.stage || "transfer",
         total: progress.total,
         ...(progress.totalItems === undefined ? {} : { totalItems: progress.totalItems ?? null }),
         updatedAt: progress.updatedAt || null,
+        waitingForAcknowledgement: Boolean(progress.waitingForAcknowledgement),
       });
     },
     [updateTransfer]
@@ -200,7 +210,9 @@ export function useTransfers({
     (id, result = {}) => {
       controllers.current.delete(id);
       updateTransfer(id, {
+        committedBytes: result.size || result.total || null,
         etaSeconds: null,
+        inFlightBytes: 0,
         loaded: result.size || result.total || null,
         ...(result.processedItems === undefined
           ? {}

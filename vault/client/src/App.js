@@ -49,6 +49,7 @@ import { noticesForState, useNotifications } from "./lib/useNotifications.js";
 import { normalizeSiteSettings } from "./lib/siteSettings.js";
 import { useAppearancePreferences } from "./lib/theme.js";
 import { useVaultResources } from "./lib/useVaultResources.js";
+import { useUploadRecoveryNotice } from "./lib/useUploadRecoveryNotice.js";
 
 const { useEffect, useMemo, useState, useCallback, useRef } = React;
 const h = React.createElement;
@@ -164,6 +165,9 @@ export function App({ initial }) {
     requestConfirm,
     showNotice,
   });
+
+  useUploadRecoveryNotice({ apiFetch, showNotice });
+
   const {
     alternateRows,
     contentsViewByFolder,

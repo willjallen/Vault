@@ -1,10 +1,13 @@
 const UPLOAD_LOW_LATENCY_CONCURRENCY = 4;
-const UPLOAD_MAX_CONCURRENCY = 8;
-const UPLOAD_GLOBAL_MAX_CONCURRENCY = 8;
+const UPLOAD_CONSTRAINED_CONCURRENCY = 2;
+const UPLOAD_GLOBAL_MAX_CONCURRENCY = 4;
 const UPLOAD_LOW_LATENCY_RTT_MS = 25;
-const UPLOAD_PART_TIMEOUT_MIN_MS = 10 * 60 * 1000;
-const UPLOAD_PART_TIMEOUT_MIN_BYTES_PER_SECOND = 64 * 1024;
+export const UPLOAD_PART_STALL_NOTICE_MS = 15 * 1000;
+export const UPLOAD_PART_IDLE_TIMEOUT_MS = 75 * 1000;
+export const UPLOAD_PART_ACK_TIMEOUT_MS = 90 * 1000;
 const UPLOAD_RETRY_LIMIT = 3;
+const UPLOAD_RETRY_INITIAL_DELAY_MS = 1000;
+const UPLOAD_RETRY_MAX_DELAY_MS = 3000;
 
 let activeUploadPartRequests = 0;
 const uploadPartWaiters = [];
@@ -123,14 +126,11 @@ export function uploadParallelismForLatency(rttMs) {
   if (Number.isFinite(rttMs) && rttMs >= 0 && rttMs <= UPLOAD_LOW_LATENCY_RTT_MS) {
     return UPLOAD_LOW_LATENCY_CONCURRENCY;
   }
-  return UPLOAD_MAX_CONCURRENCY;
+  return UPLOAD_CONSTRAINED_CONCURRENCY;
 }
 
-export function uploadPartTimeoutMs(chunkSize) {
-  return Math.max(
-    UPLOAD_PART_TIMEOUT_MIN_MS,
-    Math.ceil((chunkSize / UPLOAD_PART_TIMEOUT_MIN_BYTES_PER_SECOND) * 1000)
-  );
+export function uploadRetryDelayMs(failedAttempt) {
+  return failedAttempt <= 1 ? UPLOAD_RETRY_INITIAL_DELAY_MS : UPLOAD_RETRY_MAX_DELAY_MS;
 }
 
 function parseJson(value) {
@@ -161,22 +161,60 @@ export function reportUploadProgress(callback, loaded) {
   }
 }
 
-export function currentUploadLoadedBytes({ activeParts, completedBytes, fileSize }) {
-  const activeBytes = [...activeParts.values()].reduce(
+export function reportUploadState(callback, state) {
+  try {
+    callback?.(state);
+  } catch {
+    // Transfer state is presentational and must never control request settlement.
+  }
+}
+
+export function currentUploadInFlightBytes(activeParts) {
+  return [...activeParts.values()].reduce(
     (total, part) => total + Math.min(part.size, Math.max(0, part.loaded || 0)),
     0
   );
+}
+
+export function currentUploadLoadedBytes({ activeParts, completedBytes, fileSize }) {
+  const activeBytes = currentUploadInFlightBytes(activeParts);
   return Math.min(fileSize, Math.max(completedBytes, completedBytes + activeBytes));
 }
 
-function uploadPartRequest({ session, partNumber, chunk, offset, onProgress, sha256, signal }) {
+function uploadPartRequest({
+  ackTimeoutMs,
+  attempt,
+  chunk,
+  idleTimeoutMs,
+  maxAttempts,
+  offset,
+  onProgress,
+  onState,
+  partNumber,
+  session,
+  sha256,
+  signal,
+  stallNoticeMs,
+}) {
   throwIfUploadPolicyAborted(signal);
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
+    let lastLoaded = 0;
+    let phase = "uploading";
     let requestStarted = false;
     let settled = false;
+    let stallTimer = null;
+    let timeoutTimer = null;
+
+    function clearWatchdogs() {
+      clearTimeout(stallTimer);
+      clearTimeout(timeoutTimer);
+      stallTimer = null;
+      timeoutTimer = null;
+    }
 
     function cleanup() {
+      clearWatchdogs();
       signal?.removeEventListener("abort", abortRequest);
     }
 
@@ -187,6 +225,55 @@ function uploadPartRequest({ session, partNumber, chunk, offset, onProgress, sha
       settled = true;
       cleanup();
       callback(value);
+    }
+
+    function emitState(stage, details = {}) {
+      if (stage !== "stalled") {
+        phase = stage;
+      }
+      reportUploadState(onState, {
+        attempt,
+        maxAttempts,
+        partNumber,
+        stage,
+        ...details,
+      });
+    }
+
+    function abortForWatchdog() {
+      const awaitingAcknowledgement = phase === "awaiting-ack";
+      const error = new Error(
+        awaitingAcknowledgement
+          ? "Vault did not acknowledge the upload part"
+          : "Upload part stopped making progress"
+      );
+      error.networkError = true;
+      error.timeout = true;
+      error.timeoutPhase = phase;
+      settle(reject, error);
+      try {
+        xhr.abort();
+      } catch {
+        // The watchdog error has already settled the request.
+      }
+    }
+
+    function armWatchdogs(timeoutMs) {
+      clearWatchdogs();
+      const boundedTimeout = Math.max(1, Number(timeoutMs) || 1);
+      const boundedNotice = Math.max(0, Number(stallNoticeMs) || 0);
+      if (boundedNotice > 0 && boundedNotice < boundedTimeout) {
+        const armedAt = Date.now();
+        const reportStall = () => {
+          emitState("stalled", {
+            noProgressSeconds: Math.max(1, Math.floor((Date.now() - armedAt) / 1000)),
+            waitingForAcknowledgement: phase === "awaiting-ack",
+          });
+          stallTimer = setTimeout(reportStall, 1000);
+        };
+        stallTimer = setTimeout(reportStall, boundedNotice);
+      }
+      timeoutTimer = setTimeout(abortForWatchdog, boundedTimeout);
     }
 
     function abortRequest() {
@@ -202,7 +289,19 @@ function uploadPartRequest({ session, partNumber, chunk, offset, onProgress, sha
 
     xhr.upload.onprogress = (progressEvent) => {
       const loaded = Number.isFinite(progressEvent.loaded) ? progressEvent.loaded : 0;
-      reportUploadProgress(onProgress, Math.min(chunk.size, Math.max(0, loaded)));
+      const boundedLoaded = Math.min(chunk.size, Math.max(0, loaded));
+      reportUploadProgress(onProgress, boundedLoaded);
+      if (boundedLoaded <= lastLoaded) {
+        return;
+      }
+      lastLoaded = boundedLoaded;
+      if (boundedLoaded >= chunk.size) {
+        emitState("awaiting-ack", { waitingForAcknowledgement: true });
+        armWatchdogs(ackTimeoutMs);
+      } else {
+        emitState("uploading");
+        armWatchdogs(idleTimeoutMs);
+      }
     };
     xhr.onload = () => {
       if (xhr.status >= 200 && xhr.status < 300) {
@@ -223,6 +322,8 @@ function uploadPartRequest({ session, partNumber, chunk, offset, onProgress, sha
     xhr.ontimeout = () => {
       const error = new Error("Upload part timed out");
       error.networkError = true;
+      error.timeout = true;
+      error.timeoutPhase = phase;
       settle(reject, error);
     };
 
@@ -233,7 +334,10 @@ function uploadPartRequest({ session, partNumber, chunk, offset, onProgress, sha
         return;
       }
       xhr.open("PUT", `/api/uploads/${session.id}/parts/${partNumber}`);
-      xhr.timeout = uploadPartTimeoutMs(chunk.size);
+      // A total XHR timeout penalizes healthy, slow transfers while letting a
+      // motionless request wait for the whole allowance. Progress-sensitive
+      // watchdogs above own timeout behavior instead.
+      xhr.timeout = 0;
       xhr.withCredentials = true;
       xhr.setRequestHeader("Content-Type", "application/octet-stream");
       xhr.setRequestHeader("X-Upload-Offset", String(offset));
@@ -244,6 +348,12 @@ function uploadPartRequest({ session, partNumber, chunk, offset, onProgress, sha
       }
       requestStarted = true;
       xhr.send(chunk);
+      // Test doubles and a cached/local transport can settle synchronously.
+      // Do not leave a watchdog behind after their load callback has run.
+      if (!settled) {
+        emitState("uploading");
+        armWatchdogs(idleTimeoutMs);
+      }
     } catch (error) {
       settle(reject, error);
       try {
@@ -262,32 +372,65 @@ export async function uploadPart({
   offset,
   onAttemptStart,
   onProgress,
+  onState,
+  reconcileAfterFailure,
   sha256,
   signal,
+  stallNoticeMs = UPLOAD_PART_STALL_NOTICE_MS,
+  idleTimeoutMs = UPLOAD_PART_IDLE_TIMEOUT_MS,
+  ackTimeoutMs = UPLOAD_PART_ACK_TIMEOUT_MS,
+  retryDelayForAttempt = uploadRetryDelayMs,
 }) {
   for (let attempt = 1; attempt <= UPLOAD_RETRY_LIMIT; attempt += 1) {
     throwIfUploadPolicyAborted(signal);
-    onAttemptStart?.();
+    onAttemptStart?.({ attempt, maxAttempts: UPLOAD_RETRY_LIMIT, partNumber });
     try {
       const releaseSlot = await acquireUploadPartSlot(signal);
       try {
         return await uploadPartRequest({
+          ackTimeoutMs,
+          attempt,
           chunk,
+          idleTimeoutMs,
+          maxAttempts: UPLOAD_RETRY_LIMIT,
           offset,
           onProgress,
+          onState,
           partNumber,
           session,
           sha256,
           signal,
+          stallNoticeMs,
         });
       } finally {
         releaseSlot();
       }
     } catch (error) {
-      if (!shouldRetryUploadPart(error) || attempt >= UPLOAD_RETRY_LIMIT) {
+      if (!shouldRetryUploadPart(error)) {
         throw error;
       }
-      await waitForRetry(attempt * 700, signal);
+      if (
+        await reconcileAfterFailure?.({
+          attempt,
+          error,
+          maxAttempts: UPLOAD_RETRY_LIMIT,
+          partNumber,
+        })
+      ) {
+        return { reconciled: true };
+      }
+      if (attempt >= UPLOAD_RETRY_LIMIT) {
+        throw error;
+      }
+      const retryDelayMs = retryDelayForAttempt(attempt);
+      reportUploadState(onState, {
+        attempt: attempt + 1,
+        maxAttempts: UPLOAD_RETRY_LIMIT,
+        partNumber,
+        retryDelayMs,
+        stage: "retrying",
+      });
+      await waitForRetry(retryDelayMs, signal);
     }
   }
   throw new Error("Upload part failed");

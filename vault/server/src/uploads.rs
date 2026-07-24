@@ -4,7 +4,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
 use base64::Engine;
@@ -56,6 +56,7 @@ const UPLOAD_CHUNK_ROUNDING_BYTES: i64 = 1024 * 1024;
 const SMALL_PART_MEMORY_BUFFER_BYTES: i64 = 8 * 1024 * 1024;
 const VERIFICATION_PROGRESS_UPDATE_BYTES: i64 = 32 * 1024 * 1024;
 const MAX_UPLOAD_PART_METADATA_BYTES: u64 = 4096;
+pub const DEFAULT_UPLOAD_PART_BODY_IDLE_TIMEOUT: StdDuration = StdDuration::from_mins(1);
 const UPLOAD_RESUME_IDENTITY_CONTEXT_KEY: &str = "_upload_resume_identity_sha256";
 const UPLOAD_PART_MANIFEST_CONTEXT_KEY: &str = "_upload_part_manifest_sha256";
 // Preverification is an optimization. Stop caching new sessions at this bound;
@@ -211,6 +212,8 @@ pub enum UploadError {
     UploadSessionMissingParts,
     #[error("upload failed while reading request body")]
     UploadReadFailed,
+    #[error("upload part request body became idle")]
+    UploadPartBodyIdleTimeout,
     #[error("upload checksum mismatch")]
     UploadChecksumMismatch,
     #[error("upload completion requires an integrity expectation")]
@@ -938,6 +941,175 @@ where
     ingest_upload_part_for_session(ingest, session, stream).await
 }
 
+#[derive(Debug, Clone, Copy)]
+enum UploadPartIngestOutcome {
+    Committed,
+    AlreadyCommitted,
+}
+
+struct UploadPartAttemptGuard {
+    cleanup_armed: bool,
+    expected_bytes: i64,
+    finished: bool,
+    part_number: i64,
+    received_bytes: AtomicI64,
+    session_id: String,
+    started_at: Instant,
+    temp_path: PathBuf,
+}
+
+impl UploadPartAttemptGuard {
+    fn new(ingest: &UploadPartIngest<'_>, expected_bytes: i64, temp_path: PathBuf) -> Self {
+        tracing::info!(
+            event = "upload_part_start",
+            session_id = ingest.session_id,
+            part_number = ingest.part_number,
+            expected_bytes,
+            offset_bytes = ingest.headers.offset,
+            body_idle_timeout_ms =
+                u64::try_from(ingest.body_idle_timeout.as_millis()).unwrap_or(u64::MAX),
+            "upload part started"
+        );
+        Self {
+            cleanup_armed: true,
+            expected_bytes,
+            finished: false,
+            part_number: ingest.part_number,
+            received_bytes: AtomicI64::new(0),
+            session_id: ingest.session_id.to_string(),
+            started_at: Instant::now(),
+            temp_path,
+        }
+    }
+
+    async fn remove_temp_file(&mut self) {
+        if !self.cleanup_armed {
+            return;
+        }
+        match fs::remove_file(&self.temp_path).await {
+            Ok(()) => self.cleanup_armed = false,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.cleanup_armed = false;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    event = "upload_part_temp_cleanup_failed",
+                    ?error,
+                    session_id = self.session_id,
+                    part_number = self.part_number,
+                    path = %self.temp_path.display(),
+                    "upload part temporary-file cleanup failed"
+                );
+            }
+        }
+    }
+
+    async fn finish(mut self, result: &Result<UploadPartIngestOutcome, UploadError>) {
+        self.remove_temp_file().await;
+        self.finished = true;
+        let termination_reason = upload_part_termination_reason(result);
+        let received_bytes = self.received_bytes.load(Ordering::Relaxed);
+        let duration_ms = u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if result.is_ok() {
+            tracing::info!(
+                event = "upload_part_stop",
+                session_id = self.session_id,
+                part_number = self.part_number,
+                expected_bytes = self.expected_bytes,
+                received_bytes,
+                duration_ms,
+                termination_reason,
+                "upload part stopped"
+            );
+        } else {
+            tracing::warn!(
+                event = "upload_part_stop",
+                session_id = self.session_id,
+                part_number = self.part_number,
+                expected_bytes = self.expected_bytes,
+                received_bytes,
+                duration_ms,
+                termination_reason,
+                "upload part stopped"
+            );
+        }
+    }
+}
+
+impl Drop for UploadPartAttemptGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            tracing::warn!(
+                event = "upload_part_stop",
+                session_id = self.session_id,
+                part_number = self.part_number,
+                expected_bytes = self.expected_bytes,
+                received_bytes = self.received_bytes.load(Ordering::Relaxed),
+                duration_ms =
+                    u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+                termination_reason = "request_cancelled",
+                "upload part stopped"
+            );
+        }
+        if self.cleanup_armed {
+            schedule_upload_part_temp_cleanup(
+                self.temp_path.clone(),
+                self.session_id.clone(),
+                self.part_number,
+            );
+            self.cleanup_armed = false;
+        }
+    }
+}
+
+fn schedule_upload_part_temp_cleanup(path: PathBuf, session_id: String, part_number: i64) {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            match fs::remove_file(&path).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => tracing::warn!(
+                    event = "upload_part_temp_cleanup_failed",
+                    ?error,
+                    session_id,
+                    part_number,
+                    path = %path.display(),
+                    "cancelled upload part temporary-file cleanup failed"
+                ),
+            }
+        });
+        return;
+    }
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => tracing::warn!(
+            event = "upload_part_temp_cleanup_failed",
+            ?error,
+            session_id,
+            part_number,
+            path = %path.display(),
+            "upload part temporary-file cleanup failed outside a Tokio runtime"
+        ),
+    }
+}
+
+fn upload_part_termination_reason(
+    result: &Result<UploadPartIngestOutcome, UploadError>,
+) -> &'static str {
+    match result {
+        Ok(UploadPartIngestOutcome::Committed) => "committed",
+        Ok(UploadPartIngestOutcome::AlreadyCommitted) => "already_committed",
+        Err(UploadError::UploadPartBodyIdleTimeout) => "body_idle_timeout",
+        Err(UploadError::UploadReadFailed) => "body_read_error",
+        Err(UploadError::UploadPartSizeMismatch) => "size_mismatch",
+        Err(UploadError::UploadPartChecksumMismatch) => "checksum_mismatch",
+        Err(UploadError::UploadPartTooLarge) => "body_too_large",
+        Err(UploadError::UploadPartConflict) => "part_conflict",
+        Err(_) => "rejected",
+    }
+}
+
 async fn ingest_upload_part_for_session<S, E>(
     ingest: UploadPartIngest<'_>,
     session: UploadSessionRow,
@@ -966,76 +1138,82 @@ where
         Uuid::new_v4().simple()
     ));
     let final_path = part_file_path(&session_dir, ingest.part_number);
-    let write_result = write_part_stream(
-        &temp_path,
-        expected_size,
-        ingest.headers.sha256,
-        &mut stream,
-    )
-    .await;
-    if write_result.is_err() {
-        let _ = fs::remove_file(&temp_path).await;
-    }
-    write_result?;
+    let attempt = UploadPartAttemptGuard::new(&ingest, expected_size, temp_path.clone());
+    let result = async {
+        write_part_stream(
+            &temp_path,
+            expected_size,
+            ingest.headers.sha256,
+            ingest.body_idle_timeout,
+            &attempt.received_bytes,
+            &mut stream,
+        )
+        .await?;
 
-    // The normal upload path is first-write-wins. Avoid probing for an existing
-    // part before every PUT; that is pure miss-path filesystem work for fresh
-    // high-fanout uploads. The atomic hard-link promotion fails if a retry or
-    // race already created the final part, and only then do we inspect metadata
-    // to preserve resumable/idempotent duplicate semantics.
-    let part = UploadPartRow {
-        part_number: ingest.part_number,
-        offset_bytes: expected_offset,
-        size_bytes: expected_size,
-        sha256: ingest.headers.sha256.map(str::to_ascii_lowercase),
-        storage_path: final_path.to_string_lossy().to_string(),
-    };
-    if !promote_part_file(&temp_path, &final_path).await? {
-        if let Some(mut existing) =
-            read_part_metadata(&session_dir, &session, ingest.part_number).await?
-        {
-            if let Some(incoming_sha256) = ingest.headers.sha256
-                && existing.sha256.as_deref() != Some(incoming_sha256)
+        // The normal upload path is first-write-wins. Avoid probing for an existing
+        // part before every PUT; that is pure miss-path filesystem work for fresh
+        // uploads. The atomic hard-link promotion fails if a retry or race already
+        // created the final part, and only then do we inspect metadata to preserve
+        // resumable/idempotent duplicate semantics.
+        let part = UploadPartRow {
+            part_number: ingest.part_number,
+            offset_bytes: expected_offset,
+            size_bytes: expected_size,
+            sha256: ingest.headers.sha256.map(str::to_ascii_lowercase),
+            storage_path: final_path.to_string_lossy().to_string(),
+        };
+        if !promote_part_file(&temp_path, &final_path).await? {
+            if let Some(mut existing) =
+                read_part_metadata(&session_dir, &session, ingest.part_number).await?
             {
-                let incoming_sha256 = incoming_sha256.to_ascii_lowercase();
-                if hash_existing_upload_part(&final_path, expected_size).await? != incoming_sha256 {
-                    return Err(UploadError::UploadPartConflict);
+                if let Some(incoming_sha256) = ingest.headers.sha256
+                    && existing.sha256.as_deref() != Some(incoming_sha256)
+                {
+                    let incoming_sha256 = incoming_sha256.to_ascii_lowercase();
+                    if hash_existing_upload_part(&final_path, expected_size).await?
+                        != incoming_sha256
+                    {
+                        return Err(UploadError::UploadPartConflict);
+                    }
+                    // A first writer can be interrupted after linking its durable
+                    // part but before publishing the checksum sidecar. Repair that
+                    // state from the verified immutable final file so both the
+                    // interrupted writer and an identical concurrent writer remain
+                    // safely retryable.
+                    existing.sha256 = Some(incoming_sha256);
+                    write_part_metadata(&session_dir, &existing).await?;
                 }
-                // A first writer can be interrupted after linking its durable
-                // part but before publishing the checksum sidecar. Repair that
-                // state from the verified immutable final file so both the
-                // interrupted writer and an identical concurrent writer remain
-                // safely retryable.
-                existing.sha256 = Some(incoming_sha256);
-                write_part_metadata(&session_dir, &existing).await?;
-            }
-            if part_metadata_matches(
-                &existing,
-                expected_offset,
-                expected_size,
-                ingest.headers.sha256,
-            ) {
-                // A concurrent first writer may have linked the part immediately
-                // before this request observed it. Make the data and its directory
-                // entry durable ourselves rather than returning success while that
-                // writer is still between promotion and its directory sync.
-                sync_file(&final_path).await?;
-                if existing.sha256.is_some() {
-                    sync_file(&part_metadata_path(&session_dir, ingest.part_number)).await?;
+                if part_metadata_matches(
+                    &existing,
+                    expected_offset,
+                    expected_size,
+                    ingest.headers.sha256,
+                ) {
+                    // A concurrent first writer may have linked the part immediately
+                    // before this request observed it. Make the data and its directory
+                    // entry durable ourselves rather than returning success while that
+                    // writer is still between promotion and its directory sync.
+                    sync_file(&final_path).await?;
+                    if existing.sha256.is_some() {
+                        sync_file(&part_metadata_path(&session_dir, ingest.part_number)).await?;
+                    }
+                    sync_directory(&session_dir).await?;
+                    return Ok(UploadPartIngestOutcome::AlreadyCommitted);
                 }
-                sync_directory(&session_dir).await?;
-                return Ok(());
             }
+            return Err(UploadError::UploadPartConflict);
         }
-        return Err(UploadError::UploadPartConflict);
+        if part.sha256.is_some() {
+            write_part_metadata(&session_dir, &part).await?;
+        }
+        // The temporary part inode (and optional sidecar inode) have already been
+        // synced. Persist their final names before acknowledging the part.
+        sync_directory(&session_dir).await?;
+        Ok(UploadPartIngestOutcome::Committed)
     }
-    if part.sha256.is_some() {
-        write_part_metadata(&session_dir, &part).await?;
-    }
-    // The temporary part inode (and optional sidecar inode) have already been
-    // synced. Persist their final names before acknowledging the part.
-    sync_directory(&session_dir).await?;
-    Ok(())
+    .await;
+    attempt.finish(&result).await;
+    result.map(|_| ())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1051,6 +1229,7 @@ pub struct UploadPartIngest<'a> {
     pub session_id: &'a str,
     pub part_number: i64,
     pub headers: UploadPartHeaders<'a>,
+    pub body_idle_timeout: StdDuration,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2080,6 +2259,8 @@ async fn write_part_stream<S, E>(
     temp_path: &Path,
     expected_size: i64,
     expected_sha256: Option<&str>,
+    body_idle_timeout: StdDuration,
+    received_bytes: &AtomicI64,
     stream: &mut S,
 ) -> Result<(), UploadError>
 where
@@ -2087,18 +2268,29 @@ where
     E: Display,
 {
     if expected_size <= SMALL_PART_MEMORY_BUFFER_BYTES {
-        return write_small_part_chunked(temp_path, expected_size, expected_sha256, stream).await;
+        return write_small_part_chunked(
+            temp_path,
+            expected_size,
+            expected_sha256,
+            body_idle_timeout,
+            received_bytes,
+            stream,
+        )
+        .await;
     }
 
     let mut file = fs::File::create(temp_path).await?;
     let mut hasher = expected_sha256.map(|_| Sha256::new());
     let mut size_bytes = 0_i64;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|_| UploadError::UploadReadFailed)?;
+    while let Some(chunk) = next_upload_part_chunk(stream, body_idle_timeout).await? {
         if chunk.is_empty() {
             continue;
         }
-        size_bytes += i64::try_from(chunk.len()).map_err(|_| UploadError::UploadPartTooLarge)?;
+        let chunk_len = i64::try_from(chunk.len()).map_err(|_| UploadError::UploadPartTooLarge)?;
+        received_bytes.fetch_add(chunk_len, Ordering::Relaxed);
+        size_bytes = size_bytes
+            .checked_add(chunk_len)
+            .ok_or(UploadError::UploadPartTooLarge)?;
         if size_bytes > expected_size {
             return Err(UploadError::UploadPartTooLarge);
         }
@@ -2125,6 +2317,8 @@ async fn write_small_part_chunked<S, E>(
     temp_path: &Path,
     expected_size: i64,
     expected_sha256: Option<&str>,
+    body_idle_timeout: StdDuration,
+    received_bytes: &AtomicI64,
     stream: &mut S,
 ) -> Result<(), UploadError>
 where
@@ -2134,7 +2328,8 @@ where
     // High-fanout medium uploads showed better local throughput when each 4 MiB
     // request is collected once and written by a blocking file writer. Larger
     // parts stay on the streaming async path to avoid unbounded per-request RAM.
-    let chunks = read_small_part_chunks(expected_size, stream).await?;
+    let chunks =
+        read_small_part_chunks(expected_size, body_idle_timeout, received_bytes, stream).await?;
     let writer_path = temp_path.to_path_buf();
     let expected_sha256 = expected_sha256.map(str::to_ascii_lowercase);
     tokio::task::spawn_blocking(move || {
@@ -2147,6 +2342,8 @@ where
 
 async fn read_small_part_chunks<S, E>(
     expected_size: i64,
+    body_idle_timeout: StdDuration,
+    received_bytes: &AtomicI64,
     stream: &mut S,
 ) -> Result<Vec<Bytes>, UploadError>
 where
@@ -2155,12 +2352,15 @@ where
 {
     let mut chunks = Vec::new();
     let mut size_bytes = 0_i64;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|_| UploadError::UploadReadFailed)?;
+    while let Some(chunk) = next_upload_part_chunk(stream, body_idle_timeout).await? {
         if chunk.is_empty() {
             continue;
         }
-        size_bytes += i64::try_from(chunk.len()).map_err(|_| UploadError::UploadPartTooLarge)?;
+        let chunk_len = i64::try_from(chunk.len()).map_err(|_| UploadError::UploadPartTooLarge)?;
+        received_bytes.fetch_add(chunk_len, Ordering::Relaxed);
+        size_bytes = size_bytes
+            .checked_add(chunk_len)
+            .ok_or(UploadError::UploadPartTooLarge)?;
         if size_bytes > expected_size {
             return Err(UploadError::UploadPartTooLarge);
         }
@@ -2170,6 +2370,26 @@ where
         return Err(UploadError::UploadPartSizeMismatch);
     }
     Ok(chunks)
+}
+
+async fn next_upload_part_chunk<S, E>(
+    stream: &mut S,
+    body_idle_timeout: StdDuration,
+) -> Result<Option<Bytes>, UploadError>
+where
+    S: Stream<Item = Result<Bytes, E>> + Unpin,
+    E: Display,
+{
+    let deadline = tokio::time::Instant::now() + body_idle_timeout;
+    loop {
+        match tokio::time::timeout_at(deadline, stream.next()).await {
+            Ok(Some(Ok(chunk))) if chunk.is_empty() => {}
+            Ok(Some(Ok(chunk))) => return Ok(Some(chunk)),
+            Ok(Some(Err(_))) => return Err(UploadError::UploadReadFailed),
+            Ok(None) => return Ok(None),
+            Err(_) => return Err(UploadError::UploadPartBodyIdleTimeout),
+        }
+    }
 }
 
 fn write_chunked_part_blocking(

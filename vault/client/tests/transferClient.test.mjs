@@ -8,7 +8,7 @@ const uploadPartPolicySource = await readFile(uploadPartPolicyUrl, "utf8");
 const uploadPartPolicyModuleUrl = `data:text/javascript;base64,${Buffer.from(
   uploadPartPolicySource
 ).toString("base64")}`;
-const { shouldRetryUploadPart, uploadParallelismForLatency } = await import(
+const { shouldRetryUploadPart, uploadParallelismForLatency, uploadPart } = await import(
   uploadPartPolicyModuleUrl
 );
 
@@ -26,10 +26,112 @@ test("upload parallelism uses low fanout for low latency paths", () => {
   assert.equal(uploadParallelismForLatency(25), 4);
 });
 
-test("upload parallelism uses high fanout for slow or unknown control paths", () => {
-  assert.equal(uploadParallelismForLatency(26), 8);
-  assert.equal(uploadParallelismForLatency(null), 8);
-  assert.equal(uploadParallelismForLatency(Number.NaN), 8);
+test("upload parallelism is conservative for constrained or unknown paths", () => {
+  assert.equal(uploadParallelismForLatency(26), 2);
+  assert.equal(uploadParallelismForLatency(null), 2);
+  assert.equal(uploadParallelismForLatency(Number.NaN), 2);
+});
+
+function installWatchdogXhr({ acknowledgeAttempt }) {
+  const requests = [];
+  globalThis.XMLHttpRequest = class FakeXMLHttpRequest {
+    constructor() {
+      this.headers = {};
+      this.responseText = "";
+      this.status = 204;
+      this.upload = {};
+    }
+
+    abort() {
+      this.onabort?.();
+    }
+
+    open(method, url) {
+      this.method = method;
+      this.url = url;
+    }
+
+    send(chunk) {
+      requests.push(this);
+      const attempt = requests.length;
+      queueMicrotask(() => {
+        this.upload.onprogress?.({ loaded: chunk.size });
+        if (acknowledgeAttempt(attempt)) {
+          this.onload?.();
+        }
+      });
+    }
+
+    setRequestHeader(name, value) {
+      this.headers[name.toLowerCase()] = value;
+    }
+  };
+  return requests;
+}
+
+test("an acknowledgement stall times out quickly and performs a real retry", async () => {
+  const requests = installWatchdogXhr({ acknowledgeAttempt: (attempt) => attempt === 2 });
+  const progress = [];
+  const states = [];
+
+  await uploadPart({
+    ackTimeoutMs: 12,
+    chunk: new Blob(["part"]),
+    idleTimeoutMs: 12,
+    offset: 0,
+    onAttemptStart: () => progress.push(0),
+    onProgress: (loaded) => progress.push(loaded),
+    onState: (state) => states.push(state),
+    partNumber: 1,
+    reconcileAfterFailure: async () => false,
+    retryDelayForAttempt: () => 1,
+    session: { id: "session", upload_token: "token" },
+    sha256: "00".repeat(32),
+    signal: new AbortController().signal,
+    stallNoticeMs: 2,
+  });
+
+  assert.equal(requests.length, 2);
+  assert.equal(
+    requests.every((request) => request.timeout === 0),
+    true
+  );
+  assert.ok(states.some((state) => state.stage === "awaiting-ack"));
+  assert.ok(
+    states.some((state) => state.stage === "stalled" && state.waitingForAcknowledgement === true)
+  );
+  assert.ok(
+    states.some(
+      (state) => state.stage === "retrying" && state.attempt === 2 && state.maxAttempts === 3
+    )
+  );
+  assert.deepEqual(progress, [0, 4, 0, 4, 4]);
+});
+
+test("an ambiguous acknowledgement failure is reconciled before retransmission", async () => {
+  const requests = installWatchdogXhr({ acknowledgeAttempt: () => false });
+  const failures = [];
+
+  const result = await uploadPart({
+    ackTimeoutMs: 5,
+    chunk: new Blob(["part"]),
+    idleTimeoutMs: 5,
+    offset: 0,
+    partNumber: 1,
+    reconcileAfterFailure: async (failure) => {
+      failures.push(failure);
+      return true;
+    },
+    retryDelayForAttempt: () => 1,
+    session: { id: "session", upload_token: "token" },
+    sha256: "00".repeat(32),
+    signal: new AbortController().signal,
+    stallNoticeMs: 1,
+  });
+
+  assert.deepEqual(result, { reconciled: true });
+  assert.equal(requests.length, 1);
+  assert.equal(failures[0].error.timeoutPhase, "awaiting-ack");
 });
 
 test("verification polling backs off and resets after forward progress", () => {

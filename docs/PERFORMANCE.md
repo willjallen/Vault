@@ -70,6 +70,41 @@ container/topology experiments against the real application routes. It does
 not register or depend on a diagnostic sink in the production server. It
 complements this harness; it is not the canonical per-change regression suite.
 
+## Real-browser HTTP protocol A/B
+
+The in-process and Python harnesses do not reproduce browser HTTP/2 request
+stream scheduling. Any suspected browser/proxy upload defect must be tested
+through the deployed TLS-terminating proxy with a real browser before changing
+Vault's protocol support.
+
+Use two otherwise identical test origins or test windows: one negotiated as
+HTTP/2 and one constrained to HTTP/1.1. Confirm the negotiated protocol in the
+browser network panel for every part request. Keep the Firefox build, browser
+profile, host, VPN state, link shaping, file, Vault revision, proxy buffering
+mode, and upload-session settings fixed. Do not route by user agent; protocol is
+the experimental variable. Run at least three fresh sessions per protocol, and
+do not reuse a part committed by the other arm.
+
+Capture the following on one synchronized clock:
+
+- a Firefox HTTP log covering request DATA and stream termination;
+- a packet capture on the client/proxy path;
+- Nginx request and HTTP/2 connection/stream fields;
+- Vault's `upload_part_start` and `upload_part_stop` events, including
+  `expected_bytes`, `received_bytes`, `duration_ms`, and
+  `termination_reason`;
+- client-visible transitions through uploading, awaiting acknowledgment,
+  stalled, reconciling, and retrying.
+
+Compare completion rate, part duration, received-minus-expected byte boundary,
+and termination reason between the two arms. A successful retry does not prove
+the original request completed, and XHR upload progress reaching the part size
+does not prove that Vault acknowledged it. Repeated HTTP/2-only truncation is
+evidence for a transport implementation problem; a shared failure requires
+continued investigation above or below that protocol layer. Preserve browser
+logs and packet captures as sensitive artifacts because they can include
+authentication and network metadata.
+
 ## Temporary-data safety
 
 The Criterion fixture never uses the operating system's default temporary

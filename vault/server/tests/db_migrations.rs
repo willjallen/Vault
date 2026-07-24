@@ -6,9 +6,17 @@ use std::str::FromStr;
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use support::migration_fixtures::v2_0_0::Fixture as V2_0_0Fixture;
+use support::migration_fixtures::v2_1_0::{
+    ACTIVE_CHECKIN_UPLOAD_ID, ACTIVE_CREATE_UPLOAD_ID, COMPLETE_CREATE_UPLOAD_ID,
+    COMPLETING_CREATE_UPLOAD_ID, Fixture as V2_1_0Fixture,
+};
 use vault_server::db;
 
-const CURRENT_HISTORY: [(i64, &str); 2] = [(1, "content previews"), (2, "normalize root folders")];
+const CURRENT_HISTORY: [(i64, &str); 3] = [
+    (1, "content previews"),
+    (2, "normalize root folders"),
+    (3, "bind uploads to target folders"),
+];
 const BASELINE_TABLES: [&str; 21] = [
     "folders",
     "folder_events",
@@ -164,6 +172,12 @@ async fn v2_0_0_fixture() -> V2_0_0Fixture {
     V2_0_0Fixture::create()
         .await
         .expect("generate pinned v2.0.0 database")
+}
+
+async fn v2_1_0_fixture() -> V2_1_0Fixture {
+    V2_1_0Fixture::create()
+        .await
+        .expect("generate pinned v2.1.0 database")
 }
 
 async fn raw_pool(path: &Path) -> SqlitePool {
@@ -344,6 +358,109 @@ async fn exact_v2_0_0_fixture_upgrades_to_current_without_changing_baseline_data
             .await
             .expect("foreign-key check");
     assert_eq!(foreign_key_violations, 0);
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn v2_1_0_upgrade_invalidates_ambiguous_create_uploads_and_preserves_checkins() {
+    let fixture = v2_1_0_fixture().await;
+    let db_path = fixture.db_path().to_path_buf();
+    let raw = raw_pool(&db_path).await;
+    assert_eq!(migration_history(&raw).await.len(), 2);
+    raw.close().await;
+
+    let pool = db::connect(&db_path).await.expect("upgrade v2.1.0 fixture");
+    assert_current_history(&migration_history(&pool).await);
+
+    let columns: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('upload_sessions')")
+            .fetch_all(&pool)
+            .await
+            .expect("upload session columns");
+    assert!(columns.iter().any(|column| column == "target_folder_id"));
+
+    let target_foreign_key: (String, String, String) = sqlx::query_as(
+        r#"
+        SELECT "table", "from", on_delete
+        FROM pragma_foreign_key_list('upload_sessions')
+        WHERE "from" = 'target_folder_id'
+        "#,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("target folder foreign key");
+    assert_eq!(
+        target_foreign_key,
+        (
+            "folders".to_string(),
+            "target_folder_id".to_string(),
+            "SET NULL".to_string(),
+        )
+    );
+
+    let upload_states: Vec<(String, String, Option<i64>, Option<String>)> = sqlx::query_as(
+        r"
+        SELECT id, status, target_folder_id, error
+        FROM upload_sessions
+        ORDER BY id
+        ",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("migrated upload states");
+    let restart_error =
+        Some("Upload target identity is unavailable after upgrade; restart the upload".to_string());
+    assert_eq!(
+        upload_states,
+        vec![
+            (
+                ACTIVE_CHECKIN_UPLOAD_ID.to_string(),
+                "active".to_string(),
+                None,
+                None,
+            ),
+            (
+                ACTIVE_CREATE_UPLOAD_ID.to_string(),
+                "failed".to_string(),
+                None,
+                restart_error.clone(),
+            ),
+            (
+                COMPLETE_CREATE_UPLOAD_ID.to_string(),
+                "complete".to_string(),
+                None,
+                None,
+            ),
+            (
+                COMPLETING_CREATE_UPLOAD_ID.to_string(),
+                "failed".to_string(),
+                None,
+                restart_error,
+            ),
+        ]
+    );
+
+    let missing_target = sqlx::query(
+        r"
+        INSERT INTO upload_sessions (
+            id, mode, status, folder_path, filename, total_size, chunk_size,
+            part_count, created_by, user_context, expires_at
+        )
+        VALUES (
+            'missing-target', 'create', 'active', 'Visual Assets',
+            'missing.txt', 1, 1, 1, 'fixture:alice', '{}',
+            '2999-01-01T00:00:00Z'
+        )
+        ",
+    )
+    .execute(&pool)
+    .await
+    .expect_err("active create upload without target identity must be rejected");
+    assert!(
+        missing_target
+            .to_string()
+            .contains("active create upload requires a target folder identity")
+    );
     pool.close().await;
 }
 
@@ -590,7 +707,7 @@ async fn migration_history_must_be_an_exact_known_prefix() {
             }
             InvalidHistory::Future => {
                 sqlx::query(
-                    "INSERT INTO schema_migrations (version, name) VALUES (3, 'future migration')",
+                    "INSERT INTO schema_migrations (version, name) VALUES (4, 'future migration')",
                 )
                 .execute(&raw)
                 .await

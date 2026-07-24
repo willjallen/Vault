@@ -32,9 +32,9 @@ use crate::documents::{
     normalize_file_name,
 };
 use crate::folders::{
-    FolderError, apply_effective_ttl_to_document_in_tx, get_folder_by_path_in_tx,
-    get_or_create_folder_path_in_tx, join_path, normalize_folder, parse_public_folder_path,
-    require_write_for_folder_path,
+    FolderError, apply_effective_ttl_to_document_in_tx, get_or_create_folder_path_in_tx, join_path,
+    normalize_folder, parse_public_folder_path, require_write_for_folder_path_in_tx,
+    resolve_writable_folder_by_id_in_tx,
 };
 use crate::previews::enqueue_preview_job_in_tx;
 use crate::state_events::state_event_resources_json;
@@ -261,7 +261,7 @@ struct UploadSessionRow {
     id: String,
     mode: String,
     status: String,
-    folder_path: Option<String>,
+    target_folder_id: Option<i64>,
     document_id: Option<i64>,
     filename: String,
     total_size: i64,
@@ -282,6 +282,29 @@ struct UploadSessionRow {
     result_path: Option<String>,
     resume_identity_sha256: Option<String>,
     part_manifest_sha256: Option<String>,
+}
+
+#[derive(Debug)]
+struct PreparedUploadTarget {
+    folder_path: Option<String>,
+    target_folder_id: Option<i64>,
+    document_id: Option<i64>,
+}
+
+struct UploadSessionInsert<'a> {
+    session_id: &'a str,
+    mode: &'a str,
+    target: &'a PreparedUploadTarget,
+    filename: &'a str,
+    payload: &'a CreateUploadRequest,
+    chunk_size: i64,
+    part_count: i64,
+    mime_type: &'a str,
+    user: &'a UserContext,
+    user_context: &'a Value,
+    meta: &'a ClientMeta,
+    now: &'a str,
+    expires_at: &'a str,
 }
 
 #[derive(Debug, FromRow)]
@@ -660,8 +683,7 @@ pub async fn create_upload_session(
     if usize::try_from(part_count).map_or(true, |count| count > STORAGE_MULTIPART_MAX_PARTS) {
         return Err(UploadError::UploadTooManyParts(STORAGE_MULTIPART_MAX_PARTS));
     }
-    let (folder_path, document_id) =
-        prepare_upload_target(pool, &mode, &filename, &payload, user).await?;
+    let target = prepare_upload_target(pool, &mode, &filename, &payload, user).await?;
 
     let session_id = if resume_identity_sha256.is_some() {
         format!("u2-{}", Uuid::new_v4().simple())
@@ -684,6 +706,36 @@ pub async fn create_upload_session(
             serde_json::Value::String(identity.clone()),
         );
     }
+    let inserted = insert_upload_session(
+        pool,
+        &UploadSessionInsert {
+            session_id: &session_id,
+            mode: &mode,
+            target: &target,
+            filename: &filename,
+            payload: &payload,
+            chunk_size,
+            part_count,
+            mime_type: &mime_type,
+            user,
+            user_context: &user_context,
+            meta,
+            now: &now,
+            expires_at: &expires_at,
+        },
+    )
+    .await;
+    if let Err(error) = inserted {
+        clear_upload_session_files(transfers_path, &session_id).await;
+        return Err(error);
+    }
+    upload_session_payload(pool, transfers_path, signing_keys, &session_id).await
+}
+
+async fn insert_upload_session(
+    pool: &SqlitePool,
+    insert: &UploadSessionInsert<'_>,
+) -> Result<(), UploadError> {
     sqlx::query(
         r"
         INSERT INTO upload_sessions
@@ -692,6 +744,7 @@ pub async fn create_upload_session(
                 mode,
                 status,
                 folder_path,
+                target_folder_id,
                 document_id,
                 filename,
                 total_size,
@@ -710,31 +763,32 @@ pub async fn create_upload_session(
                 expires_at
             )
         VALUES
-            (?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ",
     )
-    .bind(&session_id)
-    .bind(&mode)
-    .bind(&folder_path)
-    .bind(document_id)
-    .bind(&filename)
-    .bind(payload.size_bytes)
-    .bind(chunk_size)
-    .bind(part_count)
-    .bind(&mime_type)
-    .bind(trim_to_option(payload.note.as_deref()))
-    .bind(payload.rename_to_upload)
-    .bind(&user.id)
-    .bind(&user.name)
-    .bind(serde_json::to_string(&user_context)?)
-    .bind(&meta.ip)
-    .bind(&meta.user_agent)
-    .bind(&now)
-    .bind(&now)
-    .bind(&expires_at)
+    .bind(insert.session_id)
+    .bind(insert.mode)
+    .bind(&insert.target.folder_path)
+    .bind(insert.target.target_folder_id)
+    .bind(insert.target.document_id)
+    .bind(insert.filename)
+    .bind(insert.payload.size_bytes)
+    .bind(insert.chunk_size)
+    .bind(insert.part_count)
+    .bind(insert.mime_type)
+    .bind(trim_to_option(insert.payload.note.as_deref()))
+    .bind(insert.payload.rename_to_upload)
+    .bind(&insert.user.id)
+    .bind(&insert.user.name)
+    .bind(serde_json::to_string(insert.user_context)?)
+    .bind(&insert.meta.ip)
+    .bind(&insert.meta.user_agent)
+    .bind(insert.now)
+    .bind(insert.now)
+    .bind(insert.expires_at)
     .execute(pool)
     .await?;
-    upload_session_payload(pool, transfers_path, signing_keys, &session_id).await
+    Ok(())
 }
 
 async fn prepare_upload_target(
@@ -743,7 +797,7 @@ async fn prepare_upload_target(
     filename: &str,
     payload: &CreateUploadRequest,
     user: &UserContext,
-) -> Result<(Option<String>, Option<i64>), UploadError> {
+) -> Result<PreparedUploadTarget, UploadError> {
     match mode {
         "create" => prepare_create_upload_target(pool, filename, payload, user).await,
         "checkin" => prepare_checkin_upload_target(pool, filename, payload, user).await,
@@ -756,15 +810,19 @@ async fn prepare_create_upload_target(
     filename: &str,
     payload: &CreateUploadRequest,
     user: &UserContext,
-) -> Result<(Option<String>, Option<i64>), UploadError> {
+) -> Result<PreparedUploadTarget, UploadError> {
     let folder_path = normalize_folder(Some(&payload.folder))?;
     ensure_upload_folder(&folder_path)?;
-    require_write_for_folder_path(pool, &folder_path, user).await?;
-    let mut transaction = pool.begin().await?;
+    let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
+    require_write_for_folder_path_in_tx(&mut transaction, &folder_path, user).await?;
     let target_folder = get_or_create_folder_path_in_tx(&mut transaction, &folder_path).await?;
     ensure_unique_document_name_in_tx(&mut transaction, target_folder.id, filename, None).await?;
     transaction.commit().await?;
-    Ok((Some(folder_path), None))
+    Ok(PreparedUploadTarget {
+        folder_path: Some(folder_path),
+        target_folder_id: Some(target_folder.id),
+        document_id: None,
+    })
 }
 
 async fn prepare_checkin_upload_target(
@@ -772,7 +830,7 @@ async fn prepare_checkin_upload_target(
     filename: &str,
     payload: &CreateUploadRequest,
     user: &UserContext,
-) -> Result<(Option<String>, Option<i64>), UploadError> {
+) -> Result<PreparedUploadTarget, UploadError> {
     let document_id = payload.document_id.unwrap_or_default();
     let document = editable_document_for_upload(pool, document_id, user).await?;
     let lock = active_upload_lock(pool, document.id).await?;
@@ -790,7 +848,11 @@ async fn prepare_checkin_upload_target(
         .await?;
         transaction.commit().await?;
     }
-    Ok((None, Some(document.id)))
+    Ok(PreparedUploadTarget {
+        folder_path: None,
+        target_folder_id: None,
+        document_id: Some(document.id),
+    })
 }
 
 pub async fn get_upload_session(
@@ -1590,20 +1652,12 @@ async fn complete_upload_session_after_store(
     } else {
         None
     };
-    if session.mode == "create" {
-        require_write_for_folder_path(
-            pool,
-            session.folder_path.as_deref().unwrap_or_default(),
-            user,
-        )
-        .await?;
-    }
     let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
     let blob_id = publication
         .prepare_metadata_in_tx(&mut transaction, stored)
         .await?;
     let result = match session.mode.as_str() {
-        "create" => complete_create_upload_in_tx(&mut transaction, session, blob_id).await?,
+        "create" => complete_create_upload_in_tx(&mut transaction, session, blob_id, user).await?,
         "checkin" => {
             let Some((document, result_path)) = checkin_document.as_ref() else {
                 return Err(UploadError::UnsupportedUploadSessionMode);
@@ -1668,11 +1722,13 @@ async fn complete_create_upload_in_tx(
     transaction: &mut Transaction<'_, Sqlite>,
     session: &UploadSessionRow,
     blob_id: i64,
+    user: &UserContext,
 ) -> Result<UploadResultPayload, UploadError> {
-    let folder_path = session.folder_path.clone().unwrap_or_default();
-    let target_folder = get_folder_by_path_in_tx(transaction, &folder_path)
-        .await?
+    let target_folder_id = session
+        .target_folder_id
         .ok_or(FolderError::FolderNotFound)?;
+    let target_folder =
+        resolve_writable_folder_by_id_in_tx(transaction, target_folder_id, user).await?;
     ensure_unique_document_name_in_tx(transaction, target_folder.id, &session.filename, None)
         .await?;
     let inserted = sqlx::query(
@@ -1719,7 +1775,7 @@ async fn complete_create_upload_in_tx(
     Ok(UploadResultPayload {
         id: document_id,
         version: version_id,
-        path: join_path(&[&folder_path, &session.filename]),
+        path: join_path(&[&target_folder.path, &session.filename]),
     })
 }
 
@@ -2503,7 +2559,7 @@ async fn fetch_upload_session(
             id,
             mode,
             status,
-            folder_path,
+            target_folder_id,
             document_id,
             filename,
             total_size,

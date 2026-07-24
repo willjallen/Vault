@@ -25,8 +25,9 @@ use vault_server::config::Config;
 use vault_server::db;
 use vault_server::documents::{ClientMeta, sweep_expired_documents};
 use vault_server::folders::{
-    ARCHIVE_ROOT_KEY, VAULT_ROOT_KEY, add_folder_permission, get_or_create_folder_path,
-    get_root_folder,
+    ARCHIVE_ROOT_KEY, FolderError, FolderRetentionUpdate, VAULT_ROOT_KEY, add_folder_permission,
+    create_folder_path, delete_empty_folder, folder_access_level, get_or_create_folder_path,
+    get_root_folder, move_folder, rename_folder, update_folder_retention,
 };
 use vault_server::http::{self, AppState};
 use vault_server::reconciliation::storage_reconciliation_report;
@@ -2538,98 +2539,6 @@ async fn empty_v2_upload_completes_with_canonical_part_manifest() {
 }
 
 #[tokio::test]
-async fn create_upload_completion_does_not_recreate_a_deleted_target_folder() {
-    let (state, _temp_dir) =
-        test_state_with_upload_settings(5 * 1024 * 1024 * 1024, 4, 86_400).await;
-    grant_writer_root(&state.db).await;
-    let target = get_or_create_folder_path(&state.db, Some("Transient"))
-        .await
-        .expect("target folder");
-    let transfers_path = state.config.transfers_path();
-    let pool = state.db.clone();
-    let app = http::router(state);
-    let created = app
-        .clone()
-        .oneshot(authed_json_request(
-            Method::POST,
-            "/api/uploads",
-            &json!({
-                "mode": "create",
-                "folder": "Transient",
-                "filename": "empty.txt",
-                "mime_type": "text/plain",
-                "size_bytes": 0,
-                "resume_identity_sha256": "ab".repeat(32)
-            }),
-        ))
-        .await
-        .expect("create upload");
-    assert_eq!(created.status(), StatusCode::OK);
-    let created = response_json(created).await;
-    let session_id = created["id"].as_str().expect("session id").to_string();
-    let chunk_size = usize::try_from(created["chunk_size"].as_i64().expect("chunk size"))
-        .expect("positive chunk size");
-    let session_dir = transfers_path.join("uploads").join(&session_id);
-    assert!(session_dir.is_dir(), "upload staging should exist");
-
-    sqlx::query("DELETE FROM folders WHERE id = ?")
-        .bind(target.id)
-        .execute(&pool)
-        .await
-        .expect("delete upload target");
-
-    let completed = app
-        .oneshot(authed_json_request(
-            Method::POST,
-            &format!("/api/uploads/{session_id}/complete"),
-            &json!({"part_manifest_sha256": part_manifest_sha256_hex(b"", chunk_size)}),
-        ))
-        .await
-        .expect("complete upload");
-    assert_eq!(completed.status(), StatusCode::NOT_FOUND);
-    assert_eq!(response_json(completed).await["detail"], "Folder not found");
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM folders WHERE root_key = 'vault' AND name = 'Transient'",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("target folder count"),
-        0
-    );
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM documents WHERE name = 'empty.txt'")
-            .fetch_one(&pool)
-            .await
-            .expect("document count"),
-        0
-    );
-    assert_eq!(
-        sqlx::query_scalar::<_, String>("SELECT status FROM upload_sessions WHERE id = ?")
-            .bind(&session_id)
-            .fetch_one(&pool)
-            .await
-            .expect("session status"),
-        "failed"
-    );
-    assert!(
-        !session_dir.exists(),
-        "failed completion must remove upload staging"
-    );
-    let orphan_counts = sqlx::query_as::<_, (i64, i64)>(
-        r"
-        SELECT
-            (SELECT COUNT(*) FROM blobs),
-            (SELECT COUNT(*) FROM blob_locations)
-        ",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("orphan metadata counts");
-    assert_eq!(orphan_counts, (0, 0));
-}
-
-#[tokio::test]
 async fn checkin_session_adds_version_renames_and_releases_lock() {
     let (state, _temp_dir) = test_state().await;
     grant_writer_root(&state.db).await;
@@ -3410,6 +3319,18 @@ async fn directly_uploaded_session_with_fixed_parts(
     data: &[u8],
     part_size: usize,
 ) -> String {
+    directly_uploaded_session_in_folder_with_fixed_parts(state, user, "", filename, data, part_size)
+        .await
+}
+
+async fn directly_uploaded_session_in_folder_with_fixed_parts(
+    state: &AppState,
+    user: &UserContext,
+    folder: &str,
+    filename: &str,
+    data: &[u8],
+    part_size: usize,
+) -> String {
     let transfers_path = state.config.transfers_path();
     let session = uploads::create_upload_session(
         &state.db,
@@ -3425,7 +3346,7 @@ async fn directly_uploaded_session_with_fixed_parts(
             filename: filename.to_string(),
             size_bytes: i64::try_from(data.len()).expect("data size"),
             mime_type: Some("text/plain".to_string()),
-            folder: String::new(),
+            folder: folder.to_string(),
             document_id: None,
             note: None,
             rename_to_upload: false,
@@ -3464,6 +3385,25 @@ async fn directly_uploaded_session_with_fixed_parts(
         .expect("upload part");
     }
     session.id
+}
+
+async fn complete_create_upload(
+    state: &AppState,
+    user: &UserContext,
+    session_id: &str,
+    data: &[u8],
+) -> i64 {
+    uploads::complete_upload_session(
+        &state.db,
+        state.storage.as_ref(),
+        &state.config.transfers_path(),
+        session_id,
+        Some(&sha256_hex(data)),
+        user,
+    )
+    .await
+    .expect("upload should complete against its original target folder")
+    .id
 }
 
 fn test_stored_blob(digest: &str, size_bytes: usize) -> StoredBlob {
@@ -4402,4 +4342,245 @@ async fn upload_completion_reuses_server_preverified_hash_state() {
         .expect("completion task")
         .expect("completion");
     assert_eq!(completed.path, "preverified-upload.txt");
+}
+
+#[tokio::test]
+async fn create_upload_target_identity_blocks_read_acl_drift_after_target_rename() {
+    let (state, _temp_dir) = test_state().await;
+    grant_writer_root(&state.db).await;
+    let user = writer_context();
+    let target = get_or_create_folder_path(&state.db, Some("Open/Incoming"))
+        .await
+        .expect("original target folder");
+    let filename = "renamed-target.txt";
+    let data = b"completed after the target folder was renamed";
+    let session_id = directly_uploaded_session_in_folder_with_fixed_parts(
+        &state,
+        &user,
+        "Open/Incoming",
+        filename,
+        data,
+        data.len(),
+    )
+    .await;
+
+    rename_folder(&state.db, target.id, Some("Open"), "Accepted", &user)
+        .await
+        .expect("rename original target");
+    let replacement = create_folder_path(&state.db, "Open/Incoming", &user)
+        .await
+        .expect("create replacement at old path");
+    let writers_group: i64 =
+        sqlx::query_scalar("SELECT id FROM vault_groups WHERE name = 'writers'")
+            .fetch_one(&state.db)
+            .await
+            .expect("writers group");
+    let readers_group = create_group(&state.db, "readers").await;
+    add_folder_permission(&state.db, replacement.id, writers_group, true, true, true)
+        .await
+        .expect("preserve uploader access to replacement");
+    add_folder_permission(&state.db, replacement.id, readers_group, true, true, false)
+        .await
+        .expect("grant readers access to replacement");
+    let reader = UserContext {
+        id: "reader".to_string(),
+        vault_user_id: 2,
+        issuer: "headers".to_string(),
+        subject: "reader".to_string(),
+        name: "Reader".to_string(),
+        email: "reader@example.com".to_string(),
+        groups: vec!["readers".to_string()],
+        is_admin: false,
+    };
+    assert_eq!(
+        folder_access_level(&state.db, replacement.id, &user)
+            .await
+            .expect("replacement access"),
+        3,
+        "replacement must remain writable so completion reaches the corrupting commit"
+    );
+    assert_eq!(
+        folder_access_level(&state.db, target.id, &reader)
+            .await
+            .expect("reader access to original target"),
+        0
+    );
+    assert_eq!(
+        folder_access_level(&state.db, replacement.id, &reader)
+            .await
+            .expect("reader access to replacement"),
+        2
+    );
+
+    let document_id = complete_create_upload(&state, &user, &session_id, data).await;
+    let stored_folder_id: i64 = sqlx::query_scalar("SELECT folder_id FROM documents WHERE id = ?")
+        .bind(document_id)
+        .fetch_one(&state.db)
+        .await
+        .expect("uploaded document");
+    assert_ne!(target.id, replacement.id);
+    assert_eq!(
+        stored_folder_id, target.id,
+        "upload completion exposed the document through replacement folder {}",
+        replacement.id
+    );
+}
+
+#[tokio::test]
+async fn create_upload_target_identity_blocks_delete_ttl_drift_after_target_move() {
+    let (state, _temp_dir) = test_state().await;
+    grant_writer_root(&state.db).await;
+    let user = writer_context();
+    let target = get_or_create_folder_path(&state.db, Some("Records/Incoming"))
+        .await
+        .expect("original target folder");
+    get_or_create_folder_path(&state.db, Some("LongTerm"))
+        .await
+        .expect("move destination");
+    let filename = "moved-target.txt";
+    let data = b"completed after the target folder was moved";
+    let session_id = directly_uploaded_session_in_folder_with_fixed_parts(
+        &state,
+        &user,
+        "Records/Incoming",
+        filename,
+        data,
+        data.len(),
+    )
+    .await;
+
+    move_folder(&state.db, target.id, "LongTerm", &user)
+        .await
+        .expect("move original target");
+    let replacement = create_folder_path(&state.db, "Records/Incoming", &user)
+        .await
+        .expect("create replacement at old path");
+    let admin = UserContext {
+        id: "admin".to_string(),
+        vault_user_id: 2,
+        issuer: "headers".to_string(),
+        subject: "admin".to_string(),
+        name: "Admin".to_string(),
+        email: "admin@example.com".to_string(),
+        groups: Vec::new(),
+        is_admin: true,
+    };
+    update_folder_retention(
+        &state.db,
+        "Records/Incoming",
+        &FolderRetentionUpdate {
+            default_ttl_days: Some(1),
+            default_ttl_action: Some("delete".to_string()),
+        },
+        &admin,
+    )
+    .await
+    .expect("set replacement retention");
+
+    let document_id = complete_create_upload(&state, &user, &session_id, data).await;
+    let stored: (i64, Option<String>) =
+        sqlx::query_as("SELECT folder_id, expiry_action FROM documents WHERE id = ?")
+            .bind(document_id)
+            .fetch_one(&state.db)
+            .await
+            .expect("uploaded document");
+    assert_ne!(target.id, replacement.id);
+    assert_eq!(
+        stored.1, None,
+        "upload completion scheduled the document for deletion under the replacement folder's TTL"
+    );
+    assert_eq!(stored.0, target.id);
+}
+
+#[tokio::test]
+async fn create_upload_target_identity_survives_ancestor_rename() {
+    let (state, _temp_dir) = test_state().await;
+    grant_writer_root(&state.db).await;
+    let user = writer_context();
+    let ancestor = get_or_create_folder_path(&state.db, Some("Projects"))
+        .await
+        .expect("target ancestor");
+    let target = get_or_create_folder_path(&state.db, Some("Projects/Incoming"))
+        .await
+        .expect("original target folder");
+    let filename = "renamed-ancestor.txt";
+    let data = b"completed after an ancestor folder was renamed";
+    let session_id = directly_uploaded_session_in_folder_with_fixed_parts(
+        &state,
+        &user,
+        "Projects/Incoming",
+        filename,
+        data,
+        data.len(),
+    )
+    .await;
+
+    rename_folder(&state.db, ancestor.id, Some(""), "ActiveProjects", &user)
+        .await
+        .expect("rename target ancestor");
+    let replacement = create_folder_path(&state.db, "Projects/Incoming", &user)
+        .await
+        .expect("recreate subtree at old path");
+
+    let document_id = complete_create_upload(&state, &user, &session_id, data).await;
+    let stored_folder_id: i64 = sqlx::query_scalar("SELECT folder_id FROM documents WHERE id = ?")
+        .bind(document_id)
+        .fetch_one(&state.db)
+        .await
+        .expect("uploaded document");
+    assert_ne!(target.id, replacement.id);
+    assert_eq!(
+        stored_folder_id, target.id,
+        "upload completion silently redirected the document into recreated subtree folder {}",
+        replacement.id
+    );
+}
+
+#[tokio::test]
+async fn create_upload_target_identity_blocks_deletion_after_target_rename() {
+    let (state, _temp_dir) = test_state().await;
+    grant_writer_root(&state.db).await;
+    let user = writer_context();
+    let target = get_or_create_folder_path(&state.db, Some("Open/Incoming"))
+        .await
+        .expect("original target folder");
+    let data = b"still uploading while the target is renamed";
+    let session_id = directly_uploaded_session_in_folder_with_fixed_parts(
+        &state,
+        &user,
+        "Open/Incoming",
+        "rename-delete-race.txt",
+        data,
+        data.len(),
+    )
+    .await;
+
+    rename_folder(&state.db, target.id, Some("Open"), "Accepted", &user)
+        .await
+        .expect("rename original target");
+    let error = delete_empty_folder(&state.db, target.id, "Open/Accepted", &user)
+        .await
+        .expect_err("active upload must keep its renamed target alive");
+    assert!(matches!(error, FolderError::FolderNotEmpty));
+
+    uploads::abort_upload_session(
+        &state.db,
+        &state.config.transfers_path(),
+        &state.auth.signing_keys,
+        &session_id,
+        &user,
+    )
+    .await
+    .expect("abort upload");
+    let deleted = delete_empty_folder(&state.db, target.id, "Open/Accepted", &user)
+        .await
+        .expect("delete target after upload abort");
+    assert_eq!(deleted.id, target.id);
+    let stored_target: Option<i64> =
+        sqlx::query_scalar("SELECT target_folder_id FROM upload_sessions WHERE id = ?")
+            .bind(&session_id)
+            .fetch_one(&state.db)
+            .await
+            .expect("terminal upload target");
+    assert_eq!(stored_target, None);
 }

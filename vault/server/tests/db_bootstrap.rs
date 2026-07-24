@@ -56,7 +56,7 @@ async fn initializes_sqlite_schema_with_root_folders() {
             .fetch_all(&pool)
             .await
             .expect("migration versions");
-    assert_eq!(migration_versions, [1, 2]);
+    assert_eq!(migration_versions, [1, 2, 3]);
 }
 
 #[tokio::test]
@@ -847,7 +847,8 @@ async fn unexpected_trigger_on_model_table_is_rejected_on_startup() {
 
     let raw = raw_pool(&db_path).await;
     let trigger: String =
-        sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'trigger'")
+        sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'trigger' AND name = ?")
+            .bind("vault_groups_delete_documents")
             .fetch_one(&raw)
             .await
             .expect("trigger remains");

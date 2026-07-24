@@ -29,6 +29,12 @@ The accepted `name='Vault'` input is a narrow compatibility representation
 that can exist in a v2.0.0 database carried forward from an earlier install;
 it does not make pre-2.0 databases supported migration sources.
 
+`v2_2_0.rs` gives create-upload sessions a foreign-keyed target folder
+identity. Because the v2.1.0 format cannot prove which folder a path-only
+session originally selected after path reuse, its in-flight create uploads
+are failed with a restart message instead of being guessed; check-ins retain
+their stable document identity.
+
 Server-owned singleton state such as root folders must not be repaired from
 request paths. Fresh bootstrap creates it, versioned migrations normalize it,
 and startup/readiness validation rejects missing or malformed state. Reset
@@ -37,12 +43,12 @@ uses current root metadata and never calls a historical seeder.
 Migration acceptance databases are generated at test runtime by independently
 pinned, versioned builders under
 `vault/server/tests/support/migration_fixtures`, beginning with the row-1
-`v2_0_0` baseline. The released DDL, ledger metadata, and representative data
-remain reviewable Rust source; generated SQLite files and blobs never enter
-the repository. Tests must cover canonical sources, explicitly supported
-representations, applied-history prefixes, rollback, idempotence, and
-user-visible route behavior. Every newly supported source prefix must gain its
-own builder.
+`v2_0_0` baseline and the path-only upload states in `v2_1_0`. The released
+DDL, ledger metadata, and representative data remain reviewable Rust source;
+generated SQLite files and blobs never enter the repository. Tests must cover
+canonical sources, explicitly supported representations, applied-history
+prefixes, rollback, idempotence, and user-visible route behavior. Every newly
+supported source prefix must gain its own builder.
 
 Database migrations are forward-only. After a new ledger row is committed, an
 older Vault image may reject the database even when the data change itself is

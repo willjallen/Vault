@@ -347,19 +347,25 @@ async fn dev_debug_emit_state_uses_default_resources_when_omitted() {
 async fn dev_database_reset_cleans_tracked_upload_resources() {
     let (state, _temp_dir) = test_state(dev_auth()).await;
     let upload_id = "reset-upload";
+    let target_folder_id: i64 =
+        sqlx::query_scalar("SELECT id FROM folders WHERE root_key = 'vault' AND is_root = 1")
+            .fetch_one(&state.db)
+            .await
+            .expect("upload target");
     sqlx::query(
         r"
         INSERT INTO upload_sessions
             (
-                id, mode, status, filename, total_size, chunk_size,
-                part_count, created_by, user_context, expires_at
+                id, mode, status, target_folder_id, filename, total_size,
+                chunk_size, part_count, created_by, user_context, expires_at
             )
         VALUES
-            (?, 'create', 'active', 'reset.txt', 1, 1, 1,
+            (?, 'create', 'active', ?, 'reset.txt', 1, 1, 1,
              'dev', '{}', '2999-01-01T00:00:00Z')
         ",
     )
     .bind(upload_id)
+    .bind(target_folder_id)
     .execute(&state.db)
     .await
     .expect("upload session");

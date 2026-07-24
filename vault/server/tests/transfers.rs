@@ -117,6 +117,9 @@ async fn insert_upload_session_with_expiration(
     status: &str,
     expires_at: &str,
 ) {
+    let target = get_root_folder(pool, VAULT_ROOT_KEY)
+        .await
+        .expect("upload target");
     sqlx::query(
         r"
         INSERT INTO upload_sessions
@@ -124,6 +127,7 @@ async fn insert_upload_session_with_expiration(
                 id,
                 mode,
                 status,
+                target_folder_id,
                 filename,
                 total_size,
                 chunk_size,
@@ -134,11 +138,12 @@ async fn insert_upload_session_with_expiration(
                 expires_at
             )
         VALUES
-            (?, 'create', ?, 'expired.txt', 1, 1, 1, 'owner', 'Owner', '{}', ?)
+            (?, 'create', ?, ?, 'expired.txt', 1, 1, 1, 'owner', 'Owner', '{}', ?)
         ",
     )
     .bind(id)
     .bind(status)
+    .bind(target.id)
     .bind(expires_at)
     .execute(pool)
     .await

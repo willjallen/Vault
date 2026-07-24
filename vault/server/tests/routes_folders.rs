@@ -240,20 +240,25 @@ fn authed_delete(uri: &str, user: &str, groups: &str) -> Request<Body> {
 }
 
 async fn insert_active_create_upload(pool: &sqlx::SqlitePool, id: &str, folder_path: &str) {
+    let target = get_or_create_folder_path(pool, Some(folder_path))
+        .await
+        .expect("upload target folder");
     sqlx::query(
         r"
         INSERT INTO upload_sessions
             (
-                id, mode, status, folder_path, filename, total_size, chunk_size,
-                part_count, created_by, created_by_name, user_context, expires_at
+                id, mode, status, folder_path, target_folder_id, filename,
+                total_size, chunk_size, part_count, created_by, created_by_name,
+                user_context, expires_at
             )
         VALUES
-            (?, 'create', 'active', ?, 'pending.txt', 1, 1, 1,
+            (?, 'create', 'active', ?, ?, 'pending.txt', 1, 1, 1,
              'writer', 'Writer', '{}', '2999-01-01T00:00:00Z')
         ",
     )
     .bind(id)
     .bind(folder_path)
+    .bind(target.id)
     .execute(pool)
     .await
     .expect("active create upload");

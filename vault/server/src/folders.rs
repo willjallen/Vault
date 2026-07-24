@@ -765,7 +765,7 @@ pub async fn delete_empty_folder(
               FROM upload_sessions
               WHERE mode = 'create'
                 AND status IN ('active', 'completing')
-                AND folder_path = ?
+                AND target_folder_id = ?
           )
         ",
     )
@@ -773,7 +773,7 @@ pub async fn delete_empty_folder(
     .bind(VAULT_ROOT_KEY)
     .bind(folder.id)
     .bind(folder.id)
-    .bind(&current_path)
+    .bind(folder.id)
     .execute(&mut *transaction)
     .await?;
     if deleted.rows_affected() != 1 {
@@ -1000,26 +1000,25 @@ pub async fn empty_folder_delete_eligible_ids(
     }
     let ids = sqlx::query_scalar::<_, i64>(
         r"
-        WITH requested(id, path) AS (
-            SELECT
-                CAST(json_extract(value, '$[0]') AS INTEGER),
-                json_extract(value, '$[1]')
+        WITH requested(id) AS (
+            SELECT CAST(json_extract(value, '$[0]') AS INTEGER)
             FROM json_each(?)
         ),
-        active_create_paths(path) AS MATERIALIZED (
-            SELECT DISTINCT folder_path
+        active_create_targets(folder_id) AS MATERIALIZED (
+            SELECT DISTINCT target_folder_id
             FROM upload_sessions
             WHERE mode = 'create'
               AND status IN ('active', 'completing')
+              AND target_folder_id IS NOT NULL
         )
         SELECT requested.id
         FROM requested
         JOIN folders ON folders.id = requested.id
-        LEFT JOIN active_create_paths
-          ON active_create_paths.path = requested.path
+        LEFT JOIN active_create_targets
+          ON active_create_targets.folder_id = folders.id
         WHERE folders.root_key = ?
           AND folders.is_root = 0
-          AND active_create_paths.path IS NULL
+          AND active_create_targets.folder_id IS NULL
           AND NOT EXISTS (
               SELECT 1
               FROM documents
@@ -1054,6 +1053,27 @@ async fn resolve_visible_folder_in_tx(
     Ok(strict_public_folder_path_in_tx(transaction, target)
         .await?
         .map(|(id, path)| ResolvedVisibleFolder { id, path }))
+}
+
+pub(crate) async fn resolve_writable_folder_by_id_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    folder_id: i64,
+    user: &UserContext,
+) -> Result<ResolvedVisibleFolder, FolderError> {
+    let target = find_folder_by_id_in_tx(transaction, folder_id)
+        .await?
+        .ok_or(FolderError::FolderNotFound)?;
+    let access_level = folder_access_level_in_tx(transaction, target.id, user).await?;
+    if access_level == 0 {
+        return Err(FolderError::FolderNotFound);
+    }
+    if access_level < 3 {
+        return Err(FolderError::InsufficientFolderAccess);
+    }
+    strict_public_folder_path_in_tx(transaction, target)
+        .await?
+        .map(|(id, path)| ResolvedVisibleFolder { id, path })
+        .ok_or(FolderError::FolderNotFound)
 }
 
 pub fn build_folder_path_cache(

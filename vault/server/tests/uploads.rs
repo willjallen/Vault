@@ -11,21 +11,27 @@ async fn upload_hash_coordinator_keeps_active_states_at_the_cache_bound() {
         .expect("database");
     let coordinator = UploadHashCoordinator::new();
     let capacity = UploadHashCoordinator::cache_capacity();
+    let target_folder_id: i64 =
+        sqlx::query_scalar("SELECT id FROM folders WHERE root_key = 'vault' AND is_root = 1")
+            .fetch_one(&pool)
+            .await
+            .expect("upload target");
     let mut transaction = pool.begin().await.expect("seed transaction");
     for index in 0..=capacity {
         sqlx::query(
             r"
             INSERT INTO upload_sessions
                 (
-                    id, mode, status, filename, total_size, chunk_size,
-                    part_count, created_by, user_context, expires_at
+                    id, mode, status, target_folder_id, filename, total_size,
+                    chunk_size, part_count, created_by, user_context, expires_at
                 )
             VALUES
-                (?, 'create', 'active', 'bounded.txt', 1, 1, 1,
+                (?, 'create', 'active', ?, 'bounded.txt', 1, 1, 1,
                  'owner', '{}', '2999-01-01T00:00:00Z')
             ",
         )
         .bind(format!("session-{index}"))
+        .bind(target_folder_id)
         .execute(&mut *transaction)
         .await
         .expect("upload session");

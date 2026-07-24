@@ -49,6 +49,37 @@ function hasExternalFiles(dropEvent) {
   );
 }
 
+export function browserScopeClasses({ browserDropActive, dragActive, inArchive, uploadHover }) {
+  return [
+    inArchive ? "archived-scope" : "",
+    uploadHover && !inArchive ? "upload-hover" : "",
+    browserDropActive && !inArchive ? "drop-target" : "",
+    dragActive && !inArchive ? "drop-zone-available" : "",
+  ];
+}
+
+export function canvasDropAttributes({
+  browserDropActive,
+  folder,
+  inArchive,
+  onCanvasDragLeave,
+  onCanvasDragOver,
+  onCanvasDrop,
+}) {
+  if (inArchive) {
+    return {};
+  }
+  return {
+    "data-vault-drop-kind": "folder",
+    "data-drop-folder": folder || "",
+    "data-drop-label": "Drop here",
+    "data-drop-active": browserDropActive ? "true" : undefined,
+    onDragOver: onCanvasDragOver,
+    onDragLeave: onCanvasDragLeave,
+    onDrop: onCanvasDrop,
+  };
+}
+
 function handleSelectionDrop({
   target,
   targetFolder,

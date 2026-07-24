@@ -130,13 +130,22 @@ async fn set_archived_access(
     source_folder: &str,
     group_id: i64,
 ) {
-    sqlx::query("UPDATE documents SET archived_from_folder = ?, archived_access = ? WHERE id = ?")
-        .bind(source_folder)
-        .bind(format!(r#"{{"{group_id}":2}}"#))
-        .bind(document_id)
-        .execute(pool)
-        .await
-        .expect("archive snapshot");
+    sqlx::query(
+        r"
+        UPDATE documents
+        SET
+            archived_at = CURRENT_TIMESTAMP,
+            archived_origin_path = ? || '/' || name,
+            archived_access = ?
+        WHERE id = ?
+        ",
+    )
+    .bind(source_folder)
+    .bind(format!(r#"{{"{group_id}":2}}"#))
+    .bind(document_id)
+    .execute(pool)
+    .await
+    .expect("archive snapshot");
 }
 
 async fn response_json(response: axum::response::Response) -> Value {
@@ -790,8 +799,14 @@ async fn archive_folder_favorite_excludes_inaccessible_document_metadata() {
             .await
             .expect("reader root access");
     }
-    let visible_id = insert_versioned_document(&state.db, archive_root.id, "visible.txt").await;
-    let hidden_id = insert_versioned_document(&state.db, archive_root.id, "hidden.txt").await;
+    let project = get_or_create_folder_path(&state.db, Some("Project"))
+        .await
+        .expect("visible source");
+    let secret = get_or_create_folder_path(&state.db, Some("Secret"))
+        .await
+        .expect("hidden source");
+    let visible_id = insert_versioned_document(&state.db, project.id, "visible.txt").await;
+    let hidden_id = insert_versioned_document(&state.db, secret.id, "hidden.txt").await;
     set_archived_access(&state.db, visible_id, "Project", readers).await;
     set_archived_access(&state.db, hidden_id, "Secret", confidential).await;
     sqlx::query(

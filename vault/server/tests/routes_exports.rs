@@ -23,7 +23,8 @@ use vault_server::config::Config;
 use vault_server::db;
 use vault_server::exports::{self, ExportSelectionItem};
 use vault_server::folders::{
-    VAULT_ROOT_KEY, add_folder_permission, get_or_create_folder_path, get_root_folder,
+    ARCHIVE_ROOT_KEY, VAULT_ROOT_KEY, add_folder_permission, get_or_create_folder_path,
+    get_root_folder,
 };
 use vault_server::http::{self, AppState};
 use vault_server::storage::{
@@ -2483,6 +2484,108 @@ async fn folder_export_excludes_inaccessible_descendant_documents() {
     assert!(body_contains(&zip_body, b"visible"));
     assert!(!body_contains(&zip_body, b"Project/Private/secret.txt"));
     assert!(!body_contains(&zip_body, b"secret"));
+    wait_for_export_event_count(&pool, 1).await;
+}
+
+#[tokio::test]
+async fn archived_folder_export_keeps_its_subtree_and_excludes_independent_archive_entries() {
+    let (state, _temp_dir) = test_state().await;
+    let readers = create_group(&state.db, "readers").await;
+    let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
+        .await
+        .expect("root");
+    let archive_root = get_root_folder(&state.db, ARCHIVE_ROOT_KEY)
+        .await
+        .expect("archive root");
+    add_folder_permission(&state.db, root.id, readers, true, true, false)
+        .await
+        .expect("reader root");
+    add_folder_permission(&state.db, archive_root.id, readers, true, true, false)
+        .await
+        .expect("reader archive");
+    let project = get_or_create_folder_path(&state.db, Some("Project"))
+        .await
+        .expect("project");
+    insert_stored_document(
+        &state.db,
+        &state.storage,
+        project.id,
+        "included.txt",
+        b"included",
+    )
+    .await;
+    let independent_id = insert_stored_document(
+        &state.db,
+        &state.storage,
+        project.id,
+        "independent.txt",
+        b"independent",
+    )
+    .await;
+    let pool = state.db.clone();
+    let app = http::router(state);
+
+    let archive_document = app
+        .clone()
+        .oneshot(authed_json_post(
+            "/api/archive",
+            "admin",
+            "vault-admin",
+            &json!({"items": [{"type": "document", "id": independent_id}]}),
+        ))
+        .await
+        .expect("archive document");
+    assert_eq!(response_json(archive_document).await["failed"], json!([]));
+    let archive_folder = app
+        .clone()
+        .oneshot(authed_json_post(
+            "/api/archive",
+            "admin",
+            "vault-admin",
+            &json!({"items": [{"type": "folder", "id": project.id}]}),
+        ))
+        .await
+        .expect("archive folder");
+    assert_eq!(response_json(archive_folder).await["failed"], json!([]));
+
+    let response = app
+        .clone()
+        .oneshot(authed_json_post(
+            "/api/exports",
+            "reader",
+            "readers",
+            &json!({"items": [{"type": "folder", "id": project.id}]}),
+        ))
+        .await
+        .expect("export response");
+    let status = response.status();
+    let payload = response_json(response).await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    assert_eq!(payload["total_items"], 1);
+    let completed = wait_for_export_status(
+        app.clone(),
+        payload["id"].as_str().expect("id"),
+        "reader",
+        "readers",
+        "complete",
+    )
+    .await;
+    let download = app
+        .oneshot(authed_get(
+            completed["download_url"].as_str().expect("download url"),
+            "reader",
+            "readers",
+        ))
+        .await
+        .expect("download response");
+    assert_eq!(download.status(), StatusCode::OK);
+    let zip_body = to_bytes(download.into_body(), usize::MAX)
+        .await
+        .expect("zip body");
+    assert!(body_contains(&zip_body, b"Project/included.txt"));
+    assert!(body_contains(&zip_body, b"included"));
+    assert!(!body_contains(&zip_body, b"Project/independent.txt"));
+    assert!(!body_contains(&zip_body, b"independent"));
     wait_for_export_event_count(&pool, 1).await;
 }
 

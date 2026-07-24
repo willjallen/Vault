@@ -65,6 +65,22 @@ test("folder items preserve only an explicit empty-folder delete capability", ()
   assert.equal(folderToItem({ id: 4, path: "Unknown", size_bytes: 0 }).can_delete_empty, false);
 });
 
+test("archived folder items preserve stable identity and origin metadata", () => {
+  const item = folderToItem({
+    archived_at: "2026-07-24T12:00:00Z",
+    archived_origin_path: "Projects/Incoming",
+    directly_archived: true,
+    id: 17,
+    path: "Archive/@17~Incoming",
+  });
+
+  assert.equal(item.id, 17);
+  assert.equal(item.name, "Incoming");
+  assert.equal(item.archived, true);
+  assert.equal(item.directly_archived, true);
+  assert.equal(item.archived_origin_path, "Projects/Incoming");
+});
+
 test("each multi-item download action creates one export operation", async () => {
   const downloads = [];
   const handlers = bulkHandlers(async (options) => {

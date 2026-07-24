@@ -230,8 +230,8 @@ async fn expired_archive_ttl_moves_document_to_flat_archive_and_restore_reapplie
         SELECT
             f.root_key,
             d.folder_id,
-            d.archived_from_folder,
-            d.archived_original_name,
+            d.archived_at,
+            d.archived_origin_path,
             d.expires_at,
             d.expiry_action
         FROM documents d
@@ -243,14 +243,12 @@ async fn expired_archive_ttl_moves_document_to_flat_archive_and_restore_reapplie
     .fetch_one(&state.db)
     .await
     .expect("archived row");
-    assert_eq!(archived.get::<String, _>("root_key"), "archive");
+    assert_eq!(archived.get::<String, _>("root_key"), "vault");
+    assert_eq!(archived.get::<i64, _>("folder_id"), project.id);
+    assert!(archived.get::<Option<String>, _>("archived_at").is_some());
     assert_eq!(
-        archived.get::<Option<String>, _>("archived_from_folder"),
-        Some("Project".to_string())
-    );
-    assert_eq!(
-        archived.get::<Option<String>, _>("archived_original_name"),
-        Some("plan.txt".to_string())
+        archived.get::<Option<String>, _>("archived_origin_path"),
+        Some("Project/plan.txt".to_string())
     );
     assert_eq!(archived.get::<Option<String>, _>("expires_at"), None);
     assert_eq!(archived.get::<Option<String>, _>("expiry_action"), None);

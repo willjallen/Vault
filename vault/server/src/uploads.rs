@@ -2873,7 +2873,7 @@ async fn ensure_unique_document_name_in_tx(
         FROM documents
         WHERE folder_id = ?
           AND name = ?
-          AND archived_from_folder IS NULL
+          AND archived_at IS NULL
           AND (? IS NULL OR id != ?)
         LIMIT 1
         ",

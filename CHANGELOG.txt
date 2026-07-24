@@ -2,6 +2,7 @@
 
 Unreleased
 
+fix: Preserve file and folder identity through archive and restore while keeping archived folders flat, browsable, downloadable, and restorable as one item.
 fix: Bind uploads to folder identity across renames and moves; in-flight create uploads from earlier versions must restart once after upgrading.
 fix: Apply guarded, ordered database migrations from the v2.0.0 baseline and normalize legacy Vault roots before folder mutations are served.
 fix: Make resumable uploads recover promptly from stalls and network interruptions while reporting only server-confirmed progress.

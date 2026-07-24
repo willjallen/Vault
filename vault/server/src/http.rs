@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -38,9 +38,10 @@ use crate::config::Config;
 use crate::db::{self, DbPool};
 use crate::documents::{
     ClientMeta, DocumentError, VersionDownload, archive_document, archive_folder,
-    checkout_version_download, current_version_download, delete_document_forever,
-    document_access_level, document_folder_path, document_for_read, lock_document, move_document,
-    record_checkout_event_and_lock, record_download_event, rename_document, restore_document,
+    archived_folder_access_level, checkout_version_download, current_version_download,
+    delete_archived_folder_forever, delete_document_forever, document_access_level,
+    document_for_read, lock_document, move_document, record_checkout_event_and_lock,
+    record_download_event, rename_document, restore_document, restore_folder,
     sweep_expired_documents, try_fetch_document_by_id, unlock_document, version_download_by_id,
 };
 use crate::exports::{
@@ -49,10 +50,12 @@ use crate::exports::{
 };
 use crate::folders::{
     CreatedFolderPayload, DeletedFolderPayload, FolderError, FolderPermissionUpdate,
-    FolderRetentionUpdate, create_folder_path, delete_empty_folder, get_folder_by_path,
-    get_or_create_folder_path_in_tx, move_folder, normalize_folder, rename_folder,
-    require_folder_write_access, resolve_visible_folder_by_id, resolve_visible_folder_by_path,
-    update_folder_permissions, update_folder_properties, update_folder_retention,
+    FolderRetentionUpdate, all_folders, build_folder_path_cache, create_folder_path,
+    delete_empty_folder, folder_is_effectively_archived_from_records, folder_path_from_cache,
+    get_folder_by_path, get_or_create_folder_path_in_tx, move_folder, normalize_folder,
+    rename_folder, require_folder_write_access, resolve_visible_folder_by_id,
+    resolve_visible_folder_by_path, update_folder_permissions, update_folder_properties,
+    update_folder_retention,
 };
 use crate::oidc::{self, CallbackRequest, OidcError};
 use crate::preferences::{PreferenceError, update_preferences_for_user};
@@ -2053,11 +2056,23 @@ async fn api_delete_forever(
                     }
                 }
             }
-            NormalizedActionItem::Folder { .. } => {
-                response.failed.push(action_result(
-                    &item,
-                    Some("Delete forever is only available for archived files".to_string()),
-                ));
+            NormalizedActionItem::Folder { id, .. } => {
+                match delete_archived_folder_forever(&state.db, *id, &user).await {
+                    Ok(deleted) => {
+                        transfers::cleanup_upload_session_resources(
+                            &state.upload_hash_coordinator,
+                            &state.config.transfers_path(),
+                            &deleted.terminated_uploads,
+                        )
+                        .await;
+                        response.ok.push(action_result(&item, Some(deleted.path)));
+                        changed = true;
+                    }
+                    Err(error) => {
+                        let detail = document_action_error_detail(error)?;
+                        response.failed.push(action_result(&item, Some(detail)));
+                    }
+                }
             }
             NormalizedActionItem::MissingFolder { .. } => {
                 response.failed.push(missing_folder_action_result(&item));
@@ -2194,11 +2209,17 @@ async fn api_restore_items(
                     }
                 }
             }
-            NormalizedActionItem::Folder { .. } => {
-                response.failed.push(action_result(
-                    &item,
-                    Some("Restore archived files, not folders".to_string()),
-                ));
+            NormalizedActionItem::Folder { id, .. } => {
+                match restore_folder(&state.db, *id, &user).await {
+                    Ok(detail) => {
+                        response.ok.push(action_result(&item, Some(detail)));
+                        changed = true;
+                    }
+                    Err(error) => {
+                        let detail = document_action_error_detail(error)?;
+                        response.failed.push(action_result(&item, Some(detail)));
+                    }
+                }
             }
             NormalizedActionItem::MissingFolder { .. } => {
                 response.failed.push(missing_folder_action_result(&item));
@@ -2342,23 +2363,25 @@ async fn prune_nested_action_items(
     pool: &DbPool,
     items: Vec<NormalizedActionItem>,
 ) -> Result<Vec<NormalizedActionItem>, ApiError> {
-    let folder_paths = items
+    let selected_folder_ids = items
         .iter()
         .filter_map(|item| match item {
-            NormalizedActionItem::Folder { path, .. } => Some(path.clone()),
+            NormalizedActionItem::Folder { id, .. } => Some(*id),
             NormalizedActionItem::Document { .. } | NormalizedActionItem::MissingFolder { .. } => {
                 None
             }
         })
-        .collect::<Vec<_>>();
+        .collect::<HashSet<_>>();
+    let folders = all_folders(pool).await?;
+    let parent_by_id = folders
+        .iter()
+        .map(|folder| (folder.id, folder.parent_id))
+        .collect::<HashMap<_, _>>();
     let mut pruned = Vec::new();
     for item in items {
         match &item {
-            NormalizedActionItem::Folder { path, .. } => {
-                if folder_paths
-                    .iter()
-                    .any(|parent| path != parent && path.starts_with(&format!("{parent}/")))
-                {
+            NormalizedActionItem::Folder { id, .. } => {
+                if has_selected_folder_ancestor(*id, &selected_folder_ids, &parent_by_id) {
                     continue;
                 }
             }
@@ -2367,10 +2390,13 @@ async fn prune_nested_action_items(
                     pruned.push(item);
                     continue;
                 };
-                let folder_path = document_folder_path(pool, &document).await?;
-                if folder_paths.iter().any(|parent| {
-                    folder_path == *parent || folder_path.starts_with(&format!("{parent}/"))
-                }) {
+                if selected_folder_ids.contains(&document.folder_id)
+                    || has_selected_folder_ancestor(
+                        document.folder_id,
+                        &selected_folder_ids,
+                        &parent_by_id,
+                    )
+                {
                     continue;
                 }
             }
@@ -2379,6 +2405,25 @@ async fn prune_nested_action_items(
         pruned.push(item);
     }
     Ok(pruned)
+}
+
+fn has_selected_folder_ancestor(
+    folder_id: i64,
+    selected_folder_ids: &HashSet<i64>,
+    parent_by_id: &HashMap<i64, Option<i64>>,
+) -> bool {
+    let mut current = parent_by_id.get(&folder_id).copied().flatten();
+    let mut visited = HashSet::new();
+    while let Some(folder_id) = current {
+        if !visited.insert(folder_id) {
+            return false;
+        }
+        if selected_folder_ids.contains(&folder_id) {
+            return true;
+        }
+        current = parent_by_id.get(&folder_id).copied().flatten();
+    }
+    false
 }
 
 async fn normalize_folder_action_item(
@@ -2392,6 +2437,25 @@ async fn normalize_folder_action_item(
             return Err(ApiError::BadRequest(
                 "Folder id must be positive".to_string(),
             ));
+        }
+        let folders = all_folders(pool).await?;
+        if let Some(folder) = folders.iter().find(|folder| {
+            folder.id == id && folder_is_effectively_archived_from_records(folder.id, &folders)
+        }) {
+            if archived_folder_access_level(pool, folder, user).await? < 1 {
+                if allow_missing {
+                    return Ok(NormalizedActionItem::MissingFolder {
+                        id: Some(id),
+                        path: None,
+                    });
+                }
+                return Err(ApiError::NotFound("Folder not found".to_string()));
+            }
+            let path_cache = build_folder_path_cache(&folders)?;
+            return Ok(NormalizedActionItem::Folder {
+                id,
+                path: folder_path_from_cache(folder, &path_cache)?,
+            });
         }
         let Some(folder) = resolve_visible_folder_by_id(pool, id, user).await? else {
             if allow_missing {
@@ -2524,11 +2588,20 @@ fn document_action_error_detail(error: DocumentError) -> Result<String, ApiError
         DocumentError::ArchivedDocumentMissingRestoreMetadata => {
             Ok("Archived document is missing restore metadata".to_string())
         }
+        DocumentError::ArchivedParentMustBeRestored
+        | DocumentError::ArchivedFolderParentMustBeRestored => {
+            Ok("Restore the containing archived folder first".to_string())
+        }
         DocumentError::CannotArchiveRootFolder => Ok("Cannot archive a root folder".to_string()),
         DocumentError::FolderAlreadyArchived => Ok("Folder is already archived".to_string()),
-        DocumentError::FolderHasNoFilesToArchive => {
-            Ok("Folder has no files to archive".to_string())
+        DocumentError::FolderNotArchived => Ok("Folder is not archived".to_string()),
+        DocumentError::FolderHasActiveUploads => {
+            Ok("Finish or cancel uploads in this folder before archiving it".to_string())
         }
+        DocumentError::FolderContainsIndependentArchiveEntries => Ok(
+            "This folder contains separately archived items; delete them first or restore the folder"
+                .to_string(),
+        ),
         DocumentError::DocumentHasNoVersions => Ok("Document has no versions".to_string()),
         DocumentError::InconsistentCurrentVersion => {
             Ok("Current document version metadata is inconsistent".to_string())
@@ -2541,7 +2614,7 @@ fn document_action_error_detail(error: DocumentError) -> Result<String, ApiError
         DocumentError::Folder(FolderError::FolderNotFound) => Ok("Folder not found".to_string()),
         DocumentError::Folder(FolderError::InvalidPath) => Ok("Invalid folder path".to_string()),
         DocumentError::Folder(FolderError::ArchiveDoesNotContainFolders) => {
-            Ok("Archive does not contain folders".to_string())
+            Ok("Folders cannot be created directly in Archive".to_string())
         }
         DocumentError::Database(error) => {
             tracing::error!(?error, "bulk document action database failure");
@@ -2580,7 +2653,7 @@ fn folder_action_error_detail(error: FolderError) -> Result<String, ApiError> {
         }
         FolderError::InvalidPath => Ok("Invalid folder path".to_string()),
         FolderError::ArchiveDoesNotContainFolders => {
-            Ok("Archive does not contain folders".to_string())
+            Ok("Folders cannot be created directly in Archive".to_string())
         }
         FolderError::InsufficientFolderAccess => Ok("Insufficient folder access".to_string()),
         FolderError::FolderNotFound => Ok("Folder not found".to_string()),
@@ -4451,7 +4524,7 @@ fn folder_error_response(error: FolderError) -> (StatusCode, String) {
         ),
         FolderError::ArchiveDoesNotContainFolders => (
             StatusCode::BAD_REQUEST,
-            "Archive does not contain folders".to_string(),
+            "Folders cannot be created directly in Archive".to_string(),
         ),
         FolderError::InsufficientFolderAccess => (
             StatusCode::FORBIDDEN,
@@ -4468,7 +4541,59 @@ fn folder_error_response(error: FolderError) -> (StatusCode, String) {
     }
 }
 
+fn archive_document_error_response(error: &DocumentError) -> Option<(StatusCode, &'static str)> {
+    Some(match error {
+        DocumentError::RestoreBeforeEditing => {
+            (StatusCode::BAD_REQUEST, "Restore this file before editing")
+        }
+        DocumentError::MoveDocumentToArchiveBeforeDeleting => (
+            StatusCode::BAD_REQUEST,
+            "Move the document to Archive before deleting",
+        ),
+        DocumentError::RestoreArchivedBeforeRenaming => (
+            StatusCode::BAD_REQUEST,
+            "Restore archived files before renaming",
+        ),
+        DocumentError::UseArchiveOrRestoreForArchiveMoves => (
+            StatusCode::BAD_REQUEST,
+            "Use archive or restore for Archive moves",
+        ),
+        DocumentError::DocumentAlreadyArchived => {
+            (StatusCode::BAD_REQUEST, "Document is already archived")
+        }
+        DocumentError::DocumentNotArchived => (StatusCode::BAD_REQUEST, "Document is not archived"),
+        DocumentError::ArchivedDocumentMissingRestoreMetadata => (
+            StatusCode::BAD_REQUEST,
+            "Archived document is missing restore metadata",
+        ),
+        DocumentError::ArchivedParentMustBeRestored
+        | DocumentError::ArchivedFolderParentMustBeRestored => (
+            StatusCode::CONFLICT,
+            "Restore the containing archived folder first",
+        ),
+        DocumentError::CannotArchiveRootFolder => {
+            (StatusCode::BAD_REQUEST, "Cannot archive a root folder")
+        }
+        DocumentError::FolderAlreadyArchived => {
+            (StatusCode::BAD_REQUEST, "Folder is already archived")
+        }
+        DocumentError::FolderNotArchived => (StatusCode::BAD_REQUEST, "Folder is not archived"),
+        DocumentError::FolderHasActiveUploads => (
+            StatusCode::CONFLICT,
+            "Finish or cancel uploads in this folder before archiving it",
+        ),
+        DocumentError::FolderContainsIndependentArchiveEntries => (
+            StatusCode::CONFLICT,
+            "This folder contains separately archived items; delete them first or restore the folder",
+        ),
+        _ => return None,
+    })
+}
+
 fn document_error_response(error: DocumentError) -> (StatusCode, String) {
+    if let Some((status, message)) = archive_document_error_response(&error) {
+        return (status, message.to_string());
+    }
     match error {
         DocumentError::DocumentNotFound => {
             (StatusCode::NOT_FOUND, "Document not found".to_string())
@@ -4476,10 +4601,6 @@ fn document_error_response(error: DocumentError) -> (StatusCode, String) {
         DocumentError::InsufficientDocumentAccess => (
             StatusCode::FORBIDDEN,
             "Insufficient document access".to_string(),
-        ),
-        DocumentError::RestoreBeforeEditing => (
-            StatusCode::BAD_REQUEST,
-            "Restore this file before editing".to_string(),
         ),
         DocumentError::DocumentLockedByOtherUser => (
             StatusCode::FORBIDDEN,
@@ -4493,10 +4614,6 @@ fn document_error_response(error: DocumentError) -> (StatusCode, String) {
             StatusCode::CONFLICT,
             "Document changed while the operation was in progress".to_string(),
         ),
-        DocumentError::MoveDocumentToArchiveBeforeDeleting => (
-            StatusCode::BAD_REQUEST,
-            "Move the document to Archive before deleting".to_string(),
-        ),
         DocumentError::FileNameRequired => {
             (StatusCode::BAD_REQUEST, "File name is required".to_string())
         }
@@ -4506,38 +4623,6 @@ fn document_error_response(error: DocumentError) -> (StatusCode, String) {
         DocumentError::DocumentPathAlreadyExists => (
             StatusCode::BAD_REQUEST,
             "A document already exists at that path".to_string(),
-        ),
-        DocumentError::RestoreArchivedBeforeRenaming => (
-            StatusCode::BAD_REQUEST,
-            "Restore archived files before renaming".to_string(),
-        ),
-        DocumentError::UseArchiveOrRestoreForArchiveMoves => (
-            StatusCode::BAD_REQUEST,
-            "Use archive or restore for Archive moves".to_string(),
-        ),
-        DocumentError::DocumentAlreadyArchived => (
-            StatusCode::BAD_REQUEST,
-            "Document is already archived".to_string(),
-        ),
-        DocumentError::DocumentNotArchived => (
-            StatusCode::BAD_REQUEST,
-            "Document is not archived".to_string(),
-        ),
-        DocumentError::ArchivedDocumentMissingRestoreMetadata => (
-            StatusCode::BAD_REQUEST,
-            "Archived document is missing restore metadata".to_string(),
-        ),
-        DocumentError::CannotArchiveRootFolder => (
-            StatusCode::BAD_REQUEST,
-            "Cannot archive a root folder".to_string(),
-        ),
-        DocumentError::FolderAlreadyArchived => (
-            StatusCode::BAD_REQUEST,
-            "Folder is already archived".to_string(),
-        ),
-        DocumentError::FolderHasNoFilesToArchive => (
-            StatusCode::BAD_REQUEST,
-            "Folder has no files to archive".to_string(),
         ),
         DocumentError::DocumentHasNoVersions => (
             StatusCode::NOT_FOUND,

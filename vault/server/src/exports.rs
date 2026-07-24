@@ -28,11 +28,12 @@ use crate::blob_lifecycle::{
     BlobLifecycleError, begin_blob_publication, collect_unreferenced_blobs_with_limit,
 };
 use crate::documents::{
-    DocumentError, VersionDownload, current_version_download, document_for_read,
+    DocumentError, VersionDownload, archived_folder_access_level, current_version_download,
+    document_for_read,
 };
 use crate::folders::{
-    FolderError, all_folders, folder_path_by_id, require_folder_read_access,
-    subtree_folder_ids_from_records,
+    FolderError, all_folders, archive_entry_subtree_folder_ids_from_records, folder_access_level,
+    folder_is_effectively_archived_from_records, folder_path_by_id,
 };
 use crate::state_events::{notify_state_event_committed, record_state_event_in_tx};
 use crate::storage::{
@@ -1158,7 +1159,7 @@ async fn validate_download_queue_selection(
                 }
             }
             ExportSelectionItem::Folder { id, .. } => {
-                require_folder_read_access(pool, *id, user).await?;
+                require_export_folder_read_access(pool, *id, user).await?;
             }
         }
     }
@@ -1194,7 +1195,7 @@ async fn resolve_downloads(
                 }
             }
             ExportSelectionItem::Folder { id, .. } => {
-                require_folder_read_access(pool, *id, user).await?;
+                require_export_folder_read_access(pool, *id, user).await?;
                 for document_id in document_ids_in_folder_subtree(pool, *id).await? {
                     if !seen_documents.insert(document_id) {
                         continue;
@@ -1244,12 +1245,36 @@ async fn require_document_read_access(
     Ok(())
 }
 
+async fn require_export_folder_read_access(
+    pool: &SqlitePool,
+    folder_id: i64,
+    user: &UserContext,
+) -> Result<(), ExportError> {
+    let folders = all_folders(pool).await?;
+    let folder = folders
+        .iter()
+        .find(|folder| folder.id == folder_id)
+        .ok_or(FolderError::FolderNotFound)?;
+    let level = if folder_is_effectively_archived_from_records(folder_id, &folders) {
+        archived_folder_access_level(pool, folder, user).await?
+    } else {
+        folder_access_level(pool, folder_id, user).await?
+    };
+    if level >= 2 {
+        return Ok(());
+    }
+    if level > 0 {
+        return Err(FolderError::InsufficientFolderAccess.into());
+    }
+    Err(FolderError::FolderNotFound.into())
+}
+
 async fn document_ids_in_folder_subtree(
     pool: &SqlitePool,
     folder_id: i64,
 ) -> Result<Vec<i64>, ExportError> {
     let folders = all_folders(pool).await?;
-    let folder_ids = subtree_folder_ids_from_records(folder_id, &folders);
+    let folder_ids = archive_entry_subtree_folder_ids_from_records(folder_id, &folders);
     if folder_ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -1260,7 +1285,7 @@ async fn document_ids_in_folder_subtree(
             separated.push_bind(*id);
         }
     }
-    builder.push(") ORDER BY folder_id, name, id");
+    builder.push(") AND archived_at IS NULL ORDER BY folder_id, name, id");
     Ok(builder.build_query_scalar::<i64>().fetch_all(pool).await?)
 }
 

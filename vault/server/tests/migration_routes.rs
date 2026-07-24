@@ -10,8 +10,8 @@ use serde_json::{Value, json};
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use support::migration_fixtures::v2_0_0::{
-    ARCHIVE_ROOT_ID, DOCUMENT_ID, EMPTY_FOLDER_ID, FIXTURE_WRITER_USER_ID, Fixture,
-    MIGRATION_PREVIEWS_FOLDER_ID, VAULT_ROOT_ID, VISUAL_ASSETS_FOLDER_ID,
+    DOCUMENT_ID, EMPTY_FOLDER_ID, FIXTURE_WRITER_USER_ID, Fixture, MIGRATION_PREVIEWS_FOLDER_ID,
+    VAULT_ROOT_ID, VISUAL_ASSETS_FOLDER_ID,
 };
 use tower::ServiceExt;
 use vault_server::auth::{AuthSettings, UserContext};
@@ -251,7 +251,10 @@ async fn derived_v2_0_0_incident_state_upgrade_restores_folder_mutation_routes()
         archive_json["ok"][0]["item"]["path"],
         "Visual Assets Renamed/Migration Previews"
     );
-    assert_eq!(archive_json["ok"][0]["detail"], "Archive");
+    assert_eq!(
+        archive_json["ok"][0]["detail"],
+        "Archive/Migration Previews"
+    );
 
     let preserved_visual_assets: (String, i64) =
         sqlx::query_as("SELECT name, parent_id FROM folders WHERE id = ?")
@@ -263,20 +266,19 @@ async fn derived_v2_0_0_incident_state_upgrade_restores_folder_mutation_routes()
         preserved_visual_assets,
         ("Visual Assets Renamed".to_string(), VAULT_ROOT_ID)
     );
-    let removed_folder_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM folders WHERE id IN (?, ?)")
-            .bind(MIGRATION_PREVIEWS_FOLDER_ID)
-            .bind(EMPTY_FOLDER_ID)
-            .fetch_one(&pool)
-            .await
-            .expect("removed fixture folders");
-    assert_eq!(removed_folder_count, 0);
+    let empty_folder_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM folders WHERE id = ?")
+        .bind(EMPTY_FOLDER_ID)
+        .fetch_one(&pool)
+        .await
+        .expect("removed empty folder");
+    assert_eq!(empty_folder_count, 0);
 
-    let archived_document: (i64, String, String) = sqlx::query_as(
+    let archived_document: (i64, String, String, bool) = sqlx::query_as(
         r"
-        SELECT folder_id, name, archived_from_folder
-        FROM documents
-        WHERE id = ?
+        SELECT d.folder_id, d.name, f.archived_origin_path, f.archived_at IS NOT NULL
+        FROM documents d
+        JOIN folders f ON f.id = d.folder_id
+        WHERE d.id = ?
         ",
     )
     .bind(DOCUMENT_ID)
@@ -286,9 +288,10 @@ async fn derived_v2_0_0_incident_state_upgrade_restores_folder_mutation_routes()
     assert_eq!(
         archived_document,
         (
-            ARCHIVE_ROOT_ID,
+            MIGRATION_PREVIEWS_FOLDER_ID,
             "migration-preview.png".to_string(),
             "Visual Assets Renamed/Migration Previews".to_string(),
+            true,
         )
     );
 

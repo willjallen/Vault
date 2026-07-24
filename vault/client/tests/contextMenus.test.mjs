@@ -45,8 +45,10 @@ function folderMenuItemsFor(folderItem, overrides = {}) {
     busy: false,
     folderItem,
     handleArchiveFolder: () => {},
+    handleDeleteForeverItems: () => {},
     handleDeleteEmptyFolder: () => {},
     handleDownloadSelection: () => {},
+    handleRestoreItems: () => {},
     handleShareItem: () => {},
     navigateToFolder: () => {},
     openFolderProperties: () => {},
@@ -157,7 +159,7 @@ test("file context lock action explains locks owned by another user", () => {
   assert.equal(released, doc.id);
 });
 
-test("empty active folder exposes a dangerous Delete action", () => {
+test("empty active folder uses the same archive lifecycle as every other folder", () => {
   const folderItem = {
     archived: false,
     can_delete_empty: true,
@@ -166,22 +168,21 @@ test("empty active folder exposes a dangerous Delete action", () => {
     path: "Projects/Empty",
     type: "folder",
   };
-  let deleted = null;
+  let archived = null;
   const items = folderMenuItemsFor(folderItem, {
-    handleDeleteEmptyFolder: (item) => {
-      deleted = item;
+    handleArchiveFolder: (path) => {
+      archived = path;
     },
   });
 
-  const deleteItem = items.find((item) => item.label === "Delete");
-  assert.equal(deleteItem?.danger, true);
-  assert.equal(deleteItem?.disabled, false);
+  const archiveItem = items.find((item) => item.label === "Move to Archive");
+  assert.equal(archiveItem?.disabled, false);
   assert.equal(
-    items.some((item) => item.label === "Move to Archive"),
+    items.some((item) => item.label === "Delete"),
     false
   );
-  deleteItem.action();
-  assert.equal(deleted, folderItem);
+  archiveItem.action();
+  assert.equal(archived, folderItem.path);
 });
 
 test("nonempty active folder retains Move to Archive without Delete", () => {
@@ -204,23 +205,52 @@ test("nonempty active folder retains Move to Archive without Delete", () => {
   );
 });
 
-test("folder Delete action requires the explicit server capability", () => {
-  const unavailable = [
-    { can_delete_empty: false, id: 1, path: "Nonempty", size_bytes: 0 },
-    { id: 2, path: "Unknown", size_bytes: 0 },
-    { can_delete_empty: true, id: 3, path: "" },
-    { can_delete_empty: true, id: 4, path: "Archive" },
-    { archived: true, can_delete_empty: true, id: 5, path: "Archived" },
-  ];
-
-  unavailable.forEach((folderItem) => {
-    const items = folderMenuItemsFor({ name: "Folder", type: "folder", ...folderItem });
-    assert.equal(
-      items.some((item) => item.label === "Delete"),
-      false,
-      folderItem.path || "Vault root"
-    );
+test("direct archived folder exposes aggregate restore and permanent delete", () => {
+  const folderItem = {
+    access: { write: true },
+    archived: true,
+    directly_archived: true,
+    id: 5,
+    name: "Project",
+    path: "Archive/@5~Project",
+    type: "folder",
+  };
+  const restored = [];
+  const deleted = [];
+  const items = folderMenuItemsFor(folderItem, {
+    handleDeleteForeverItems: (selection) => deleted.push(selection),
+    handleRestoreItems: (selection) => restored.push(selection),
+    isAdmin: true,
   });
+
+  assert.deepEqual(
+    items.map((item) => item.label),
+    ["Download", "Open", "Restore to Vault", "Delete forever"]
+  );
+  items.find((item) => item.label === "Restore to Vault").action();
+  items.find((item) => item.label === "Delete forever").action();
+  assert.deepEqual(restored, [[folderItem]]);
+  assert.deepEqual(deleted, [[folderItem]]);
+});
+
+test("inherited archived folder cannot be restored independently", () => {
+  const items = folderMenuItemsFor({
+    archived: true,
+    directly_archived: false,
+    id: 6,
+    name: "Nested",
+    path: "Archive/@5~Project/@6~Nested",
+    type: "folder",
+  });
+
+  assert.equal(
+    items.some((item) => item.label === "Restore to Vault"),
+    false
+  );
+  assert.equal(
+    items.some((item) => item.label === "Delete forever"),
+    false
+  );
 });
 
 test("picker capability keeps a single Download menu action", () => {
@@ -274,4 +304,20 @@ test("page actions remain disabled during foreground busy operations", () => {
   assert.equal(items.find((item) => item.label === "Upload file")?.disabled, true);
   assert.equal(items.find((item) => item.label === "Upload folder")?.disabled, true);
   assert.equal(items.find((item) => item.label === "New folder")?.disabled, true);
+});
+
+test("page mutations remain disabled throughout an archived folder subtree", () => {
+  const items = buildPageMenuItems({
+    beginCreateFolder: () => {},
+    busy: false,
+    creatingFolder: false,
+    folder: "Archive/@5~Project/@6~Nested",
+    handleUploadClick: () => {},
+    handleUploadFolderClick: () => {},
+  });
+
+  assert.equal(
+    items.every((item) => item.disabled),
+    true
+  );
 });

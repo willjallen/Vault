@@ -12,10 +12,11 @@ use support::migration_fixtures::v2_1_0::{
 };
 use vault_server::db;
 
-const CURRENT_HISTORY: [(i64, &str); 3] = [
+const CURRENT_HISTORY: [(i64, &str); 4] = [
     (1, "content previews"),
     (2, "normalize root folders"),
     (3, "bind uploads to target folders"),
+    (4, "preserve archived item identities"),
 ];
 const BASELINE_TABLES: [&str; 21] = [
     "folders",
@@ -123,8 +124,7 @@ const BASELINE_SNAPSHOT_QUERIES: [(&str, &str); 12] = [
             id, folder_id, name, description, created_at, created_by,
             created_by_name, latest_modified_at, latest_modified_by,
             latest_version_number, version_count, current_version_id, expires_at,
-            expiry_action, archived_from_folder, archived_original_name,
-            archived_access
+            expiry_action
         )
         FROM documents
         ORDER BY id
@@ -465,6 +465,95 @@ async fn v2_1_0_upgrade_invalidates_ambiguous_create_uploads_and_preserves_check
 }
 
 #[tokio::test]
+async fn archive_identity_migration_normalizes_legacy_rows_without_permanent_compatibility_state() {
+    let fixture = v2_1_0_fixture().await;
+    let db_path = fixture.db_path().to_path_buf();
+    let raw = raw_pool(&db_path).await;
+    let archive_root_id: i64 =
+        sqlx::query_scalar("SELECT id FROM folders WHERE root_key = 'archive' AND is_root = 1")
+            .fetch_one(&raw)
+            .await
+            .expect("archive root");
+    let document_id = sqlx::query(
+        r"
+        INSERT INTO documents (
+            folder_id,
+            name,
+            created_by,
+            latest_modified_by,
+            archived_from_folder,
+            archived_original_name,
+            archived_access
+        )
+        VALUES (?, 'legacy-display-name', 'fixture:alice', 'fixture:alice',
+                'Projects/Incoming', 'payload.bin', '{}')
+        ",
+    )
+    .bind(archive_root_id)
+    .execute(&raw)
+    .await
+    .expect("legacy archived document")
+    .last_insert_rowid();
+    raw.close().await;
+
+    let pool = db::connect(&db_path)
+        .await
+        .expect("upgrade archived legacy row");
+    let migrated: (
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = sqlx::query_as(
+        r"
+        SELECT
+            f.name,
+            d.name,
+            d.archived_at,
+            d.archived_origin_path,
+            d.archived_access
+        FROM documents d
+        JOIN folders f ON f.id = d.folder_id
+        WHERE d.id = ?
+        ",
+    )
+    .bind(document_id)
+    .fetch_one(&pool)
+    .await
+    .expect("migrated archived document");
+    assert_eq!(migrated.0, "Incoming");
+    assert_eq!(migrated.1, "payload.bin");
+    assert!(migrated.2.is_some());
+    assert_eq!(migrated.3.as_deref(), Some("Projects/Incoming/payload.bin"));
+    assert_eq!(migrated.4.as_deref(), Some("{}"));
+
+    let document_columns: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('documents')")
+            .fetch_all(&pool)
+            .await
+            .expect("document columns");
+    assert!(
+        !document_columns
+            .iter()
+            .any(|name| name == "archived_from_folder")
+    );
+    assert!(
+        !document_columns
+            .iter()
+            .any(|name| name == "archived_original_name")
+    );
+    assert!(document_columns.iter().any(|name| name == "archived_at"));
+    assert!(
+        document_columns
+            .iter()
+            .any(|name| name == "archived_origin_path")
+    );
+    assert_current_history(&migration_history(&pool).await);
+    pool.close().await;
+}
+
+#[tokio::test]
 async fn derived_v2_0_0_incident_state_normalizes_legacy_root_without_replacing_descendants() {
     let fixture = v2_0_0_fixture().await;
     let db_path = fixture.db_path().to_path_buf();
@@ -707,7 +796,7 @@ async fn migration_history_must_be_an_exact_known_prefix() {
             }
             InvalidHistory::Future => {
                 sqlx::query(
-                    "INSERT INTO schema_migrations (version, name) VALUES (4, 'future migration')",
+                    "INSERT INTO schema_migrations (version, name) VALUES (5, 'future migration')",
                 )
                 .execute(&raw)
                 .await

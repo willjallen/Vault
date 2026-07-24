@@ -377,21 +377,19 @@ async fn insert_document_event_at(
 async fn mark_document_archived(
     pool: &sqlx::SqlitePool,
     document_id: i64,
-    archive_folder_id: i64,
+    _archive_folder_id: i64,
     archived_access: &Value,
 ) {
     sqlx::query(
         r"
         UPDATE documents
         SET
-            folder_id = ?,
-            archived_from_folder = 'Project',
-            archived_original_name = name,
+            archived_at = CURRENT_TIMESTAMP,
+            archived_origin_path = 'Project/' || name,
             archived_access = ?
         WHERE id = ?
         ",
     )
-    .bind(archive_folder_id)
     .bind(archived_access.to_string())
     .bind(document_id)
     .execute(pool)
@@ -2643,12 +2641,19 @@ async fn unlock_route_rechecks_current_folder_access_after_acl_move() {
 #[tokio::test]
 async fn lock_routes_validate_payload_and_reject_archived_documents() {
     let (state, _temp_dir) = test_state().await;
-    let archive_root = get_root_folder(&state.db, ARCHIVE_ROOT_KEY)
+    let project = get_or_create_folder_path(&state.db, Some("Project"))
         .await
-        .expect("archive root");
-    let document_id = insert_versioned_document(&state.db, archive_root.id).await;
+        .expect("project");
+    let document_id = insert_versioned_document(&state.db, project.id).await;
     sqlx::query(
-        "UPDATE documents SET archived_from_folder = 'Project', archived_original_name = name WHERE id = ?",
+        r"
+        UPDATE documents
+        SET
+            archived_at = CURRENT_TIMESTAMP,
+            archived_origin_path = 'Project/' || name,
+            archived_access = '{}'
+        WHERE id = ?
+        ",
     )
     .bind(document_id)
     .execute(&state.db)
@@ -3160,7 +3165,7 @@ async fn delete_forever_relaxed_policy_checks_access_archive_state_and_item_type
     let folder_denied_json = response_json(folder_denied).await;
     assert_eq!(
         folder_denied_json["failed"][0]["detail"],
-        "Delete forever is only available for archived files",
+        "Folder is not archived",
     );
 
     let document_count =
@@ -3249,7 +3254,10 @@ async fn archive_folder_and_restore_document(
         ))
         .await
         .expect("archive folder response");
-    assert_eq!(response_json(archive).await["ok"][0]["detail"], "Archive");
+    assert_eq!(
+        response_json(archive).await["ok"][0]["detail"],
+        "Archive/Project"
+    );
 
     let source_folder_exists =
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM folders WHERE id = ?")
@@ -3257,7 +3265,7 @@ async fn archive_folder_and_restore_document(
             .fetch_one(pool)
             .await
             .expect("source folder count");
-    assert_eq!(source_folder_exists, 0);
+    assert_eq!(source_folder_exists, 1);
 
     let restore = app
         .clone()
@@ -3265,19 +3273,19 @@ async fn archive_folder_and_restore_document(
             "/api/restore",
             "writer",
             "writers",
-            &json!({"items": [{"type": "document", "id": document_id}]}),
+            &json!({"items": [{"type": "folder", "id": source_folder_id}]}),
         ))
         .await
         .expect("restore response");
-    assert_eq!(
-        response_json(restore).await["ok"][0]["detail"],
-        "Project/plan.txt",
-    );
-    sqlx::query_scalar::<_, i64>("SELECT id FROM folders WHERE root_key = ? AND name = 'Project'")
-        .bind(VAULT_ROOT_KEY)
-        .fetch_one(pool)
-        .await
-        .expect("restored project folder")
+    assert_eq!(response_json(restore).await["ok"][0]["detail"], "Project",);
+    let restored_document_folder: i64 =
+        sqlx::query_scalar("SELECT folder_id FROM documents WHERE id = ?")
+            .bind(document_id)
+            .fetch_one(pool)
+            .await
+            .expect("restored document folder");
+    assert_eq!(restored_document_folder, source_folder_id);
+    source_folder_id
 }
 
 async fn assert_restored_document_storage_intact(
@@ -3285,9 +3293,10 @@ async fn assert_restored_document_storage_intact(
     storage: &SharedBlobStorage,
     document_id: i64,
     project_id: i64,
+    expected_events: &[&str],
 ) {
     let document = sqlx::query_as::<_, (i64, Option<String>, Option<String>)>(
-        "SELECT folder_id, archived_from_folder, archived_original_name FROM documents WHERE id = ?",
+        "SELECT folder_id, archived_at, archived_origin_path FROM documents WHERE id = ?",
     )
     .bind(document_id)
     .fetch_one(pool)
@@ -3330,7 +3339,13 @@ async fn assert_restored_document_storage_intact(
 
     assert_eq!(document, (project_id, None, None));
     assert_eq!(row_counts, (1, 1, 1, 2));
-    assert_eq!(events, vec!["archive".to_string(), "unarchive".to_string()],);
+    assert_eq!(
+        events,
+        expected_events
+            .iter()
+            .map(|event| (*event).to_string())
+            .collect::<Vec<_>>()
+    );
     assert_eq!(object_keys, vec![object_key]);
     assert_eq!(stored_bytes, b"restored bytes");
 }
@@ -3359,7 +3374,14 @@ async fn delete_forever_rejects_restored_document_without_deleting_storage() {
         delete_json["failed"][0]["detail"],
         "Move the document to Archive before deleting",
     );
-    assert_restored_document_storage_intact(&pool, &storage, document_id, project_id).await;
+    assert_restored_document_storage_intact(
+        &pool,
+        &storage,
+        document_id,
+        project_id,
+        &["archive", "unarchive"],
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -3388,8 +3410,14 @@ async fn delete_forever_rejects_document_restored_after_folder_archive() {
         delete_json["failed"][0]["detail"],
         "Move the document to Archive before deleting",
     );
-    assert_restored_document_storage_intact(&pool, &storage, document_id, restored_project_id)
-        .await;
+    assert_restored_document_storage_intact(
+        &pool,
+        &storage,
+        document_id,
+        restored_project_id,
+        &["archive"],
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -3504,7 +3532,10 @@ async fn delete_forever_rejects_folder_archived_document_locked_by_other_user() 
         ))
         .await
         .expect("archive folder response");
-    assert_eq!(response_json(archive).await["ok"][0]["detail"], "Archive");
+    assert_eq!(
+        response_json(archive).await["ok"][0]["detail"],
+        "Archive/Project"
+    );
     sqlx::query(
         r"
         INSERT INTO document_locks (document_id, locked_by, locked_by_name)
@@ -3566,8 +3597,8 @@ async fn delete_forever_rejects_folder_archived_document_locked_by_other_user() 
     .await
     .expect("version count");
 
-    assert_eq!(document, (ARCHIVE_ROOT_KEY.to_string(), archive_root.id));
-    assert_eq!(source_folder_count, 0);
+    assert_eq!(document, (VAULT_ROOT_KEY.to_string(), project.id));
+    assert_eq!(source_folder_count, 1);
     assert_eq!(active_locks, 1);
     assert_eq!(version_count, 1);
 }
@@ -4203,7 +4234,7 @@ async fn move_document_rejects_archived_document_without_creating_destination() 
     assert_archived_document_move_to_archive_child_fails(app.clone(), document_id).await;
 
     let archived = sqlx::query_as::<_, (i64, Option<String>, Option<String>)>(
-        "SELECT folder_id, archived_from_folder, archived_original_name FROM documents WHERE id = ?",
+        "SELECT folder_id, archived_at, archived_origin_path FROM documents WHERE id = ?",
     )
     .bind(document_id)
     .fetch_one(&pool)
@@ -4228,14 +4259,9 @@ async fn move_document_rejects_archived_document_without_creating_destination() 
     .await
     .expect("state event count");
 
-    assert_eq!(
-        archived,
-        (
-            archive_root.id,
-            Some("Project".to_string()),
-            Some("plan.txt".to_string()),
-        ),
-    );
+    assert_eq!(archived.0, project.id);
+    assert!(archived.1.is_some());
+    assert_eq!(archived.2.as_deref(), Some("Project/plan.txt"));
     assert_eq!(other_exists, 0);
     assert_eq!(move_events, 0);
     assert_eq!(state_events, 0);
@@ -4261,18 +4287,18 @@ async fn assert_archived_document_move_to_archive_child_fails(app: Router, docum
     assert_eq!(json["ok"], json!([]));
     assert_eq!(
         json["failed"][0]["detail"],
-        "Archive does not contain folders",
+        "Use archive or restore for Archive moves",
     );
 }
 
 async fn assert_document_archived_and_lock_released(
     pool: &sqlx::SqlitePool,
     document_id: i64,
-    archive_root_id: i64,
+    project_id: i64,
 ) {
-    let archived = sqlx::query_as::<_, (i64, String, String, String)>(
+    let archived = sqlx::query_as::<_, (i64, String, bool, String)>(
         r"
-        SELECT folder_id, name, archived_from_folder, archived_original_name
+        SELECT folder_id, name, archived_at IS NOT NULL, archived_origin_path
         FROM documents
         WHERE id = ?
         ",
@@ -4290,10 +4316,10 @@ async fn assert_document_archived_and_lock_released(
     assert_eq!(
         archived,
         (
-            archive_root_id,
+            project_id,
             "plan.txt".to_string(),
-            "Project".to_string(),
-            "plan.txt".to_string(),
+            true,
+            "Project/plan.txt".to_string(),
         ),
     );
     assert_eq!(active_locks, 0);
@@ -4305,7 +4331,7 @@ async fn assert_document_restored_with_archive_events(
     project_id: i64,
 ) {
     let restored = sqlx::query_as::<_, (i64, Option<String>, Option<String>)>(
-        "SELECT folder_id, archived_from_folder, archived_original_name FROM documents WHERE id = ?",
+        "SELECT folder_id, archived_at, archived_origin_path FROM documents WHERE id = ?",
     )
     .bind(document_id)
     .fetch_one(pool)
@@ -4335,7 +4361,7 @@ async fn assert_document_restored_with_archive_events(
         events[1],
         (
             "unarchive".to_string(),
-            "Restored to Vault from Archive/plan.txt".to_string(),
+            "Restored Project/plan.txt to Vault".to_string(),
         ),
     );
     assert_eq!(
@@ -4384,7 +4410,7 @@ async fn archive_restore_document_round_trip_preserves_metadata_and_events() {
         .expect("archive response");
     let archive_json = response_json(archive).await;
     assert_eq!(archive_json["ok"][0]["detail"], "Archive/plan.txt");
-    assert_document_archived_and_lock_released(&pool, document_id, archive_root.id).await;
+    assert_document_archived_and_lock_released(&pool, document_id, project.id).await;
 
     let restore = app
         .oneshot(authed_json_post(
@@ -4548,9 +4574,9 @@ async fn archived_document_hidden_when_source_acl_snapshot_denies_access() {
         .await
         .expect("archive contents");
     let archive_json = response_json(archive_contents).await;
-    let archived = sqlx::query_as::<_, (i64, String, String, String)>(
+    let archived = sqlx::query_as::<_, (i64, String, bool, String)>(
         r"
-        SELECT folder_id, name, archived_from_folder, archived_original_name
+        SELECT folder_id, name, archived_at IS NOT NULL, archived_origin_path
         FROM documents
         WHERE id = ?
         ",
@@ -4565,10 +4591,10 @@ async fn archived_document_hidden_when_source_acl_snapshot_denies_access() {
     assert_eq!(
         archived,
         (
-            archive_root.id,
+            secret.id,
             "roadmap.txt".to_string(),
-            "Secret".to_string(),
-            "roadmap.txt".to_string(),
+            true,
+            "Secret/roadmap.txt".to_string(),
         ),
     );
 }
@@ -4654,7 +4680,7 @@ async fn restore_document_preserves_current_vault_folder_acl() {
     .expect("secret permission");
     let restored = sqlx::query_as::<_, (i64, Option<String>, Option<String>, Option<String>)>(
         r"
-        SELECT folder_id, archived_from_folder, archived_original_name, archived_access
+        SELECT folder_id, archived_at, archived_origin_path, archived_access
         FROM documents
         WHERE id = ?
         ",
@@ -4894,24 +4920,13 @@ async fn archive_restore_document_returns_item_level_failures() {
         "Document is not archived",
     );
 
-    sqlx::query("UPDATE documents SET archived_from_folder = NULL WHERE id = ?")
-        .bind(archived_doc)
-        .execute(&pool)
-        .await
-        .expect("missing metadata");
-    let missing_metadata = app
-        .oneshot(authed_json_post(
-            "/api/restore",
-            "writer",
-            "writers",
-            &json!({"items": [{"type": "document", "id": archived_doc}]}),
-        ))
-        .await
-        .expect("missing metadata restore");
-    assert_eq!(
-        response_json(missing_metadata).await["failed"][0]["detail"],
-        "Archived document is missing restore metadata",
-    );
+    let archived_at: Option<String> =
+        sqlx::query_scalar("SELECT archived_at FROM documents WHERE id = ?")
+            .bind(archived_doc)
+            .fetch_one(&pool)
+            .await
+            .expect("archived state");
+    assert!(archived_at.is_some());
 }
 
 #[tokio::test]
@@ -4967,5 +4982,5 @@ async fn restore_document_rejects_duplicate_target_name() {
             .fetch_one(&pool)
             .await
             .expect("archived folder id");
-    assert_eq!(still_archived, archive_root.id);
+    assert_eq!(still_archived, project.id);
 }

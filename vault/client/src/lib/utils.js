@@ -35,7 +35,15 @@ export function formatBytes(bytes, options = {}) {
 export function toBreadcrumbs(folder) {
   const safeFolder = folder || "";
   if (isArchivedPath(safeFolder)) {
-    return [{ name: "Archive", path: "Archive" }];
+    const archiveCrumbs = [{ name: "Archive", path: "Archive" }];
+    const archiveParts = safeFolder.split("/").filter(Boolean).slice(1);
+    archiveParts.forEach((part, idx) => {
+      archiveCrumbs.push({
+        name: archiveBrowserPartName(part),
+        path: ["Archive", ...archiveParts.slice(0, idx + 1)].join("/"),
+      });
+    });
+    return archiveCrumbs;
   }
 
   const vaultCrumbs = [{ name: "Vault", path: "" }];
@@ -215,7 +223,8 @@ export function isArchivedPath(path) {
 }
 
 export function folderNameFromPath(path) {
-  return (path || "").split("/").filter(Boolean).slice(-1)[0] || "";
+  const part = (path || "").split("/").filter(Boolean).slice(-1)[0] || "";
+  return archiveBrowserPartName(part);
 }
 
 export function folderParts(path) {
@@ -227,7 +236,14 @@ export function folderParent(path) {
 }
 
 export function folderBaseName(path, fallback = "New Folder") {
-  return folderParts(path).slice(-1)[0] || fallback;
+  return folderNameFromPath(path) || fallback;
+}
+
+function archiveBrowserPartName(part) {
+  if (!part.startsWith("@") || !part.includes("~")) {
+    return part;
+  }
+  return part.slice(part.indexOf("~") + 1) || "Folder";
 }
 
 export function normalizeFolderName(value) {

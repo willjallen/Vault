@@ -288,11 +288,7 @@ async fn insert_stored_versioned_document(
     document_id
 }
 
-async fn mark_document_archived_for_writer(
-    pool: &sqlx::SqlitePool,
-    document_id: i64,
-    archive_folder_id: i64,
-) {
+async fn mark_document_archived_for_writer(pool: &sqlx::SqlitePool, document_id: i64) {
     let writer_group_id: i64 =
         sqlx::query_scalar("SELECT id FROM vault_groups WHERE name = 'writers'")
             .fetch_one(pool)
@@ -303,14 +299,12 @@ async fn mark_document_archived_for_writer(
     sqlx::query(
         r"
         UPDATE documents
-        SET folder_id = ?,
-            archived_from_folder = 'Project',
-            archived_original_name = name,
+        SET archived_at = CURRENT_TIMESTAMP,
+            archived_origin_path = 'Project/' || name,
             archived_access = ?
         WHERE id = ?
         ",
     )
-    .bind(archive_folder_id)
     .bind(Value::Object(archived_access).to_string())
     .bind(document_id)
     .execute(pool)
@@ -2766,9 +2760,6 @@ async fn checkin_completion_rechecks_archived_state_after_part_upload() {
     let project = get_or_create_folder_path(&state.db, Some("Project"))
         .await
         .expect("project");
-    let archive_root = get_root_folder(&state.db, ARCHIVE_ROOT_KEY)
-        .await
-        .expect("archive root");
     let document_id =
         insert_stored_versioned_document(&state.db, &state.storage, project.id, "plan.txt", b"old")
             .await;
@@ -2814,7 +2805,7 @@ async fn checkin_completion_rechecks_archived_state_after_part_upload() {
         .expect("upload part");
     assert_eq!(uploaded.status(), StatusCode::NO_CONTENT);
 
-    mark_document_archived_for_writer(&pool, document_id, archive_root.id).await;
+    mark_document_archived_for_writer(&pool, document_id).await;
     let completed = app
         .oneshot(authed_json_request(
             Method::POST,

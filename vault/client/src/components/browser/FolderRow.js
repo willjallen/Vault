@@ -1,7 +1,7 @@
 import {
   classNames,
   formatDate,
-  isArchiveRootPath,
+  isArchivedPath,
   retentionPolicyLabel,
   retentionPolicyStatusLabels,
 } from "../../lib/utils.js";
@@ -12,8 +12,8 @@ import { TtlStatusLabel } from "./TtlStatusLabel.js";
 const { useEffect, useRef } = React;
 const h = React.createElement;
 
-function folderDropAttributes({ editing, folder, isDraft, isDropTarget }) {
-  if (editing || isDraft) {
+function folderDropAttributes({ editing, folder, isArchived, isDraft, isDropTarget }) {
+  if (editing || isArchived || isDraft) {
     return {};
   }
   return {
@@ -68,8 +68,8 @@ function folderRowAttributes({
     ),
     "data-selection-key": selectionKey || undefined,
     "aria-selected": Boolean(selected),
-    ...folderDropAttributes({ editing, folder, isDraft, isDropTarget }),
-    draggable: !editing && !isDraft && selected,
+    ...folderDropAttributes({ editing, folder, isArchived, isDraft, isDropTarget }),
+    draggable: !editing && !isArchived && !isDraft && selected,
     role: "row",
     tabIndex: editing ? undefined : tabIndex,
     onClick: editing ? undefined : onSelect,
@@ -144,15 +144,19 @@ function folderNameCell({
             }
           },
         })
-      : h(
-          "div",
-          { className: "file-name-line" },
+      : h("div", { className: "file-name-line" }, [
           h(
             "div",
             { className: classNames("name", isArchived ? "archived-text" : "") },
             folder.name || "Folder"
-          )
-        ),
+          ),
+          isArchived && folder.archived_origin_path
+            ? h("span", { className: "file-search-path", key: "archive-origin" }, [
+                h("span", { "aria-hidden": "true", key: "arrow" }, ">"),
+                h("span", { key: "path" }, folder.archived_origin_path),
+              ])
+            : null,
+        ]),
   ]);
 }
 
@@ -226,7 +230,7 @@ export function FolderRow({
 }) {
   const inputRef = useRef(null);
   const committingRef = useRef(false);
-  const isArchived = isArchiveRootPath(folder.path || "");
+  const isArchived = Boolean(folder.archived) || isArchivedPath(folder.path || "");
   const retention = folderRetentionStatus(folder);
   const rowAttributes = folderRowAttributes({
     editing,

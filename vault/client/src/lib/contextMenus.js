@@ -1,4 +1,4 @@
-import { isArchiveRootPath } from "./utils.js";
+import { isArchivedPath, isArchiveRootPath } from "./utils.js";
 import { canDeleteForeverItem } from "./siteSettings.js";
 
 function compactMenuItems(items) {
@@ -59,9 +59,11 @@ export function buildFileMenuItems(actions) {
           action: () => actions.openMoveDialogForDoc(doc),
           disabled: busy || lockedByOther,
         },
-    doc.archived
+    doc.archived && doc.directly_archived
       ? { label: "Restore to Vault", action: () => actions.handleUnarchive(doc.id), disabled: busy }
-      : { label: "Archive", action: () => actions.handleArchive(doc.id), disabled: busy },
+      : doc.archived
+        ? null
+        : { label: "Archive", action: () => actions.handleArchive(doc.id), disabled: busy },
     doc.favorite && actions.handleRemoveFavoriteItem
       ? {
           label: "Remove from Favorites",
@@ -121,12 +123,16 @@ export function buildFolderMenuItems(actions) {
           disabled: busy,
         }
       : null,
-    { label: "Share", action: () => actions.handleShareItem(folderItem), disabled: busy },
-    {
-      label: "Properties",
-      action: () => actions.openFolderProperties(folderItem),
-      disabled: busy,
-    },
+    isArchivedFolder
+      ? null
+      : { label: "Share", action: () => actions.handleShareItem(folderItem), disabled: busy },
+    isArchivedFolder
+      ? null
+      : {
+          label: "Properties",
+          action: () => actions.openFolderProperties(folderItem),
+          disabled: busy,
+        },
     canMoveFolder
       ? {
           label: "Move...",
@@ -134,17 +140,24 @@ export function buildFolderMenuItems(actions) {
           disabled: busy,
         }
       : null,
-    canMoveFolder && folderItem.can_delete_empty !== true
+    canMoveFolder
       ? {
           label: "Move to Archive",
           action: () => actions.handleArchiveFolder(folderPath, { navigate: false }),
           disabled: busy,
         }
       : null,
-    canMoveFolder && folderItem.can_delete_empty === true
+    isArchivedFolder && folderItem.directly_archived
       ? {
-          label: "Delete",
-          action: () => actions.handleDeleteEmptyFolder(folderItem),
+          label: "Restore to Vault",
+          action: () => actions.handleRestoreItems([folderItem]),
+          disabled: busy,
+        }
+      : null,
+    isArchivedFolder && folderItem.directly_archived && canDeleteForeverItem(folderItem, actions)
+      ? {
+          label: "Delete forever",
+          action: () => actions.handleDeleteForeverItems([folderItem]),
           danger: true,
           disabled: busy,
         }
@@ -181,6 +194,7 @@ export function buildSelectionMenuItems(actions) {
   const allDocs = docs.length === selectedItems.length;
   const noRoots = selectedItems.every((item) => !isRootFolder(item));
   const allArchived = selectedItems.every((item) => item.archived);
+  const allDirectlyArchived = selectedItems.every((item) => item.directly_archived);
   const noneArchived = selectedItems.every((item) => !item.archived);
   const sameLocationScope = allArchived || noneArchived;
   const canMove =
@@ -191,7 +205,10 @@ export function buildSelectionMenuItems(actions) {
   const canLock = allDocs && docs.every((doc) => !doc.archived && !doc.lock?.by);
   const canUnlock = allDocs && docs.every((doc) => isLockedByMeOrAdmin(doc, currentUser, isAdmin));
   const canDelete =
-    allArchived && noRoots && selectedItems.every((item) => canDeleteForeverItem(item, actions));
+    allArchived &&
+    noRoots &&
+    selectedItems.every((item) => item.type === "document" || item.directly_archived) &&
+    selectedItems.every((item) => canDeleteForeverItem(item, actions));
 
   return compactMenuItems([
     {
@@ -211,7 +228,7 @@ export function buildSelectionMenuItems(actions) {
           disabled: busy,
         }
       : null,
-    allArchived && noRoots
+    allArchived && allDirectlyArchived && noRoots
       ? {
           label: "Restore to Vault",
           action: () => actions.handleRestoreItems(selectedItems),
@@ -245,7 +262,7 @@ export function buildSelectionMenuItems(actions) {
 
 export function buildPageMenuItems(actions) {
   const currentFolder = actions.folder || "";
-  const inArchive = isArchiveRootPath(currentFolder);
+  const inArchive = isArchivedPath(currentFolder);
   return [
     {
       label: "Upload file",

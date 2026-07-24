@@ -1,6 +1,7 @@
 mod v2_0_0;
 mod v2_1_0;
 mod v2_2_0;
+mod v2_2_0_archive;
 
 use std::str::FromStr;
 use std::time::Duration;
@@ -40,7 +41,11 @@ pub struct MigrationDefinition {
 }
 
 const BASELINE: BaselineDefinition = v2_0_0::BASELINE;
-pub const MIGRATIONS: [MigrationDefinition; 2] = [v2_1_0::MIGRATION, v2_2_0::MIGRATION];
+pub const MIGRATIONS: [MigrationDefinition; 3] = [
+    v2_1_0::MIGRATION,
+    v2_2_0::MIGRATION,
+    v2_2_0_archive::MIGRATION,
+];
 const CURRENT_MIGRATION_VERSION: i64 = MIGRATIONS[MIGRATIONS.len() - 1].version;
 const KNOWN_HISTORY_LENGTH: usize = MIGRATIONS.len() + 1;
 

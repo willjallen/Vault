@@ -56,7 +56,7 @@ async fn initializes_sqlite_schema_with_root_folders() {
             .fetch_all(&pool)
             .await
             .expect("migration versions");
-    assert_eq!(migration_versions, [1, 2, 3]);
+    assert_eq!(migration_versions, [1, 2, 3, 4]);
 }
 
 #[tokio::test]

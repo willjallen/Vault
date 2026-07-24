@@ -1658,6 +1658,9 @@ fn assert_folder_summary_payload_shape(folder_row: &Value) {
         folder_row,
         &[
             "access",
+            "archived",
+            "archived_at",
+            "archived_origin_path",
             "can_delete_empty",
             "color",
             "default_ttl_action",
@@ -1680,6 +1683,9 @@ fn assert_folder_summary_payload_shape(folder_row: &Value) {
     assert_eq!(folder_row["path"], "Project/Assets");
     assert_eq!(folder_row["can_delete_empty"], false);
     assert_eq!(folder_row["name"], "Assets");
+    assert_eq!(folder_row["archived"], false);
+    assert_eq!(folder_row["archived_at"], Value::Null);
+    assert_eq!(folder_row["archived_origin_path"], "");
     assert_eq!(folder_row["color"], "#445566");
     assert_eq!(folder_row["icon"], "palette");
     assert_eq!(folder_row["latest_by"], "Asset Author");
@@ -1706,6 +1712,7 @@ fn assert_document_row_payload_shape(document_row: &Value, document_id: i64) {
             "created_by",
             "created_by_name",
             "download_url",
+            "directly_archived",
             "expires_at",
             "expiry_action",
             "folder",
@@ -1734,6 +1741,7 @@ fn assert_document_row_payload_shape(document_row: &Value, document_id: i64) {
     assert_eq!(document_row["path"], "Project/project-overview.txt");
     assert_eq!(document_row["folder"], "Project");
     assert_eq!(document_row["archived"], false);
+    assert_eq!(document_row["directly_archived"], false);
     assert_eq!(document_row["archived_from_folder"], "");
     assert_eq!(document_row["archived_original_name"], "");
     assert_eq!(document_row["archived_original_path"], "");
@@ -3784,7 +3792,7 @@ async fn archive_folder_archives_descendant_documents_and_prunes_nested_items() 
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["ok"].as_array().expect("ok").len(), 1);
-    assert_eq!(json["ok"][0]["detail"], "Archive");
+    assert_eq!(json["ok"][0]["detail"], "Archive/Old");
     assert_eq!(json["failed"], json!([]));
 
     let remaining_folders =
@@ -3794,8 +3802,8 @@ async fn archive_folder_archives_descendant_documents_and_prunes_nested_items() 
             .fetch_one(&pool)
             .await
             .expect("remaining folders");
-    let archived_docs = sqlx::query_as::<_, (i64, String, String)>(
-        "SELECT folder_id, name, archived_from_folder FROM documents ORDER BY id",
+    let archived_docs = sqlx::query_as::<_, (i64, String, Option<String>)>(
+        "SELECT folder_id, name, archived_at FROM documents ORDER BY id",
     )
     .fetch_all(&pool)
     .await
@@ -3813,23 +3821,17 @@ async fn archive_folder_archives_descendant_documents_and_prunes_nested_items() 
     .await
     .expect("state event");
 
-    assert_eq!(remaining_folders, 0);
-    assert_eq!(
-        archived_docs[0],
-        (
-            archive_root.id,
-            "top.txt".to_string(),
-            "Project/Old".to_string()
-        )
-    );
-    assert_eq!(
-        archived_docs[1],
-        (
-            archive_root.id,
-            "nested.txt".to_string(),
-            "Project/Old/Sub".to_string()
-        )
-    );
+    assert_eq!(remaining_folders, 2);
+    assert_eq!(archived_docs[0], (old.id, "top.txt".to_string(), None));
+    assert_eq!(archived_docs[1], (sub.id, "nested.txt".to_string(), None));
+    let folder_archive: (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT archived_at, archived_origin_path FROM folders WHERE id = ?")
+            .bind(old.id)
+            .fetch_one(&pool)
+            .await
+            .expect("folder archive state");
+    assert!(folder_archive.0.is_some());
+    assert_eq!(folder_archive.1.as_deref(), Some("Project/Old"));
     assert_eq!(event_count, 2);
     assert_eq!(state_event, "batch.archive");
     assert_ne!(top_doc, nested_doc);
@@ -3838,7 +3840,7 @@ async fn archive_folder_archives_descendant_documents_and_prunes_nested_items() 
 #[tokio::test]
 async fn archive_allows_duplicate_display_names_and_returns_flat_contents() {
     let (state, _temp_dir) = test_state().await;
-    let (_, _, archive_root_id) = grant_writer_roots(&state.db).await;
+    grant_writer_roots(&state.db).await;
     let one = get_or_create_folder_path(&state.db, Some("One"))
         .await
         .expect("one folder");
@@ -3869,15 +3871,16 @@ async fn archive_allows_duplicate_display_names_and_returns_flat_contents() {
     assert_eq!(archive_json["ok"].as_array().expect("ok").len(), 2);
     assert_eq!(archive_json["failed"], json!([]));
 
-    let mut archived_rows = sqlx::query_as::<_, (i64, i64, String, String, String)>(
+    let mut archived_rows = sqlx::query_as::<_, (i64, i64, String, bool, String)>(
         r"
-        SELECT id, folder_id, name, archived_from_folder, archived_original_name
+        SELECT id, folder_id, name, archived_at IS NOT NULL, archived_origin_path
         FROM documents
-        WHERE folder_id = ? AND name = 'plan.txt'
-        ORDER BY archived_from_folder
+        WHERE id IN (?, ?)
+        ORDER BY archived_origin_path
         ",
     )
-    .bind(archive_root_id)
+    .bind(first)
+    .bind(second)
     .fetch_all(&pool)
     .await
     .expect("archived rows");
@@ -3885,11 +3888,11 @@ async fn archive_allows_duplicate_display_names_and_returns_flat_contents() {
     assert_eq!(
         archived_rows
             .iter()
-            .map(|row| (row.2.as_str(), row.3.as_str(), row.4.as_str()))
+            .map(|row| (row.1, row.2.as_str(), row.3, row.4.as_str()))
             .collect::<Vec<_>>(),
         vec![
-            ("plan.txt", "One", "plan.txt"),
-            ("plan.txt", "Two", "plan.txt")
+            (one.id, "plan.txt", true, "One/plan.txt"),
+            (two.id, "plan.txt", true, "Two/plan.txt")
         ],
     );
 
@@ -3932,33 +3935,25 @@ async fn archive_allows_duplicate_display_names_and_returns_flat_contents() {
 }
 
 #[tokio::test]
-async fn archive_contents_search_matches_original_path_when_original_name_is_empty() {
+async fn archive_contents_search_matches_original_path() {
     let (state, _temp_dir) = test_state().await;
-    let (writers, _, archive_root_id) = grant_writer_roots(&state.db).await;
-    let archived_id = sqlx::query(
-        r"
-        INSERT INTO documents
-            (
-                folder_id,
-                name,
-                created_by,
-                created_by_name,
-                latest_modified_by,
-                archived_from_folder,
-                archived_original_name,
-                archived_access
-            )
-        VALUES
-            (?, 'archived-display.txt', 'admin', 'Admin', 'admin', 'One', '', ?)
-        ",
-    )
-    .bind(archive_root_id)
-    .bind(format!("{{\"{writers}\":3}}"))
-    .execute(&state.db)
-    .await
-    .expect("archived document")
-    .last_insert_rowid();
+    grant_writer_roots(&state.db).await;
+    let one = get_or_create_folder_path(&state.db, Some("One"))
+        .await
+        .expect("source folder");
+    let archived_id = insert_document(&state.db, one.id, "archived-display.txt").await;
     let app = http::router(state);
+    let archive = app
+        .clone()
+        .oneshot(authed_json_post(
+            "/api/archive",
+            "writer",
+            "writers",
+            &json!({"items": [{"type": "document", "id": archived_id}]}),
+        ))
+        .await
+        .expect("archive response");
+    assert_eq!(response_json(archive).await["failed"], json!([]));
 
     let response = app
         .oneshot(authed_get(
@@ -3982,67 +3977,10 @@ async fn archive_contents_search_matches_original_path_when_original_name_is_emp
             .collect::<Vec<_>>(),
         vec![archived_id],
     );
-    assert_eq!(body["documents"][0]["archived_original_path"], "One",);
-}
-
-#[tokio::test]
-async fn restore_document_recreates_missing_original_folder_from_archive_metadata() {
-    let (state, _temp_dir) = test_state().await;
-    grant_writer_roots(&state.db).await;
-    let source = get_or_create_folder_path(&state.db, Some("Project/Sub"))
-        .await
-        .expect("source folder");
-    let document_id = insert_document(&state.db, source.id, "restore.txt").await;
-    let pool = state.db.clone();
-    let app = http::router(state);
-
-    let archive = app
-        .clone()
-        .oneshot(authed_json_post(
-            "/api/archive",
-            "writer",
-            "writers",
-            &json!({"items": [{"type": "document", "id": document_id}]}),
-        ))
-        .await
-        .expect("archive response");
     assert_eq!(
-        response_json(archive).await["ok"][0]["detail"],
-        "Archive/restore.txt",
+        body["documents"][0]["archived_original_path"],
+        "One/archived-display.txt",
     );
-    sqlx::query("DELETE FROM folders WHERE id = ?")
-        .bind(source.id)
-        .execute(&pool)
-        .await
-        .expect("delete original folder");
-
-    let restore = app
-        .oneshot(authed_json_post(
-            "/api/restore",
-            "writer",
-            "writers",
-            &json!({"items": [{"type": "document", "id": document_id}]}),
-        ))
-        .await
-        .expect("restore response");
-    let restore_json = response_json(restore).await;
-    assert_eq!(restore_json["ok"][0]["detail"], "Project/Sub/restore.txt");
-
-    let restored_folder = get_or_create_folder_path(&pool, Some("Project/Sub"))
-        .await
-        .expect("restored folder lookup");
-    let restored_doc = sqlx::query_as::<_, (i64, Option<String>, Option<String>)>(
-        r"
-        SELECT folder_id, archived_from_folder, archived_original_name
-        FROM documents
-        WHERE id = ?
-        ",
-    )
-    .bind(document_id)
-    .fetch_one(&pool)
-    .await
-    .expect("restored doc");
-    assert_eq!(restored_doc, (restored_folder.id, None, None));
 }
 
 #[tokio::test]
@@ -4162,7 +4100,7 @@ async fn archive_folder_rejects_inaccessible_descendant_without_mutating() {
 
     let document_rows = sqlx::query_as::<_, (i64, i64, String, Option<String>)>(
         r"
-        SELECT id, folder_id, name, archived_from_folder
+        SELECT id, folder_id, name, archived_at
         FROM documents
         ORDER BY id
         ",

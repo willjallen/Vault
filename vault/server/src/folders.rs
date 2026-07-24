@@ -36,6 +36,9 @@ pub struct FolderRecord {
     pub icon: Option<String>,
     pub default_ttl_days: Option<i64>,
     pub default_ttl_action: Option<String>,
+    pub archived_at: Option<String>,
+    pub archived_origin_path: Option<String>,
+    pub archived_access: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -303,22 +306,7 @@ pub async fn get_folder_by_path(
     Ok(Some(current))
 }
 
-/// Resolves a folder path without bootstrapping roots or issuing per-segment queries.
-pub async fn get_folder_by_path_read(
-    pool: &SqlitePool,
-    path: &str,
-) -> Result<Option<FolderRecord>, FolderError> {
-    let parsed = parse_public_folder_path(Some(path))?;
-    if parsed.root_key == ARCHIVE_ROOT_KEY && !parsed.relative_path.is_empty() {
-        return Ok(None);
-    }
-    let segments = if parsed.relative_path.is_empty() {
-        Vec::new()
-    } else {
-        parsed.relative_path.split('/').collect::<Vec<_>>()
-    };
-    Ok(sqlx::query_as::<_, FolderRecord>(
-        r"
+const FOLDER_BY_PATH_READ_SQL: &str = r"
         WITH RECURSIVE
         segments(depth, name) AS (
             SELECT CAST(key AS INTEGER) + 1, value
@@ -338,6 +326,9 @@ pub async fn get_folder_by_path_read(
             icon,
             default_ttl_days,
             default_ttl_action,
+            archived_at,
+            archived_origin_path,
+            archived_access,
             depth
         ) AS (
             SELECT
@@ -353,9 +344,12 @@ pub async fn get_folder_by_path_read(
                 icon,
                 default_ttl_days,
                 default_ttl_action,
+                archived_at,
+                archived_origin_path,
+                archived_access,
                 0
             FROM folders
-            WHERE root_key = ? AND is_root = 1
+            WHERE root_key = ? AND is_root = 1 AND archived_at IS NULL
 
             UNION ALL
 
@@ -372,6 +366,9 @@ pub async fn get_folder_by_path_read(
                 child.icon,
                 child.default_ttl_days,
                 child.default_ttl_action,
+                child.archived_at,
+                child.archived_origin_path,
+                child.archived_access,
                 resolved.depth + 1
             FROM resolved
             JOIN segments ON segments.depth = resolved.depth + 1
@@ -379,6 +376,7 @@ pub async fn get_folder_by_path_read(
               ON child.parent_id = resolved.id
              AND child.name = segments.name
              AND child.is_root = 0
+             AND child.archived_at IS NULL
         )
         SELECT
             id,
@@ -392,16 +390,34 @@ pub async fn get_folder_by_path_read(
             color,
             icon,
             default_ttl_days,
-            default_ttl_action
+            default_ttl_action,
+            archived_at,
+            archived_origin_path,
+            archived_access
         FROM resolved
         WHERE depth = (SELECT COUNT(*) FROM segments)
         LIMIT 1
-        ",
-    )
-    .bind(sqlx::types::Json(segments))
-    .bind(&parsed.root_key)
-    .fetch_optional(pool)
-    .await?)
+        ";
+
+/// Resolves a folder path without bootstrapping roots or issuing per-segment queries.
+pub async fn get_folder_by_path_read(
+    pool: &SqlitePool,
+    path: &str,
+) -> Result<Option<FolderRecord>, FolderError> {
+    let parsed = parse_public_folder_path(Some(path))?;
+    if parsed.root_key == ARCHIVE_ROOT_KEY && !parsed.relative_path.is_empty() {
+        return Ok(None);
+    }
+    let segments = if parsed.relative_path.is_empty() {
+        Vec::new()
+    } else {
+        parsed.relative_path.split('/').collect::<Vec<_>>()
+    };
+    Ok(sqlx::query_as::<_, FolderRecord>(FOLDER_BY_PATH_READ_SQL)
+        .bind(sqlx::types::Json(segments))
+        .bind(&parsed.root_key)
+        .fetch_optional(pool)
+        .await?)
 }
 
 pub async fn get_or_create_folder_path(
@@ -728,6 +744,10 @@ pub async fn delete_empty_folder(
     if folder.root_key != VAULT_ROOT_KEY {
         return Err(FolderError::FolderNotFound);
     }
+    let folders = all_folders_in_tx(&mut transaction).await?;
+    if folder_is_effectively_archived_from_records(folder.id, &folders) {
+        return Err(FolderError::FolderNotFound);
+    }
 
     let level = folder_access_level_in_tx(&mut transaction, folder.id, user).await?;
     if level < 1 {
@@ -804,13 +824,16 @@ async fn move_or_rename_folder(
     if source.is_root {
         return Err(FolderError::CannotMoveRootFolder);
     }
+    let folders = all_folders(pool).await?;
+    if folder_is_effectively_archived_from_records(source.id, &folders) {
+        return Err(FolderError::UseArchiveOrRestoreForArchiveMoves);
+    }
     let target_name = match name {
         Some(name) => normalize_folder_item_name(name)?,
         None => source.name.clone(),
     };
     require_folder_write_access(pool, source.id, user).await?;
 
-    let folders = all_folders(pool).await?;
     let path_cache = build_folder_path_cache(&folders)?;
     let source_path = folder_path_from_cache(&source, &path_cache)?;
     let Some(source_parent_id) = source.parent_id else {
@@ -1379,7 +1402,8 @@ async fn find_public_folder_by_path_in_tx(
 
     for name in parsed.relative_path.split('/') {
         let Some(child) = sqlx::query_as::<_, FolderRecord>(&format!(
-            "{} WHERE parent_id = ? AND name = ? AND root_key = ? AND is_root = 0",
+            "{} WHERE parent_id = ? AND name = ? AND root_key = ? AND is_root = 0 \
+             AND archived_at IS NULL",
             folder_select_sql()
         ))
         .bind(current.id)
@@ -1401,7 +1425,7 @@ async fn find_child_folder(
     name: &str,
 ) -> Result<Option<FolderRecord>, FolderError> {
     Ok(sqlx::query_as::<_, FolderRecord>(&format!(
-        "{} WHERE parent_id = ? AND name = ?",
+        "{} WHERE parent_id = ? AND name = ? AND archived_at IS NULL",
         folder_select_sql()
     ))
     .bind(parent_id)
@@ -1416,7 +1440,7 @@ async fn find_child_folder_in_tx(
     name: &str,
 ) -> Result<Option<FolderRecord>, FolderError> {
     Ok(sqlx::query_as::<_, FolderRecord>(&format!(
-        "{} WHERE parent_id = ? AND name = ?",
+        "{} WHERE parent_id = ? AND name = ? AND archived_at IS NULL",
         folder_select_sql()
     ))
     .bind(parent_id)
@@ -1867,6 +1891,104 @@ pub fn subtree_folder_ids_from_records(root_id: i64, folders: &[FolderRecord]) -
     ids
 }
 
+/// Returns the folders owned by one flat Archive entry.
+///
+/// Independently archived descendants are separate Archive entries, so their
+/// markers and subtrees are traversal boundaries.
+#[must_use]
+pub fn archive_entry_subtree_folder_ids_from_records(
+    root_id: i64,
+    folders: &[FolderRecord],
+) -> Vec<i64> {
+    let mut children: HashMap<i64, Vec<i64>> = HashMap::new();
+    for folder in folders {
+        if folder.archived_at.is_none()
+            && let Some(parent_id) = folder.parent_id
+        {
+            children.entry(parent_id).or_default().push(folder.id);
+        }
+    }
+    let mut pending = vec![root_id];
+    let mut seen = HashSet::new();
+    let mut ids = Vec::new();
+    while let Some(folder_id) = pending.pop() {
+        if !seen.insert(folder_id) {
+            continue;
+        }
+        ids.push(folder_id);
+        if let Some(child_ids) = children.get(&folder_id) {
+            pending.extend(child_ids);
+        }
+    }
+    ids
+}
+
+#[must_use]
+pub fn folder_is_directly_archived(folder: &FolderRecord) -> bool {
+    folder.archived_at.is_some()
+}
+
+#[must_use]
+pub fn folder_is_effectively_archived_from_records(
+    folder_id: i64,
+    folders: &[FolderRecord],
+) -> bool {
+    let by_id = folders
+        .iter()
+        .map(|folder| (folder.id, folder))
+        .collect::<HashMap<_, _>>();
+    let mut current = by_id.get(&folder_id).copied();
+    let mut visited = HashSet::new();
+    while let Some(folder) = current {
+        if !visited.insert(folder.id) {
+            return true;
+        }
+        if folder_is_directly_archived(folder) {
+            return true;
+        }
+        current = folder
+            .parent_id
+            .and_then(|parent_id| by_id.get(&parent_id).copied());
+    }
+    false
+}
+
+pub(crate) async fn direct_archived_ancestor_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    folder_id: i64,
+    include_self: bool,
+) -> Result<Option<FolderRecord>, FolderError> {
+    let folders = all_folders_in_tx(transaction).await?;
+    let by_id = folders
+        .iter()
+        .map(|folder| (folder.id, folder))
+        .collect::<HashMap<_, _>>();
+    let start = by_id
+        .get(&folder_id)
+        .copied()
+        .ok_or(FolderError::FolderNotFound)?;
+    let mut current = if include_self {
+        Some(start)
+    } else {
+        start
+            .parent_id
+            .and_then(|parent_id| by_id.get(&parent_id).copied())
+    };
+    let mut visited = HashSet::new();
+    while let Some(folder) = current {
+        if !visited.insert(folder.id) {
+            return Err(FolderError::InvalidStoredHierarchy);
+        }
+        if folder_is_directly_archived(folder) {
+            return Ok(Some(folder.clone()));
+        }
+        current = folder
+            .parent_id
+            .and_then(|parent_id| by_id.get(&parent_id).copied());
+    }
+    Ok(None)
+}
+
 async fn ensure_subtree_not_locked_by_other(
     pool: &SqlitePool,
     folder_ids: &[i64],
@@ -2047,7 +2169,10 @@ fn folder_select_sql() -> &'static str {
         color,
         icon,
         default_ttl_days,
-        default_ttl_action
+        default_ttl_action,
+        archived_at,
+        archived_origin_path,
+        archived_access
     FROM folders
     "
 }

@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -11,14 +12,15 @@ use time::{OffsetDateTime, PrimitiveDateTime, UtcOffset};
 
 use crate::auth::UserContext;
 use crate::documents::{
-    AccessPayload, DocumentError, DocumentRecord, access_payload, document_access_level,
-    parse_archived_access,
+    AccessPayload, DocumentError, DocumentRecord, access_payload, archived_folder_access_level,
+    document_access_level,
 };
 use crate::folders::{
     ARCHIVE_ROOT, ARCHIVE_ROOT_KEY, FolderError, FolderRecord, VAULT_ROOT_KEY, all_folders,
-    build_folder_path_cache, empty_folder_delete_eligible_ids, folder_access_level,
-    folder_access_levels, folder_path_from_cache, get_folder_by_path, get_folder_by_path_read,
-    join_path, load_root_folders, normalize_folder,
+    archive_entry_subtree_folder_ids_from_records, build_folder_path_cache,
+    empty_folder_delete_eligible_ids, folder_access_level, folder_access_levels,
+    folder_path_from_cache, get_folder_by_path, get_folder_by_path_read, join_path,
+    load_root_folders, normalize_folder,
 };
 use crate::preferences::{PreferenceError, preferences_for_user};
 use crate::previews::{self, PreviewError, VisualPayload, VisualSource};
@@ -65,6 +67,7 @@ walk(request_id, folder_id, visited) AS (
     FROM walk
     JOIN folders child ON child.parent_id = walk.folder_id
     WHERE instr(walk.visited, printf(',%d,', child.id)) = 0
+      AND child.archived_at IS NULL
 ),
 scoped_folders(folder_id) AS (
     SELECT folder_id
@@ -169,9 +172,11 @@ visible_documents AS (
      AND v.id = d.current_version_id
     LEFT JOIN blobs b ON b.id = v.blob_id
     CROSS JOIN params
-    WHERE params.is_admin != 0
-       OR folders.root_key != 'archive'
-       OR (
+    WHERE d.archived_at IS NULL
+      AND (
+        params.is_admin != 0
+        OR folders.root_key != 'archive'
+        OR (
             json_type(CASE
                 WHEN d.archived_access IS NULL OR trim(d.archived_access) = '' THEN '{}'
                 ELSE d.archived_access
@@ -187,7 +192,8 @@ visible_documents AS (
                 WHERE snapshot.type = 'integer'
                   AND CAST(snapshot.value AS INTEGER) >= 1
             )
-       )
+        )
+      )
 ),
 ranked_documents AS (
     SELECT
@@ -329,6 +335,9 @@ pub struct FolderSummaryPayload {
     pub can_delete_empty: bool,
     pub path: String,
     pub name: String,
+    pub archived: bool,
+    pub archived_at: Option<String>,
+    pub archived_origin_path: String,
     pub color: String,
     pub icon: String,
     pub default_ttl_days: Option<i64>,
@@ -368,6 +377,7 @@ pub struct DocumentRowPayload {
     pub download_url: Option<String>,
     pub lock: LockPayload,
     pub archived: bool,
+    pub directly_archived: bool,
     pub expires_at: Option<String>,
     pub expiry_action: Option<String>,
     pub access: AccessPayload,
@@ -404,8 +414,8 @@ struct DocumentViewRow {
     version_count: i64,
     expires_at: Option<String>,
     expiry_action: Option<String>,
-    archived_from_folder: Option<String>,
-    archived_original_name: Option<String>,
+    archived_at: Option<String>,
+    archived_origin_path: Option<String>,
     archived_access: Option<String>,
     current_version_id: Option<String>,
     has_versions: bool,
@@ -445,6 +455,9 @@ struct FolderPageRow {
     icon: Option<String>,
     default_ttl_days: Option<i64>,
     default_ttl_action: Option<String>,
+    archived_at: Option<String>,
+    archived_origin_path: Option<String>,
+    archived_access: Option<String>,
     path: String,
 }
 
@@ -463,6 +476,9 @@ impl FolderPageRow {
             icon: record.icon.clone(),
             default_ttl_days: record.default_ttl_days,
             default_ttl_action: record.default_ttl_action.clone(),
+            archived_at: record.archived_at.clone(),
+            archived_origin_path: record.archived_origin_path.clone(),
+            archived_access: record.archived_access.clone(),
             path,
         }
     }
@@ -481,6 +497,9 @@ impl FolderPageRow {
             icon: self.icon.clone(),
             default_ttl_days: self.default_ttl_days,
             default_ttl_action: self.default_ttl_action.clone(),
+            archived_at: self.archived_at.clone(),
+            archived_origin_path: self.archived_origin_path.clone(),
+            archived_access: self.archived_access.clone(),
         }
     }
 }
@@ -583,14 +602,27 @@ struct ContentsPageContext<'a> {
     limit: usize,
 }
 
+struct ArchivedContentsPageContext<'a> {
+    pool: &'a SqlitePool,
+    user: &'a UserContext,
+    query: &'a str,
+    recursive: bool,
+    limit: usize,
+    archive_root: &'a FolderRecord,
+    target: &'a FolderRecord,
+    folders: &'a [FolderRecord],
+    folder_by_id: &'a HashMap<i64, &'a FolderRecord>,
+    path_cache: &'a HashMap<i64, String>,
+    scope: &'a HashSet<i64>,
+}
+
 struct FavoriteDocumentContext<'a> {
+    pool: &'a SqlitePool,
     user: &'a UserContext,
     documents: &'a HashMap<i64, &'a DocumentViewRow>,
     folders: &'a HashMap<i64, &'a FolderRecord>,
     paths: &'a HashMap<i64, String>,
     locks: &'a HashMap<i64, DocumentLockRow>,
-    folder_levels: &'a HashMap<i64, i64>,
-    user_group_ids: &'a HashSet<String>,
     visuals: &'a HashMap<i64, VisualPayload>,
 }
 
@@ -769,6 +801,21 @@ pub async fn build_contents_page_payload(
     options: ContentsPageOptions,
 ) -> Result<ContentsPayload, ViewError> {
     let normalized_request = normalize_folder(Some(folder))?;
+    if let Some((archive_root_id, target_folder_id)) =
+        parse_archive_browser_path(&normalized_request)
+    {
+        return build_archived_folder_contents_page_payload(
+            pool,
+            &normalized_request,
+            archive_root_id,
+            target_folder_id,
+            user,
+            q,
+            recursive,
+            options,
+        )
+        .await;
+    }
     let Some(current_folder) = get_folder_by_path_read(pool, &normalized_request).await? else {
         return Err(ViewError::FolderNotFound);
     };
@@ -822,6 +869,224 @@ pub async fn build_contents_page_payload(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn build_archived_folder_contents_page_payload(
+    pool: &SqlitePool,
+    browser_path: &str,
+    archive_root_id: i64,
+    target_folder_id: i64,
+    user: &UserContext,
+    q: &str,
+    recursive: bool,
+    options: ContentsPageOptions,
+) -> Result<ContentsPayload, ViewError> {
+    let folders = all_folders(pool).await?;
+    let folder_by_id = folders
+        .iter()
+        .map(|folder| (folder.id, folder))
+        .collect::<HashMap<_, _>>();
+    let path_cache = build_folder_path_cache(&folders)?;
+    let archive_root = folder_by_id
+        .get(&archive_root_id)
+        .copied()
+        .filter(|folder| folder.archived_at.is_some())
+        .ok_or(ViewError::FolderNotFound)?;
+    let target = folder_by_id
+        .get(&target_folder_id)
+        .copied()
+        .ok_or(ViewError::FolderNotFound)?;
+    validate_archive_browser_chain(browser_path, archive_root, target, &folder_by_id)?;
+    if archived_folder_access_level(pool, target, user).await? < 1 {
+        return Err(ViewError::FolderNotFound);
+    }
+
+    let search_query = q.trim().to_string();
+    let limit = options
+        .limit
+        .unwrap_or(CONTENTS_DEFAULT_LIMIT)
+        .clamp(1, CONTENTS_MAX_LIMIT);
+    let mut cursor = decode_contents_cursor(
+        options.cursor.as_deref(),
+        browser_path,
+        &search_query,
+        recursive,
+    )?;
+    let scope_ids = if !search_query.is_empty() && recursive {
+        archive_entry_subtree_folder_ids_from_records(target.id, &folders)
+    } else {
+        vec![target.id]
+    };
+    let scope_set = scope_ids.iter().copied().collect::<HashSet<_>>();
+    let context = ArchivedContentsPageContext {
+        pool,
+        user,
+        query: &search_query,
+        recursive,
+        limit,
+        archive_root,
+        target,
+        folders: &folders,
+        folder_by_id: &folder_by_id,
+        path_cache: &path_cache,
+        scope: &scope_set,
+    };
+    let mut folder_rows = archived_contents_folder_page(&context, &mut cursor).await?;
+    let mut documents = archived_contents_document_page(&context, &mut cursor).await?;
+    folder_rows.sort_by_key(|row| row.name.to_lowercase());
+    documents.sort_by_key(|row| row.name.to_lowercase());
+    let next_cursor = (!cursor.folders_done || !cursor.documents_done)
+        .then(|| encode_contents_cursor(&cursor))
+        .transpose()?;
+    Ok(ContentsPayload {
+        folder: browser_path.to_string(),
+        q: search_query,
+        recursive,
+        folders: folder_rows,
+        documents,
+        next_cursor,
+    })
+}
+
+async fn archived_contents_folder_page(
+    context: &ArchivedContentsPageContext<'_>,
+    cursor: &mut ContentsCursor,
+) -> Result<Vec<FolderSummaryPayload>, ViewError> {
+    let scan_limit = context
+        .limit
+        .checked_mul(CONTENTS_SCAN_MULTIPLIER)
+        .ok_or(ViewError::InvalidContentsCursor)?;
+    let mut candidates = if cursor.folders_done {
+        Vec::new()
+    } else {
+        context
+            .folders
+            .iter()
+            .filter(|folder| {
+                !folder.is_root
+                    && folder.archived_at.is_none()
+                    && folder.id > cursor.folder_after
+                    && if !context.query.is_empty() && context.recursive {
+                        folder.id != context.target.id && context.scope.contains(&folder.id)
+                    } else {
+                        folder.parent_id == Some(context.target.id)
+                    }
+            })
+            .collect::<Vec<_>>()
+    };
+    candidates.sort_by_key(|folder| folder.id);
+    let raw_has_more = candidates.len() > scan_limit;
+    candidates.truncate(scan_limit);
+    let mut rows = Vec::new();
+    for folder in candidates {
+        cursor.folder_after = folder.id;
+        let level = archived_folder_access_level(context.pool, folder, context.user).await?;
+        let path =
+            archive_browser_path_for_folder(context.archive_root.id, folder, context.folder_by_id)?;
+        let physical_path = folder_path_from_cache(folder, context.path_cache)?;
+        if level < 1
+            || (!context.query.is_empty()
+                && !matches_query(
+                    context.query,
+                    &[
+                        Some(&folder.name),
+                        Some(&path),
+                        Some(&physical_path),
+                        folder.archived_origin_path.as_deref(),
+                    ],
+                ))
+        {
+            continue;
+        }
+        let mut summary =
+            folder_summary_payload(folder, &path, &[], level, context.folder_by_id, false);
+        if folder.archived_origin_path.is_none() {
+            summary.archived_origin_path = physical_path;
+        }
+        rows.push(summary);
+        if rows.len() == context.limit {
+            break;
+        }
+    }
+    cursor.folders_done = rows.len() < context.limit && !raw_has_more;
+    Ok(rows)
+}
+
+async fn archived_contents_document_page(
+    context: &ArchivedContentsPageContext<'_>,
+    cursor: &mut ContentsCursor,
+) -> Result<Vec<DocumentRowPayload>, ViewError> {
+    let scan_limit = context
+        .limit
+        .checked_mul(CONTENTS_SCAN_MULTIPLIER)
+        .ok_or(ViewError::InvalidContentsCursor)?;
+    let mut candidates = if cursor.documents_done {
+        Vec::new()
+    } else {
+        document_view_rows(context.pool)
+            .await?
+            .into_iter()
+            .filter(|document| {
+                document.id > cursor.document_after
+                    && document.archived_at.is_none()
+                    && context.scope.contains(&document.folder_id)
+            })
+            .collect::<Vec<_>>()
+    };
+    candidates.sort_by_key(|document| document.id);
+    let raw_has_more = candidates.len() > scan_limit;
+    candidates.truncate(scan_limit);
+    let candidate_ids = candidates
+        .iter()
+        .map(|document| document.id)
+        .collect::<Vec<_>>();
+    let locks = active_locks_by_document_ids(context.pool, &candidate_ids).await?;
+    let mut visible = Vec::new();
+    for document in candidates {
+        cursor.document_after = document.id;
+        let level = document_access_level_for_view(context.pool, &document, context.user).await?;
+        if level < 1 {
+            continue;
+        }
+        let folder = context
+            .folder_by_id
+            .get(&document.folder_id)
+            .copied()
+            .ok_or(ViewError::FolderNotFound)?;
+        let display_folder =
+            archive_browser_path_for_folder(context.archive_root.id, folder, context.folder_by_id)?;
+        let physical_folder = folder_path_from_cache(folder, context.path_cache)?;
+        if !document_matches_query(&document, folder, &physical_folder, context.query) {
+            continue;
+        }
+        visible.push((document, level, display_folder, physical_folder));
+        if visible.len() == context.limit {
+            break;
+        }
+    }
+    cursor.documents_done = visible.len() < context.limit && !raw_has_more;
+    let visuals = document_visuals(
+        context.pool,
+        visible
+            .iter()
+            .map(|(document, level, _, _)| (document, *level)),
+    )
+    .await?;
+    visible
+        .iter()
+        .map(|(document, level, display_folder, physical_folder)| {
+            document_row_payload(
+                document,
+                display_folder,
+                true,
+                *level,
+                locks.get(&document.id),
+                visuals.get(&document.id),
+                Some(&join_path(&[physical_folder, &document.name])),
+            )
+        })
+        .collect()
+}
+
 async fn contents_folder_page(
     context: &ContentsPageContext<'_>,
     cursor: &ContentsCursor,
@@ -858,21 +1123,23 @@ async fn contents_folder_page(
         .collect::<Vec<_>>();
     let delete_eligible =
         empty_folder_delete_eligible_ids(context.pool, &delete_candidates).await?;
-    let rows = folder_page
-        .iter()
-        .map(|row| {
-            let record = row.record();
-            let level = levels.get(&record.id).copied().unwrap_or(0);
-            folder_summary_payload_from_aggregate(
-                &record,
-                &row.path,
-                &stats,
-                level,
-                &folder_by_id,
-                level >= 3 && delete_eligible.contains(&record.id),
-            )
-        })
-        .collect();
+    let mut rows = Vec::with_capacity(folder_page.len());
+    for row in &folder_page {
+        let record = row.record();
+        let level = if record.archived_at.is_some() {
+            archived_folder_access_level(context.pool, &record, context.user).await?
+        } else {
+            levels.get(&record.id).copied().unwrap_or(0)
+        };
+        rows.push(folder_summary_payload_from_aggregate(
+            &record,
+            &row.path,
+            &stats,
+            level,
+            &folder_by_id,
+            record.archived_at.is_none() && level >= 3 && delete_eligible.contains(&record.id),
+        ));
+    }
     Ok((rows, after, done))
 }
 
@@ -921,15 +1188,22 @@ async fn contents_document_page(
         .rows
         .iter()
         .filter_map(|(document, level)| {
-            let folder = folder_by_id.get(&document.folder_id)?;
-            let path = page.path_cache.get(&document.folder_id)?;
+            if !folder_by_id.contains_key(&document.folder_id) {
+                return None;
+            }
+            let path = if folder_is_archive(context.current_folder) {
+                ARCHIVE_ROOT
+            } else {
+                page.path_cache.get(&document.folder_id)?
+            };
             Some(document_row_payload(
                 document,
-                folder,
                 path,
+                document_view_is_archived(document, &folder_by_id),
                 *level,
                 locks.get(&document.id),
                 visuals.get(&document.id),
+                None,
             ))
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -987,12 +1261,44 @@ async fn scan_visible_folder_page(
     limit: usize,
 ) -> Result<(Vec<FolderPageRow>, i64, bool), ViewError> {
     if folder_is_archive(current_folder) {
-        return Ok((Vec::new(), after, true));
+        let scan_limit = limit
+            .checked_mul(CONTENTS_SCAN_MULTIPLIER)
+            .ok_or(ViewError::InvalidContentsCursor)?;
+        let mut candidates = archived_folder_page_rows(pool, after, scan_limit + 1).await?;
+        let raw_has_more = candidates.len() > scan_limit;
+        candidates.truncate(scan_limit);
+        let mut rows = Vec::new();
+        let mut next_after = after;
+        let mut stopped_early = false;
+        for candidate in candidates {
+            next_after = candidate.id;
+            let record = candidate.record();
+            let level = archived_folder_access_level(pool, &record, user).await?;
+            if level >= 1
+                && (q.is_empty()
+                    || matches_query(
+                        q,
+                        &[
+                            Some(&candidate.name),
+                            Some(&candidate.path),
+                            candidate.archived_origin_path.as_deref(),
+                        ],
+                    ))
+            {
+                rows.push(candidate);
+                if rows.len() == limit {
+                    stopped_early = true;
+                    break;
+                }
+            }
+        }
+        return Ok((rows, next_after, !stopped_early && !raw_has_more));
     }
     let scan_limit = limit
         .checked_mul(CONTENTS_SCAN_MULTIPLIER)
         .ok_or(ViewError::InvalidContentsCursor)?;
-    let recursive_scope = !q.is_empty() && recursive;
+    let archive_root = folder_is_archive(current_folder);
+    let recursive_scope = !archive_root && !q.is_empty() && recursive;
     let mut candidates = folder_page_rows(
         pool,
         current_folder.id,
@@ -1025,6 +1331,48 @@ async fn scan_visible_folder_page(
     Ok((rows, next_after, !stopped_early && !raw_has_more))
 }
 
+async fn archived_folder_page_rows(
+    pool: &SqlitePool,
+    after: i64,
+    limit: usize,
+) -> Result<Vec<FolderPageRow>, ViewError> {
+    let limit = i64::try_from(limit).map_err(|_| ViewError::InvalidContentsCursor)?;
+    Ok(sqlx::query_as::<_, FolderPageRow>(
+        r"
+        SELECT
+            id,
+            root_key,
+            parent_id,
+            name,
+            is_root,
+            created_at,
+            created_by,
+            created_by_name,
+            color,
+            icon,
+            default_ttl_days,
+            default_ttl_action,
+            archived_at,
+            archived_origin_path,
+            archived_access,
+            ? || '/@' || id || '~' || name AS path
+        FROM folders
+        WHERE archived_at IS NOT NULL
+          AND root_key = ?
+          AND is_root = 0
+          AND id > ?
+        ORDER BY id
+        LIMIT ?
+        ",
+    )
+    .bind(ARCHIVE_ROOT)
+    .bind(VAULT_ROOT_KEY)
+    .bind(after)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?)
+}
+
 async fn folder_page_rows(
     pool: &SqlitePool,
     current_folder_id: i64,
@@ -1040,11 +1388,12 @@ async fn folder_page_rows(
             WITH RECURSIVE subtree(
                 id, root_key, parent_id, name, is_root, created_at, created_by,
                 created_by_name, color, icon, default_ttl_days, default_ttl_action,
-                path, visited
+                archived_at, archived_origin_path, archived_access, path, visited
             ) AS (
                 SELECT
                     id, root_key, parent_id, name, is_root, created_at, created_by,
                     created_by_name, color, icon, default_ttl_days, default_ttl_action,
+                    archived_at, archived_origin_path, archived_access,
                     ?, printf(',%d,', id)
                 FROM folders
                 WHERE id = ?
@@ -1053,16 +1402,19 @@ async fn folder_page_rows(
                     child.id, child.root_key, child.parent_id, child.name, child.is_root,
                     child.created_at, child.created_by, child.created_by_name, child.color,
                     child.icon, child.default_ttl_days, child.default_ttl_action,
+                    child.archived_at, child.archived_origin_path, child.archived_access,
                     CASE WHEN subtree.path = '' THEN child.name
                          ELSE subtree.path || '/' || child.name END,
                     subtree.visited || child.id || ','
                 FROM folders child
                 JOIN subtree ON child.parent_id = subtree.id
                 WHERE instr(subtree.visited, printf(',%d,', child.id)) = 0
+                  AND child.archived_at IS NULL
             )
             SELECT
                 id, root_key, parent_id, name, is_root, created_at, created_by,
-                created_by_name, color, icon, default_ttl_days, default_ttl_action, path
+                created_by_name, color, icon, default_ttl_days, default_ttl_action,
+                archived_at, archived_origin_path, archived_access, path
             FROM subtree
             WHERE id != ? AND id > ?
             ORDER BY id
@@ -1082,9 +1434,10 @@ async fn folder_page_rows(
         SELECT
             id, root_key, parent_id, name, is_root, created_at, created_by,
             created_by_name, color, icon, default_ttl_days, default_ttl_action,
+            archived_at, archived_origin_path, archived_access,
             CASE WHEN ? = '' THEN name ELSE ? || '/' || name END AS path
         FROM folders
-        WHERE parent_id = ? AND id > ?
+        WHERE parent_id = ? AND archived_at IS NULL AND id > ?
         ORDER BY id
         LIMIT ?
         ",
@@ -1124,7 +1477,8 @@ async fn folder_records_with_ancestors(
         )
         SELECT
             id, root_key, parent_id, name, is_root, created_at, created_by,
-            created_by_name, color, icon, default_ttl_days, default_ttl_action
+            created_by_name, color, icon, default_ttl_days, default_ttl_action,
+            archived_at, archived_origin_path, archived_access
         FROM folders
         WHERE id IN (SELECT id FROM ancestors)
         ",
@@ -1182,10 +1536,12 @@ async fn scan_visible_document_page(
     let scan_limit = limit
         .checked_mul(CONTENTS_SCAN_MULTIPLIER)
         .ok_or(ViewError::InvalidContentsCursor)?;
-    let recursive_scope = !q.is_empty() && recursive;
+    let archive_root = folder_is_archive(current_folder);
+    let recursive_scope = !archive_root && !q.is_empty() && recursive;
     let mut documents = scoped_document_page_rows(
         pool,
         current_folder.id,
+        archive_root,
         recursive_scope,
         after,
         scan_limit + 1,
@@ -1205,8 +1561,6 @@ async fn scan_visible_document_page(
         .iter()
         .map(|folder| (folder.id, folder))
         .collect::<HashMap<_, _>>();
-    let levels = folder_access_levels(pool, &folder_ids, user).await?;
-    let user_group_ids = user_group_ids(pool, user).await?;
     let mut rows = Vec::new();
     let mut next_after = after;
     let mut stopped_early = false;
@@ -1215,13 +1569,7 @@ async fn scan_visible_document_page(
         let Some(folder) = folder_by_id.get(&document.folder_id) else {
             continue;
         };
-        let level = document_access_level_for_view(
-            &document,
-            folder,
-            levels.get(&document.folder_id).copied().unwrap_or(0),
-            user,
-            &user_group_ids,
-        )?;
+        let level = document_access_level_for_view(pool, &document, user).await?;
         if level < 1 {
             continue;
         }
@@ -1231,7 +1579,7 @@ async fn scan_visible_document_page(
         let path = path_cache
             .get(&document.folder_id)
             .map_or(current_path, String::as_str);
-        if !document_matches_query(&document, folder, path, q)? {
+        if !document_matches_query(&document, folder, path, q) {
             continue;
         }
         rows.push((document, level));
@@ -1252,6 +1600,7 @@ async fn scan_visible_document_page(
 async fn scoped_document_page_rows(
     pool: &SqlitePool,
     current_folder_id: i64,
+    archive_root: bool,
     recursive: bool,
     after: i64,
     limit: usize,
@@ -1266,15 +1615,39 @@ async fn scoped_document_page_rows(
             FROM scope
             JOIN folders child ON child.parent_id = scope.id
             WHERE instr(scope.visited, printf(',%d,', child.id)) = 0
+              AND child.archived_at IS NULL
         )
         "
     } else {
         ""
     };
-    let folder_predicate = if recursive {
+    let folder_predicate = if archive_root {
+        "d.archived_at IS NOT NULL"
+    } else if recursive {
         "d.folder_id IN (SELECT id FROM scope)"
     } else {
         "d.folder_id = ?"
+    };
+    let archive_predicate = if archive_root {
+        ""
+    } else {
+        r"
+        AND d.archived_at IS NULL
+        AND NOT EXISTS (
+            WITH RECURSIVE ancestry(id, parent_id, archived_at, visited) AS (
+                SELECT id, parent_id, archived_at, printf(',%d,', id)
+                FROM folders
+                WHERE id = d.folder_id
+                UNION ALL
+                SELECT parent.id, parent.parent_id, parent.archived_at,
+                       ancestry.visited || parent.id || ','
+                FROM ancestry
+                JOIN folders parent ON parent.id = ancestry.parent_id
+                WHERE instr(ancestry.visited, printf(',%d,', parent.id)) = 0
+            )
+            SELECT 1 FROM ancestry WHERE archived_at IS NOT NULL
+        )
+        "
     };
     let sql = format!(
         r"
@@ -1290,8 +1663,8 @@ async fn scoped_document_page_rows(
             d.version_count,
             d.expires_at,
             d.expiry_action,
-            d.archived_from_folder,
-            d.archived_original_name,
+            d.archived_at,
+            d.archived_origin_path,
             d.archived_access,
             d.current_version_id,
             EXISTS (
@@ -1310,17 +1683,16 @@ async fn scoped_document_page_rows(
         FROM documents d
         LEFT JOIN document_versions v ON v.document_id = d.id AND v.id = d.current_version_id
         LEFT JOIN blobs b ON b.id = v.blob_id
-        WHERE {folder_predicate} AND d.id > ?
+        WHERE {folder_predicate} {archive_predicate} AND d.id > ?
         ORDER BY d.id
         LIMIT ?
         "
     );
-    Ok(sqlx::query_as::<_, DocumentViewRow>(&sql)
-        .bind(current_folder_id)
-        .bind(after)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?)
+    let mut query = sqlx::query_as::<_, DocumentViewRow>(&sql);
+    if !archive_root {
+        query = query.bind(current_folder_id);
+    }
+    Ok(query.bind(after).bind(limit).fetch_all(pool).await?)
 }
 
 async fn user_group_ids(
@@ -1348,26 +1720,12 @@ async fn user_group_ids(
         .collect())
 }
 
-fn document_access_level_for_view(
+async fn document_access_level_for_view(
+    pool: &SqlitePool,
     document: &DocumentViewRow,
-    folder: &FolderRecord,
-    folder_level: i64,
     user: &UserContext,
-    user_group_ids: &HashSet<String>,
 ) -> Result<i64, ViewError> {
-    if user.is_admin {
-        return Ok(3);
-    }
-    if !folder_is_archive(folder) || folder_level <= 0 {
-        return Ok(folder_level);
-    }
-    let snapshot = parse_archived_access(document.archived_access.as_deref())?;
-    let source_level = user_group_ids
-        .iter()
-        .filter_map(|group_id| snapshot.get(group_id).copied())
-        .max()
-        .unwrap_or(0);
-    Ok(folder_level.min(source_level))
+    Ok(document_access_level(pool, &document.document_record(), user).await?)
 }
 
 async fn active_locks_by_document_ids(
@@ -1421,7 +1779,8 @@ async fn sidebar_folder_records(
         r"
         SELECT
             id, root_key, parent_id, name, is_root, created_at, created_by,
-            created_by_name, color, icon, default_ttl_days, default_ttl_action
+            created_by_name, color, icon, default_ttl_days, default_ttl_action,
+            archived_at, archived_origin_path, archived_access
         FROM folders
         WHERE is_root = 1
         ",
@@ -1439,9 +1798,10 @@ async fn sidebar_folder_records(
         r"
         SELECT
             id, root_key, parent_id, name, is_root, created_at, created_by,
-            created_by_name, color, icon, default_ttl_days, default_ttl_action
+            created_by_name, color, icon, default_ttl_days, default_ttl_action,
+            archived_at, archived_origin_path, archived_access
         FROM folders
-        WHERE parent_id = ? AND id > ?
+        WHERE parent_id = ? AND archived_at IS NULL AND id > ?
         ORDER BY id
         LIMIT ?
         ",
@@ -1492,20 +1852,12 @@ pub async fn build_my_edits_payload(
         .iter()
         .map(|folder| (folder.id, folder))
         .collect::<HashMap<_, _>>();
-    let levels = folder_access_levels(pool, &folder_ids, user).await?;
-    let user_group_ids = user_group_ids(pool, user).await?;
     let mut visual_levels = Vec::new();
     for doc in &docs {
-        let Some(folder) = folder_by_id.get(&doc.folder_id) else {
+        if !folder_by_id.contains_key(&doc.folder_id) {
             continue;
-        };
-        let level = document_access_level_for_view(
-            doc,
-            folder,
-            levels.get(&doc.folder_id).copied().unwrap_or(0),
-            user,
-            &user_group_ids,
-        )?;
+        }
+        let level = document_access_level_for_view(pool, doc, user).await?;
         visual_levels.push((doc, level));
     }
     let visuals = document_visuals(pool, visual_levels).await?;
@@ -1518,24 +1870,20 @@ pub async fn build_my_edits_payload(
         let Some(folder) = folder_by_id.get(&doc.folder_id) else {
             continue;
         };
-        let level = document_access_level_for_view(
-            &doc,
-            folder,
-            levels.get(&doc.folder_id).copied().unwrap_or(0),
-            user,
-            &user_group_ids,
-        )?;
+        let level = document_access_level_for_view(pool, &doc, user).await?;
         if level < 3 {
             continue;
         }
-        let doc_folder_path = folder_path_from_cache(folder, &path_cache)?;
+        let (doc_folder_path, archived, archived_fallback_path) =
+            document_payload_location(&doc, folder, &folder_by_id, &path_cache)?;
         let row = document_row_payload(
             &doc,
-            folder,
             &doc_folder_path,
+            archived,
             level,
             Some(lock),
             visuals.get(&doc.id),
+            archived_fallback_path.as_deref(),
         )?;
         rows.push((row.path.to_lowercase(), row));
     }
@@ -1575,16 +1923,18 @@ pub async fn build_document_detail_payload(
     let Some(folder) = folder_by_id.get(&doc.folder_id) else {
         return Err(ViewError::DocumentNotFound);
     };
-    let doc_folder_path = folder_path_from_cache(folder, &path_cache)?;
+    let (doc_folder_path, archived, archived_fallback_path) =
+        document_payload_location(&doc, folder, &folder_by_id, &path_cache)?;
     let locks = active_locks_by_document(pool).await?;
     let visuals = document_visuals(pool, [(&doc, level)]).await?;
     let row = document_row_payload(
         &doc,
-        folder,
         &doc_folder_path,
+        archived,
         level,
         locks.get(&doc.id),
         visuals.get(&doc.id),
+        archived_fallback_path.as_deref(),
     )?;
     let versions = document_history_items(pool, doc.id).await?;
     Ok(DocumentDetailPayload { row, versions })
@@ -1616,16 +1966,18 @@ pub async fn build_share_document_payload(
     let Some(folder) = folder_by_id.get(&doc.folder_id) else {
         return Ok(None);
     };
-    let doc_folder_path = folder_path_from_cache(folder, &path_cache)?;
+    let (doc_folder_path, archived, archived_fallback_path) =
+        document_payload_location(&doc, folder, &folder_by_id, &path_cache)?;
     let locks = active_locks_by_document(pool).await?;
     let visuals = document_visuals(pool, [(&doc, level)]).await?;
     let row = document_row_payload(
         &doc,
-        folder,
         &doc_folder_path,
+        archived,
         level,
         locks.get(&doc.id),
         visuals.get(&doc.id),
+        archived_fallback_path.as_deref(),
     )?;
     Ok(Some((doc_folder_path, row)))
 }
@@ -1644,13 +1996,33 @@ pub async fn build_share_folder_payload(
     let Some(folder) = folder_by_id.get(&folder_id) else {
         return Ok(None);
     };
-    let level = folder_access_level(pool, folder.id, user).await?;
+    let archived = folder_view_is_archived(folder, &folder_by_id);
+    let level = if archived {
+        archived_folder_access_level(pool, folder, user).await?
+    } else {
+        folder_access_level(pool, folder.id, user).await?
+    };
     if level < 1 {
         return Ok(None);
     }
-    let path = folder_path_from_cache(folder, &path_cache)?;
+    let path = if archived {
+        let archive_root = nearest_direct_archived_folder(folder, &folder_by_id)
+            .ok_or(ViewError::FolderNotFound)?;
+        archive_browser_path_for_folder(archive_root.id, folder, &folder_by_id)?
+    } else {
+        folder_path_from_cache(folder, &path_cache)?
+    };
     let visible_docs = visible_document_rows(pool, user).await?;
-    let stats = docs_stats_for_folder_payloads(&visible_docs, &folder_by_id, &path_cache)?;
+    let stats = if folder_is_archive(folder) {
+        archive_docs_stats_for_folder_payloads(&visible_docs, &folder_by_id)
+    } else if archived {
+        let scope = archive_entry_subtree_folder_ids_from_records(folder.id, &folders)
+            .into_iter()
+            .collect::<HashSet<_>>();
+        archived_folder_docs_stats(&visible_docs, &scope, &path)
+    } else {
+        docs_stats_for_folder_payloads(&visible_docs, &folder_by_id, &path_cache)?
+    };
     let delete_eligible = empty_folder_delete_eligible_ids(pool, &[(folder.id, path.clone())])
         .await?
         .contains(&folder.id);
@@ -1660,7 +2032,7 @@ pub async fn build_share_folder_payload(
         &stats,
         level,
         &folder_by_id,
-        level >= 3 && delete_eligible,
+        !archived && level >= 3 && delete_eligible,
     );
     Ok(Some((path, folder_summary_without_access(summary)?)))
 }
@@ -1688,7 +2060,11 @@ pub async fn build_folder_properties_payload(
         .collect::<HashMap<_, _>>();
     let path = folder_path_from_cache(&folder, &path_cache)?;
     let visible_docs = visible_document_rows(pool, user).await?;
-    let stats = docs_stats_for_folder_payloads(&visible_docs, &folder_by_id, &path_cache)?;
+    let stats = if folder_is_archive(&folder) {
+        archive_docs_stats_for_folder_payloads(&visible_docs, &folder_by_id)
+    } else {
+        docs_stats_for_folder_payloads(&visible_docs, &folder_by_id, &path_cache)?
+    };
     let delete_eligible = empty_folder_delete_eligible_ids(pool, &[(folder.id, path.clone())])
         .await?
         .contains(&folder.id);
@@ -1769,6 +2145,29 @@ async fn folder_counts_payload(
     folders: &[FolderRecord],
     visible_docs: &[DocumentViewRow],
 ) -> Result<Value, ViewError> {
+    if folder_is_archive(folder) {
+        let mut visible_folder_count = 0_i64;
+        for candidate in folders
+            .iter()
+            .filter(|candidate| candidate.archived_at.is_some())
+        {
+            if archived_folder_access_level(pool, candidate, user).await? >= 1 {
+                visible_folder_count += 1;
+            }
+        }
+        let folder_by_id = folders
+            .iter()
+            .map(|folder| (folder.id, folder))
+            .collect::<HashMap<_, _>>();
+        let document_count = visible_docs
+            .iter()
+            .filter(|document| document_view_is_archived(document, &folder_by_id))
+            .count();
+        return Ok(json!({
+            "folders": visible_folder_count,
+            "documents": document_count,
+        }));
+    }
     let subtree_ids = subtree_folder_ids(folder.id, folders);
     let mut visible_folder_count = 0_i64;
     for folder_id in &subtree_ids {
@@ -1947,7 +2346,23 @@ async fn resolved_favorite_items(
         .iter()
         .map(|folder| (folder.id, folder))
         .collect::<HashMap<_, _>>();
-    let favorite_folder_levels = folder_access_levels(pool, &favorite_folder_ids, user).await?;
+    let mut favorite_folder_levels = folder_access_levels(pool, &favorite_folder_ids, user).await?;
+    let mut favorite_folder_paths = HashMap::new();
+    for folder_id in &favorite_folder_ids {
+        let Some(folder) = folder_by_id.get(folder_id).copied() else {
+            continue;
+        };
+        let path = if folder_view_is_archived(folder, &folder_by_id) {
+            let archive_root = nearest_direct_archived_folder(folder, &folder_by_id)
+                .ok_or(ViewError::FolderNotFound)?;
+            let archived_level = archived_folder_access_level(pool, folder, user).await?;
+            favorite_folder_levels.insert(*folder_id, archived_level);
+            archive_browser_path_for_folder(archive_root.id, folder, &folder_by_id)?
+        } else {
+            folder_path_from_cache(folder, &path_cache)?
+        };
+        favorite_folder_paths.insert(*folder_id, path);
+    }
     let visible_favorite_folders = favorite_folder_ids
         .iter()
         .filter(|folder_id| favorite_folder_levels.get(folder_id).copied().unwrap_or(0) >= 1)
@@ -1955,15 +2370,31 @@ async fn resolved_favorite_items(
         .map(|folder| {
             Ok(FolderPageRow::from_record(
                 folder,
-                folder_path_from_cache(folder, &path_cache)?,
+                favorite_folder_paths
+                    .get(&folder.id)
+                    .cloned()
+                    .ok_or(ViewError::FolderNotFound)?,
             ))
         })
         .collect::<Result<Vec<_>, ViewError>>()?;
-    let stats = folder_page_stats(pool, &visible_favorite_folders, user).await?;
+    let mut stats = folder_page_stats(pool, &visible_favorite_folders, user).await?;
+    if visible_favorite_folders
+        .iter()
+        .any(|folder| folder.root_key == ARCHIVE_ROOT_KEY && folder.is_root)
+    {
+        let archive_folders = all_folders(pool).await?;
+        let archive_folder_by_id = archive_folders
+            .iter()
+            .map(|folder| (folder.id, folder))
+            .collect::<HashMap<_, _>>();
+        let visible_archive_docs = visible_document_rows(pool, user).await?;
+        stats.extend(archive_docs_stats_for_folder_payloads(
+            &visible_archive_docs,
+            &archive_folder_by_id,
+        ));
+    }
     let delete_eligible =
         favorite_empty_folder_delete_eligible_ids(pool, &visible_favorite_folders).await?;
-    let document_levels = folder_access_levels(pool, &document_folder_ids, user).await?;
-    let user_group_ids = user_group_ids(pool, user).await?;
     let document_by_id = documents
         .iter()
         .map(|document| (document.id, document))
@@ -1971,30 +2402,20 @@ async fn resolved_favorite_items(
     let locks = active_locks_by_document_ids(pool, &favorite_document_ids).await?;
     let mut visual_levels = Vec::new();
     for document in &documents {
-        let Some(folder) = folder_by_id.get(&document.folder_id) else {
+        if !folder_by_id.contains_key(&document.folder_id) {
             continue;
-        };
-        let level = document_access_level_for_view(
-            document,
-            folder,
-            document_levels
-                .get(&document.folder_id)
-                .copied()
-                .unwrap_or(0),
-            user,
-            &user_group_ids,
-        )?;
+        }
+        let level = document_access_level_for_view(pool, document, user).await?;
         visual_levels.push((document, level));
     }
     let visuals = document_visuals(pool, visual_levels).await?;
     let document_context = FavoriteDocumentContext {
+        pool,
         user,
         documents: &document_by_id,
         folders: &folder_by_id,
         paths: &path_cache,
         locks: &locks,
-        folder_levels: &document_levels,
-        user_group_ids: &user_group_ids,
         visuals: &visuals,
     };
     let mut resolved = Vec::new();
@@ -2011,7 +2432,7 @@ async fn resolved_favorite_items(
                 if let Some(row) = favorite_folder_payload(
                     item_id,
                     &folder_by_id,
-                    &path_cache,
+                    &favorite_folder_paths,
                     &stats,
                     &favorite_folder_levels,
                     &delete_eligible,
@@ -2020,7 +2441,7 @@ async fn resolved_favorite_items(
                 }
             }
             "document" => {
-                if let Some(row) = favorite_document_payload(&document_context, item_id)? {
+                if let Some(row) = favorite_document_payload(&document_context, item_id).await? {
                     resolved.push(row);
                 }
             }
@@ -2044,7 +2465,7 @@ async fn favorite_empty_folder_delete_eligible_ids(
 fn favorite_folder_payload(
     folder_id: i64,
     folder_by_id: &HashMap<i64, &FolderRecord>,
-    path_cache: &HashMap<i64, String>,
+    favorite_paths: &HashMap<i64, String>,
     stats: &[DocStat],
     access_levels: &HashMap<i64, i64>,
     delete_eligible: &HashSet<i64>,
@@ -2056,23 +2477,25 @@ fn favorite_folder_payload(
     if level < 1 {
         return Ok(None);
     }
-    let path = folder_path_from_cache(folder, path_cache)?;
+    let path = favorite_paths
+        .get(&folder.id)
+        .ok_or(ViewError::FolderNotFound)?;
+    let archived = folder_view_is_archived(folder, folder_by_id);
     let mut value = serde_json::to_value(folder_summary_payload_from_aggregate(
         folder,
-        &path,
+        path,
         stats,
         level,
         folder_by_id,
-        level >= 3 && delete_eligible.contains(&folder.id),
+        !archived && level >= 3 && delete_eligible.contains(&folder.id),
     ))?;
     if let Some(object) = value.as_object_mut() {
         object.insert("type".to_string(), json!("folder"));
-        object.insert("archived".to_string(), json!(folder_is_archive(folder)));
     }
     Ok(Some(value))
 }
 
-fn favorite_document_payload(
+async fn favorite_document_payload(
     context: &FavoriteDocumentContext<'_>,
     document_id: i64,
 ) -> Result<Option<Value>, ViewError> {
@@ -2082,31 +2505,23 @@ fn favorite_document_payload(
     let Some(folder) = context.folders.get(&doc.folder_id) else {
         return Ok(None);
     };
-    let level = document_access_level_for_view(
-        doc,
-        folder,
-        context
-            .folder_levels
-            .get(&doc.folder_id)
-            .copied()
-            .unwrap_or(0),
-        context.user,
-        context.user_group_ids,
-    )?;
+    let level = document_access_level_for_view(context.pool, doc, context.user).await?;
     if level < 1 {
         return Ok(None);
     }
     if current_version_metadata_is_inconsistent(doc) {
         return Err(ViewError::InconsistentDocumentVersion);
     }
-    let doc_folder_path = folder_path_from_cache(folder, context.paths)?;
+    let (doc_folder_path, archived, archived_fallback_path) =
+        document_payload_location(doc, folder, context.folders, context.paths)?;
     let mut value = serde_json::to_value(document_row_payload(
         doc,
-        folder,
         &doc_folder_path,
+        archived,
         level,
         context.locks.get(&doc.id),
         context.visuals.get(&doc.id),
+        archived_fallback_path.as_deref(),
     )?)?;
     if let Some(object) = value.as_object_mut() {
         object.insert("type".to_string(), json!("document"));
@@ -2119,35 +2534,26 @@ fn document_matches_query(
     folder: &FolderRecord,
     doc_folder_path: &str,
     search_query: &str,
-) -> Result<bool, ViewError> {
+) -> bool {
     if search_query.is_empty() {
-        return Ok(true);
+        return true;
     }
     let doc_path = join_path(&[doc_folder_path, &doc.name]);
     let archived_original_path = if folder_is_archive(folder) {
-        let archived_from = normalize_folder(doc.archived_from_folder.as_deref())?;
-        // Python builds the search-only original path with
-        // `archived_original_name or doc.name`, so legacy archived rows with an
-        // empty original-name field are still discoverable by original path.
-        let original_name = doc
-            .archived_original_name
-            .as_deref()
-            .filter(|name| !name.is_empty())
-            .unwrap_or(&doc.name);
-        join_path(&[&archived_from, original_name])
+        doc.archived_origin_path.clone().unwrap_or_default()
     } else {
         String::new()
     };
-    Ok(matches_query(
+    matches_query(
         search_query,
         &[
             Some(&doc.name),
             Some(&doc_path),
             Some(doc_folder_path),
-            doc.archived_from_folder.as_deref(),
+            doc.archived_origin_path.as_deref(),
             Some(&archived_original_path),
         ],
-    ))
+    )
 }
 
 impl DocumentViewRow {
@@ -2156,8 +2562,8 @@ impl DocumentViewRow {
             id: self.id,
             folder_id: self.folder_id,
             name: self.name.clone(),
-            archived_from_folder: self.archived_from_folder.clone(),
-            archived_original_name: self.archived_original_name.clone(),
+            archived_at: self.archived_at.clone(),
+            archived_origin_path: self.archived_origin_path.clone(),
             archived_access: self.archived_access.clone(),
         }
     }
@@ -2185,16 +2591,26 @@ fn folder_summary_payload(
         }
     }
     let effective = effective_ttl_policy(folder, folder_by_id);
+    let archived = folder_view_is_archived(folder, folder_by_id);
     FolderSummaryPayload {
         id: folder.id,
         can_delete_empty,
         path: path.to_string(),
-        name: path
-            .rsplit('/')
-            .next()
-            .filter(|name| !name.is_empty())
-            .unwrap_or(VAULT_PUBLIC_NAME)
-            .to_string(),
+        name: if folder.is_root {
+            VAULT_PUBLIC_NAME.to_string()
+        } else {
+            folder.name.clone()
+        },
+        archived,
+        archived_at: payload_timestamp(folder.archived_at.as_deref()),
+        archived_origin_path: if archived {
+            folder
+                .archived_origin_path
+                .clone()
+                .unwrap_or_else(|| path.to_string())
+        } else {
+            String::new()
+        },
         color: folder.color.clone().unwrap_or_default(),
         icon: folder.icon.clone().unwrap_or_default(),
         default_ttl_days: folder.default_ttl_days,
@@ -2263,32 +2679,30 @@ fn folder_metadata_payload(
 
 fn document_row_payload(
     doc: &DocumentViewRow,
-    folder: &FolderRecord,
     doc_folder: &str,
+    archived: bool,
     level: i64,
     lock: Option<&DocumentLockRow>,
     visual: Option<&VisualPayload>,
+    archived_fallback_path: Option<&str>,
 ) -> Result<DocumentRowPayload, ViewError> {
     if current_version_metadata_is_inconsistent(doc) {
         return Err(ViewError::InconsistentDocumentVersion);
     }
-    let archived = folder_is_archive(folder);
     let doc_path = join_path(&[doc_folder, &doc.name]);
-    let archived_from_folder = if archived {
-        normalize_folder(doc.archived_from_folder.as_deref())?
+    let archived_original_path = if archived {
+        doc.archived_origin_path
+            .clone()
+            .or_else(|| archived_fallback_path.map(ToOwned::to_owned))
+            .unwrap_or_else(|| doc_path.clone())
     } else {
         String::new()
     };
-    let archived_original_name = if archived {
-        doc.archived_original_name.clone().unwrap_or_default()
-    } else {
-        String::new()
-    };
-    let archived_original_path = if archived_original_name.is_empty() {
-        archived_from_folder.clone()
-    } else {
-        join_path(&[&archived_from_folder, &archived_original_name])
-    };
+    let (archived_from_folder, archived_original_name) =
+        archived_original_path.rsplit_once('/').map_or_else(
+            || (String::new(), archived_original_path.clone()),
+            |(folder, name)| (folder.to_string(), name.to_string()),
+        );
     let modified_at = doc.committed_at.clone();
     Ok(DocumentRowPayload {
         id: doc.id,
@@ -2315,6 +2729,7 @@ fn document_row_payload(
             .map(|version_id| format!("/documents/{}/versions/{version_id}/download", doc.id)),
         lock: lock_payload(lock),
         archived,
+        directly_archived: doc.archived_at.is_some(),
         expires_at: payload_timestamp(doc.expires_at.as_deref()),
         expiry_action: doc.expiry_action.clone(),
         access: access_payload(level),
@@ -2375,6 +2790,43 @@ fn docs_stats_for_folder_payloads(
     Ok(stats)
 }
 
+fn archive_docs_stats_for_folder_payloads(
+    docs: &[DocumentViewRow],
+    folder_by_id: &HashMap<i64, &FolderRecord>,
+) -> Vec<DocStat> {
+    docs.iter()
+        .filter(|document| document_view_is_archived(document, folder_by_id))
+        .map(|document| DocStat {
+            folder: ARCHIVE_ROOT.to_string(),
+            size_bytes: document.size_bytes.unwrap_or(0),
+            mtime: document.committed_at.clone(),
+            latest_by: first_non_empty(
+                document.committed_by_name.clone(),
+                document.committed_by.clone(),
+            ),
+        })
+        .collect()
+}
+
+fn archived_folder_docs_stats(
+    docs: &[DocumentViewRow],
+    scope: &HashSet<i64>,
+    display_path: &str,
+) -> Vec<DocStat> {
+    docs.iter()
+        .filter(|document| document.archived_at.is_none() && scope.contains(&document.folder_id))
+        .map(|document| DocStat {
+            folder: display_path.to_string(),
+            size_bytes: document.size_bytes.unwrap_or(0),
+            mtime: document.committed_at.clone(),
+            latest_by: first_non_empty(
+                document.committed_by_name.clone(),
+                document.committed_by.clone(),
+            ),
+        })
+        .collect()
+}
+
 async fn document_view_rows(pool: &SqlitePool) -> Result<Vec<DocumentViewRow>, ViewError> {
     Ok(sqlx::query_as::<_, DocumentViewRow>(
         r"
@@ -2389,8 +2841,8 @@ async fn document_view_rows(pool: &SqlitePool) -> Result<Vec<DocumentViewRow>, V
             d.version_count,
             d.expires_at,
             d.expiry_action,
-            d.archived_from_folder,
-            d.archived_original_name,
+            d.archived_at,
+            d.archived_origin_path,
             d.archived_access,
             d.current_version_id,
             EXISTS (
@@ -2438,8 +2890,8 @@ async fn document_view_rows_by_ids(
             d.version_count,
             d.expires_at,
             d.expiry_action,
-            d.archived_from_folder,
-            d.archived_original_name,
+            d.archived_at,
+            d.archived_origin_path,
             d.archived_access,
             d.current_version_id,
             EXISTS (
@@ -2486,8 +2938,8 @@ async fn document_view_row_by_id(
             d.version_count,
             d.expires_at,
             d.expiry_action,
-            d.archived_from_folder,
-            d.archived_original_name,
+            d.archived_at,
+            d.archived_origin_path,
             d.archived_access,
             d.current_version_id,
             EXISTS (
@@ -2711,6 +3163,170 @@ fn lock_payload(lock: Option<&DocumentLockRow>) -> LockPayload {
 
 fn folder_is_archive(folder: &FolderRecord) -> bool {
     folder.root_key == ARCHIVE_ROOT_KEY
+}
+
+fn parse_archive_browser_path(path: &str) -> Option<(i64, i64)> {
+    let mut parts = path.split('/');
+    if parts.next()? != ARCHIVE_ROOT {
+        return None;
+    }
+    let ids = parts
+        .map(archive_browser_segment)
+        .collect::<Option<Vec<_>>>()?;
+    Some((ids.first()?.0, ids.last()?.0))
+}
+
+fn archive_browser_segment(segment: &str) -> Option<(i64, &str)> {
+    let (raw_id, name) = segment.strip_prefix('@')?.split_once('~')?;
+    let id = raw_id.parse::<i64>().ok().filter(|id| *id > 0)?;
+    Some((id, name))
+}
+
+fn validate_archive_browser_chain(
+    path: &str,
+    archive_root: &FolderRecord,
+    target: &FolderRecord,
+    folder_by_id: &HashMap<i64, &FolderRecord>,
+) -> Result<(), ViewError> {
+    let segments = path
+        .split('/')
+        .skip(1)
+        .map(archive_browser_segment)
+        .collect::<Option<Vec<_>>>()
+        .ok_or(ViewError::FolderNotFound)?;
+    if segments.is_empty()
+        || segments.first().map(|segment| segment.0) != Some(archive_root.id)
+        || segments.last().map(|segment| segment.0) != Some(target.id)
+    {
+        return Err(ViewError::FolderNotFound);
+    }
+    let mut parent_id = archive_root.parent_id;
+    for (index, (folder_id, name)) in segments.iter().enumerate() {
+        let folder = folder_by_id
+            .get(folder_id)
+            .copied()
+            .ok_or(ViewError::FolderNotFound)?;
+        if folder.name != *name
+            || folder.root_key != VAULT_ROOT_KEY
+            || (index == 0 && folder.id != archive_root.id)
+            || (index > 0 && folder.parent_id != parent_id)
+            || (index > 0 && folder.archived_at.is_some())
+        {
+            return Err(ViewError::FolderNotFound);
+        }
+        parent_id = Some(folder.id);
+    }
+    Ok(())
+}
+
+fn archive_browser_path_for_folder(
+    archive_root_id: i64,
+    target: &FolderRecord,
+    folder_by_id: &HashMap<i64, &FolderRecord>,
+) -> Result<String, ViewError> {
+    let mut current = Some(target);
+    let mut chain = Vec::new();
+    let mut visited = HashSet::new();
+    while let Some(folder) = current {
+        if !visited.insert(folder.id) {
+            return Err(ViewError::FolderNotFound);
+        }
+        chain.push(folder);
+        if folder.id == archive_root_id {
+            chain.reverse();
+            let mut path = ARCHIVE_ROOT.to_string();
+            for part in chain {
+                path.push('/');
+                let _ = write!(path, "@{}~{}", part.id, part.name);
+            }
+            return Ok(path);
+        }
+        if folder.archived_at.is_some() {
+            return Err(ViewError::FolderNotFound);
+        }
+        current = folder
+            .parent_id
+            .and_then(|parent_id| folder_by_id.get(&parent_id).copied());
+    }
+    Err(ViewError::FolderNotFound)
+}
+
+fn nearest_direct_archived_folder<'a>(
+    target: &'a FolderRecord,
+    folder_by_id: &'a HashMap<i64, &'a FolderRecord>,
+) -> Option<&'a FolderRecord> {
+    let mut current = Some(target);
+    let mut visited = HashSet::new();
+    while let Some(folder) = current {
+        if !visited.insert(folder.id) {
+            return None;
+        }
+        if folder.archived_at.is_some() {
+            return Some(folder);
+        }
+        current = folder
+            .parent_id
+            .and_then(|parent_id| folder_by_id.get(&parent_id).copied());
+    }
+    None
+}
+
+fn document_payload_location(
+    document: &DocumentViewRow,
+    folder: &FolderRecord,
+    folder_by_id: &HashMap<i64, &FolderRecord>,
+    path_cache: &HashMap<i64, String>,
+) -> Result<(String, bool, Option<String>), ViewError> {
+    let physical_folder = folder_path_from_cache(folder, path_cache)?;
+    let archived = document_view_is_archived(document, folder_by_id);
+    if !archived {
+        return Ok((physical_folder, false, None));
+    }
+    let fallback_path = Some(join_path(&[&physical_folder, &document.name]));
+    if document.archived_at.is_some() {
+        return Ok((ARCHIVE_ROOT.to_string(), true, fallback_path));
+    }
+    let archive_root =
+        nearest_direct_archived_folder(folder, folder_by_id).ok_or(ViewError::FolderNotFound)?;
+    let display_folder = archive_browser_path_for_folder(archive_root.id, folder, folder_by_id)?;
+    Ok((display_folder, true, fallback_path))
+}
+
+fn document_view_is_archived(
+    document: &DocumentViewRow,
+    folder_by_id: &HashMap<i64, &FolderRecord>,
+) -> bool {
+    if document.archived_at.is_some() {
+        return true;
+    }
+    let mut current = folder_by_id.get(&document.folder_id).copied();
+    let mut visited = HashSet::new();
+    while let Some(folder) = current {
+        if !visited.insert(folder.id) || folder.archived_at.is_some() {
+            return true;
+        }
+        current = folder
+            .parent_id
+            .and_then(|parent_id| folder_by_id.get(&parent_id).copied());
+    }
+    false
+}
+
+fn folder_view_is_archived(
+    folder: &FolderRecord,
+    folder_by_id: &HashMap<i64, &FolderRecord>,
+) -> bool {
+    let mut current = Some(folder);
+    let mut visited = HashSet::new();
+    while let Some(candidate) = current {
+        if !visited.insert(candidate.id) || candidate.archived_at.is_some() {
+            return true;
+        }
+        current = candidate
+            .parent_id
+            .and_then(|parent_id| folder_by_id.get(&parent_id).copied());
+    }
+    false
 }
 
 fn folder_contains_doc_folder(folder: &str, doc_folder: &str) -> bool {

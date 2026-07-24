@@ -5,9 +5,12 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::auth::UserContext;
-use crate::documents::{DocumentError, document_access_level, try_fetch_document_by_id};
+use crate::documents::{
+    DocumentError, archived_folder_access_level, document_access_level, try_fetch_document_by_id,
+};
 use crate::folders::{
-    FolderError, FolderRecord, all_folders, folder_access_level, get_folder_by_path,
+    FolderError, FolderRecord, all_folders, folder_access_level,
+    folder_is_effectively_archived_from_records, get_folder_by_path,
 };
 use crate::views::{self, ViewError};
 
@@ -175,7 +178,13 @@ async fn create_share_target(
         get_folder_by_path(pool, request.path.as_deref()).await?
     }
     .ok_or(FolderError::FolderNotFound)?;
-    if folder_access_level(pool, folder.id, user).await? < 1 {
+    let folders = all_folders(pool).await?;
+    let level = if folder_is_effectively_archived_from_records(folder.id, &folders) {
+        archived_folder_access_level(pool, &folder, user).await?
+    } else {
+        folder_access_level(pool, folder.id, user).await?
+    };
+    if level < 1 {
         return Err(FolderError::FolderNotFound.into());
     }
     Ok(ShareTarget {

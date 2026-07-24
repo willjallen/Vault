@@ -1,4 +1,4 @@
-import { folderBaseName, folderParent, isArchivedPath, isArchiveRootPath } from "./utils.js";
+import { folderBaseName, folderParent, isArchivedPath } from "./utils.js";
 
 export function keyForItem(item) {
   if (item.type === "document") {
@@ -13,6 +13,7 @@ export function docToItem(doc) {
   }
   return {
     archived: Boolean(doc.archived),
+    directly_archived: Boolean(doc.directly_archived),
     archived_from_folder: doc.archived_from_folder || "",
     archived_original_name: doc.archived_original_name || "",
     archived_original_path: doc.archived_original_path || "",
@@ -41,7 +42,10 @@ export function docToItem(doc) {
 
 export function folderToItem(folderItem) {
   return {
-    archived: isArchiveRootPath(folderItem.path || ""),
+    archived: Boolean(folderItem.archived) || isArchivedPath(folderItem.path || ""),
+    directly_archived: Boolean(folderItem.archived_at || folderItem.directly_archived),
+    archived_at: folderItem.archived_at || null,
+    archived_origin_path: folderItem.archived_origin_path || "",
     access: folderItem.access || {},
     can_delete_empty: folderItem.can_delete_empty === true,
     color: folderItem.color || "",

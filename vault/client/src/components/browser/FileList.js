@@ -1,6 +1,7 @@
 import { CONTENTS_VIEW_MODES, contentsVisualSize } from "../../lib/contentsView.js";
+import { browserScopeClasses, canvasDropAttributes } from "../../lib/dropHandlers.js";
 import { writeLocalPreference } from "../../lib/localPreferences.js";
-import { classNames, formatBytes, isArchiveRootPath } from "../../lib/utils.js";
+import { classNames, formatBytes, isArchivedPath } from "../../lib/utils.js";
 import { Icon } from "../common/Icon.js";
 import {
   COLUMN_WIDTH_STORAGE_KEY,
@@ -35,10 +36,6 @@ function itemSelectionKey(item) {
     return `document:${item.id}`;
   }
   return item.id ? `folder:${item.id}` : `folder:${item.path || ""}`;
-}
-
-function classIf(condition, className) {
-  return condition ? className : "";
 }
 
 function rovingSelectionKey(orderedKeys, focusedKey) {
@@ -122,7 +119,7 @@ function fileListState({
   selectedKeys,
   subfolders,
 }) {
-  const inArchive = isArchiveRootPath(folder);
+  const inArchive = isArchivedPath(folder);
   const draftInFolder = inlineFolderDraft && inlineFolderDraft.parent === (folder || "");
   const createDraft = draftInFolder && inlineFolderDraft.mode === "create";
   const hasRows = files.length > 0 || subfolders.length > 0 || createDraft;
@@ -545,6 +542,7 @@ export function VaultFileList({
       type === "document"
         ? {
             archived: Boolean(item.archived),
+            directly_archived: Boolean(item.directly_archived),
             archived_from_folder: item.archived_from_folder || "",
             archived_original_name: item.archived_original_name || "",
             archived_original_path: item.archived_original_path || "",
@@ -557,7 +555,9 @@ export function VaultFileList({
             type: "document",
           }
         : {
-            archived: isArchiveRootPath(item.path || ""),
+            archived: Boolean(item.archived) || isArchivedPath(item.path || ""),
+            directly_archived: Boolean(item.archived_at || item.directly_archived),
+            archived_origin_path: item.archived_origin_path || "",
             id: item.id || null,
             name: item.name,
             path: item.path || "",
@@ -782,18 +782,16 @@ export function VaultFileList({
       className: classNames(
         "finder-browser",
         `finder-view-${contentsView.mode}`,
-        classIf(inArchive, "archived-scope"),
-        classIf(uploadHover, "upload-hover"),
-        classIf(browserDropActive, "drop-target"),
-        classIf(dragActive, "drop-zone-available")
+        ...browserScopeClasses({ browserDropActive, dragActive, inArchive, uploadHover })
       ),
-      "data-vault-drop-kind": "folder",
-      "data-drop-folder": folder || "",
-      "data-drop-label": "Drop here",
-      "data-drop-active": browserDropActive ? "true" : undefined,
-      onDragOver: onCanvasDragOver,
-      onDragLeave: onCanvasDragLeave,
-      onDrop: onCanvasDrop,
+      ...canvasDropAttributes({
+        browserDropActive,
+        folder,
+        inArchive,
+        onCanvasDragLeave,
+        onCanvasDragOver,
+        onCanvasDrop,
+      }),
       onClick: handleBackgroundClick,
       style: contentColumnStyle(columnWidths),
     },

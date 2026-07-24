@@ -1,20 +1,21 @@
 use std::time::Duration;
 
-use serde_json::json;
 use tokio::sync::oneshot;
 use vault_server::auth::UserContext;
 use vault_server::db;
 use vault_server::documents::{
-    AccessPayload, ClientMeta, DocumentError, access_payload, archive_access_snapshot,
-    archive_folder, delete_document_forever, document_access_level, document_folder_path,
-    document_for_read, document_for_write, document_is_archive, document_path,
-    editable_document_for_write, fetch_document_by_id, lock_document, move_document,
-    normalize_file_name,
+    AccessPayload, ClientMeta, DocumentError, access_payload, archive_document, archive_folder,
+    delete_archived_folder_forever, delete_document_forever, document_access_level,
+    document_folder_path, document_for_read, document_for_write, document_is_archive,
+    document_path, editable_document_for_write, fetch_document_by_id, lock_document, move_document,
+    normalize_file_name, restore_document, restore_folder,
 };
 use vault_server::folders::{
-    ARCHIVE_ROOT_KEY, VAULT_ROOT_KEY, add_folder_permission, get_or_create_folder_path,
-    get_root_folder,
+    ARCHIVE_ROOT_KEY, FolderError, FolderRetentionUpdate, VAULT_ROOT_KEY, add_folder_permission,
+    create_folder_path, get_or_create_folder_path, get_root_folder, move_folder, rename_folder,
+    update_folder_retention,
 };
+use vault_server::views::build_contents_payload;
 
 async fn test_pool() -> sqlx::SqlitePool {
     let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -79,7 +80,6 @@ async fn assert_waiting_on_writer_gate<T>(task: &mut tokio::task::JoinHandle<T>)
 }
 
 struct ArchiveRaceExpectation {
-    archive_root: i64,
     source: i64,
     child: i64,
     late_folder: i64,
@@ -93,7 +93,7 @@ struct ArchiveRaceExpectation {
 async fn assert_archive_race_state(pool: &sqlx::SqlitePool, expected: ArchiveRaceExpectation) {
     let rows = sqlx::query_as::<_, (i64, i64, Option<String>)>(
         r"
-        SELECT id, folder_id, archived_from_folder
+        SELECT id, folder_id, archived_at
         FROM documents
         WHERE id IN (?, ?, ?, ?)
         ORDER BY id
@@ -107,22 +107,10 @@ async fn assert_archive_race_state(pool: &sqlx::SqlitePool, expected: ArchiveRac
     .await
     .expect("documents after archive");
     assert_eq!(rows.len(), 4);
-    assert!(rows.contains(&(
-        expected.original,
-        expected.archive_root,
-        Some("Project/Work".to_string()),
-    )));
+    assert!(rows.contains(&(expected.original, expected.source, None)));
     assert!(rows.contains(&(expected.moved_out, expected.safe, None)));
-    assert!(rows.contains(&(
-        expected.moved_in,
-        expected.archive_root,
-        Some("Project/Work/Sub".to_string()),
-    )));
-    assert!(rows.contains(&(
-        expected.late_document,
-        expected.archive_root,
-        Some("Project/Work/Late".to_string()),
-    )));
+    assert!(rows.contains(&(expected.moved_in, expected.child, None)));
+    assert!(rows.contains(&(expected.late_document, expected.late_folder, None)));
     let source_folders =
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM folders WHERE id IN (?, ?, ?)")
             .bind(expected.source)
@@ -131,7 +119,14 @@ async fn assert_archive_race_state(pool: &sqlx::SqlitePool, expected: ArchiveRac
             .fetch_one(pool)
             .await
             .expect("source folder count");
-    assert_eq!(source_folders, 0);
+    assert_eq!(source_folders, 3);
+    let source_archived: Option<String> =
+        sqlx::query_scalar("SELECT archived_at FROM folders WHERE id = ?")
+            .bind(expected.source)
+            .fetch_one(pool)
+            .await
+            .expect("source archive marker");
+    assert!(source_archived.is_some());
 }
 
 #[test]
@@ -310,12 +305,18 @@ async fn archived_document_access_is_capped_by_archive_and_source_snapshot() {
         .await
         .expect("writer archive");
 
-    let snapshot = archive_access_snapshot(&pool, project.id)
-        .await
-        .expect("snapshot");
-    let archived_access = json!(snapshot).to_string();
-    let document_id =
-        insert_document(&pool, archive_root.id, "plan.txt", Some(archived_access)).await;
+    let document_id = insert_document(&pool, project.id, "plan.txt", None).await;
+    archive_document(
+        &pool,
+        document_id,
+        &user(&["outsiders"], true),
+        &ClientMeta {
+            ip: None,
+            user_agent: None,
+        },
+    )
+    .await
+    .expect("archive document");
     let document = fetch_document_by_id(&pool, document_id)
         .await
         .expect("document");
@@ -366,21 +367,18 @@ async fn delete_forever_rechecks_archive_state_after_restore_wins_writer_gate() 
     let project = get_or_create_folder_path(&pool, Some("Project"))
         .await
         .expect("project");
-    let archive_root = get_root_folder(&pool, ARCHIVE_ROOT_KEY)
-        .await
-        .expect("archive root");
-    let document_id = insert_document(&pool, archive_root.id, "restore.txt", None).await;
-    sqlx::query(
-        r"
-        UPDATE documents
-        SET archived_from_folder = 'Project', archived_original_name = name
-        WHERE id = ?
-        ",
+    let document_id = insert_document(&pool, project.id, "restore.txt", None).await;
+    archive_document(
+        &pool,
+        document_id,
+        &user(&[], true),
+        &ClientMeta {
+            ip: None,
+            user_agent: None,
+        },
     )
-    .bind(document_id)
-    .execute(&pool)
     .await
-    .expect("archive metadata");
+    .expect("archive document");
 
     let mut gate = pool
         .begin_with("BEGIN IMMEDIATE")
@@ -400,14 +398,12 @@ async fn delete_forever_rechecks_archive_state_after_restore_wins_writer_gate() 
         r"
         UPDATE documents
         SET
-            folder_id = ?,
-            archived_from_folder = NULL,
-            archived_original_name = NULL,
+            archived_at = NULL,
+            archived_origin_path = NULL,
             archived_access = NULL
         WHERE id = ?
         ",
     )
-    .bind(project.id)
     .bind(document_id)
     .execute(&mut *gate)
     .await
@@ -425,7 +421,7 @@ async fn delete_forever_rechecks_archive_state_after_restore_wins_writer_gate() 
     ));
     let remaining = sqlx::query_as::<_, (i64, Option<String>, Option<String>)>(
         r"
-        SELECT folder_id, archived_from_folder, archived_original_name
+        SELECT folder_id, archived_at, archived_origin_path
         FROM documents
         WHERE id = ?
         ",
@@ -443,9 +439,6 @@ async fn lock_rechecks_document_after_archive_wins_writer_gate() {
     let source = get_or_create_folder_path(&pool, Some("Project"))
         .await
         .expect("source folder");
-    let archive_root = get_root_folder(&pool, ARCHIVE_ROOT_KEY)
-        .await
-        .expect("archive root");
     let document_id = insert_document(&pool, source.id, "locking.txt", None).await;
     let mut gate = pool
         .begin_with("BEGIN IMMEDIATE")
@@ -474,14 +467,12 @@ async fn lock_rechecks_document_after_archive_wins_writer_gate() {
         r"
         UPDATE documents
         SET
-            folder_id = ?,
-            archived_from_folder = 'Project',
-            archived_original_name = name,
+            archived_at = CURRENT_TIMESTAMP,
+            archived_origin_path = 'Project/locking.txt',
             archived_access = '{}'
         WHERE id = ?
         ",
     )
-    .bind(archive_root.id)
     .bind(document_id)
     .execute(&mut *gate)
     .await
@@ -512,9 +503,6 @@ async fn move_rechecks_document_after_archive_wins_writer_gate() {
     get_or_create_folder_path(&pool, Some("Safe"))
         .await
         .expect("safe folder");
-    let archive_root = get_root_folder(&pool, ARCHIVE_ROOT_KEY)
-        .await
-        .expect("archive root");
     let document_id = insert_document(&pool, source.id, "moving.txt", None).await;
     let mut gate = pool
         .begin_with("BEGIN IMMEDIATE")
@@ -544,14 +532,12 @@ async fn move_rechecks_document_after_archive_wins_writer_gate() {
         r"
         UPDATE documents
         SET
-            folder_id = ?,
-            archived_from_folder = 'Project',
-            archived_original_name = name,
+            archived_at = CURRENT_TIMESTAMP,
+            archived_origin_path = 'Project/moving.txt',
             archived_access = '{}'
         WHERE id = ?
         ",
     )
-    .bind(archive_root.id)
     .bind(document_id)
     .execute(&mut *gate)
     .await
@@ -568,13 +554,14 @@ async fn move_rechecks_document_after_archive_wins_writer_gate() {
         DocumentError::UseArchiveOrRestoreForArchiveMoves
     ));
     let state = sqlx::query_as::<_, (i64, Option<String>)>(
-        "SELECT folder_id, archived_from_folder FROM documents WHERE id = ?",
+        "SELECT folder_id, archived_at FROM documents WHERE id = ?",
     )
     .bind(document_id)
     .fetch_one(&pool)
     .await
     .expect("archived document state");
-    assert_eq!(state, (archive_root.id, Some("Project".to_string())));
+    assert_eq!(state.0, source.id);
+    assert!(state.1.is_some());
 }
 
 #[tokio::test]
@@ -592,9 +579,6 @@ async fn archive_folder_uses_subtree_and_documents_committed_before_writer_gate_
     let outside = get_or_create_folder_path(&pool, Some("Outside"))
         .await
         .expect("outside folder");
-    let archive_root = get_root_folder(&pool, ARCHIVE_ROOT_KEY)
-        .await
-        .expect("archive root");
     let original_id = insert_document(&pool, source.id, "original.txt", None).await;
     let moved_out_id = insert_document(&pool, child.id, "outbound.txt", None).await;
     let moved_in_id = insert_document(&pool, outside.id, "inbound.txt", None).await;
@@ -663,12 +647,11 @@ async fn archive_folder_uses_subtree_and_documents_committed_before_writer_gate_
         .expect("folder archive timed out")
         .expect("archive task")
         .expect("archive folder");
-    assert_eq!(result, "Archive");
+    assert_eq!(result, "Archive/Work");
 
     assert_archive_race_state(
         &pool,
         ArchiveRaceExpectation {
-            archive_root: archive_root.id,
             source: source.id,
             child: child.id,
             late_folder: late_folder_id,
@@ -680,4 +663,580 @@ async fn archive_folder_uses_subtree_and_documents_committed_before_writer_gate_
         },
     )
     .await;
+}
+
+#[tokio::test]
+async fn restore_target_identity_survives_source_folder_rename() {
+    let pool = test_pool().await;
+    let actor = user(&[], true);
+    let source = get_or_create_folder_path(&pool, Some("Projects/Incoming"))
+        .await
+        .expect("source folder");
+    let document_id = insert_document(&pool, source.id, "renamed-source.txt", None).await;
+    let meta = ClientMeta {
+        ip: None,
+        user_agent: None,
+    };
+
+    archive_document(&pool, document_id, &actor, &meta)
+        .await
+        .expect("archive document");
+    rename_folder(&pool, source.id, Some("Projects"), "Accepted", &actor)
+        .await
+        .expect("rename original source");
+    let replacement = create_folder_path(&pool, "Projects/Incoming", &actor)
+        .await
+        .expect("create replacement at archived path");
+
+    let restored_path = restore_document(&pool, document_id, &actor, &meta)
+        .await
+        .expect("restore document");
+    let stored_folder_id: i64 = sqlx::query_scalar("SELECT folder_id FROM documents WHERE id = ?")
+        .bind(document_id)
+        .fetch_one(&pool)
+        .await
+        .expect("restored document");
+
+    assert_ne!(source.id, replacement.id);
+    assert_eq!(
+        stored_folder_id, source.id,
+        "restore silently rebound the document to replacement folder {}",
+        replacement.id
+    );
+    assert_eq!(restored_path, "Projects/Accepted/renamed-source.txt");
+}
+
+#[tokio::test]
+async fn restore_target_identity_blocks_delete_ttl_drift_after_source_move() {
+    let pool = test_pool().await;
+    let actor = user(&[], true);
+    let source = get_or_create_folder_path(&pool, Some("Records/Incoming"))
+        .await
+        .expect("source folder");
+    get_or_create_folder_path(&pool, Some("LongTerm"))
+        .await
+        .expect("move destination");
+    let document_id = insert_document(&pool, source.id, "retention.txt", None).await;
+    let meta = ClientMeta {
+        ip: None,
+        user_agent: None,
+    };
+
+    archive_document(&pool, document_id, &actor, &meta)
+        .await
+        .expect("archive document");
+    move_folder(&pool, source.id, "LongTerm", &actor)
+        .await
+        .expect("move original source");
+    let replacement = create_folder_path(&pool, "Records/Incoming", &actor)
+        .await
+        .expect("create replacement at archived path");
+    update_folder_retention(
+        &pool,
+        "Records/Incoming",
+        &FolderRetentionUpdate {
+            default_ttl_days: Some(1),
+            default_ttl_action: Some("delete".to_string()),
+        },
+        &actor,
+    )
+    .await
+    .expect("set replacement retention");
+
+    restore_document(&pool, document_id, &actor, &meta)
+        .await
+        .expect("restore document");
+    let restored: (i64, Option<String>) =
+        sqlx::query_as("SELECT folder_id, expiry_action FROM documents WHERE id = ?")
+            .bind(document_id)
+            .fetch_one(&pool)
+            .await
+            .expect("restored document");
+
+    assert_ne!(source.id, replacement.id);
+    assert_eq!(
+        restored.1, None,
+        "restore inherited the replacement folder's automatic-delete policy"
+    );
+    assert_eq!(restored.0, source.id);
+}
+
+#[tokio::test]
+async fn restore_target_identity_blocks_acl_drift_after_ancestor_rename() {
+    let pool = test_pool().await;
+    let actor = user(&[], true);
+    let readers = create_group(&pool, "readers").await;
+    let root = get_root_folder(&pool, VAULT_ROOT_KEY)
+        .await
+        .expect("vault root");
+    add_folder_permission(&pool, root.id, readers, true, true, false)
+        .await
+        .expect("reader root access");
+    let ancestor = get_or_create_folder_path(&pool, Some("Projects"))
+        .await
+        .expect("source ancestor");
+    let source = get_or_create_folder_path(&pool, Some("Projects/Incoming"))
+        .await
+        .expect("source folder");
+    add_folder_permission(&pool, source.id, readers, false, false, false)
+        .await
+        .expect("hide original source from readers");
+    let document_id = insert_document(&pool, source.id, "private.txt", None).await;
+    let meta = ClientMeta {
+        ip: None,
+        user_agent: None,
+    };
+
+    archive_document(&pool, document_id, &actor, &meta)
+        .await
+        .expect("archive document");
+    rename_folder(&pool, ancestor.id, Some(""), "ActiveProjects", &actor)
+        .await
+        .expect("rename source ancestor");
+    create_folder_path(&pool, "Projects", &actor)
+        .await
+        .expect("recreate old ancestor");
+    let replacement = create_folder_path(&pool, "Projects/Incoming", &actor)
+        .await
+        .expect("recreate old subtree");
+
+    restore_document(&pool, document_id, &actor, &meta)
+        .await
+        .expect("restore document");
+    let restored = fetch_document_by_id(&pool, document_id)
+        .await
+        .expect("restored document");
+    let reader_access = document_access_level(&pool, &restored, &user(&["readers"], false))
+        .await
+        .expect("reader access");
+
+    assert_ne!(source.id, replacement.id);
+    assert_eq!(
+        reader_access, 0,
+        "restore exposed the document through replacement folder {}",
+        replacement.id
+    );
+    assert_eq!(restored.folder_id, source.id);
+}
+
+#[tokio::test]
+async fn archive_identity_model_folder_restore_retains_the_original_subtree() {
+    let pool = test_pool().await;
+    let actor = user(&[], true);
+    let parent = get_or_create_folder_path(&pool, Some("Projects"))
+        .await
+        .expect("parent");
+    let source = get_or_create_folder_path(&pool, Some("Projects/Incoming"))
+        .await
+        .expect("source");
+    let child = get_or_create_folder_path(&pool, Some("Projects/Incoming/Nested"))
+        .await
+        .expect("child");
+    let document_id = insert_document(&pool, child.id, "payload.bin", None).await;
+    let meta = ClientMeta {
+        ip: None,
+        user_agent: None,
+    };
+
+    archive_folder(&pool, source.id, &actor, &meta)
+        .await
+        .expect("archive folder");
+    rename_folder(&pool, parent.id, Some(""), "Accepted", &actor)
+        .await
+        .expect("rename parent");
+    let restored_path = restore_folder(&pool, source.id, &actor)
+        .await
+        .expect("restore folder");
+
+    let stored_document_folder: i64 =
+        sqlx::query_scalar("SELECT folder_id FROM documents WHERE id = ?")
+            .bind(document_id)
+            .fetch_one(&pool)
+            .await
+            .expect("document folder");
+    let archived_at: Option<String> =
+        sqlx::query_scalar("SELECT archived_at FROM folders WHERE id = ?")
+            .bind(source.id)
+            .fetch_one(&pool)
+            .await
+            .expect("folder marker");
+    assert_eq!(restored_path, "Accepted/Incoming");
+    assert_eq!(stored_document_folder, child.id);
+    assert!(archived_at.is_none());
+}
+
+#[tokio::test]
+async fn archive_identity_model_folder_restore_rejects_a_reused_name_without_rebinding() {
+    let pool = test_pool().await;
+    let actor = user(&[], true);
+    let source = get_or_create_folder_path(&pool, Some("Projects/Incoming"))
+        .await
+        .expect("source");
+    let document_id = insert_document(&pool, source.id, "payload.bin", None).await;
+    let meta = ClientMeta {
+        ip: None,
+        user_agent: None,
+    };
+
+    archive_folder(&pool, source.id, &actor, &meta)
+        .await
+        .expect("archive folder");
+    let replacement = create_folder_path(&pool, "Projects/Incoming", &actor)
+        .await
+        .expect("replacement");
+    let error = restore_folder(&pool, source.id, &actor)
+        .await
+        .expect_err("name conflict must block restore");
+
+    assert!(matches!(
+        error,
+        DocumentError::Folder(FolderError::TargetFolderAlreadyExists)
+    ));
+    assert_ne!(source.id, replacement.id);
+    let state: (i64, Option<String>) =
+        sqlx::query_as("SELECT folder_id, archived_at FROM documents WHERE id = ?")
+            .bind(document_id)
+            .fetch_one(&pool)
+            .await
+            .expect("archived document");
+    assert_eq!(state.0, source.id);
+    assert!(
+        state.1.is_none(),
+        "folder archive must not mark every document"
+    );
+    let folder_marker: Option<String> =
+        sqlx::query_scalar("SELECT archived_at FROM folders WHERE id = ?")
+            .bind(source.id)
+            .fetch_one(&pool)
+            .await
+            .expect("source marker");
+    assert!(folder_marker.is_some());
+}
+
+#[tokio::test]
+async fn archive_identity_model_parent_restore_preserves_an_independent_child_archive() {
+    let pool = test_pool().await;
+    let actor = user(&[], true);
+    let parent = get_or_create_folder_path(&pool, Some("Project"))
+        .await
+        .expect("parent");
+    let child = get_or_create_folder_path(&pool, Some("Project/Independent"))
+        .await
+        .expect("child");
+    let parent_document = insert_document(&pool, parent.id, "parent.txt", None).await;
+    let child_document = insert_document(&pool, child.id, "child.txt", None).await;
+    let meta = ClientMeta {
+        ip: None,
+        user_agent: None,
+    };
+
+    archive_folder(&pool, child.id, &actor, &meta)
+        .await
+        .expect("archive child");
+    archive_folder(&pool, parent.id, &actor, &meta)
+        .await
+        .expect("archive parent");
+    let archive = build_contents_payload(&pool, "Archive", &actor, "", false)
+        .await
+        .expect("archive contents");
+    assert_eq!(
+        archive
+            .folders
+            .iter()
+            .map(|folder| folder.id)
+            .collect::<std::collections::HashSet<_>>(),
+        std::collections::HashSet::from([parent.id, child.id])
+    );
+    let parent_archive_path = archive
+        .folders
+        .iter()
+        .find(|folder| folder.id == parent.id)
+        .expect("parent archive root")
+        .path
+        .clone();
+    let parent_contents = build_contents_payload(&pool, &parent_archive_path, &actor, "", false)
+        .await
+        .expect("parent archive contents");
+    assert!(
+        parent_contents
+            .folders
+            .iter()
+            .all(|folder| folder.id != child.id),
+        "independently archived child must remain a separate archive root"
+    );
+    restore_folder(&pool, parent.id, &actor)
+        .await
+        .expect("restore parent");
+
+    let child_marker: Option<String> =
+        sqlx::query_scalar("SELECT archived_at FROM folders WHERE id = ?")
+            .bind(child.id)
+            .fetch_one(&pool)
+            .await
+            .expect("child marker");
+    let parent_record = fetch_document_by_id(&pool, parent_document)
+        .await
+        .expect("parent document");
+    let child_record = fetch_document_by_id(&pool, child_document)
+        .await
+        .expect("child document");
+    assert!(child_marker.is_some());
+    assert!(
+        !document_is_archive(&pool, &parent_record)
+            .await
+            .expect("parent document state")
+    );
+    assert!(
+        document_is_archive(&pool, &child_record)
+            .await
+            .expect("child document state")
+    );
+}
+
+#[tokio::test]
+async fn archive_identity_model_parent_delete_never_cascades_into_separate_archive_entries() {
+    let pool = test_pool().await;
+    let actor = user(&[], true);
+    let parent = get_or_create_folder_path(&pool, Some("Project"))
+        .await
+        .expect("parent");
+    let child = get_or_create_folder_path(&pool, Some("Project/Independent"))
+        .await
+        .expect("child");
+    insert_document(&pool, parent.id, "owned-by-parent.txt", None).await;
+    let independent_document =
+        insert_document(&pool, parent.id, "independent-document.txt", None).await;
+    insert_document(&pool, child.id, "independent-child.txt", None).await;
+    let meta = ClientMeta {
+        ip: None,
+        user_agent: None,
+    };
+
+    archive_document(&pool, independent_document, &actor, &meta)
+        .await
+        .expect("archive document separately");
+    archive_folder(&pool, child.id, &actor, &meta)
+        .await
+        .expect("archive child separately");
+    archive_folder(&pool, parent.id, &actor, &meta)
+        .await
+        .expect("archive parent");
+
+    let error = delete_archived_folder_forever(&pool, parent.id, &actor)
+        .await
+        .expect_err("parent delete must preserve separate archive entries");
+    assert!(matches!(
+        error,
+        DocumentError::FolderContainsIndependentArchiveEntries
+    ));
+
+    delete_archived_folder_forever(&pool, child.id, &actor)
+        .await
+        .expect("delete independent child explicitly");
+    let error = delete_archived_folder_forever(&pool, parent.id, &actor)
+        .await
+        .expect_err("independent document must still block parent delete");
+    assert!(matches!(
+        error,
+        DocumentError::FolderContainsIndependentArchiveEntries
+    ));
+    assert!(
+        fetch_document_by_id(&pool, independent_document)
+            .await
+            .is_ok(),
+        "blocked parent deletion must preserve the separately archived document"
+    );
+
+    delete_document_forever(&pool, independent_document, &actor)
+        .await
+        .expect("delete independent document explicitly");
+    delete_archived_folder_forever(&pool, parent.id, &actor)
+        .await
+        .expect("delete parent once it owns the remaining subtree");
+}
+
+#[tokio::test]
+async fn archive_identity_model_aggregate_mutations_require_write_access_to_the_owned_subtree() {
+    let pool = test_pool().await;
+    let writers = create_group(&pool, "writers").await;
+    let restricted = create_group(&pool, "restricted").await;
+    let vault_root = get_root_folder(&pool, VAULT_ROOT_KEY)
+        .await
+        .expect("vault root");
+    let archive_root = get_root_folder(&pool, ARCHIVE_ROOT_KEY)
+        .await
+        .expect("archive root");
+    add_folder_permission(&pool, vault_root.id, writers, true, true, true)
+        .await
+        .expect("vault permission");
+    add_folder_permission(&pool, archive_root.id, writers, true, true, true)
+        .await
+        .expect("archive permission");
+    let parent = get_or_create_folder_path(&pool, Some("Project"))
+        .await
+        .expect("parent");
+    let restricted_child = get_or_create_folder_path(&pool, Some("Project/Restricted"))
+        .await
+        .expect("restricted child");
+    add_folder_permission(&pool, parent.id, writers, true, true, true)
+        .await
+        .expect("parent permission");
+    add_folder_permission(&pool, restricted_child.id, restricted, true, true, true)
+        .await
+        .expect("restricted boundary");
+    let protected_document =
+        insert_document(&pool, restricted_child.id, "protected.txt", None).await;
+    sqlx::query(
+        r"
+        INSERT INTO vault_settings (key, value)
+        VALUES ('archivePermanentDeleteAdminOnly', 'false')
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        ",
+    )
+    .execute(&pool)
+    .await
+    .expect("allow writer permanent delete");
+    let admin = user(&[], true);
+    let writer = user(&["writers"], false);
+    archive_folder(
+        &pool,
+        parent.id,
+        &admin,
+        &ClientMeta {
+            ip: None,
+            user_agent: None,
+        },
+    )
+    .await
+    .expect("admin archives aggregate");
+
+    let delete_error = delete_archived_folder_forever(&pool, parent.id, &writer)
+        .await
+        .expect_err("writer must not delete a restricted descendant");
+    assert!(matches!(
+        delete_error,
+        DocumentError::InsufficientDocumentAccess
+    ));
+    let restore_error = restore_folder(&pool, parent.id, &writer)
+        .await
+        .expect_err("writer must not restore a restricted descendant");
+    assert!(matches!(
+        restore_error,
+        DocumentError::InsufficientDocumentAccess
+    ));
+
+    assert!(
+        fetch_document_by_id(&pool, protected_document)
+            .await
+            .is_ok(),
+        "denied aggregate mutations must preserve restricted data"
+    );
+    let marker: Option<String> = sqlx::query_scalar("SELECT archived_at FROM folders WHERE id = ?")
+        .bind(parent.id)
+        .fetch_one(&pool)
+        .await
+        .expect("parent marker");
+    assert!(marker.is_some());
+}
+
+#[tokio::test]
+async fn archive_identity_model_folder_archive_blocks_an_active_bound_upload() {
+    let pool = test_pool().await;
+    let actor = user(&[], true);
+    let source = get_or_create_folder_path(&pool, Some("Project"))
+        .await
+        .expect("source");
+    let child = get_or_create_folder_path(&pool, Some("Project/Incoming"))
+        .await
+        .expect("child");
+    sqlx::query(
+        r"
+        INSERT INTO upload_sessions
+            (
+                id, mode, status, target_folder_id, filename, total_size,
+                chunk_size, part_count, created_by, user_context, expires_at
+            )
+        VALUES
+            ('bound-upload', 'create', 'active', ?, 'pending.bin', 1, 1, 1,
+             'admin', '{}', '2999-01-01T00:00:00Z')
+        ",
+    )
+    .bind(child.id)
+    .execute(&pool)
+    .await
+    .expect("upload");
+
+    let error = archive_folder(
+        &pool,
+        source.id,
+        &actor,
+        &ClientMeta {
+            ip: None,
+            user_agent: None,
+        },
+    )
+    .await
+    .expect_err("active upload must block folder archive");
+    assert!(matches!(error, DocumentError::FolderHasActiveUploads));
+    let marker: Option<String> = sqlx::query_scalar("SELECT archived_at FROM folders WHERE id = ?")
+        .bind(source.id)
+        .fetch_one(&pool)
+        .await
+        .expect("source marker");
+    assert!(marker.is_none());
+}
+
+#[tokio::test]
+async fn archive_identity_model_archive_is_flat_but_archived_folders_are_browsable() {
+    let pool = test_pool().await;
+    let actor = user(&[], true);
+    let source = get_or_create_folder_path(&pool, Some("Project"))
+        .await
+        .expect("source");
+    let child = get_or_create_folder_path(&pool, Some("Project/Nested"))
+        .await
+        .expect("child");
+    let nested_document = insert_document(&pool, child.id, "inside.txt", None).await;
+    let loose_folder = get_or_create_folder_path(&pool, Some("Loose"))
+        .await
+        .expect("loose folder");
+    let loose_document = insert_document(&pool, loose_folder.id, "loose.txt", None).await;
+    let meta = ClientMeta {
+        ip: None,
+        user_agent: None,
+    };
+
+    archive_folder(&pool, source.id, &actor, &meta)
+        .await
+        .expect("archive folder");
+    archive_document(&pool, loose_document, &actor, &meta)
+        .await
+        .expect("archive document");
+
+    let archive = build_contents_payload(&pool, "Archive", &actor, "", false)
+        .await
+        .expect("archive contents");
+    assert_eq!(archive.folders.len(), 1);
+    assert_eq!(archive.folders[0].id, source.id);
+    assert_eq!(archive.documents.len(), 1);
+    assert_eq!(archive.documents[0].id, loose_document);
+    assert!(archive.folders[0].path.starts_with("Archive/@"));
+
+    let archived_root = build_contents_payload(&pool, &archive.folders[0].path, &actor, "", false)
+        .await
+        .expect("browse archived root");
+    assert_eq!(archived_root.folders.len(), 1);
+    assert_eq!(archived_root.folders[0].id, child.id);
+    assert!(archived_root.documents.is_empty());
+
+    let archived_child =
+        build_contents_payload(&pool, &archived_root.folders[0].path, &actor, "", false)
+            .await
+            .expect("browse archived child");
+    assert_eq!(archived_child.documents.len(), 1);
+    assert_eq!(archived_child.documents[0].id, nested_document);
+    assert_eq!(
+        archived_child.documents[0].archived_original_path,
+        "Project/Nested/inside.txt"
+    );
 }

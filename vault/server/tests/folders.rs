@@ -232,8 +232,8 @@ async fn folder_path_helpers_tolerate_corrupt_parent_cycle() {
         id: 1,
         folder_id: first_id,
         name: "loop.txt".to_string(),
-        archived_from_folder: None,
-        archived_original_name: None,
+        archived_at: None,
+        archived_origin_path: None,
         archived_access: None,
     };
     let full_path = document_path(&pool, &doc).await.expect("document path");

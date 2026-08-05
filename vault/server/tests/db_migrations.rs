@@ -12,11 +12,10 @@ use support::migration_fixtures::v2_1_0::{
 };
 use vault_server::db;
 
-const CURRENT_HISTORY: [(i64, &str); 4] = [
+const CURRENT_HISTORY: [(i64, &str); 3] = [
     (1, "content previews"),
     (2, "normalize root folders"),
-    (3, "bind uploads to target folders"),
-    (4, "preserve archived item identities"),
+    (3, "preserve stored item identities"),
 ];
 const BASELINE_TABLES: [&str; 21] = [
     "folders",

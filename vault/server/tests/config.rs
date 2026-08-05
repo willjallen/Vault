@@ -15,6 +15,11 @@ fn root_file(path: &str) -> String {
 
 #[test]
 fn rust_config_uses_single_data_dir_defaults() {
+    /*
+     * Parses the minimum command line containing only a data directory. It checks that database,
+     * object, and transfer paths derive from that directory and that every operational limit and
+     * site setting starts at its documented default.
+     */
     let data_dir = tempfile::tempdir().expect("tempdir");
     let config = Config::try_parse_from([
         "vault-server",
@@ -48,6 +53,11 @@ fn rust_config_uses_single_data_dir_defaults() {
 
 #[test]
 fn explicit_runtime_paths_and_site_name_override_data_dir() {
+    /*
+     * Parses a command line that explicitly supplies every path, listener, storage, branding,
+     * and numeric runtime option. It checks each supplied value wins over the
+     * data-directory-derived defaults without being lost or redirected.
+     */
     let base = tempfile::tempdir().expect("tempdir");
     let data_dir = base.path().join("data");
     let db_path = base.path().join("metadata").join("vault.db");
@@ -128,6 +138,12 @@ fn explicit_runtime_paths_and_site_name_override_data_dir() {
 
 #[test]
 fn runtime_numeric_values_normalize_to_python_compatible_bounds() {
+    /*
+     * Parses zero, negative, undersized, oversized, and mutually inconsistent runtime limits,
+     * then normalizes the configuration. It checks each field is clamped to the
+     * compatibility bounds and that worker and per-user limits cannot exceed the global job
+     * limit.
+     */
     let config = Config::try_parse_from([
         "vault-server",
         "--max-upload-bytes",
@@ -172,6 +188,11 @@ fn runtime_numeric_values_normalize_to_python_compatible_bounds() {
 
 #[test]
 fn export_worker_count_has_an_absolute_task_bound() {
+    /*
+     * Supplies the largest signed integer for both export workers and admitted jobs. It checks
+     * normalization caps spawned worker tasks at 64 without imposing that implementation limit
+     * on the separately configured job-admission count.
+     */
     let config = Config::try_parse_from([
         "vault-server",
         "--export-workers",
@@ -188,6 +209,11 @@ fn export_worker_count_has_an_absolute_task_bound() {
 
 #[test]
 fn legacy_object_path_env_fallback_matches_python_runtime_compatibility() {
+    /*
+     * Resolves object storage with both legacy environment variables present, then with only the
+     * older files variable and with neither. It checks the compatibility precedence before
+     * falling back to the objects directory under the configured data root.
+     */
     let base = tempfile::tempdir().expect("tempdir");
     let data_dir = base.path().join("data");
     let legacy_objects_path = base.path().join("legacy-objects");
@@ -217,6 +243,11 @@ fn legacy_object_path_env_fallback_matches_python_runtime_compatibility() {
 
 #[test]
 fn explicit_object_path_overrides_legacy_object_path_env_fallbacks() {
+    /*
+     * Configures an explicit objects path while also exposing a conflicting legacy environment
+     * value. It checks the command-line path remains authoritative instead of being replaced by
+     * a compatibility fallback.
+     */
     let base = tempfile::tempdir().expect("tempdir");
     let data_dir = base.path().join("data");
     let explicit_objects_path = base.path().join("explicit-objects");
@@ -240,6 +271,10 @@ fn explicit_object_path_overrides_legacy_object_path_env_fallbacks() {
 
 #[test]
 fn app_version_comes_from_version_file() {
+    /*
+     * Reads the repository VERSION file independently of the server helper. It checks the
+     * runtime application version is sourced from that file after trimming its line ending.
+     */
     let expected = std::fs::read_to_string(repo_root().join("VERSION")).expect("VERSION");
 
     assert_eq!(vault_server::version::app_version(), expected.trim());
@@ -247,6 +282,10 @@ fn app_version_comes_from_version_file() {
 
 #[test]
 fn cli_version_comes_from_version_file() {
+    /*
+     * Inspects the version registered with the generated command-line interface. It checks the
+     * CLI reports the same VERSION-backed value as the running application.
+     */
     assert_eq!(
         Config::command().get_version(),
         Some(vault_server::version::app_version())
@@ -255,6 +294,12 @@ fn cli_version_comes_from_version_file() {
 
 #[test]
 fn dockerfile_runs_rust_server_with_single_data_volume_contract() {
+    /*
+     * Treats the Dockerfile as a deployment contract and checks its asset, Rust build, and
+     * minimal runtime stages. It also verifies the non-root server, health check, paths, and
+     * single `/data` volume are present while legacy Python and split-volume settings are
+     * absent.
+     */
     let dockerfile = root_file("Dockerfile");
 
     assert!(dockerfile.contains("FROM node:22-slim AS assets"));
@@ -285,6 +330,12 @@ fn dockerfile_runs_rust_server_with_single_data_volume_contract() {
 
 #[test]
 fn production_compose_uses_latest_image_single_data_volume_and_hardened_defaults() {
+    /*
+     * Inspects the production Compose file for its image, bind address, volume, authentication,
+     * transfer, export, security, OIDC, and object-storage defaults. It checks the public
+     * template stays configurable but conservative, and excludes development credentials,
+     * legacy volumes, and an all-interface default bind.
+     */
     let compose = root_file("docker-compose.yml");
 
     assert!(compose.contains("ghcr.io/willjallen/vault:latest"));
@@ -386,6 +437,11 @@ fn production_compose_uses_latest_image_single_data_volume_and_hardened_defaults
 
 #[test]
 fn development_compose_is_the_only_compose_file_that_enables_dev_auth() {
+    /*
+     * Compares the production and development Compose definitions. It checks development mode
+     * and its local authentication shortcut exist only in the build-based development
+     * overlay, without introducing a fixed session secret or version override.
+     */
     let compose = root_file("docker-compose.yml");
     let dev_compose = root_file("docker-compose.dev.yml");
 
@@ -406,6 +462,11 @@ fn development_compose_is_the_only_compose_file_that_enables_dev_auth() {
 
 #[test]
 fn example_documents_remote_readiness_bucket_permissions() {
+    /*
+     * Reads the sample environment documentation for the remote-storage readiness contract. It
+     * checks operators are told that HeadBucket-style access, including the required
+     * bucket-level permission and endpoint credentials, is necessary.
+     */
     let example = root_file(".env.example");
 
     for contract in [
@@ -424,6 +485,11 @@ fn example_documents_remote_readiness_bucket_permissions() {
 
 #[test]
 fn generated_static_assets_are_ignored_build_output() {
+    /*
+     * Reads both Docker and Git ignore rules for generated frontend bundles. It checks
+     * distribution assets stay out of source context and version control while Rust build
+     * output is also omitted from the container context.
+     */
     let dockerignore = root_file(".dockerignore");
     let gitignore = root_file(".gitignore");
 
@@ -434,6 +500,11 @@ fn generated_static_assets_are_ignored_build_output() {
 
 #[test]
 fn canonical_transfer_harness_uses_valid_security_configuration() {
+    /*
+     * Inspects the benchmark harness configuration used to launch transfer tests. It checks
+     * trusted proxy coverage and high-entropy secrets are explicit, and that the known
+     * insecure placeholder secret cannot reappear.
+     */
     let harness = root_file("extras/bench_transfers.py");
 
     assert!(harness.contains("\"FORWARDED_ALLOW_IPS\","));
@@ -446,6 +517,11 @@ fn canonical_transfer_harness_uses_valid_security_configuration() {
 
 #[test]
 fn repository_gate_runs_for_branches_pull_requests_and_release_tags() {
+    /*
+     * Reads the reusable continuous-integration workflow that guards ordinary and release work.
+     * It checks pull requests and callers install the pinned Rust, npm, and pre-commit
+     * tooling before invoking the full repository gate.
+     */
     let workflow = root_file(".github/workflows/ci.yml");
 
     assert!(workflow.contains("name: Repository gate"));
@@ -459,6 +535,12 @@ fn repository_gate_runs_for_branches_pull_requests_and_release_tags() {
 
 #[test]
 fn semver_tag_workflow_gates_smoke_tests_and_publishes_the_same_image() {
+    /*
+     * Inspects the release workflow from tag matching through image publication. It checks tags
+     * are validated against VERSION, the repository gate runs first, and the locally
+     * smoke-tested image is the one pushed with full SemVer and conditional latest tags
+     * rather than floating major aliases.
+     */
     let workflow = root_file(".github/workflows/docker-image.yml");
 
     assert!(workflow.contains("      - \"v*.*.*\""));

@@ -306,6 +306,11 @@ fn authed_request(
 
 #[tokio::test]
 async fn folder_routes_require_authenticated_headers() {
+    /*
+     * A folder read request without Vault identity headers must be rejected before any data is
+     * returned. The response must use the standard authentication-required status and error
+     * payload.
+     */
     let (state, _temp_dir) = test_state().await;
     let app = http::router(state);
 
@@ -327,6 +332,11 @@ async fn folder_routes_require_authenticated_headers() {
 
 #[tokio::test]
 async fn create_folder_requires_authenticated_headers() {
+    /*
+     * Creating a folder is not allowed when the request omits authenticated user and group
+     * headers. The handler must fail with the same authentication-required response used by
+     * protected reads.
+     */
     let (state, _temp_dir) = test_state().await;
     let app = http::router(state);
 
@@ -350,6 +360,11 @@ async fn create_folder_requires_authenticated_headers() {
 
 #[tokio::test]
 async fn create_folder_persists_creator_events_and_state_change() {
+    /*
+     * A writer creates a nested folder and receives its canonical path and identifier in the
+     * response. The database must retain creator attribution, append folder history, publish
+     * the expected UI state resources, and expose the new child in contents.
+     */
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -422,6 +437,11 @@ async fn create_folder_persists_creator_events_and_state_change() {
 
 #[tokio::test]
 async fn created_child_folder_inherits_restricted_parent_acl() {
+    /*
+     * A child created below an explicit access boundary should inherit that boundary instead of
+     * receiving copied permission rows. A group denied by the parent therefore cannot
+     * discover the new child even though it can access the Vault root.
+     */
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -480,6 +500,11 @@ async fn created_child_folder_inherits_restricted_parent_acl() {
 
 #[tokio::test]
 async fn create_folder_rejects_archive_duplicate_and_missing_write_access() {
+    /*
+     * Folder creation must reject the reserved Archive tree, an existing sibling name, and a
+     * parent on which the caller is read-only. An entirely hidden parent is reported as
+     * missing so the API does not disclose inaccessible paths.
+     */
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let readers = create_group(&state.db, "readers").await;
@@ -572,6 +597,11 @@ async fn create_folder_rejects_archive_duplicate_and_missing_write_access() {
 
 #[tokio::test]
 async fn idempotent_folder_create_requires_write_access_and_returns_existing_folder() {
+    /*
+     * With `exist_ok`, a writer may repeat creation and receive the already-existing folder
+     * rather than a duplicate. Idempotency does not bypass authorization: a reader still
+     * receives a write-access failure.
+     */
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let readers = create_group(&state.db, "readers").await;
@@ -632,6 +662,11 @@ async fn idempotent_folder_create_requires_write_access_and_returns_existing_fol
 
 #[tokio::test]
 async fn sidebar_exposes_only_visible_root_children() {
+    /*
+     * Sidebar construction must filter root children using the caller's effective ACL before
+     * serializing them. A visible-but-unreadable child remains discoverable with accurate
+     * access flags, while a hidden sibling is omitted entirely.
+     */
     let (state, _temp_dir) = test_state().await;
     let viewers = create_group(&state.db, "viewers").await;
     let outsiders = create_group(&state.db, "outsiders").await;
@@ -683,6 +718,11 @@ async fn sidebar_exposes_only_visible_root_children() {
 
 #[tokio::test]
 async fn sidebar_hidden_rows_do_not_consume_the_visible_child_limit() {
+    /*
+     * A page filled by ACL-hidden database rows may be empty but must provide a cursor that
+     * continues the scan. Following that cursor must eventually return a later visible
+     * folder, so hidden rows cannot permanently crowd visible children out of pagination.
+     */
     let (state, _temp_dir) = test_state().await;
     let viewers = create_group(&state.db, "viewers").await;
     let outsiders = create_group(&state.db, "outsiders").await;
@@ -758,6 +798,11 @@ async fn sidebar_hidden_rows_do_not_consume_the_visible_child_limit() {
 
 #[tokio::test]
 async fn sidebar_paginates_more_than_two_hundred_visible_root_children() {
+    /*
+     * A root containing 205 visible children must split into a full 200-row page and a final
+     * five-row page. Cursor traversal must return every folder exactly once and reject
+     * malformed cursor input.
+     */
     let (state, _temp_dir) = test_state().await;
     grant_writer_roots(&state.db).await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -834,6 +879,11 @@ async fn sidebar_paginates_more_than_two_hundred_visible_root_children() {
 
 #[tokio::test]
 async fn sidebar_root_children_use_python_path_sorting() {
+    /*
+     * Root children must retain the ordering behavior of the Python implementation rather than
+     * SQLite's default lexical order. Mixed-case names are compared through that
+     * compatibility sort, placing `Beta` before `alpha`.
+     */
     let (state, _temp_dir) = test_state().await;
     grant_writer_roots(&state.db).await;
     get_or_create_folder_path(&state.db, Some("alpha"))
@@ -857,6 +907,11 @@ async fn sidebar_root_children_use_python_path_sorting() {
 
 #[tokio::test]
 async fn folder_contents_returns_document_access_and_hides_inaccessible_folder() {
+    /*
+     * A caller who can discover a folder receives its documents with access capabilities
+     * computed from the effective folder ACL. A caller without visibility receives a
+     * not-found response, preventing the endpoint from revealing that the folder exists.
+     */
     let (state, _temp_dir) = test_state().await;
     let viewers = create_group(&state.db, "viewers").await;
     let outsiders = create_group(&state.db, "outsiders").await;
@@ -913,6 +968,12 @@ async fn folder_contents_returns_document_access_and_hides_inaccessible_folder()
 
 #[tokio::test]
 async fn folder_contents_rejects_visible_inconsistent_current_version_metadata() {
+    /*
+     * Visible documents whose current-version pointer and stored version rows disagree must not
+     * be serialized as plausible content. The endpoint reports an internal consistency error
+     * for missing pointers, missing rows, and null pointers that conflict with existing
+     * versions.
+     */
     let (state, _temp_dir) = test_state().await;
     let readers = create_group(&state.db, "readers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -1008,6 +1069,11 @@ async fn folder_contents_rejects_visible_inconsistent_current_version_metadata()
 
 #[tokio::test]
 async fn folder_contents_recursive_scope_only_expands_search_results() {
+    /*
+     * Setting `recursive=true` alone still lists only the requested folder's immediate contents.
+     * Recursive descent is activated only by a nonblank search term, at which point matching
+     * descendants from deeper folders are included.
+     */
     let (state, _temp_dir) = test_state().await;
     grant_writer_roots(&state.db).await;
     let project = get_or_create_folder_path(&state.db, Some("Project"))
@@ -1079,6 +1145,11 @@ async fn folder_contents_recursive_scope_only_expands_search_results() {
 
 #[tokio::test]
 async fn folder_contents_paginates_visible_recursive_results_without_gaps_or_duplicates() {
+    /*
+     * Recursive search pages a mixed stream of matching folders and documents while excluding an
+     * ACL-hidden subtree. Repeated cursor requests must terminate after returning every
+     * visible match once, with no gaps or duplicate identifiers.
+     */
     let (state, _temp_dir) = test_state().await;
     let viewers = create_group(&state.db, "viewers").await;
     let restricted = create_group(&state.db, "restricted").await;
@@ -1179,6 +1250,12 @@ async fn folder_contents_paginates_visible_recursive_results_without_gaps_or_dup
 
 #[tokio::test]
 async fn recursive_search_does_not_double_count_overlapping_folder_summaries() {
+    /*
+     * When both a parent and its child match a recursive query, each folder summary must
+     * aggregate its own subtree independently. The parent's size includes each descendant
+     * document once, while the child's summary reports only the child's content and latest
+     * author.
+     */
     let (state, _temp_dir) = test_state().await;
     grant_writer_roots(&state.db).await;
     let parent = get_or_create_folder_path(&state.db, Some("Project/needle-parent"))
@@ -1232,6 +1309,12 @@ async fn recursive_search_does_not_double_count_overlapping_folder_summaries() {
 
 #[tokio::test]
 async fn folder_summaries_exclude_hidden_descendants_and_include_deeper_reopened_grants() {
+    /*
+     * Aggregate folder metadata must follow effective access at every descendant boundary rather
+     * than blindly summing the physical subtree. It excludes content beneath a hidden branch
+     * but includes a deeper branch where access is explicitly reopened, including that branch's
+     * size and latest author.
+     */
     let (state, _temp_dir) = test_state().await;
     let readers = create_group(&state.db, "readers").await;
     let confidential = create_group(&state.db, "confidential").await;
@@ -1306,6 +1389,11 @@ async fn folder_summaries_exclude_hidden_descendants_and_include_deeper_reopened
 
 #[tokio::test]
 async fn folder_contents_cursor_is_bound_to_scope_and_rejects_malformed_values() {
+    /*
+     * A contents cursor is valid only for the folder, query, recursion mode, and page shape that
+     * produced it. Reusing it in another scope or supplying malformed data must fail instead
+     * of silently skipping or mixing results.
+     */
     let (state, _temp_dir) = test_state().await;
     grant_writer_roots(&state.db).await;
     let project = get_or_create_folder_path(&state.db, Some("Project"))
@@ -1364,6 +1452,11 @@ async fn folder_contents_cursor_is_bound_to_scope_and_rejects_malformed_values()
 
 #[tokio::test]
 async fn folder_contents_ignores_inconsistent_documents_outside_the_requested_scope() {
+    /*
+     * Corrupt current-version metadata in an unrelated folder must not poison an otherwise valid
+     * folder listing. Consistency validation is limited to documents that are actually
+     * within the requested result scope.
+     */
     let (state, _temp_dir) = test_state().await;
     let readers = create_group(&state.db, "readers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -1412,6 +1505,11 @@ async fn folder_contents_ignores_inconsistent_documents_outside_the_requested_sc
 
 #[tokio::test]
 async fn folder_contents_sort_and_search_use_python_unicode_lowercase() {
+    /*
+     * Folder and document ordering and search matching must reproduce Python's Unicode lowercase
+     * behavior. Accented uppercase and lowercase names are normalized consistently for both
+     * result order and substring queries.
+     */
     let (state, _temp_dir) = test_state().await;
     grant_writer_roots(&state.db).await;
     let project = get_or_create_folder_path(&state.db, Some("Project"))
@@ -1500,6 +1598,11 @@ async fn folder_contents_sort_and_search_use_python_unicode_lowercase() {
 
 #[tokio::test]
 async fn folder_contents_and_properties_default_to_vault_root() {
+    /*
+     * Omitting the folder path must resolve both contents and properties requests to the Vault
+     * root. Root responses include direct children plus root documents, while aggregate
+     * properties cover the visible subtree and identify the root as `Vault`.
+     */
     let (state, _temp_dir) = test_state().await;
     let (_, root_id, _) = grant_writer_roots(&state.db).await;
     let project = get_or_create_folder_path(&state.db, Some("Project"))
@@ -1777,6 +1880,12 @@ fn assert_document_row_payload_shape(document_row: &Value, document_id: i64) {
 
 #[tokio::test]
 async fn folder_sidebar_and_contents_payloads_expose_python_compatible_shape() {
+    /*
+     * Sidebar and contents responses must preserve the Python service's exact object keys,
+     * nesting, defaults, and access fields. The fixture also verifies derived folder
+     * summaries and document presentation data such as timestamps, sizes, preview state, and
+     * download URL.
+     */
     let (state, _temp_dir) = test_state().await;
     let fixture = seed_payload_shape_fixture(&state).await;
     let app = http::router(state);
@@ -1807,6 +1916,11 @@ async fn folder_sidebar_and_contents_payloads_expose_python_compatible_shape() {
 
 #[tokio::test]
 async fn folder_contents_and_properties_use_python_modified_display_format() {
+    /*
+     * RFC3339 and SQLite-style source timestamps must normalize to the same UTC ISO value and
+     * Python-compatible display text. The formatting and latest-author calculation must
+     * agree across child summaries, document rows, and folder properties.
+     */
     let (state, _temp_dir) = test_state().await;
     let readers = create_group(&state.db, "readers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -1904,6 +2018,11 @@ async fn folder_contents_and_properties_use_python_modified_display_format() {
 
 #[tokio::test]
 async fn folder_properties_hide_inaccessible_descendant_stats() {
+    /*
+     * Folder properties must not leak counts, sizes, timestamps, authors, permissions, or group
+     * names from an inaccessible descendant. The visible parent remains readable but its
+     * aggregate fields describe only content the caller may see.
+     */
     let (state, _temp_dir) = test_state().await;
     let artists = create_group(&state.db, "artists").await;
     let confidential = create_group(&state.db, "confidential").await;
@@ -1951,6 +2070,12 @@ async fn folder_properties_hide_inaccessible_descendant_stats() {
 
 #[tokio::test]
 async fn folder_and_document_created_timestamps_use_python_datetime_iso_shape() {
+    /*
+     * Naive SQLite timestamps with fractional seconds must be emitted in the same ISO shape as
+     * the Python service for folders, documents, and history. Empty display names and
+     * messages fall back to stable actor and event values while modified timestamps retain their
+     * UTC offset.
+     */
     let (state, _temp_dir) = test_state().await;
     grant_writer_roots(&state.db).await;
     let project = get_or_create_folder_path(&state.db, Some("Project"))
@@ -2043,6 +2168,11 @@ async fn folder_and_document_created_timestamps_use_python_datetime_iso_shape() 
 
 #[tokio::test]
 async fn folder_properties_patch_persists_appearance_history_and_state_event() {
+    /*
+     * Updating folder appearance normalizes accepted color and icon values before storing and
+     * returning them. The mutation must also record who changed the metadata and publish a
+     * state event invalidating both contents and sidebar consumers.
+     */
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -2104,6 +2234,11 @@ async fn folder_properties_patch_persists_appearance_history_and_state_event() {
 
 #[tokio::test]
 async fn folder_properties_patch_rejects_invalid_values_and_missing_write_access() {
+    /*
+     * Appearance updates validate colors and icon syntax before touching folder metadata.
+     * Even valid appearance values are rejected when the caller can read the folder but lacks
+     * write access.
+     */
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let readers = create_group(&state.db, "readers").await;
@@ -2174,6 +2309,11 @@ async fn folder_properties_patch_rejects_invalid_values_and_missing_write_access
 
 #[tokio::test]
 async fn folder_permissions_put_replaces_permissions_history_and_state_event() {
+    /*
+     * An administrator can replace a folder's complete ACL, removing obsolete rows and returning
+     * the new entries in stable group order. The replacement must immediately govern access,
+     * append permission history, and invalidate contents and sidebar state.
+     */
     let (state, _temp_dir) = test_state().await;
     let artists = create_group(&state.db, "artists").await;
     let reviewers = create_group(&state.db, "reviewers").await;
@@ -2265,6 +2405,11 @@ async fn folder_permissions_put_replaces_permissions_history_and_state_event() {
 
 #[tokio::test]
 async fn folder_permissions_put_requires_admin_and_does_not_mutate() {
+    /*
+     * Membership in the group being granted access does not authorize a caller to edit folder
+     * permissions. A non-administrator receives a forbidden response and no ACL row is
+     * inserted.
+     */
     let (state, _temp_dir) = test_state().await;
     let artists = create_group(&state.db, "artists").await;
     let project = get_or_create_folder_path(&state.db, Some("Project"))
@@ -2303,6 +2448,11 @@ async fn folder_permissions_put_requires_admin_and_does_not_mutate() {
 
 #[tokio::test]
 async fn folder_permissions_put_rejects_invalid_rows_before_mutating() {
+    /*
+     * ACL replacement rejects write-without-read flags, duplicate groups, and nonexistent group
+     * identifiers during validation. None of those failures may partially replace the
+     * folder's previously stored permission.
+     */
     let (state, _temp_dir) = test_state().await;
     let artists = create_group(&state.db, "artists").await;
     let project = get_or_create_folder_path(&state.db, Some("Project"))
@@ -2390,6 +2540,11 @@ async fn folder_permissions_put_rejects_invalid_rows_before_mutating() {
 
 #[tokio::test]
 async fn folder_retention_put_reapplies_subtree_policy() {
+    /*
+     * Applying an archive TTL to a parent must recompute expiry metadata for existing documents
+     * throughout its subtree. Descendant payloads report the inherited policy, and the
+     * mutation records history plus all state resources affected by the expiry change.
+     */
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -2498,6 +2653,11 @@ async fn folder_retention_put_reapplies_subtree_policy() {
 
 #[tokio::test]
 async fn folder_retention_put_clears_policy_and_document_expiry() {
+    /*
+     * Clearing a folder's retention policy must remove both the folder defaults and inherited
+     * expiry fields already materialized on descendant documents. The returned properties
+     * then show no effective TTL.
+     */
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -2573,6 +2733,11 @@ async fn folder_retention_put_clears_policy_and_document_expiry() {
 
 #[tokio::test]
 async fn folder_retention_put_rejects_delete_for_non_admin_and_invalid_payloads() {
+    /*
+     * Destructive delete TTLs require administrator authority even when the caller can write the
+     * folder. Unknown actions, missing day counts, and out-of-range values are rejected
+     * without persisting any policy.
+     */
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -2680,6 +2845,11 @@ async fn folder_retention_put_rejects_delete_for_non_admin_and_invalid_payloads(
 
 #[tokio::test]
 async fn folder_retention_put_rejects_inaccessible_descendants_without_mutating() {
+    /*
+     * A retention update cannot proceed when its subtree contains a branch the caller is not
+     * allowed to traverse. The endpoint conceals that branch with a not-found response and
+     * leaves both the parent policy and secret document expiry untouched.
+     */
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let confidential = create_group(&state.db, "confidential").await;
@@ -2743,6 +2913,11 @@ async fn folder_retention_put_rejects_inaccessible_descendants_without_mutating(
 
 #[tokio::test]
 async fn rename_folder_updates_path_history_and_state() {
+    /*
+     * Renaming a writable folder changes only its name while preserving its parent and reporting
+     * both the old item path and new destination. The successful batch records a descriptive
+     * folder event and publishes the rename state event.
+     */
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -2807,6 +2982,11 @@ async fn rename_folder_updates_path_history_and_state() {
 
 #[tokio::test]
 async fn rename_folder_rejects_root_duplicate_and_cycle() {
+    /*
+     * Rename must reject root folders, sibling-name collisions, invalid destination syntax, and
+     * moves beneath the folder's own subtree. After every item-level failure, the source
+     * folder retains its original name and parent.
+     */
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -2913,6 +3093,12 @@ async fn rename_folder_rejects_root_duplicate_and_cycle() {
 
 #[tokio::test]
 async fn folder_mutations_reject_reserved_root_names_and_preserve_restartability() {
+    /*
+     * Renaming or moving a folder to the reserved top-level `Archive` name must fail, while the
+     * same name remains legal below another folder. Rejected mutations leave rows and event
+     * logs unchanged, and the database must still pass readiness checks before and after
+     * reopening.
+     */
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -3012,6 +3198,11 @@ async fn folder_mutations_reject_reserved_root_names_and_preserve_restartability
 
 #[tokio::test]
 async fn rename_folder_rejects_locked_descendant_without_mutating() {
+    /*
+     * A lock held by another user on any descendant document blocks renaming the containing
+     * folder. The failed batch reports the lock owner conflict and leaves the folder's name
+     * and parent unchanged.
+     */
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -3065,6 +3256,12 @@ async fn rename_folder_rejects_locked_descendant_without_mutating() {
 
 #[tokio::test]
 async fn move_folder_moves_subtree_reapplies_ttl_and_prunes_nested_items() {
+    /*
+     * Moving a folder carries its entire subtree to the destination and reapplies the
+     * destination's inherited retention policy to nested documents. A document redundantly
+     * included beside its ancestor is pruned from the batch, so only the folder move and its
+     * corresponding events are recorded.
+     */
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -3163,6 +3360,11 @@ async fn move_folder_moves_subtree_reapplies_ttl_and_prunes_nested_items() {
 
 #[tokio::test]
 async fn move_folder_out_of_delete_ttl_scope_clears_descendant_expiry_before_sweep() {
+    /*
+     * Moving a subtree out of an inherited delete policy must clear stale expiry metadata on
+     * every descendant document. A subsequent retention sweep therefore preserves a document
+     * that would have been expired under its old location.
+     */
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -3255,6 +3457,11 @@ async fn move_folder_out_of_delete_ttl_scope_clears_descendant_expiry_before_swe
 
 #[tokio::test]
 async fn move_folder_rejects_descendant_destination_without_creating_missing_parent() {
+    /*
+     * A destination path lexically beneath the source is rejected as a self-move even when part
+     * of that path does not yet exist. Validation must occur before path creation, row
+     * updates, or event publication.
+     */
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -3323,6 +3530,12 @@ async fn move_folder_rejects_descendant_destination_without_creating_missing_par
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // One endpoint scenario keeps every destructive guard and cascade assertion together.
 async fn delete_empty_folder_is_leaf_only_stale_safe_and_uses_folder_write_access() {
+    /*
+     * Empty-folder deletion requires current-path confirmation and folder write access, and it
+     * refuses roots or folders containing documents, children, or active uploads.
+     * A valid deletion removes dependent ACL and share rows but preserves unrelated data, then
+     * emits exactly one state event for affected views.
+     */
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let readers = create_group(&state.db, "readers").await;
@@ -3533,6 +3746,11 @@ async fn delete_empty_folder_is_leaf_only_stale_safe_and_uses_folder_write_acces
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // One payload scenario compares every eligibility surface against the same folder states.
 async fn folder_payloads_report_authoritative_empty_delete_eligibility() {
+    /*
+     * The `can_delete_empty` flag must reflect documents, child folders, active uploads, root
+     * status, and the caller's write access. Contents, sidebar, favorites, and properties
+     * must all report the same authoritative eligibility for the same folders.
+     */
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let readers = create_group(&state.db, "readers").await;
@@ -3673,6 +3891,11 @@ async fn folder_payloads_report_authoritative_empty_delete_eligibility() {
 
 #[tokio::test]
 async fn archive_folder_path_item_reports_stale_path_as_item_failure_without_mutating() {
+    /*
+     * A path-addressed archive request normalizes separators and whitespace, then treats a
+     * concurrently renamed source as a stale missing item. The item-level failure must not
+     * move its document or create document and state events.
+     */
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -3748,6 +3971,12 @@ async fn archive_folder_path_item_reports_stale_path_as_item_failure_without_mut
 
 #[tokio::test]
 async fn archive_folder_archives_descendant_documents_and_prunes_nested_items() {
+    /*
+     * Archiving a folder flattens all descendant documents into Archive while preserving each
+     * document's original folder metadata. A nested document also submitted explicitly is
+     * deduplicated, the source folders are removed, and one archive event is recorded per
+     * document.
+     */
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -3839,6 +4068,11 @@ async fn archive_folder_archives_descendant_documents_and_prunes_nested_items() 
 
 #[tokio::test]
 async fn archive_allows_duplicate_display_names_and_returns_flat_contents() {
+    /*
+     * Archive may contain documents with identical display names when they originated from
+     * different folders. Both identities are preserved in one flat listing, with original
+     * folder and full original path available to distinguish them.
+     */
     let (state, _temp_dir) = test_state().await;
     grant_writer_roots(&state.db).await;
     let one = get_or_create_folder_path(&state.db, Some("One"))
@@ -3936,6 +4170,11 @@ async fn archive_allows_duplicate_display_names_and_returns_flat_contents() {
 
 #[tokio::test]
 async fn archive_contents_search_matches_original_path() {
+    /*
+     * Archives a document and searches the flat Archive view using its complete pre-archive
+     * path. The query finds that document and returns the same canonical path in its
+     * archive-origin metadata.
+     */
     let (state, _temp_dir) = test_state().await;
     grant_writer_roots(&state.db).await;
     let one = get_or_create_folder_path(&state.db, Some("One"))
@@ -3985,6 +4224,10 @@ async fn archive_contents_search_matches_original_path() {
 
 #[tokio::test]
 async fn archive_folder_rejects_locked_descendant_without_mutating() {
+    /*
+     * Archiving a folder is blocked when any descendant document is locked by another user.
+     * The folder remains present and the locked document stays at its original location.
+     */
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -4049,6 +4292,11 @@ async fn archive_folder_rejects_locked_descendant_without_mutating() {
 
 #[tokio::test]
 async fn archive_folder_rejects_inaccessible_descendant_without_mutating() {
+    /*
+     * A caller cannot archive a visible parent when a deeper ACL boundary hides part of its
+     * subtree. The operation is reported as an item-level not-found failure and atomically
+     * leaves all folders, documents, and event tables unchanged.
+     */
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let confidential = create_group(&state.db, "confidential").await;
@@ -4138,6 +4386,11 @@ async fn archive_folder_rejects_inaccessible_descendant_without_mutating() {
 
 #[tokio::test]
 async fn failed_folder_archive_preserves_source_folder_acl() {
+    /*
+     * A failed archive attempt against an inaccessible child must not strip or rewrite that
+     * child's explicit ACL. Subsequent changes at the parent still leave the child hidden,
+     * its document in place, and all mutation event tables empty.
+     */
     let (state, _temp_dir) = test_state().await;
     let outsiders = create_group(&state.db, "outsiders").await;
     let confidential = create_group(&state.db, "confidential").await;

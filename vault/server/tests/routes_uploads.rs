@@ -742,6 +742,12 @@ async fn assert_lightweight_upload_status(app: &axum::Router, session_id: &str, 
 
 #[tokio::test]
 async fn lightweight_upload_status_uses_only_persisted_state() {
+    /*
+     * The polling endpoint must derive active, completing, and complete responses strictly from
+     * the session row, without opening staged parts or malformed sidecars.
+     * It clamps impossible progress to the upload size and returns persisted result and manifest
+     * fields even after the staging directory is detached.
+     */
     let (state, _temp_dir) =
         test_state_with_upload_settings(5 * 1024 * 1024 * 1024, 4, 86_400).await;
     grant_writer_root(&state.db).await;
@@ -837,6 +843,11 @@ async fn lightweight_upload_status_uses_only_persisted_state() {
 
 #[tokio::test]
 async fn lightweight_upload_status_is_hidden_from_other_owners_and_visible_to_admins() {
+    /*
+     * Missing sessions and sessions owned by another user deliberately return the same no-store
+     * not-found response. An administrator can inspect that same active session without
+     * taking ownership of it.
+     */
     let (state, _temp_dir) = test_state().await;
     grant_writer_root(&state.db).await;
     let app = http::router(state);
@@ -898,6 +909,10 @@ async fn lightweight_upload_status_is_hidden_from_other_owners_and_visible_to_ad
 
 #[tokio::test]
 async fn upload_size_limit_rejects_before_metadata_or_blob_write() {
+    /*
+     * A six-byte request exceeds the configured five-byte upload ceiling.
+     * Rejection occurs before creating a session, document, blob, location, or physical object.
+     */
     let (state, temp_dir) = test_state_with_upload_settings(5, 32 * 1024 * 1024, 86_400).await;
     grant_writer_root(&state.db).await;
     let pool = state.db.clone();
@@ -962,6 +977,11 @@ async fn upload_size_limit_rejects_before_metadata_or_blob_write() {
 
 #[tokio::test]
 async fn upload_session_stores_basename_from_client_file_paths() {
+    /*
+     * Browsers may submit a Windows client path rather than a bare filename.
+     * Session creation strips the directory components and persists only the safe basename in
+     * both response and database.
+     */
     let (state, _temp_dir) = test_state().await;
     grant_writer_root(&state.db).await;
     let pool = state.db.clone();
@@ -997,6 +1017,11 @@ async fn upload_session_stores_basename_from_client_file_paths() {
 
 #[tokio::test]
 async fn upload_session_mode_is_strict_while_missing_mode_defaults_to_create() {
+    /*
+     * Explicit mode values are protocol tokens, so altered casing or surrounding whitespace is
+     * rejected rather than normalized. Omitting the field retains backward compatibility by
+     * creating exactly one normal `create` session.
+     */
     let (state, _temp_dir) = test_state().await;
     grant_writer_root(&state.db).await;
     let pool = state.db.clone();
@@ -1052,6 +1077,11 @@ async fn upload_session_mode_is_strict_while_missing_mode_defaults_to_create() {
 
 #[tokio::test]
 async fn upload_route_uses_python_compatible_runtime_numeric_bounds() {
+    /*
+     * Zero upload and chunk limits plus a one-second TTL are normalized to the minimums used by
+     * the Python service. A one-byte upload receives a one-byte chunk and an expiration
+     * roughly one minute in the future.
+     */
     let (state, _temp_dir) = test_state_with_upload_settings(0, 0, 1).await;
     assert_eq!(state.config.max_upload_bytes, 1);
     assert_eq!(state.config.transfer_chunk_bytes, 1);
@@ -1087,6 +1117,10 @@ async fn upload_route_uses_python_compatible_runtime_numeric_bounds() {
 
 #[tokio::test]
 async fn upload_session_create_requires_write_access_on_target_folder() {
+    /*
+     * Read access to the destination folder is insufficient to create new content there.
+     * The route denies the request before producing upload, part, document, or blob rows.
+     */
     let (state, _temp_dir) = test_state().await;
     let readers = create_group(&state.db, "readers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -1138,6 +1172,11 @@ async fn upload_session_create_requires_write_access_on_target_folder() {
 
 #[tokio::test]
 async fn upload_session_adapts_chunk_size_from_runtime_config_and_client_parallelism() {
+    /*
+     * Chunk planning scales through bounded sizes as payloads grow, keeping part counts
+     * practical beneath the runtime ceiling. Higher advertised client parallelism selects
+     * larger chunks for the same remote-sized payload to reduce coordination overhead.
+     */
     let (state, _temp_dir) =
         test_state_with_upload_settings(5 * 1024 * 1024 * 1024, 32 * 1024 * 1024, 86_400).await;
     grant_writer_root(&state.db).await;
@@ -1168,6 +1207,11 @@ async fn upload_session_adapts_chunk_size_from_runtime_config_and_client_paralle
 
 #[tokio::test]
 async fn upload_session_rejects_an_unbounded_part_count_without_inflating_chunks() {
+    /*
+     * A five-gibibyte upload with a one-byte runtime chunk would require far more than the
+     * 1,024-part protocol limit. The server rejects it with configuration guidance instead
+     * of silently overriding the operator's chunk size or persisting a session.
+     */
     let size = 5 * 1024 * 1024 * 1024_i64;
     let (state, _temp_dir) = test_state_with_upload_settings(size, 1, 86_400).await;
     grant_writer_root(&state.db).await;
@@ -1207,6 +1251,11 @@ async fn upload_session_rejects_an_unbounded_part_count_without_inflating_chunks
 
 #[tokio::test]
 async fn upload_session_caps_chunks_for_bounded_client_integrity_hashing() {
+    /*
+     * An excessively large configured chunk would force clients to hash half a gibibyte at once.
+     * Planning caps chunks at 32 MiB, splitting the 512 MiB upload into sixteen bounded
+     * integrity units.
+     */
     let (state, _temp_dir) =
         test_state_with_upload_settings(5 * 1024 * 1024 * 1024, 512 * 1024 * 1024, 86_400).await;
     grant_writer_root(&state.db).await;
@@ -1220,6 +1269,12 @@ async fn upload_session_caps_chunks_for_bounded_client_integrity_hashing() {
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // One resume flow covers checksum-free upload and sidecar repair.
 async fn upload_part_does_not_require_client_checksum_header() {
+    /*
+     * A legacy browser may upload a part without a checksum, leaving only the final part file
+     * and a null hash in resume state. Repeating it with a checksum repairs the sidecar;
+     * completion still requires a whole-file or part-manifest expectation, and the correct
+     * manifest produces readable content.
+     */
     let (state, temp_dir) = test_state().await;
     grant_writer_root(&state.db).await;
     let app = http::router(state);
@@ -1336,6 +1391,11 @@ async fn upload_part_does_not_require_client_checksum_header() {
 
 #[tokio::test]
 async fn upload_resume_ignores_sidecars_without_a_matching_final_part() {
+    /*
+     * A valid-looking sidecar is not evidence that its part was durably promoted.
+     * Resume ignores both sidecar-only state and a matching sidecar paired with a wrong-sized
+     * final part.
+     */
     let (state, _temp_dir) = test_state().await;
     grant_writer_root(&state.db).await;
     let transfers_path = state.config.transfers_path();
@@ -1393,6 +1453,12 @@ async fn upload_resume_ignores_sidecars_without_a_matching_final_part() {
 
 #[tokio::test]
 async fn restart_recovers_checksum_free_browser_upload_parts() {
+    /*
+     * Two checksum-free browser parts survive an interrupted completion and a full
+     * database/application restart without in-memory hash state. Recovery returns the
+     * session to active, resume reports both null-checksum parts, and a canonical manifest can
+     * complete and download the original bytes.
+     */
     let (state, _temp_dir) =
         test_state_with_upload_settings(5 * 1024 * 1024 * 1024, 4, 86_400).await;
     grant_writer_root(&state.db).await;
@@ -1470,6 +1536,11 @@ async fn restart_recovers_checksum_free_browser_upload_parts() {
 
 #[tokio::test]
 async fn upload_part_checksum_failure_leaves_no_part_or_canonical_metadata() {
+    /*
+     * The declared part digest intentionally disagrees with the streamed body.
+     * Ingest rejects it and removes every temporary or final part while leaving the active
+     * session resumable with zero bytes and no canonical content metadata.
+     */
     let (state, _temp_dir) = test_state().await;
     grant_writer_root(&state.db).await;
     let transfers_path = state.config.transfers_path();
@@ -1562,6 +1633,11 @@ async fn upload_part_checksum_failure_leaves_no_part_or_canonical_metadata() {
 
 #[tokio::test]
 async fn idle_upload_part_times_out_and_removes_its_partial_temp_file() {
+    /*
+     * A part body sends a short prefix and then stalls beyond the configured idle timeout.
+     * The timeout is reported distinctly and its cancellation guard removes both the temporary
+     * ingest file and any final part.
+     */
     const PART_SIZE: i64 = 8 * 1024 * 1024 + 1;
     let (state, _temp_dir) =
         test_state_with_upload_settings(5 * 1024 * 1024 * 1024, PART_SIZE, 86_400).await;
@@ -1600,6 +1676,11 @@ async fn idle_upload_part_times_out_and_removes_its_partial_temp_file() {
 
 #[tokio::test]
 async fn dropping_pending_upload_part_ingest_removes_its_partial_temp_file() {
+    /*
+     * An ingest task is aborted after a partial temporary file appears but while the request
+     * body remains pending. Drop cleanup eventually removes that temp and never promotes an
+     * incomplete final part.
+     */
     const PART_SIZE: i64 = 8 * 1024 * 1024 + 1;
     let (state, _temp_dir) =
         test_state_with_upload_settings(5 * 1024 * 1024 * 1024, PART_SIZE, 86_400).await;
@@ -1666,6 +1747,11 @@ async fn dropping_pending_upload_part_ingest_removes_its_partial_temp_file() {
 
 #[tokio::test]
 async fn duplicate_part_upload_is_idempotent_but_conflicting_content_is_rejected() {
+    /*
+     * Retrying the same numbered part with identical offset and bytes succeeds as an idempotent
+     * client retry. Reusing that slot for different content returns a conflict rather than
+     * overwriting the accepted part.
+     */
     let (state, _temp_dir) =
         test_state_with_upload_settings(5 * 1024 * 1024 * 1024, 4, 86_400).await;
     grant_writer_root(&state.db).await;
@@ -1715,6 +1801,11 @@ async fn duplicate_part_upload_is_idempotent_but_conflicting_content_is_rejected
 
 #[tokio::test]
 async fn concurrent_part_promotion_does_not_overwrite_existing_part() {
+    /*
+     * Two different bodies race to publish the same part number directly through the ingest API.
+     * Exactly one promotion succeeds, and the final file contains that winner's complete bytes
+     * rather than a last-writer overwrite or mixture.
+     */
     let (state, _temp_dir) =
         test_state_with_upload_settings(5 * 1024 * 1024 * 1024, 4, 86_400).await;
     grant_writer_root(&state.db).await;
@@ -1804,6 +1895,12 @@ async fn concurrent_part_promotion_does_not_overwrite_existing_part() {
 
 #[tokio::test]
 async fn upload_session_resume_reports_existing_parts_and_completes_without_final_hash() {
+    /*
+     * After the first chunk, resume reconstructs exact byte, offset, size, and checksum metadata
+     * from staged files.
+     * Uploading the remaining chunk and supplying only the canonical part-manifest digest is
+     * sufficient to create a document whose download matches the source.
+     */
     let (state, _temp_dir) =
         test_state_with_upload_settings(5 * 1024 * 1024 * 1024, 4, 86_400).await;
     grant_writer_root(&state.db).await;
@@ -1894,6 +1991,11 @@ async fn upload_session_resume_reports_existing_parts_and_completes_without_fina
 
 #[tokio::test]
 async fn upload_completion_promotes_parts_without_assembled_blob() {
+    /*
+     * Local completion promotes two verified chunks into a content-addressed multipart manifest
+     * and removes the transfer session. It does not create a second full-size assembled
+     * blob, yet the resulting document streams as the original contiguous payload.
+     */
     let (state, temp_dir) =
         test_state_with_upload_settings(5 * 1024 * 1024 * 1024, 4, 86_400).await;
     grant_writer_root(&state.db).await;
@@ -2003,6 +2105,12 @@ async fn upload_completion_promotes_parts_without_assembled_blob() {
 
 #[tokio::test]
 async fn upload_session_creates_document_without_part_database_writes() {
+    /*
+     * Part ingestion is represented on disk rather than by `upload_parts` rows and does not
+     * churn the session's persisted update timestamp.
+     * Completion consumes that staged state, removes the transfer directory, creates the
+     * requested document, and yields readable bytes.
+     */
     let (state, temp_dir) = test_state().await;
     grant_writer_root(&state.db).await;
     let pool = state.db.clone();
@@ -2103,6 +2211,12 @@ async fn upload_session_creates_document_without_part_database_writes() {
 
 #[tokio::test]
 async fn create_completion_rechecks_duplicate_path_and_cleans_promoted_object() {
+    /*
+     * Another document wins the requested path after upload admission but before the staged
+     * object is finalized. Completion rechecks uniqueness, preserves only the winner's
+     * metadata and bytes, removes the loser's promoted manifest, and leaves reconciliation
+     * clean.
+     */
     let (state, temp_dir) = test_state().await;
     grant_writer_root(&state.db).await;
     let race_folder = get_or_create_folder_path(&state.db, Some("Race"))
@@ -2207,6 +2321,11 @@ async fn create_completion_rechecks_duplicate_path_and_cleans_promoted_object() 
 
 #[tokio::test]
 async fn upload_part_accepts_signed_token_without_user_headers() {
+    /*
+     * A valid session-bound upload token authorizes part PUTs without normal identity headers.
+     * Malformed or cross-session tokens are unauthorized, and even a valid token cannot write
+     * after the session becomes aborted.
+     */
     let (state, _temp_dir) = test_state().await;
     grant_writer_root(&state.db).await;
     let pool = state.db.clone();
@@ -2284,6 +2403,12 @@ async fn upload_part_accepts_signed_token_without_user_headers() {
 
 #[tokio::test]
 async fn upload_tokens_use_domain_separation_and_bounded_key_rotation() {
+    /*
+     * An upload token signed by the old root remains valid only while that root is explicitly
+     * retained during rotation, and resume refreshes it under the new root. Raw legacy
+     * HMACs, session-domain signatures, and upload tokens presented as login sessions all fail
+     * because each token family uses separated derived keys.
+     */
     const OLD_ROOT: &str = "7d92b4e10a6fc83531de709bca4825f06e13d97a58c02bf46a91e53c7bd80462";
     const NEW_ROOT: &str = "a3f1c9e72b840d56ff196ab30ce2d785914b8c6230e7fa5d4921bc68e30fd754";
 
@@ -2376,6 +2501,12 @@ async fn upload_tokens_use_domain_separation_and_bounded_key_rotation() {
 
 #[tokio::test]
 async fn v2_upload_identity_is_echoed_and_bound_to_part_token() {
+    /*
+     * V2 sessions require a syntactically valid resume-identity digest, echo it to the client,
+     * and use the `u2-` identity form with checksum-bearing parts.
+     * The signed part token binds that digest, so changing persisted identity invalidates the
+     * previously issued token.
+     */
     let (state, _temp_dir) = test_state().await;
     grant_writer_root(&state.db).await;
     let pool = state.db.clone();
@@ -2480,6 +2611,11 @@ async fn v2_upload_identity_is_echoed_and_bound_to_part_token() {
 
 #[tokio::test]
 async fn empty_v2_upload_completes_with_canonical_part_manifest() {
+    /*
+     * A V2 zero-byte upload legitimately has no parts but still has a deterministic empty
+     * manifest digest. Supplying that digest completes the document, whose download is an
+     * empty body.
+     */
     let (state, _temp_dir) =
         test_state_with_upload_settings(5 * 1024 * 1024 * 1024, 4, 86_400).await;
     grant_writer_root(&state.db).await;
@@ -2534,6 +2670,11 @@ async fn empty_v2_upload_completes_with_canonical_part_manifest() {
 
 #[tokio::test]
 async fn checkin_session_adds_version_renames_and_releases_lock() {
+    /*
+     * A locked document is checked in with new bytes, a note, and a request to adopt the upload
+     * filename. Completion creates version two, renames the document, releases its lock, and
+     * emits move, check-in, and upload-complete events in causal order.
+     */
     let (state, _temp_dir) = test_state().await;
     grant_writer_root(&state.db).await;
     let project = get_or_create_folder_path(&state.db, Some("Project"))
@@ -2697,6 +2838,11 @@ async fn complete_checkin_upload_for_document(
 
 #[tokio::test]
 async fn checkin_session_refreshes_delete_ttl_before_sweep() {
+    /*
+     * A document appears expired under a seven-day delete policy before a new version is checked
+     * in. Check-in recomputes expiration from the fresh modification time, so an immediate
+     * retention sweep leaves it intact.
+     */
     let (state, _temp_dir) = test_state().await;
     grant_writer_root(&state.db).await;
     let temp = get_or_create_folder_path(&state.db, Some("Temp"))
@@ -2755,6 +2901,11 @@ async fn checkin_session_refreshes_delete_ttl_before_sweep() {
 
 #[tokio::test]
 async fn checkin_completion_rechecks_archived_state_after_part_upload() {
+    /*
+     * A check-in is admitted and receives its bytes while the document is editable, then the
+     * document is archived before completion. Finalization rechecks live state, refuses to
+     * add a version, and marks the session failed with restore-before-edit guidance.
+     */
     let (state, _temp_dir) = test_state().await;
     grant_writer_root(&state.db).await;
     let project = get_or_create_folder_path(&state.db, Some("Project"))
@@ -2836,6 +2987,11 @@ async fn checkin_completion_rechecks_archived_state_after_part_upload() {
 
 #[tokio::test]
 async fn upload_abort_cleans_parts_blocks_completion_and_preserves_canonical_state() {
+    /*
+     * Aborting an active upload removes its staged bytes and returns an empty terminal session
+     * representation. Later completion is rejected, and no document, blob, location, or
+     * legacy part metadata was ever committed.
+     */
     let (state, _temp_dir) = test_state().await;
     grant_writer_root(&state.db).await;
     let transfers_path = state.config.transfers_path();
@@ -2920,6 +3076,11 @@ async fn upload_abort_cleans_parts_blocks_completion_and_preserves_canonical_sta
 
 #[tokio::test]
 async fn upload_abort_requires_owner_or_admin() {
+    /*
+     * A different user cannot discover or abort another owner's upload, and the failed attempt
+     * leaves it active for its owner. An administrator can terminate that same session
+     * explicitly.
+     */
     let (state, _temp_dir) = test_state().await;
     grant_writer_root(&state.db).await;
     let app = http::router(state);
@@ -2989,6 +3150,11 @@ async fn upload_abort_requires_owner_or_admin() {
 
 #[tokio::test]
 async fn expired_upload_session_cleans_parts_and_is_not_resumable() {
+    /*
+     * An active session with a staged part is moved just past its expiration and then fetched.
+     * Resume returns Gone while atomically marking it expired, deleting scratch data, and
+     * clearing any part metadata.
+     */
     let (state, _temp_dir) = test_state().await;
     grant_writer_root(&state.db).await;
     let transfers_path = state.config.transfers_path();
@@ -3065,6 +3231,11 @@ async fn expired_upload_session_cleans_parts_and_is_not_resumable() {
 
 #[tokio::test]
 async fn completed_upload_session_reports_verification_progress() {
+    /*
+     * Successful completion persists verification totals instead of losing them when the session
+     * becomes terminal. Both the resume response and database show every source byte
+     * processed.
+     */
     let (state, _temp_dir) = test_state().await;
     grant_writer_root(&state.db).await;
     let pool = state.db.clone();
@@ -3476,6 +3647,11 @@ async fn wait_for_completion_claim_marker(pool: &sqlx::SqlitePool, session_id: &
 
 #[tokio::test]
 async fn incomplete_upload_completion_returns_to_active_and_can_retry() {
+    /*
+     * Completion is attempted after only the first of two required parts has arrived.
+     * The missing-part error releases the completion claim back to a clean active state,
+     * allowing the second part and a later completion to succeed.
+     */
     let (state, _temp_dir) =
         test_state_with_upload_settings(5 * 1024 * 1024 * 1024, 4, 86_400).await;
     grant_writer_root(&state.db).await;
@@ -3550,6 +3726,11 @@ async fn incomplete_upload_completion_returns_to_active_and_can_retry() {
 
 #[tokio::test]
 async fn checksum_mismatch_preserves_parts_and_allows_completion_retry() {
+    /*
+     * All parts are present, but the supplied whole-file checksum describes different content.
+     * Verification returns the session to active with both staged parts untouched, and retrying
+     * with the correct digest completes normally.
+     */
     let (state, _temp_dir) =
         test_state_with_upload_settings(5 * 1024 * 1024 * 1024, 4, 86_400).await;
     grant_writer_root(&state.db).await;
@@ -3600,6 +3781,11 @@ async fn checksum_mismatch_preserves_parts_and_allows_completion_retry() {
 
 #[tokio::test]
 async fn part_manifest_mismatch_preserves_parts_and_allows_retry() {
+    /*
+     * A wrong expected part-manifest digest is rejected before document creation and is not
+     * persisted as a completed result. The staged parts remain active for retry, after which
+     * the canonical manifest becomes durable even though session staging is removed.
+     */
     let (state, _temp_dir) =
         test_state_with_upload_settings(5 * 1024 * 1024 * 1024, 4, 86_400).await;
     grant_writer_root(&state.db).await;
@@ -3666,6 +3852,11 @@ async fn part_manifest_mismatch_preserves_parts_and_allows_retry() {
 
 #[tokio::test]
 async fn part_manifest_is_derived_from_staged_bytes_not_sidecars() {
+    /*
+     * After clearing preverification state, one staged part is modified while its old checksum
+     * sidecar remains. Completion hashes the actual bytes, detects the manifest mismatch,
+     * preserves retry data, and creates no document.
+     */
     let (state, _temp_dir) =
         test_state_with_upload_settings(5 * 1024 * 1024 * 1024, 4, 86_400).await;
     grant_writer_root(&state.db).await;
@@ -3708,6 +3899,11 @@ async fn part_manifest_is_derived_from_staged_bytes_not_sidecars() {
 
 #[tokio::test]
 async fn part_read_failure_returns_to_active_and_preserves_retry_data() {
+    /*
+     * A final part file is temporarily moved out of place while its sidecar remains, causing
+     * completion to fail its live layout read. The claim resets to active without deleting
+     * the backup, and restoring the part permits a successful retry.
+     */
     let (state, temp_dir) =
         test_state_with_upload_settings(5 * 1024 * 1024 * 1024, 4, 86_400).await;
     grant_writer_root(&state.db).await;
@@ -3775,6 +3971,11 @@ async fn part_read_failure_returns_to_active_and_preserves_retry_data() {
 
 #[tokio::test]
 async fn completion_reset_database_failure_is_not_silently_discarded() {
+    /*
+     * Missing parts require completion to reset `completing` back to `active`, but a trigger
+     * forces that recovery update to fail. The route surfaces an internal error and leaves
+     * the observable status at `completing` rather than pretending the reset succeeded.
+     */
     let (state, _temp_dir) =
         test_state_with_upload_settings(5 * 1024 * 1024 * 1024, 4, 86_400).await;
     grant_writer_root(&state.db).await;
@@ -3844,6 +4045,11 @@ async fn completion_reset_database_failure_is_not_silently_discarded() {
 
 #[tokio::test]
 async fn cancelled_upload_completion_returns_to_active_and_can_retry() {
+    /*
+     * Completion is cancelled while storage publication is blocked after server-side
+     * preverification. Drop recovery resets the session to active, clears cached hash state,
+     * preserves both parts, and allows a fresh storage backend to complete the upload.
+     */
     let (state, temp_dir) =
         test_state_with_upload_settings(5 * 1024 * 1024 * 1024, 4, 86_400).await;
     grant_writer_root(&state.db).await;
@@ -3939,6 +4145,11 @@ async fn cancelled_upload_completion_returns_to_active_and_can_retry() {
 
 #[tokio::test]
 async fn abort_wins_against_in_flight_completion_without_committing_metadata() {
+    /*
+     * Abort races with completion after the latter has claimed the session and entered blocked
+     * storage publication. The abort removes staging and wins the terminal state; when
+     * storage returns, completion observes `aborted` and commits no canonical metadata.
+     */
     let (state, _temp_dir) =
         test_state_with_upload_settings(5 * 1024 * 1024 * 1024, 4, 86_400).await;
     grant_writer_root(&state.db).await;
@@ -4019,6 +4230,11 @@ async fn abort_wins_against_in_flight_completion_without_committing_metadata() {
 
 #[tokio::test]
 async fn deletion_tombstone_returns_upload_to_active_without_discarding_parts() {
+    /*
+     * A lifecycle deletion tombstone already owns the exact content-addressed key that
+     * completion wants to publish. That transient contention propagates as retryable, resets
+     * the session to active, and leaves every staged part available.
+     */
     let (state, _temp_dir) =
         test_state_with_upload_settings(5 * 1024 * 1024 * 1024, 4, 86_400).await;
     grant_writer_root(&state.db).await;
@@ -4080,6 +4296,12 @@ async fn deletion_tombstone_returns_upload_to_active_without_discarding_parts() 
 
 #[tokio::test]
 async fn cancellation_while_completion_claim_is_blocked_cannot_strand_session() {
+    /*
+     * SQLite's writer gate blocks the transition from active to completing, and the waiting
+     * completion task is then cancelled. Once the gate opens, its claim guard still restores
+     * active state; the durable parts can subsequently complete instead of leaving a stranded
+     * session.
+     */
     let (state, temp_dir) =
         test_state_with_upload_settings(5 * 1024 * 1024 * 1024, 4, 86_400).await;
     grant_writer_root(&state.db).await;
@@ -4171,6 +4393,11 @@ async fn cancellation_while_completion_claim_is_blocked_cannot_strand_session() 
 
 #[tokio::test]
 async fn upload_completion_reports_verification_bytes_before_storage_finishes() {
+    /*
+     * Completion verifies both staged parts and then pauses inside storage publication.
+     * While still `completing`, persisted progress already reports the full verified byte count,
+     * and releasing storage finishes the document.
+     */
     let (state, _temp_dir) =
         test_state_with_upload_settings(5 * 1024 * 1024 * 1024, 4, 86_400).await;
     grant_writer_root(&state.db).await;
@@ -4245,6 +4472,12 @@ async fn upload_completion_reports_verification_bytes_before_storage_finishes() 
 
 #[tokio::test]
 async fn upload_completion_reuses_server_preverified_hash_state() {
+    /*
+     * The background hash coordinator precomputes verification for all four parts before
+     * completion starts. Completion carries that full progress into its blocked storage
+     * phase and successfully publishes after handoff, demonstrating that server-maintained
+     * verification state is reusable.
+     */
     let (state, _temp_dir) =
         test_state_with_upload_settings(5 * 1024 * 1024 * 1024, 4, 86_400).await;
     grant_writer_root(&state.db).await;
@@ -4337,6 +4570,11 @@ async fn upload_completion_reuses_server_preverified_hash_state() {
 
 #[tokio::test]
 async fn create_upload_target_identity_blocks_read_acl_drift_after_target_rename() {
+    /*
+     * Starts an upload, renames its target, and recreates the old path with more permissive
+     * reader access. Completion follows the stored folder identity, keeping the document in
+     * the renamed original instead of exposing it through the writable replacement.
+     */
     let (state, _temp_dir) = test_state().await;
     grant_writer_root(&state.db).await;
     let user = writer_context();
@@ -4419,6 +4657,11 @@ async fn create_upload_target_identity_blocks_read_acl_drift_after_target_rename
 
 #[tokio::test]
 async fn create_upload_target_identity_blocks_delete_ttl_drift_after_target_move() {
+    /*
+     * Starts an upload, moves its target, and recreates the old path with automatic deletion
+     * enabled. Completion stores the document in the moved target identity without inheriting
+     * the replacement folder's expiry policy.
+     */
     let (state, _temp_dir) = test_state().await;
     grant_writer_root(&state.db).await;
     let user = writer_context();
@@ -4485,6 +4728,11 @@ async fn create_upload_target_identity_blocks_delete_ttl_drift_after_target_move
 
 #[tokio::test]
 async fn create_upload_target_identity_survives_ancestor_rename() {
+    /*
+     * Starts an upload before renaming the target's ancestor and recreating the original
+     * subtree. Completion follows the original target ID to its new path rather than
+     * redirecting the document into the replacement tree.
+     */
     let (state, _temp_dir) = test_state().await;
     grant_writer_root(&state.db).await;
     let user = writer_context();
@@ -4529,6 +4777,11 @@ async fn create_upload_target_identity_survives_ancestor_rename() {
 
 #[tokio::test]
 async fn create_upload_target_identity_blocks_deletion_after_target_rename() {
+    /*
+     * Renames the target of an active upload and attempts to delete that now-empty folder. The
+     * durable upload reference blocks deletion until abort clears the target identity, after
+     * which the folder can be removed safely.
+     */
     let (state, _temp_dir) = test_state().await;
     grant_writer_root(&state.db).await;
     let user = writer_context();

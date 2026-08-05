@@ -4,6 +4,11 @@ use vault_server::exports::{
 
 #[test]
 fn zip_headers_keep_classic_fields_when_values_fit() {
+    /*
+     * Builds headers for a small archive whose sizes, offsets, and entry count fit classic ZIP
+     * fields. It checks the signatures, version numbers, lengths, and directory values to ensure
+     * ZIP64 records are not added unnecessarily.
+     */
     let probe = zip_header_probe(ZipHeaderProbeInput {
         name: "small.bin",
         compressed_size: 11,
@@ -39,6 +44,11 @@ fn zip_headers_keep_classic_fields_when_values_fit() {
 
 #[test]
 fn zip_headers_use_zip64_extra_when_entry_size_exceeds_classic_fields() {
+    /*
+     * Builds an entry whose compressed and uncompressed sizes exceed 32-bit ZIP limits. It
+     * checks that classic size and offset fields become sentinels and that the ZIP64 extras
+     * carry the original 64-bit values in the required order.
+     */
     let compressed_size = u64::from(u32::MAX) + 9;
     let uncompressed_size = u64::from(u32::MAX) + 17;
     let local_header_offset = 1234;
@@ -78,6 +88,11 @@ fn zip_headers_use_zip64_extra_when_entry_size_exceeds_classic_fields() {
 
 #[test]
 fn zip_footer_uses_zip64_records_when_archive_directory_exceeds_classic_fields() {
+    /*
+     * Gives the archive too many entries and a directory too large and too far into the file for
+     * classic end records. It checks the ZIP64 end record and locator values while also
+     * requiring the trailing classic footer to contain the mandated sentinel fields.
+     */
     let entry_count = u16::MAX as usize + 1;
     let central_directory_size = u64::from(u32::MAX) + 1;
     let central_directory_offset = u64::from(u32::MAX) + 2;
@@ -120,6 +135,11 @@ fn zip_footer_uses_zip64_records_when_archive_directory_exceeds_classic_fields()
 
 #[test]
 fn streaming_deflated_entry_reserves_zip64_before_sizes_are_known() {
+    /*
+     * Models a deflated streaming entry whose final sizes are unavailable when its local header
+     * is written. It checks that the header reserves ZIP64 space with zero placeholders, the
+     * descriptor publishes 64-bit sizes, and the central directory records the final values.
+     */
     let compressed_size = 37;
     let uncompressed_size = 4096;
     let local_header_offset = 128;
@@ -167,6 +187,11 @@ fn streaming_deflated_entry_reserves_zip64_before_sizes_are_known() {
 
 #[test]
 fn streaming_small_stored_entry_uses_classic_descriptor_fields() {
+    /*
+     * Models a small uncompressed entry written with a streaming data descriptor. It checks that
+     * the sizes are deferred from the local header but remain in classic 32-bit descriptor and
+     * central-directory fields, with no ZIP64 extra data.
+     */
     let size = 11_u32;
     let probe = streaming_zip_header_probe(StreamingZipHeaderProbeInput {
         name: "small-stream.bin",
@@ -196,6 +221,11 @@ fn streaming_small_stored_entry_uses_classic_descriptor_fields() {
 
 #[test]
 fn streaming_stored_entry_switches_to_zip64_at_the_classic_size_sentinel() {
+    /*
+     * Places a stored streaming entry exactly at the reserved 32-bit size sentinel. It checks
+     * that the writer treats the boundary as ZIP64, using a 64-bit descriptor and sentinel
+     * sizes in the central directory rather than emitting an ambiguous classic entry.
+     */
     let size = u64::from(u32::MAX);
     let probe = streaming_zip_header_probe(StreamingZipHeaderProbeInput {
         name: "sentinel.bin",

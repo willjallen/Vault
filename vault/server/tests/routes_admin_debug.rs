@@ -106,6 +106,11 @@ async fn response_json(response: axum::response::Response) -> Value {
 
 #[tokio::test]
 async fn debug_tools_are_hidden_outside_dev_mode() {
+    /*
+     * Debug error and timeout endpoints must not be discoverable in a normal deployment, even to
+     * an authenticated administrator. Both routes answer as not found rather than revealing
+     * a disabled development capability.
+     */
     let (state, _temp_dir) = test_state(AuthSettings::default()).await;
     let app = http::router(state);
 
@@ -128,6 +133,11 @@ async fn debug_tools_are_hidden_outside_dev_mode() {
 
 #[tokio::test]
 async fn dev_mode_exposes_debug_error_and_timeout_tools() {
+    /*
+     * Development mode intentionally exposes controllable server-error and bad-request responses
+     * for client testing. Its timeout action also returns the configured delay and
+     * event-stream retry contract in a successful diagnostic response.
+     */
     let (state, _temp_dir) = test_state(dev_auth()).await;
     let app = http::router(state);
 
@@ -170,6 +180,11 @@ async fn dev_mode_exposes_debug_error_and_timeout_tools() {
 
 #[tokio::test]
 async fn dev_debug_timeout_sends_retry_and_closes_existing_event_stream() {
+    /*
+     * Triggering the development timeout while an event stream is open must tell that client to
+     * reconnect after ten seconds. The stream emits the SSE retry directive and then closes
+     * promptly instead of remaining half-open.
+     */
     let (state, _temp_dir) = test_state(dev_auth()).await;
     let app = http::router(state);
     let stream_response = app
@@ -206,6 +221,12 @@ async fn dev_debug_timeout_sends_retry_and_closes_existing_event_stream() {
 
 #[tokio::test]
 async fn dev_debug_seed_emit_report_sweep_and_reset_work() {
+    /*
+     * The development toolbox is exercised end to end: seed sample metadata, emit a filtered
+     * refresh, report storage, sweep retention, and reset the database. Responses reflect
+     * real persisted effects, reset removes seeded documents, and bootstrap remains usable in
+     * development mode afterward.
+     */
     let (state, _temp_dir) = test_state(dev_auth()).await;
     let db = state.db.clone();
     let app = http::router(state);
@@ -311,6 +332,11 @@ async fn dev_debug_seed_emit_report_sweep_and_reset_work() {
 
 #[tokio::test]
 async fn dev_debug_emit_state_uses_default_resources_when_omitted() {
+    /*
+     * Omitting an explicit resource list should refresh the standard contents, sidebar, and edit
+     * views. The response preserves its presentation order while the durable event stores
+     * the canonical normalized resource order.
+     */
     let (state, _temp_dir) = test_state(dev_auth()).await;
     let db = state.db.clone();
     let app = http::router(state);
@@ -345,6 +371,11 @@ async fn dev_debug_emit_state_uses_default_resources_when_omitted() {
 
 #[tokio::test]
 async fn dev_database_reset_cleans_tracked_upload_resources() {
+    /*
+     * Reset begins with an active upload, its transfer directory, and cached preverification
+     * state in the hash coordinator. The operation removes the database row, on-disk session
+     * data, and in-memory tracking together.
+     */
     let (state, _temp_dir) = test_state(dev_auth()).await;
     let upload_id = "reset-upload";
     let target_folder_id: i64 =
@@ -417,6 +448,11 @@ async fn dev_database_reset_cleans_tracked_upload_resources() {
 
 #[tokio::test]
 async fn dev_database_reset_preserves_monotonic_state_event_ids_with_a_refresh_marker() {
+    /*
+     * Reset clears prior events without allowing their numeric identifiers to be reused.
+     * It inserts one full-refresh compaction marker above the old id, and the next event
+     * advances beyond that marker.
+     */
     let (state, _temp_dir) = test_state(dev_auth()).await;
     let old_event_id = sqlx::query(
         r#"
@@ -466,6 +502,11 @@ async fn dev_database_reset_preserves_monotonic_state_event_ids_with_a_refresh_m
 
 #[tokio::test]
 async fn debug_seed_rolls_back_all_metadata_when_outbox_insert_fails() {
+    /*
+     * A trigger forces the seed operation's state-event insert to abort.
+     * The failed transaction leaves no sample folder, document, version, blob metadata, event,
+     * or leaked storage object.
+     */
     let (state, _temp_dir) = test_state(dev_auth()).await;
     let db = state.db.clone();
     let storage = state.storage.clone();

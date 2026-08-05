@@ -88,6 +88,11 @@ fn authed_request(
 
 #[tokio::test]
 async fn settings_route_requires_auth_and_returns_defaults() {
+    /*
+     * Deployment settings are not public and reject a request without identity.
+     * An authenticated reader receives the default archive-deletion and custom-streaming feature
+     * values.
+     */
     let (state, _temp_dir) = test_state().await;
     let app = http::router(state);
 
@@ -120,6 +125,11 @@ async fn settings_route_requires_auth_and_returns_defaults() {
 
 #[tokio::test]
 async fn admin_directory_requires_admin_and_returns_users_groups_and_settings() {
+    /*
+     * An ordinary writer cannot inspect the administrative directory.
+     * An effective admin receives a mutually populated view of users, group memberships, runtime
+     * mode, and current settings.
+     */
     let (state, _temp_dir) = test_state().await;
     let app = http::router(state);
 
@@ -152,6 +162,11 @@ async fn admin_directory_requires_admin_and_returns_users_groups_and_settings() 
 
 #[tokio::test]
 async fn admin_directory_allows_bootstrap_admin_email_without_stored_admin_flag() {
+    /*
+     * A configured bootstrap email grants access to the admin directory and is represented there
+     * as effectively administrative. That derived privilege does not mutate the user's
+     * persisted admin flag.
+     */
     let (state, _temp_dir) = test_state_with_auth(AuthSettings {
         bootstrap_admin_emails: ["owner@example.com".to_string()].into_iter().collect(),
         ..AuthSettings::default()
@@ -187,6 +202,11 @@ async fn admin_directory_allows_bootstrap_admin_email_without_stored_admin_flag(
 
 #[tokio::test]
 async fn admin_settings_patch_persists_setting_and_emits_state_event() {
+    /*
+     * An administrator changes both supported settings and receives their updated directory
+     * representation. Ordinary readers see the persisted values, and the transaction records
+     * one normalized admin-settings state event.
+     */
     let (state, _temp_dir) = test_state().await;
     let pool = state.db.clone();
     let app = http::router(state);
@@ -251,6 +271,10 @@ async fn admin_settings_patch_persists_setting_and_emits_state_event() {
 
 #[tokio::test]
 async fn admin_settings_patch_allows_bootstrap_admin_email_without_stored_admin_flag() {
+    /*
+     * Configuration-derived bootstrap administration is sufficient to patch a supported setting.
+     * The change and event persist while the owner's database admin bit remains false.
+     */
     let (state, _temp_dir) = test_state_with_auth(AuthSettings {
         bootstrap_admin_emails: ["owner@example.com".to_string()].into_iter().collect(),
         ..AuthSettings::default()
@@ -301,6 +325,11 @@ async fn admin_settings_patch_allows_bootstrap_admin_email_without_stored_admin_
 
 #[tokio::test]
 async fn admin_settings_patch_rejects_non_admin_and_invalid_settings() {
+    /*
+     * Settings mutation rejects an unauthorized caller, an unknown key, and a supported key with
+     * the wrong JSON type. Each case maps to its intended status and diagnostic instead of
+     * silently ignoring malformed input.
+     */
     let (state, _temp_dir) = test_state().await;
     let app = http::router(state);
 

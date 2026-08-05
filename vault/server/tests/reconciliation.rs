@@ -338,6 +338,11 @@ fn lower_hex(bytes: &[u8]) -> String {
 
 #[tokio::test]
 async fn report_flags_corrupt_referenced_local_object_without_deleting_it() {
+    /*
+     * A referenced object's bytes are replaced without changing its metadata or key.
+     * Both dry-run and apply detect the checksum mismatch, but reconciliation must not delete
+     * corrupt content that still has a live reference.
+     */
     let (state, _temp_dir) = test_state().await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
         .await
@@ -365,6 +370,11 @@ async fn report_flags_corrupt_referenced_local_object_without_deleting_it() {
 
 #[tokio::test]
 async fn reconciliation_streams_multiframe_regular_objects_for_integrity() {
+    /*
+     * Integrity checking must consume an ordinary object across several bounded stream frames,
+     * not validate only its beginning. Changing the final byte turns an initially clean
+     * report into a corruption finding.
+     */
     let (state, _temp_dir) = test_state().await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
         .await
@@ -395,6 +405,11 @@ async fn reconciliation_streams_multiframe_regular_objects_for_integrity() {
 
 #[tokio::test]
 async fn reconciliation_accepts_zero_bytes_and_rejects_negative_blob_sizes() {
+    /*
+     * A legitimate empty blob should pass size and digest validation.
+     * Negative size metadata is impossible, so its otherwise present object is reported as
+     * corrupt rather than missing.
+     */
     let (state, _temp_dir) = test_state().await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
         .await
@@ -418,6 +433,11 @@ async fn reconciliation_accepts_zero_bytes_and_rejects_negative_blob_sizes() {
 
 #[tokio::test]
 async fn reconciliation_streams_multiframe_multipart_objects_for_integrity() {
+    /*
+     * A referenced multipart object spans multiple storage frames and uneven part boundaries.
+     * Reconciliation accepts the intact stream, then detects a mutation near the end of an
+     * internal part and reports the manifest key.
+     */
     let (state, _temp_dir) = test_state().await;
     let storage = local_storage(&state);
     let source_dir = state.config.data_dir.join("multiframe-parts");
@@ -466,6 +486,11 @@ async fn reconciliation_streams_multiframe_multipart_objects_for_integrity() {
 
 #[tokio::test]
 async fn apply_restores_missing_local_location_metadata() {
+    /*
+     * The content-addressed file remains present and referenced after its local location row is
+     * removed. Apply reconstructs exactly one canonical location, and repeated report/apply
+     * passes are clean and idempotent.
+     */
     let (state, _temp_dir) = test_state().await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
         .await
@@ -512,6 +537,12 @@ async fn apply_restores_missing_local_location_metadata() {
 
 #[tokio::test]
 async fn stale_plan_skips_missing_location_restore_when_live_state_changed() {
+    /*
+     * A plan proposes restoring three missing location rows, but before apply one loses its
+     * reference, one changes identity and has its key claimed, and one becomes corrupt.
+     * Apply revalidates every candidate, restores none, preserves live references, and never
+     * overwrites the new key owner.
+     */
     let (state, _temp_dir) = test_state().await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
         .await
@@ -614,6 +645,11 @@ async fn stale_plan_skips_missing_location_restore_when_live_state_changed() {
 
 #[tokio::test]
 async fn apply_removes_orphan_blob_metadata_and_local_object() {
+    /*
+     * Deleting the only document turns its blob row and local object into a coordinated orphan.
+     * Dry-run reports it, while apply deletes the bytes and both metadata layers so a subsequent
+     * report is clean.
+     */
     let (state, _temp_dir) = test_state().await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
         .await
@@ -657,6 +693,11 @@ async fn apply_removes_orphan_blob_metadata_and_local_object() {
 
 #[tokio::test]
 async fn stale_plan_preserves_orphan_claimed_by_same_digest_publication() {
+    /*
+     * A blob is orphaned when reconciliation plans deletion, then a same-digest publication
+     * reuses that identity and attaches a new document. Applying the stale plan must observe
+     * the new reference and preserve the blob row, location, and bytes.
+     */
     let (state, _temp_dir) = test_state().await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
         .await
@@ -732,6 +773,11 @@ async fn stale_plan_preserves_orphan_claimed_by_same_digest_publication() {
 
 #[tokio::test]
 async fn stale_plan_preserves_raw_key_claimed_by_publication() {
+    /*
+     * A raw local object is initially untracked, but a publication claims its digest-derived key
+     * before the deletion plan runs. Apply respects the newly committed metadata and
+     * reference rather than deleting content based on the stale inventory snapshot.
+     */
     let (state, _temp_dir) = test_state().await;
     let storage = local_storage(&state);
     let content = b"raw publication race";
@@ -794,6 +840,11 @@ async fn stale_plan_preserves_raw_key_claimed_by_publication() {
 
 #[tokio::test]
 async fn apply_deletes_untracked_key_and_finalizes_reservation_metadata() {
+    /*
+     * A content-addressed local object with no database ownership is planned for deletion.
+     * Apply removes the bytes and also clears the temporary reservation metadata used to make
+     * that deletion race-safe.
+     */
     let (state, _temp_dir) = test_state().await;
     let storage = local_storage(&state);
     let raw = storage
@@ -824,6 +875,11 @@ async fn apply_deletes_untracked_key_and_finalizes_reservation_metadata() {
 
 #[tokio::test]
 async fn untracked_key_tombstone_blocks_publication_until_apply_finishes() {
+    /*
+     * A held read delays deletion long enough to observe the reconciliation tombstone for an
+     * untracked key. That tombstone blocks a competing publication until apply completes,
+     * after which the same content can be published and referenced normally.
+     */
     let (state, _temp_dir) = test_state().await;
     let storage = local_storage(&state);
     let content = b"collector wins";
@@ -918,6 +974,11 @@ async fn untracked_key_tombstone_blocks_publication_until_apply_finishes() {
 
 #[tokio::test]
 async fn apply_preserves_remote_orphan_metadata_without_local_delete_support() {
+    /*
+     * The orphan exists only in an S3 location while this reconciliation run has a local backend
+     * available. It reports the orphan but retains both rows because it cannot safely delete
+     * storage owned by an unsupported remote backend.
+     */
     let (state, _temp_dir) = test_state().await;
     let blob_id = sqlx::query(
         r"
@@ -968,6 +1029,11 @@ async fn apply_preserves_remote_orphan_metadata_without_local_delete_support() {
 
 #[tokio::test]
 async fn reconciliation_removes_only_aged_parts_outside_the_current_layout() {
+    /*
+     * Two multipart layouts represent identical content, but only the newer layout has the
+     * referenced manifest. Reconciliation identifies and deletes the old layout's detached
+     * parts while preserving every current part and a readable object.
+     */
     let (state, _temp_dir) = test_state().await;
     let storage = local_storage(&state);
     let source_dir = state.config.data_dir.join("multipart-sources");
@@ -1053,6 +1119,11 @@ async fn reconciliation_removes_only_aged_parts_outside_the_current_layout() {
 
 #[tokio::test]
 async fn multipart_part_sweep_respects_age_and_pending_publications() {
+    /*
+     * A part whose manifest is absent remains protected while it is too young or covered by a
+     * pending publication marker. Once the marker is removed and the age threshold permits
+     * collection, the sweep deletes that orphan part.
+     */
     let (state, _temp_dir) = test_state().await;
     let storage = local_storage(&state);
     let source = state.config.data_dir.join("orphan-source.part");
@@ -1127,6 +1198,11 @@ async fn multipart_part_sweep_respects_age_and_pending_publications() {
 
 #[tokio::test]
 async fn multipart_part_sweep_preserves_referenced_parts_when_the_manifest_is_missing() {
+    /*
+     * Losing a referenced multipart manifest should be treated as damage, not proof that its
+     * parts are garbage. The part sweep consults database ownership and preserves those
+     * recoverable chunks even with a zero-age threshold.
+     */
     let (state, _temp_dir) = test_state().await;
     let storage = local_storage(&state);
     let source = state.config.data_dir.join("referenced-source.part");

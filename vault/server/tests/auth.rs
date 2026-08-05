@@ -98,6 +98,11 @@ fn assert_urlsafe_token(token: &str) {
 
 #[test]
 fn oidc_token_urlsafe_uses_python_compatible_nonce_byte_lengths() {
+    /*
+     * Generates URL-safe OIDC tokens at the default, a configured, and a below-minimum byte
+     * count. It checks output length follows unpadded base64 expansion, uses only URL-safe
+     * characters, and floors undersized requests to the 16-byte security minimum.
+     */
     let default_token = oidc_token_urlsafe(24).expect("default token");
     assert_eq!(default_token.len(), token_urlsafe_len(24));
     assert_urlsafe_token(&default_token);
@@ -113,6 +118,11 @@ fn oidc_token_urlsafe_uses_python_compatible_nonce_byte_lengths() {
 
 #[tokio::test]
 async fn missing_identity_headers_reject_without_dev_auth() {
+    /*
+     * Calls header authentication with no upstream identity headers under normal settings. It
+     * checks the absence is treated as missing authentication rather than creating an anonymous
+     * or development user.
+     */
     let pool = test_pool().await;
     let settings = AuthSettings::default();
 
@@ -125,6 +135,12 @@ async fn missing_identity_headers_reject_without_dev_auth() {
 
 #[tokio::test]
 async fn header_identity_is_stripped_and_groups_are_synced() {
+    /*
+     * Authenticates whitespace-padded identity headers containing ordinary and administrator
+     * groups. It checks profile values are trimmed, groups are sorted and synchronized,
+     * effective admin status is derived, and the user group receives permissions on both
+     * roots.
+     */
     let pool = test_pool().await;
     let settings = AuthSettings::default();
     let request_headers = headers(&[
@@ -153,6 +169,11 @@ async fn header_identity_is_stripped_and_groups_are_synced() {
 
 #[tokio::test]
 async fn unchanged_header_identity_does_not_wait_for_sqlite_writer() {
+    /*
+     * Synchronizes a header user once, holds an unrelated SQLite writer, and authenticates the
+     * same claims again. It checks the unchanged fast path completes without a write lock
+     * and leaves the stored last-seen timestamp untouched.
+     */
     let pool = test_pool().await;
     let settings = AuthSettings::default();
     let request_headers = headers(&[
@@ -194,6 +215,11 @@ async fn unchanged_header_identity_does_not_wait_for_sqlite_writer() {
 
 #[tokio::test]
 async fn unchanged_header_claims_repair_a_missing_root_permission_row() {
+    /*
+     * Synchronizes a group, manually removes one of its required root permissions, then presents
+     * unchanged identity claims. It checks authentication detects and repairs incomplete derived
+     * permissions even though the user profile and memberships did not change.
+     */
     let pool = test_pool().await;
     let settings = AuthSettings::default();
     let request_headers = headers(&[
@@ -242,6 +268,11 @@ async fn unchanged_header_claims_repair_a_missing_root_permission_row() {
 
 #[tokio::test]
 async fn missing_header_email_stays_null_and_cannot_match_a_bootstrap_admin_email() {
+    /*
+     * Authenticates multiple header users without an email while an email-based bootstrap admin
+     * is configured. It checks missing values remain SQL `NULL`, appear empty only in the
+     * runtime context, and cannot accidentally match the configured administrator address.
+     */
     let pool = test_pool().await;
     let settings = AuthSettings {
         bootstrap_admin_emails: ["admin@example.com".to_string()].into_iter().collect(),
@@ -273,6 +304,11 @@ async fn missing_header_email_stays_null_and_cannot_match_a_bootstrap_admin_emai
 
 #[tokio::test]
 async fn missing_header_email_clears_a_legacy_synthetic_bootstrap_email() {
+    /*
+     * Seeds a legacy header user with a bootstrap-admin email, then authenticates authoritative
+     * headers that omit email. It checks the stale synthetic value is cleared durably and no
+     * longer grants effective administrator access.
+     */
     let pool = test_pool().await;
     let settings = AuthSettings {
         bootstrap_admin_emails: ["admin@example.com".to_string()].into_iter().collect(),
@@ -309,6 +345,12 @@ async fn missing_header_email_clears_a_legacy_synthetic_bootstrap_email() {
 
 #[tokio::test]
 async fn missing_header_email_blocks_to_revoke_then_stable_none_is_read_only() {
+    /*
+     * Starts with an email-derived bootstrap administrator, then removes the authoritative email
+     * while another writer holds SQLite. It checks that revocation waits for a durable write,
+     * clears admin access and stored email, and that later unchanged email-less logins use the
+     * read-only fast path.
+     */
     let pool = test_pool().await;
     let settings = AuthSettings {
         bootstrap_admin_emails: ["owner@example.com".to_string()].into_iter().collect(),
@@ -375,6 +417,11 @@ async fn missing_header_email_blocks_to_revoke_then_stable_none_is_read_only() {
 
 #[tokio::test]
 async fn header_admin_group_removal_revokes_admin_context() {
+    /*
+     * Authenticates the same header user first with and then without the administrator group. It
+     * checks current group claims immediately revoke effective admin status and synchronize the
+     * persisted admin flag back to false.
+     */
     let pool = test_pool().await;
     let settings = AuthSettings::default();
     let admin_headers = headers(&[
@@ -410,6 +457,12 @@ async fn header_admin_group_removal_revokes_admin_context() {
 
 #[tokio::test]
 async fn bootstrap_admin_email_grants_effective_admin_without_persisting_admin_flag() {
+    /*
+     * Authenticates a mixed-case email that matches the configured bootstrap administrator after
+     * normalization. It checks the request receives effective admin rights while the user's
+     * stored `is_admin` flag remains false, keeping bootstrap policy separate from durable
+     * assignment.
+     */
     let pool = test_pool().await;
     let settings = AuthSettings {
         bootstrap_admin_emails: ["alice@example.com".to_string()].into_iter().collect(),
@@ -439,6 +492,11 @@ async fn bootstrap_admin_email_grants_effective_admin_without_persisting_admin_f
 
 #[test]
 fn oidc_bootstrap_admin_subject_is_exact_and_bound_to_the_configured_issuer() {
+    /*
+     * Evaluates bootstrap-subject policy across exact, case-changed, whitespace-changed, wrong
+     * issuer, header, and development identities. It checks only the opaque subject from the
+     * configured OIDC issuer grants admin and that legacy email bootstrap policy does not apply.
+     */
     let settings = AuthSettings {
         bootstrap_admin_emails: ["owner@example.com".to_string()].into_iter().collect(),
         mode: AuthMode::Oidc,
@@ -512,6 +570,11 @@ fn oidc_bootstrap_admin_subject_is_exact_and_bound_to_the_configured_issuer() {
 
 #[tokio::test]
 async fn legacy_oidc_email_does_not_grant_bootstrap_admin_to_an_existing_session() {
+    /*
+     * Seeds a non-admin OIDC user whose stored email matches the header-mode bootstrap list and
+     * resolves an existing signed session. It checks legacy email data cannot elevate an OIDC
+     * session now that OIDC administration is subject-based.
+     */
     let pool = test_pool().await;
     let settings = AuthSettings {
         bootstrap_admin_emails: ["owner@example.com".to_string()].into_iter().collect(),
@@ -552,6 +615,11 @@ async fn legacy_oidc_email_does_not_grant_bootstrap_admin_to_an_existing_session
 
 #[tokio::test]
 async fn oidc_relogin_without_a_verified_email_preserves_the_existing_profile_email() {
+    /*
+     * Creates an OIDC profile with a verified email, then logs the same subject in again without
+     * an email claim. It checks the trusted stored email is retained while the login
+     * timestamp still advances, rather than treating claim omission as revocation.
+     */
     let pool = test_pool().await;
     let settings = AuthSettings {
         mode: AuthMode::Oidc,
@@ -598,6 +666,11 @@ async fn oidc_relogin_without_a_verified_email_preserves_the_existing_profile_em
 
 #[tokio::test]
 async fn disabled_header_user_request_does_not_sync_groups_or_profile() {
+    /*
+     * Presents updated profile and group headers for a user already marked inactive. It checks
+     * authentication fails before synchronizing anything, preserving the old name and email and
+     * avoiding creation of the newly claimed group.
+     */
     let pool = test_pool().await;
     let settings = AuthSettings::default();
     sqlx::query(
@@ -642,6 +715,11 @@ async fn disabled_header_user_request_does_not_sync_groups_or_profile() {
 
 #[tokio::test]
 async fn concurrent_header_identity_upserts_create_one_user_and_membership() {
+    /*
+     * Authenticates the same new subject concurrently from sixteen tasks with varying display
+     * names and one shared group. It checks every caller resolves the identity while uniqueness
+     * and transaction handling leave exactly one user, group, and membership.
+     */
     let pool = test_pool().await;
     let settings = AuthSettings::default();
     let mut handles = Vec::new();
@@ -698,6 +776,11 @@ async fn concurrent_header_identity_upserts_create_one_user_and_membership() {
 
 #[tokio::test]
 async fn dev_auth_requires_local_base_domain() {
+    /*
+     * Enables development authentication but configures a nonlocal base domain. It checks the
+     * shortcut declines to create or return a development identity outside an explicitly local
+     * deployment.
+     */
     let pool = test_pool().await;
     let settings = AuthSettings {
         mode: AuthMode::Dev,
@@ -716,6 +799,11 @@ async fn dev_auth_requires_local_base_domain() {
 
 #[tokio::test]
 async fn dev_auth_syncs_configured_groups_on_local_domain() {
+    /*
+     * Enables development authentication on localhost with configured user and admin groups. It
+     * checks the synthetic identity and memberships are synchronized correctly, then confirms an
+     * unchanged repeat can authenticate while another SQLite writer is active.
+     */
     let pool = test_pool().await;
     let settings = AuthSettings {
         mode: AuthMode::Dev,
@@ -751,6 +839,11 @@ async fn dev_auth_syncs_configured_groups_on_local_domain() {
 
 #[tokio::test]
 async fn session_payload_requires_expiration_and_numeric_user_id() {
+    /*
+     * Signs payloads with no expiry, an expired value, boolean expiry or user ID, and also
+     * probes a non-ASCII token. It checks verification accepts neither malformed claim types
+     * nor expired or syntactically invalid sessions.
+     */
     let settings = AuthSettings::default();
     let mut missing_exp = Map::new();
     missing_exp.insert("uid".to_string(), json!(1));
@@ -789,6 +882,11 @@ async fn session_payload_requires_expiration_and_numeric_user_id() {
 
 #[test]
 fn session_cookie_lookup_uses_exact_cookie_name_from_multi_cookie_header() {
+    /*
+     * Parses a multi-cookie header containing both the configured session name and a longer name
+     * that shares its prefix. It checks only an exact cookie-name match is returned and missing
+     * headers or prefix-only matches produce no session.
+     */
     assert_eq!(
         cookie_value(
             Some("theme=dark; vault_session_extra=wrong; vault_session=payload.signature"),
@@ -805,6 +903,11 @@ fn session_cookie_lookup_uses_exact_cookie_name_from_multi_cookie_header() {
 
 #[tokio::test]
 async fn session_identity_resolves_active_user() {
+    /*
+     * Stores an active user, signs a future-expiring session for that row ID, and resolves the
+     * cookie through normal session lookup. It checks the complete runtime user context is
+     * loaded from persisted identity data rather than trusted from cookie fields.
+     */
     let pool = test_pool().await;
     let settings = AuthSettings::default();
     let user_id = sqlx::query(
@@ -850,6 +953,11 @@ async fn session_identity_resolves_active_user() {
 
 #[tokio::test]
 async fn stale_session_refreshes_once_then_fresh_session_is_read_only() {
+    /*
+     * Resolves a session whose stored last-seen timestamp is stale, then resolves it again while
+     * a writer lock is held. It checks the first access refreshes activity durably and the
+     * fresh access performs no redundant write or lock wait.
+     */
     let pool = test_pool().await;
     let settings = AuthSettings::default();
     let stale_last_seen = "2000-01-01T00:00:00Z";
@@ -910,6 +1018,11 @@ async fn stale_session_refreshes_once_then_fresh_session_is_read_only() {
 
 #[tokio::test]
 async fn session_identity_ignores_inactive_users() {
+    /*
+     * Signs a structurally valid, unexpired session for a user whose persisted account is
+     * inactive. It checks session resolution returns no identity even though the token
+     * itself verifies.
+     */
     let pool = test_pool().await;
     let settings = AuthSettings::default();
     let user_id = sqlx::query(
@@ -942,6 +1055,11 @@ async fn session_identity_ignores_inactive_users() {
 
 #[test]
 fn runtime_validation_rejects_missing_docker_session_secret() {
+    /*
+     * Models a runtime that requires an explicit session secret but only has an unrelated OIDC
+     * client-secret fallback. It checks validation demands `VAULT_SESSION_SECRET` and explains
+     * that fallback is reserved for the built-in development secret.
+     */
     let settings = AuthSettings {
         session_secret_requirement: SessionSecretRequirement::Required,
         signing_keys: SigningKeyring::from_configured("oidc-client-secret", vec![]),
@@ -968,6 +1086,10 @@ fn runtime_validation_rejects_missing_docker_session_secret() {
 
 #[test]
 fn runtime_validation_rejects_development_session_secret_outside_dev() {
+    /*
+     * Configures the built-in insecure signing secret while development mode is off. It checks
+     * runtime validation prevents that fallback from protecting production sessions.
+     */
     let settings = AuthSettings {
         signing_keys: SigningKeyring::from_configured("dev-insecure-session-secret", vec![]),
         session_secret_source: SessionSecretSource::Fallback,
@@ -988,6 +1110,10 @@ fn runtime_validation_rejects_development_session_secret_outside_dev() {
 
 #[test]
 fn runtime_validation_allows_development_session_secret_in_dev_mode() {
+    /*
+     * Combines development authentication, development mode, and the built-in fallback signing
+     * secret. It checks this intentionally local configuration passes runtime validation.
+     */
     let settings = AuthSettings {
         mode: AuthMode::Dev,
         auth_mode_raw: "dev".to_string(),
@@ -1004,6 +1130,12 @@ fn runtime_validation_allows_development_session_secret_in_dev_mode() {
 
 #[test]
 fn runtime_validation_requires_canonical_high_diversity_explicit_signing_roots() {
+    /*
+     * Validates short, non-hex, repeated, periodic, skewed, and predictable 32-byte signing
+     * roots alongside one canonical random-looking root. It checks explicit secrets must be
+     * exactly 64 hexadecimal characters and pass the diversity checks intended to reject
+     * human-generated or patterned material.
+     */
     let weak_roots = [
         "password".to_string(),
         "g".repeat(64),
@@ -1034,6 +1166,12 @@ fn runtime_validation_requires_canonical_high_diversity_explicit_signing_roots()
 
 #[test]
 fn runtime_validation_bounds_and_deduplicates_previous_signing_roots() {
+    /*
+     * Exercises malformed, low-diversity, current-key duplicate, repeated, case-variant, and
+     * overlong previous-key lists. It checks at most four distinct canonical roots are accepted
+     * and that verification honors the fourth configured key but never an out-of-bound fifth
+     * key.
+     */
     let invalid = explicit_dev_settings(TEST_SIGNING_ROOT, &["not-hex"])
         .validate_runtime_config()
         .expect_err("invalid previous root must reject")
@@ -1115,6 +1253,12 @@ fn runtime_validation_bounds_and_deduplicates_previous_signing_roots() {
 
 #[test]
 fn session_signing_key_rotation_verifies_previous_but_signs_only_with_current() {
+    /*
+     * Rotates from an old signing root to a new root while retaining the old one for
+     * verification. It checks old sessions survive only during the grace period, new
+     * sessions use only the current derived key, secrets are redacted from debug output, and
+     * legacy raw-key signatures are not accepted.
+     */
     let old = explicit_dev_settings(PREVIOUS_SIGNING_ROOT, &[]);
     let rotated = explicit_dev_settings(TEST_SIGNING_ROOT, &[PREVIOUS_SIGNING_ROOT]);
     let current_only = explicit_dev_settings(TEST_SIGNING_ROOT, &[]);
@@ -1145,6 +1289,11 @@ fn session_signing_key_rotation_verifies_previous_but_signs_only_with_current() 
 
 #[test]
 fn trusted_proxy_set_matches_exact_cidrs_ipv6_and_mapped_ipv6() {
+    /*
+     * Parses exact IPv4, IPv4 CIDR, IPv6 CIDR, and IPv4-mapped IPv6 trust entries. It checks
+     * peers inside each boundary match while adjacent networks and mapped addresses outside
+     * the declared range do not.
+     */
     let proxies =
         TrustedProxySet::parse("127.0.0.1, 10.20.0.0/16, 2001:db8::/48, ::ffff:192.0.2.0/120");
 
@@ -1159,6 +1308,12 @@ fn trusted_proxy_set_matches_exact_cidrs_ipv6_and_mapped_ipv6() {
 
 #[test]
 fn runtime_validation_requires_valid_proxy_trust_for_header_auth() {
+    /*
+     * Validates header authentication with missing trust, wildcard and all-network ranges,
+     * malformed lists, hostnames, and a bounded set of IP/CIDR entries. It checks only
+     * explicit, syntactically valid proxy boundaries are accepted for identity-bearing
+     * headers.
+     */
     let base = AuthSettings {
         signing_keys: signing_keys(TEST_SIGNING_ROOT, &[]),
         session_secret_source: SessionSecretSource::Explicit,
@@ -1200,6 +1355,11 @@ fn runtime_validation_requires_valid_proxy_trust_for_header_auth() {
 
 #[test]
 fn runtime_validation_rejects_dev_auth_mixed_with_header_auth() {
+    /*
+     * Enables the development identity shortcut while leaving the configured authentication mode
+     * on trusted headers. It checks runtime validation rejects the mixed mode before either
+     * authentication source can be used ambiguously.
+     */
     let settings = AuthSettings {
         dev_mode: true,
         dev_auth_enabled: true,
@@ -1216,6 +1376,11 @@ fn runtime_validation_rejects_dev_auth_mixed_with_header_auth() {
 
 #[test]
 fn malformed_optional_proxy_trust_rejects_outside_header_mode() {
+    /*
+     * Supplies malformed proxy trust while running in development mode, then compares a
+     * development configuration that omits proxy trust entirely. It checks optional trust
+     * may be absent outside header mode but can never be present in an invalid form.
+     */
     let settings = AuthSettings {
         mode: AuthMode::Dev,
         auth_mode_raw: "dev".to_string(),
@@ -1242,6 +1407,11 @@ fn malformed_optional_proxy_trust_rejects_outside_header_mode() {
 
 #[test]
 fn runtime_validation_rejects_invalid_auth_cookie_and_oidc_client_modes() {
+    /*
+     * Combines an unknown authentication mode, invalid secure-cookie setting, unsafe cookie
+     * names, and unsupported OIDC client authentication. It checks validation reports every
+     * independent configuration error rather than stopping after the first one.
+     */
     let settings = AuthSettings {
         auth_mode_raw: "bogus".to_string(),
         session_cookie_name: "vault session".to_string(),
@@ -1273,6 +1443,11 @@ fn runtime_validation_rejects_invalid_auth_cookie_and_oidc_client_modes() {
 
 #[test]
 fn runtime_validation_rejects_insecure_production_urls() {
+    /*
+     * Configures a nonlocal HTTP public URL with otherwise explicit production signing material.
+     * It checks runtime validation requires HTTPS before the deployment can emit cookies or
+     * redirects against that origin.
+     */
     let settings = AuthSettings {
         public_url: "http://vault.example.com".to_string(),
         signing_keys: signing_keys(TEST_SIGNING_ROOT, &[]),
@@ -1293,6 +1468,11 @@ fn runtime_validation_rejects_insecure_production_urls() {
 
 #[test]
 fn runtime_validation_rejects_incomplete_or_insecure_oidc_config() {
+    /*
+     * Builds an OIDC configuration with an insecure and colliding issuer, missing client
+     * credentials, the wrong bootstrap policy, and an insecure redirect. It checks validation
+     * reports all of those deployment hazards together with actionable setting names.
+     */
     let settings = AuthSettings {
         bootstrap_admin_emails: ["owner@example.com".to_string()].into_iter().collect(),
         mode: vault_server::auth::AuthMode::Oidc,
@@ -1329,6 +1509,11 @@ fn runtime_validation_rejects_incomplete_or_insecure_oidc_config() {
 
 #[test]
 fn runtime_validation_allows_local_http_oidc_in_production() {
+    /*
+     * Configures a complete OIDC client whose issuer and callback both use loopback HTTP. It
+     * checks the local-development exception remains valid even when the broader runtime is
+     * not in development mode.
+     */
     let settings = AuthSettings {
         mode: vault_server::auth::AuthMode::Oidc,
         auth_mode_raw: "oidc".to_string(),

@@ -131,6 +131,11 @@ async fn assert_archive_race_state(pool: &sqlx::SqlitePool, expected: ArchiveRac
 
 #[test]
 fn file_name_normalization_keeps_basename_from_client_paths() {
+    /*
+     * Normalizes Windows paths, slash-separated paths, and whitespace around a client-supplied
+     * basename. It checks directory components are discarded while traversal-only and
+     * control-bearing names are rejected instead of becoming stored document names.
+     */
     assert_eq!(
         normalize_file_name(r"C:\Users\Artist\plan.txt").expect("windows path"),
         "plan.txt",
@@ -149,6 +154,11 @@ fn file_name_normalization_keeps_basename_from_client_paths() {
 
 #[tokio::test]
 async fn document_paths_follow_folder_public_paths() {
+    /*
+     * Creates an active document inside a nested Vault folder and reloads its persisted record.
+     * It checks the document is not mistaken for archived content and that both its folder
+     * path and full public path are reconstructed from the live hierarchy.
+     */
     let pool = test_pool().await;
     let project = get_or_create_folder_path(&pool, Some("Project/Private"))
         .await
@@ -179,6 +189,12 @@ async fn document_paths_follow_folder_public_paths() {
 
 #[tokio::test]
 async fn active_document_access_delegates_to_folder_acl() {
+    /*
+     * Places reader and writer grants on a document's parent folder, then evaluates the document
+     * for readers, writers, and an unrelated user. It checks document access inherits the
+     * folder's read/write level and converts that level into the expected client access
+     * flags.
+     */
     let pool = test_pool().await;
     let project = get_or_create_folder_path(&pool, Some("Project"))
         .await
@@ -221,6 +237,12 @@ async fn active_document_access_delegates_to_folder_acl() {
 
 #[tokio::test]
 async fn document_access_helpers_preserve_read_write_and_hidden_semantics() {
+    /*
+     * Gives separate groups view-only, read, and write access to a document's folder and calls
+     * the read, write, and editable lookup helpers. It checks insufficient visible access
+     * produces an explicit denial, wholly hidden documents look missing, and only a writer
+     * can edit the active document.
+     */
     let pool = test_pool().await;
     let project = get_or_create_folder_path(&pool, Some("Project"))
         .await
@@ -278,6 +300,12 @@ async fn document_access_helpers_preserve_read_write_and_hidden_semantics() {
 
 #[tokio::test]
 async fn archived_document_access_is_capped_by_archive_and_source_snapshot() {
+    /*
+     * Stores a document in Archive with a snapshot of its source-folder ACL and different
+     * current permissions on the Archive root. It checks effective access is the
+     * intersection of those two boundaries, except for an administrator, and that even an
+     * administrator must restore the document before editing its content.
+     */
     let pool = test_pool().await;
     let vault_root = get_root_folder(&pool, VAULT_ROOT_KEY).await.expect("vault");
     let archive_root = get_root_folder(&pool, ARCHIVE_ROOT_KEY)
@@ -363,6 +391,12 @@ async fn archived_document_access_is_capped_by_archive_and_source_snapshot() {
 
 #[tokio::test]
 async fn delete_forever_rechecks_archive_state_after_restore_wins_writer_gate() {
+    /*
+     * Blocks permanent deletion behind a SQLite writer, restores the document in the winning
+     * transaction, and then releases the delete. It checks deletion re-reads the committed
+     * state, refuses to remove an active document, and leaves the restored location and
+     * archive metadata intact.
+     */
     let pool = test_pool().await;
     let project = get_or_create_folder_path(&pool, Some("Project"))
         .await
@@ -435,6 +469,11 @@ async fn delete_forever_rechecks_archive_state_after_restore_wins_writer_gate() 
 
 #[tokio::test]
 async fn lock_rechecks_document_after_archive_wins_writer_gate() {
+    /*
+     * Starts a lock operation behind a held writer transaction, archives the document first, and
+     * then lets the lock continue. It checks the lock path observes the new archived state,
+     * requires restoration, and creates no stale lock row.
+     */
     let pool = test_pool().await;
     let source = get_or_create_folder_path(&pool, Some("Project"))
         .await
@@ -496,6 +535,11 @@ async fn lock_rechecks_document_after_archive_wins_writer_gate() {
 
 #[tokio::test]
 async fn move_rechecks_document_after_archive_wins_writer_gate() {
+    /*
+     * Starts a normal move while another transaction holds the writer gate, then archives the
+     * document before the move can acquire it. It checks the move rejects the now-archived item
+     * and preserves its Archive location and original source metadata.
+     */
     let pool = test_pool().await;
     let source = get_or_create_folder_path(&pool, Some("Project"))
         .await
@@ -566,6 +610,13 @@ async fn move_rechecks_document_after_archive_wins_writer_gate() {
 
 #[tokio::test]
 async fn archive_folder_uses_subtree_and_documents_committed_before_writer_gate_releases() {
+    /*
+     * Pauses a folder archive behind a writer, then atomically adds a descendant, moves one
+     * document into the subtree, and moves another out before releasing the archive. It checks
+     * the operation archives the committed subtree snapshot—including late and inbound
+     * content—while preserving outbound content and removing only the archived source
+     * folders.
+     */
     let pool = test_pool().await;
     let source = get_or_create_folder_path(&pool, Some("Project/Work"))
         .await
@@ -667,6 +718,11 @@ async fn archive_folder_uses_subtree_and_documents_committed_before_writer_gate_
 
 #[tokio::test]
 async fn restore_target_identity_survives_source_folder_rename() {
+    /*
+     * Archives a document, renames its original folder, and recreates a different folder at the
+     * old path. Restore follows the stored folder identity to the renamed source instead of
+     * silently rebinding the document to the replacement.
+     */
     let pool = test_pool().await;
     let actor = user(&[], true);
     let source = get_or_create_folder_path(&pool, Some("Projects/Incoming"))
@@ -708,6 +764,11 @@ async fn restore_target_identity_survives_source_folder_rename() {
 
 #[tokio::test]
 async fn restore_target_identity_blocks_delete_ttl_drift_after_source_move() {
+    /*
+     * Archives a document, moves its source folder, and recreates the old path with automatic
+     * deletion enabled. Restore returns the document to the moved source identity without
+     * inheriting the replacement folder's retention policy.
+     */
     let pool = test_pool().await;
     let actor = user(&[], true);
     let source = get_or_create_folder_path(&pool, Some("Records/Incoming"))
@@ -763,6 +824,11 @@ async fn restore_target_identity_blocks_delete_ttl_drift_after_source_move() {
 
 #[tokio::test]
 async fn restore_target_identity_blocks_acl_drift_after_ancestor_rename() {
+    /*
+     * Archives a hidden document, renames its source ancestor, and recreates a readable tree at
+     * the old path. Restore keeps the original folder identity and its deny boundary rather
+     * than exposing the document through the replacement ACLs.
+     */
     let pool = test_pool().await;
     let actor = user(&[], true);
     let readers = create_group(&pool, "readers").await;
@@ -821,6 +887,11 @@ async fn restore_target_identity_blocks_acl_drift_after_ancestor_rename() {
 
 #[tokio::test]
 async fn archive_identity_model_folder_restore_retains_the_original_subtree() {
+    /*
+     * Archives a folder with a nested document, renames its parent, and restores the archived
+     * root. The same folder, child, and document identities reappear beneath the parent's
+     * current name, and the archive marker is cleared from the restored root.
+     */
     let pool = test_pool().await;
     let actor = user(&[], true);
     let parent = get_or_create_folder_path(&pool, Some("Projects"))
@@ -867,6 +938,11 @@ async fn archive_identity_model_folder_restore_retains_the_original_subtree() {
 
 #[tokio::test]
 async fn archive_identity_model_folder_restore_rejects_a_reused_name_without_rebinding() {
+    /*
+     * Archives a folder and creates a replacement with the same path before attempting restore.
+     * The collision is rejected without moving the archived document or clearing the original
+     * folder's archive marker.
+     */
     let pool = test_pool().await;
     let actor = user(&[], true);
     let source = get_or_create_folder_path(&pool, Some("Projects/Incoming"))
@@ -915,6 +991,11 @@ async fn archive_identity_model_folder_restore_rejects_a_reused_name_without_reb
 
 #[tokio::test]
 async fn archive_identity_model_parent_restore_preserves_an_independent_child_archive() {
+    /*
+     * Archives a child independently before archiving its parent. Both remain separate archive
+     * roots, and restoring the parent restores only its owned content while the child and its
+     * document stay archived.
+     */
     let pool = test_pool().await;
     let actor = user(&[], true);
     let parent = get_or_create_folder_path(&pool, Some("Project"))
@@ -995,6 +1076,12 @@ async fn archive_identity_model_parent_restore_preserves_an_independent_child_ar
 
 #[tokio::test]
 async fn archive_identity_model_parent_delete_never_cascades_into_separate_archive_entries() {
+    /*
+     * Archives a document and child folder independently before archiving their parent.
+     * Permanent parent deletion is blocked until those separate entries are explicitly
+     * removed, preventing an aggregate delete from cascading across archive ownership
+     * boundaries.
+     */
     let pool = test_pool().await;
     let actor = user(&[], true);
     let parent = get_or_create_folder_path(&pool, Some("Project"))
@@ -1057,6 +1144,11 @@ async fn archive_identity_model_parent_delete_never_cascades_into_separate_archi
 
 #[tokio::test]
 async fn archive_identity_model_aggregate_mutations_require_write_access_to_the_owned_subtree() {
+    /*
+     * An administrator archives a tree containing a descendant hidden from an otherwise writable
+     * user. That user cannot restore or permanently delete the aggregate, and both denied
+     * operations preserve the restricted document and archive marker.
+     */
     let pool = test_pool().await;
     let writers = create_group(&pool, "writers").await;
     let restricted = create_group(&pool, "restricted").await;
@@ -1141,6 +1233,11 @@ async fn archive_identity_model_aggregate_mutations_require_write_access_to_the_
 
 #[tokio::test]
 async fn archive_identity_model_folder_archive_blocks_an_active_bound_upload() {
+    /*
+     * Binds an active create upload to a descendant of the folder being archived. The upload
+     * prevents the aggregate archive from starting, leaving the source folder unmarked and
+     * available as the stable upload target.
+     */
     let pool = test_pool().await;
     let actor = user(&[], true);
     let source = get_or_create_folder_path(&pool, Some("Project"))
@@ -1188,6 +1285,11 @@ async fn archive_identity_model_folder_archive_blocks_an_active_bound_upload() {
 
 #[tokio::test]
 async fn archive_identity_model_archive_is_flat_but_archived_folders_are_browsable() {
+    /*
+     * Archives one folder subtree and one loose document as independent entries. The Archive
+     * root stays flat, while the archived folder's synthetic path remains browsable through
+     * its child and preserves the nested document's original path.
+     */
     let pool = test_pool().await;
     let actor = user(&[], true);
     let source = get_or_create_folder_path(&pool, Some("Project"))

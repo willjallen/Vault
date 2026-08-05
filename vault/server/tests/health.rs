@@ -138,6 +138,11 @@ impl BlobStorageBackend for ReadinessStorage {
 
 #[tokio::test]
 async fn health_remains_process_only_when_dependencies_are_unavailable() {
+    /*
+     * Closes the database and supplies a storage readiness check that would never complete, then
+     * calls the lightweight health endpoint. It checks liveness still returns `ok` promptly and
+     * never touches either dependency.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let config = test_config(temp_dir.path());
     let storage = Arc::new(ReadinessStorage::new(ReadinessBehavior::Pending));
@@ -153,6 +158,11 @@ async fn health_remains_process_only_when_dependencies_are_unavailable() {
 
 #[tokio::test]
 async fn readiness_checks_database_and_storage_without_leaving_probe_artifacts() {
+    /*
+     * Runs the full readiness endpoint against a valid database and initialized local object
+     * store. It checks both dependencies are reported healthy, storage is probed exactly once,
+     * and the nonmutating probe leaves the object directory empty.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let config = test_config(temp_dir.path());
     let objects_path = config.objects_path();
@@ -191,6 +201,11 @@ async fn readiness_checks_database_and_storage_without_leaving_probe_artifacts()
 
 #[tokio::test]
 async fn readiness_rejects_noncanonical_root_metadata_without_repairing_it() {
+    /*
+     * Corrupts the persisted Vault root name after startup, then compares liveness with full
+     * readiness. It checks liveness stays process-only, readiness marks the database unhealthy,
+     * storage is still checked, and the probe does not silently repair the bad root.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let config = test_config(temp_dir.path());
     let local_storage = LocalBlobStorage::new(config.objects_path(), &config.storage_prefix);
@@ -243,6 +258,11 @@ async fn readiness_rejects_noncanonical_root_metadata_without_repairing_it() {
 
 #[tokio::test]
 async fn readiness_rejects_cross_root_hierarchy_without_repairing_it() {
+    /*
+     * Inserts an Archive-keyed folder beneath the Vault root and invokes full readiness. It
+     * checks semantic validation marks only the database unhealthy and leaves the cross-root
+     * row untouched for an explicit operator repair.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let config = test_config(temp_dir.path());
     let local_storage = LocalBlobStorage::new(config.objects_path(), &config.storage_prefix);
@@ -296,6 +316,11 @@ async fn readiness_rejects_cross_root_hierarchy_without_repairing_it() {
 
 #[tokio::test]
 async fn readiness_rejects_nonbinary_root_flag_without_repairing_it() {
+    /*
+     * Changes the canonical Vault root flag to an out-of-domain value before probing readiness.
+     * It checks the semantic database failure is reported while the invalid value remains
+     * persisted, proving health checks are observational rather than corrective.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let (state, storage) = test_state_with_ready_storage(temp_dir.path()).await;
     let db = state.db.clone();
@@ -321,6 +346,11 @@ async fn readiness_rejects_nonbinary_root_flag_without_repairing_it() {
 
 #[tokio::test]
 async fn readiness_rejects_archive_descendant_without_repairing_it() {
+    /*
+     * Adds a forbidden child beneath the otherwise flat Archive root and snapshots its stored
+     * fields. It checks readiness rejects the hierarchy while preserving the exact row rather
+     * than deleting or relocating it during a probe.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let (state, storage) = test_state_with_ready_storage(temp_dir.path()).await;
     let db = state.db.clone();
@@ -362,6 +392,11 @@ async fn readiness_rejects_archive_descendant_without_repairing_it() {
 
 #[tokio::test]
 async fn readiness_rejects_vault_archive_name_collision_without_repairing_it() {
+    /*
+     * Adds a direct Vault child named `Archive`, which collides with the reserved public root
+     * name. It checks readiness flags the semantic corruption but leaves the colliding row
+     * byte-for-byte unchanged.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let (state, storage) = test_state_with_ready_storage(temp_dir.path()).await;
     let db = state.db.clone();
@@ -403,6 +438,11 @@ async fn readiness_rejects_vault_archive_name_collision_without_repairing_it() {
 
 #[tokio::test]
 async fn readiness_reports_database_failure_without_leaking_details() {
+    /*
+     * Closes the database while leaving local storage healthy, then calls full readiness. It
+     * checks the response reports only the database boolean failure, still probes storage
+     * once, and exposes no internal database error text.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let config = test_config(temp_dir.path());
     let local_storage = LocalBlobStorage::new(config.objects_path(), &config.storage_prefix);
@@ -433,6 +473,11 @@ async fn readiness_reports_database_failure_without_leaking_details() {
 
 #[tokio::test]
 async fn readiness_does_not_recreate_an_absent_local_storage_root() {
+    /*
+     * Configures local storage at a path that does not exist and calls readiness without
+     * performing startup initialization. It checks the database remains healthy, storage is
+     * reported unavailable, and the probe does not create the missing directory.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let config = test_config(temp_dir.path());
     let objects_path = config.objects_path();
@@ -457,6 +502,11 @@ async fn readiness_does_not_recreate_an_absent_local_storage_root() {
 
 #[tokio::test]
 async fn readiness_redacts_storage_failure_busy_and_timeout() {
+    /*
+     * Runs readiness against storage implementations that fail with a secret-bearing error,
+     * report busy, or never return before the deadline. It checks all three collapse to the
+     * same redacted storage-unavailable response and are attempted exactly once.
+     */
     for behavior in [
         ReadinessBehavior::Failure,
         ReadinessBehavior::Busy,
@@ -485,6 +535,11 @@ async fn readiness_redacts_storage_failure_busy_and_timeout() {
 
 #[tokio::test]
 async fn readiness_reports_unusable_local_storage_without_probe_debris() {
+    /*
+     * Points local object storage at an existing regular file containing sentinel bytes. It
+     * checks readiness reports storage failure without disclosing the path, overwriting the
+     * file, or leaving any probe artifact behind.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let mut config = test_config(temp_dir.path());
     let objects_path = temp_dir.path().join("objects-is-a-file");
@@ -515,6 +570,11 @@ async fn readiness_reports_unusable_local_storage_without_probe_debris() {
 #[cfg(unix)]
 #[tokio::test]
 async fn readiness_rejects_symlinked_storage_root_without_touching_target() {
+    /*
+     * Makes the configured object root a symlink to an outside directory containing a sentinel.
+     * It checks readiness rejects the root without following or replacing the link, and leaves
+     * the external directory and its contents untouched.
+     */
     use std::os::unix::fs::symlink;
 
     let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -561,6 +621,11 @@ async fn readiness_rejects_symlinked_storage_root_without_touching_target() {
 
 #[tokio::test]
 async fn production_router_does_not_register_benchmark_sink() {
+    /*
+     * Sends both read and write requests to the benchmark sink path on the production router. It
+     * checks the development-only throughput endpoint is entirely absent rather than merely
+     * rejecting one method.
+     */
     let (_temp_dir, app) = test_app().await;
 
     for method in [Method::GET, Method::PUT] {

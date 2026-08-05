@@ -96,6 +96,12 @@ fn asset_path(manifest: &Value, name: &str) -> String {
 
 #[tokio::test]
 async fn index_renders_bootstrap_state_and_manifest_assets() {
+    /*
+     * Renders the authenticated index using appearance overrides and the generated asset
+     * manifest. It checks the shell is non-cacheable HTML containing the mount point,
+     * bootstrap state, override logic, and the exact content-hashed script and stylesheet
+     * paths.
+     */
     let (state, _temp_dir) = test_state().await;
     let app = http::router(state);
     let manifest: Value = serde_json::from_str(
@@ -130,6 +136,11 @@ async fn index_renders_bootstrap_state_and_manifest_assets() {
 
 #[tokio::test]
 async fn index_ignores_folder_query_parameter() {
+    /*
+     * Creates a real Project folder, then requests the index with the legacy folder query
+     * parameter. It checks the server still bootstraps at the root and does not reflect or
+     * retain the query-driven navigation state in the rendered shell.
+     */
     let (state, _temp_dir) = test_state().await;
     get_or_create_folder_path(&state.db, Some("Project"))
         .await
@@ -150,6 +161,11 @@ async fn index_ignores_folder_query_parameter() {
 
 #[tokio::test]
 async fn index_ignores_invalid_host_appearance_headers() {
+    /*
+     * Sends unsupported palette and theme override headers while rendering the index. It checks
+     * that neither unrecognized value reaches the initial state or page body, leaving both
+     * overrides unset.
+     */
     let (state, _temp_dir) = test_state().await;
     let app = http::router(state);
 
@@ -172,6 +188,11 @@ async fn index_ignores_invalid_host_appearance_headers() {
 
 #[tokio::test]
 async fn index_bootstrap_script_keeps_preference_booleans_strict() {
+    /*
+     * Inspects the bootstrap JavaScript embedded in the application shell. It checks preference
+     * flags accept actual booleans only, preventing the strings "true" and "false" from being
+     * silently treated as trusted boolean state.
+     */
     let (state, _temp_dir) = test_state().await;
     let app = http::router(state);
 
@@ -186,6 +207,11 @@ async fn index_bootstrap_script_keeps_preference_booleans_strict() {
 
 #[tokio::test]
 async fn share_entry_renders_app_state_with_share_code_and_rejects_bad_codes() {
+    /*
+     * Opens the share entry point once with a syntactically valid code and once with invalid
+     * punctuation. It checks valid codes enter the application through bootstrap state without a
+     * folder query, while malformed codes are rejected before rendering.
+     */
     let (state, _temp_dir) = test_state().await;
     let app = http::router(state);
 
@@ -208,6 +234,11 @@ async fn share_entry_renders_app_state_with_share_code_and_rejects_bad_codes() {
 
 #[tokio::test]
 async fn static_assets_are_served_from_manifest_and_missing_paths_404() {
+    /*
+     * Requests a manifest-listed bundle, the manifest itself, a missing bundle, and a traversal
+     * path. It checks immutable caching and the JavaScript type for hashed assets, revalidation
+     * for the manifest, and not-found responses for absent or unsafe paths.
+     */
     let (state, _temp_dir) = test_state().await;
     let app = http::router(state);
     let manifest: Value = serde_json::from_str(

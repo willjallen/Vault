@@ -40,6 +40,11 @@ struct ReadinessMockState {
 
 #[tokio::test]
 async fn s3_compatible_storage_puts_reads_ranges_and_deletes_objects() {
+    /*
+     * The S3-compatible backend must round-trip a content-addressed payload with correct backend
+     * metadata. Buffered ranges and bounded streaming return the requested bytes, and
+     * deletion makes the key unreadable.
+     */
     let endpoint_url = start_s3_mock().await;
     let storage = S3CompatibleBlobStorage::from_settings(S3StorageSettings {
         name: "s3".to_string(),
@@ -109,6 +114,11 @@ async fn s3_compatible_storage_puts_reads_ranges_and_deletes_objects() {
 
 #[tokio::test]
 async fn s3_compatible_storage_overwrites_existing_digest_key_with_new_bytes() {
+    /*
+     * The mock bucket starts with incorrect data at the key derived from the correct payload's
+     * digest. Uploading that payload must repair the remote object rather than accepting the
+     * occupied key as a valid deduplicated copy.
+     */
     let (endpoint_url, objects) = start_s3_mock_with_objects().await;
     let storage = S3CompatibleBlobStorage::from_settings(S3StorageSettings {
         name: "s3".to_string(),
@@ -145,6 +155,11 @@ async fn s3_compatible_storage_overwrites_existing_digest_key_with_new_bytes() {
 
 #[tokio::test]
 async fn s3_full_object_stream_is_bounded_across_multiple_mebibytes() {
+    /*
+     * A remote object larger than two internal chunks is streamed to completion.
+     * Every emitted frame stays within the memory bound, while their total exactly matches the
+     * source size.
+     */
     let (endpoint_url, objects) = start_s3_mock_with_objects().await;
     let storage = S3CompatibleBlobStorage::from_settings(S3StorageSettings {
         name: "s3".to_string(),
@@ -193,6 +208,11 @@ async fn s3_full_object_stream_is_bounded_across_multiple_mebibytes() {
 
 #[tokio::test]
 async fn s3_range_stream_rejects_a_provider_that_ignores_the_range() {
+    /*
+     * The fake provider ignores a range request and responds with the full object and a normal
+     * success status. Storage must recognize the response contract violation before exposing
+     * those unintended bytes.
+     */
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
     let addr = listener.local_addr().expect("listener address");
     let app = Router::new().route(
@@ -240,6 +260,10 @@ async fn s3_range_stream_rejects_a_provider_that_ignores_the_range() {
 
 #[tokio::test]
 async fn s3_compatible_storage_rejects_missing_bucket_configuration() {
+    /*
+     * Constructing an R2 backend with an empty bucket must fail during configuration validation.
+     * The diagnostic identifies the Vault bucket setting the operator needs to supply.
+     */
     let error = S3CompatibleBlobStorage::from_settings(S3StorageSettings {
         name: "r2".to_string(),
         bucket: String::new(),
@@ -277,6 +301,11 @@ fn endpoint_policy_settings(
 
 #[tokio::test]
 async fn s3_readiness_uses_non_mutating_head_bucket_and_maps_failure() {
+    /*
+     * Readiness probes a successful and a forbidden bucket using HEAD only.
+     * It reports remote failure accurately and never performs a write or other mutating request
+     * as part of health checking.
+     */
     for (head_status, should_succeed) in [(StatusCode::OK, true), (StatusCode::FORBIDDEN, false)] {
         let (endpoint_url, state) = start_s3_readiness_mock(head_status).await;
         let storage =
@@ -298,6 +327,11 @@ async fn s3_readiness_uses_non_mutating_head_bucket_and_maps_failure() {
 
 #[tokio::test]
 async fn s3_endpoint_policy_accepts_https_and_explicit_loopback_http() {
+    /*
+     * Secure endpoints are accepted normally, while cleartext HTTP is allowed only when
+     * explicitly enabled for recognized loopback spellings. The accepted set covers
+     * localhost subdomains plus IPv4, IPv6, and mapped-loopback numeric forms.
+     */
     for (endpoint_url, allow_insecure_local_http) in [
         ("https://s3.example.test", false),
         ("http://localhost:9000", true),
@@ -321,6 +355,11 @@ async fn s3_endpoint_policy_accepts_https_and_explicit_loopback_http() {
 
 #[tokio::test]
 async fn s3_endpoint_policy_rejects_http_without_explicit_opt_in() {
+    /*
+     * Even a loopback endpoint must use HTTPS unless the insecure-local option is deliberately
+     * enabled. Validation rejects the default cleartext configuration with an actionable
+     * protocol error.
+     */
     let error = S3CompatibleBlobStorage::from_settings(endpoint_policy_settings(
         "http://127.0.0.1:9000",
         false,
@@ -334,6 +373,11 @@ async fn s3_endpoint_policy_rejects_http_without_explicit_opt_in() {
 
 #[tokio::test]
 async fn s3_endpoint_policy_rejects_non_loopback_http_even_with_opt_in() {
+    /*
+     * The local-development HTTP exception must not extend to public, private-network,
+     * link-local, carrier-grade NAT, unspecified, or deceptive hostnames. Each candidate is
+     * rejected without echoing the potentially sensitive endpoint in the error.
+     */
     for endpoint_url in [
         "http://example.test:9000",
         "http://8.8.8.8:9000",
@@ -370,6 +414,11 @@ async fn s3_endpoint_policy_rejects_non_loopback_http_even_with_opt_in() {
 
 #[tokio::test]
 async fn s3_endpoint_policy_rejects_non_http_and_malformed_urls() {
+    /*
+     * Endpoint parsing rejects unsupported schemes, malformed hosts, embedded credentials, and
+     * query or fragment tricks. Errors remain specific enough to diagnose configuration
+     * while redacting the supplied URL.
+     */
     for (endpoint_url, message) in [
         ("ftp://localhost/bucket", "must use HTTP or HTTPS"),
         ("not a URL", "URL is invalid"),
@@ -399,6 +448,11 @@ async fn s3_endpoint_policy_rejects_non_http_and_malformed_urls() {
 
 #[test]
 fn s3_storage_settings_treat_unknown_insecure_http_flag_as_disabled() {
+    /*
+     * An unrecognized value for the insecure-local HTTP environment flag must fail closed.
+     * Settings therefore leave cleartext loopback access disabled instead of guessing operator
+     * intent.
+     */
     let settings = S3StorageSettings::s3_from_env_with("objects", |name| {
         (name == "VAULT_S3_ALLOW_INSECURE_LOCAL_HTTP").then(|| "sometimes".to_string())
     });
@@ -408,6 +462,11 @@ fn s3_storage_settings_treat_unknown_insecure_http_flag_as_disabled() {
 
 #[test]
 fn s3_storage_settings_use_vault_env_with_aws_credential_fallbacks() {
+    /*
+     * Generic S3 settings take Vault-specific bucket, region, endpoint, prefix, and transport
+     * values from the environment. Standard AWS credential variables remain valid fallbacks,
+     * including the optional session token.
+     */
     let env = HashMap::from([
         ("VAULT_S3_BUCKET", "vault-prod"),
         ("VAULT_S3_REGION", "us-west-2"),
@@ -438,6 +497,11 @@ fn s3_storage_settings_use_vault_env_with_aws_credential_fallbacks() {
 
 #[test]
 fn r2_storage_settings_derive_endpoint_from_account_id() {
+    /*
+     * R2 configuration builds Cloudflare's endpoint from the account identifier and uses the
+     * provider's automatic region. It also selects the R2 credential variables and preserves
+     * the configured object prefix.
+     */
     let env = HashMap::from([
         ("VAULT_R2_BUCKET", "vault-r2"),
         ("VAULT_R2_ACCOUNT_ID", "acct123"),
@@ -466,6 +530,11 @@ fn r2_storage_settings_derive_endpoint_from_account_id() {
 
 #[tokio::test]
 async fn s3_compatible_storage_promotes_part_files_as_content_addressed_object() {
+    /*
+     * Two local upload parts are staged, concatenated, verified against the expected digest, and
+     * uploaded as one R2 object. Returned metadata and remote bytes match the combined
+     * payload, and the temporary staging file is removed.
+     */
     let endpoint_url = start_s3_mock().await;
     let storage = S3CompatibleBlobStorage::from_settings(S3StorageSettings {
         name: "r2".to_string(),
@@ -514,6 +583,11 @@ async fn s3_compatible_storage_promotes_part_files_as_content_addressed_object()
 
 #[tokio::test]
 async fn s3_compatible_storage_rejects_part_file_checksum_mismatch_without_uploading() {
+    /*
+     * The expected digest intentionally describes different bytes than the staged part.
+     * Verification fails before remote publication and cleans the local staging file, leaving no
+     * object under the actual digest either.
+     */
     let endpoint_url = start_s3_mock().await;
     let storage = S3CompatibleBlobStorage::from_settings(S3StorageSettings {
         name: "s3".to_string(),
@@ -553,6 +627,11 @@ async fn s3_compatible_storage_rejects_part_file_checksum_mismatch_without_uploa
 
 #[tokio::test]
 async fn s3_staged_part_upload_supports_empty_objects() {
+    /*
+     * An upload with no part files still represents a legitimate zero-byte object.
+     * It is published under the empty-content digest, reads back empty, and leaves no staging
+     * artifact.
+     */
     let endpoint_url = start_s3_mock().await;
     let storage = S3CompatibleBlobStorage::from_settings(S3StorageSettings {
         name: "s3".to_string(),
@@ -589,6 +668,11 @@ async fn s3_staged_part_upload_supports_empty_objects() {
 
 #[tokio::test]
 async fn s3_part_staging_is_session_local_and_cancel_safe() {
+    /*
+     * While a remote PUT is blocked, the assembled payload must exist only inside that upload
+     * session and contain the exact combined bytes. Cancelling the task removes the
+     * session-local staging file through its cleanup guard.
+     */
     let (endpoint_url, blocked_put) = start_blocked_s3_put_mock().await;
     let storage = S3CompatibleBlobStorage::from_settings(S3StorageSettings {
         name: "s3".to_string(),
@@ -643,6 +727,10 @@ async fn s3_part_staging_is_session_local_and_cancel_safe() {
 #[cfg(unix)]
 #[tokio::test]
 async fn s3_stage_cleanup_refuses_symlinks() {
+    /*
+     * A staging filename is replaced with a symlink to an outside file before cleanup.
+     * Cleanup rejects the unsafe path and preserves both the link and its external target.
+     */
     use std::os::unix::fs::symlink;
 
     let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -678,6 +766,11 @@ async fn s3_stage_cleanup_refuses_symlinks() {
 #[cfg(unix)]
 #[tokio::test]
 async fn legacy_s3_stage_sweep_is_aged_bounded_and_symlink_safe() {
+    /*
+     * Legacy cleanup must honor its work limit and age threshold while matching only the exact
+     * temporary-file naming scheme. It deletes the old regular file but preserves fresh
+     * files, lookalikes, directories, symlinks, outside targets, and an unsafe root.
+     */
     use std::os::unix::fs::symlink;
 
     let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -747,6 +840,11 @@ async fn legacy_s3_stage_sweep_is_aged_bounded_and_symlink_safe() {
 
 #[tokio::test]
 async fn blob_lifecycle_garbage_collection_deletes_s3_object_and_metadata() {
+    /*
+     * An S3 object is published with blob metadata but deliberately receives no live reference.
+     * Garbage collection must report and remove both the remote payload and its database row
+     * without recording a failure.
+     */
     let (endpoint_url, objects) = start_s3_mock_with_objects().await;
     let storage = S3CompatibleBlobStorage::from_settings(S3StorageSettings {
         name: "s3".to_string(),

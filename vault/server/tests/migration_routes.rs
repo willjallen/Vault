@@ -101,6 +101,13 @@ async fn response_json(response: axum::response::Response) -> Value {
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // One ordered upgrade canary keeps every mutation and audit assertion together.
 async fn derived_v2_0_0_incident_state_upgrade_restores_folder_mutation_routes() {
+    /*
+     * Derives the historical named-root incident from a pinned v2.0.0 database, then opens it
+     * through normal startup to run the migration. It checks strict folder resolution before
+     * exercising move, rename, delete, and archive routes against the upgraded hierarchy. The
+     * final database and event assertions ensure those mutations preserve the right parent,
+     * archive provenance, document, and audit history.
+     */
     let fixture = Fixture::create()
         .await
         .expect("generate pinned v2.0.0 database");

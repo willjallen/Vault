@@ -681,6 +681,12 @@ fn assert_document_detail_history_payload(reader_json: &Value, document_id: i64)
 
 #[tokio::test]
 async fn document_detail_requires_read_access_and_returns_version_history() {
+    /*
+     * Document detail requires read permission, distinguishes a discoverable-but-unreadable
+     * document from a hidden one, and never exposes history across that boundary.
+     * An authorized reader receives Python-compatible metadata plus versions and events merged
+     * in timestamp order with actor and display fallbacks.
+     */
     let (state, _temp_dir) = test_state().await;
     let readers = create_group(&state.db, "readers").await;
     let viewers = create_group(&state.db, "viewers").await;
@@ -774,6 +780,12 @@ async fn document_detail_requires_read_access_and_returns_version_history() {
 
 #[tokio::test]
 async fn document_detail_dedupes_matching_version_events_by_normalized_timestamp() {
+    /*
+     * An upload event that describes the same version commit must not appear as a second history
+     * entry merely because its timestamp uses a different ISO representation.
+     * Timestamp normalization and trimmed message matching collapse the duplicate into the
+     * canonical version row.
+     */
     let (state, _temp_dir) = test_state().await;
     let readers = create_group(&state.db, "readers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -823,6 +835,12 @@ async fn document_detail_dedupes_matching_version_events_by_normalized_timestamp
 
 #[tokio::test]
 async fn document_detail_dedupes_version_checksums_after_version_number_ordering() {
+    /*
+     * Version history ordering must remain based on descending version number even when two
+     * versions reference the same blob checksum and commit times are out of order.
+     * Deduplicating checksum lookups must not discard either version or reorder the serialized
+     * history.
+     */
     let (state, _temp_dir) = test_state().await;
     let readers = create_group(&state.db, "readers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -921,6 +939,11 @@ async fn document_detail_dedupes_version_checksums_after_version_number_ordering
 
 #[tokio::test]
 async fn document_detail_lock_payload_uses_python_datetime_iso_shape() {
+    /*
+     * Active lock metadata is exposed with the Python service's naive ISO timestamp shape,
+     * including fractional seconds. The response must also preserve the lock owner, network
+     * provenance, user agent, and normal-versus-forced acquisition flag.
+     */
     let (state, _temp_dir) = test_state().await;
     let readers = create_group(&state.db, "readers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -979,6 +1002,11 @@ async fn document_detail_lock_payload_uses_python_datetime_iso_shape() {
 
 #[tokio::test]
 async fn legacy_document_detail_redirect_requires_visible_access() {
+    /*
+     * The legacy document page redirects a caller who may discover the document to the current
+     * application shell. Hidden and nonexistent identifiers both return not found so the
+     * redirect cannot be used as an existence oracle.
+     */
     let (state, _temp_dir) = test_state().await;
     let viewers = create_group(&state.db, "viewers").await;
     let project = get_or_create_folder_path(&state.db, Some("Project"))
@@ -1021,6 +1049,12 @@ async fn legacy_document_detail_redirect_requires_visible_access() {
 
 #[tokio::test]
 async fn current_version_routes_reject_inconsistent_metadata() {
+    /*
+     * Detail and download routes must detect documents whose current-version pointer is missing,
+     * null, or empty despite stored version metadata.
+     * A truly unversioned document with an empty pointer remains a normal not-found case rather
+     * than an internal consistency failure.
+     */
     let (state, _temp_dir) = test_state().await;
     let readers = create_group(&state.db, "readers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -1103,6 +1137,11 @@ async fn current_version_routes_reject_inconsistent_metadata() {
 
 #[tokio::test]
 async fn legacy_create_document_returns_gone_after_authentication() {
+    /*
+     * Authenticated clients using the removed direct-create endpoint receive a permanent
+     * migration signal instead of creating an empty document. The response directs them to
+     * resumable upload sessions.
+     */
     let (state, _temp_dir) = test_state().await;
     let app = http::router(state);
 
@@ -1125,6 +1164,11 @@ async fn legacy_create_document_returns_gone_after_authentication() {
 
 #[tokio::test]
 async fn legacy_create_document_returns_gone_for_authenticated_read_only_user() {
+    /*
+     * The retired direct-create endpoint returns the same gone response to any authenticated
+     * caller, even one without folder write access. It must not insert a document while
+     * reporting that the workflow has moved to resumable uploads.
+     */
     let (state, _temp_dir) = test_state().await;
     let readers = create_group(&state.db, "readers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -1168,6 +1212,11 @@ async fn legacy_create_document_returns_gone_for_authenticated_read_only_user() 
 
 #[tokio::test]
 async fn legacy_checkin_document_requires_authentication_before_gone_response() {
+    /*
+     * Authentication remains mandatory on the retired check-in endpoint, so anonymous requests
+     * cannot probe its migration behavior. Once authenticated, callers receive the gone
+     * response that points to resumable uploads.
+     */
     let (state, _temp_dir) = test_state().await;
     let app = http::router(state);
 
@@ -1208,6 +1257,11 @@ async fn legacy_checkin_document_requires_authentication_before_gone_response() 
 
 #[tokio::test]
 async fn current_document_download_streams_range_headers_and_records_event() {
+    /*
+     * A byte-range request against the current version streams only the requested bytes with
+     * correct length, range, MIME, encoding, and filename headers. Starting the transfer
+     * records both document history and the state event used to refresh interested clients.
+     */
     let (state, _temp_dir) = test_state().await;
     let readers = create_group(&state.db, "readers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -1285,6 +1339,11 @@ async fn current_document_download_streams_range_headers_and_records_event() {
 
 #[tokio::test]
 async fn api_download_single_document_streams_current_version_and_records_event() {
+    /*
+     * Selecting one document through the batch download API streams its current bytes directly
+     * rather than wrapping them in an archive. The response retains the original filename
+     * and records the same download history and state notification as the direct route.
+     */
     let (state, _temp_dir) = test_state().await;
     let readers = create_group(&state.db, "readers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -1361,6 +1420,11 @@ async fn api_download_single_document_streams_current_version_and_records_event(
 
 #[tokio::test]
 async fn api_download_missing_folder_path_reports_normalized_python_detail() {
+    /*
+     * Folder selections normalize surrounding whitespace and mixed separators before lookup.
+     * A missing folder is reported using that canonical slash-separated path to preserve
+     * Python-compatible error text.
+     */
     let (state, _temp_dir) = test_state().await;
     let app = http::router(state);
 
@@ -1386,6 +1450,11 @@ async fn api_download_missing_folder_path_reports_normalized_python_detail() {
 
 #[tokio::test]
 async fn api_download_rejects_visible_only_document_access_without_recording_events() {
+    /*
+     * Visibility alone permits discovery but not downloading document bytes; read access is
+     * still required. A forbidden transfer must not leave document history or publish a
+     * state event for work that never started.
+     */
     let (state, _temp_dir) = test_state().await;
     let viewers = create_group(&state.db, "viewers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -1447,6 +1516,11 @@ async fn api_download_rejects_visible_only_document_access_without_recording_eve
 
 #[tokio::test]
 async fn explicit_version_download_uses_original_filename_and_records_version_event() {
+    /*
+     * Downloading a historical version streams that version's bytes and uses its original
+     * uploaded filename in content disposition. The audit message identifies both the
+     * version number and the document's current path.
+     */
     let (state, _temp_dir) = test_state().await;
     let readers = create_group(&state.db, "readers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -1511,6 +1585,12 @@ async fn explicit_version_download_uses_original_filename_and_records_version_ev
 
 #[tokio::test]
 async fn download_routes_recheck_current_access_after_folder_acl_move() {
+    /*
+     * Download authorization must be evaluated from the document's current folder on every
+     * request rather than cached from an earlier successful transfer. Moving the document
+     * beneath a confidential ACL makes both batch and explicit-version downloads return not
+     * found.
+     */
     let (state, _temp_dir) = test_state().await;
     let readers = create_group(&state.db, "readers").await;
     let confidential = create_group(&state.db, "confidential").await;
@@ -1589,6 +1669,11 @@ async fn download_routes_recheck_current_access_after_folder_acl_move() {
 
 #[tokio::test]
 async fn download_routes_return_not_found_for_missing_versions_and_locations() {
+    /*
+     * Download failures distinguish an existing version with no physical storage location from a
+     * version identifier that does not exist. Both cases return not found with a precise,
+     * stable explanation.
+     */
     let (state, _temp_dir) = test_state().await;
     let readers = create_group(&state.db, "readers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -1636,6 +1721,11 @@ async fn download_routes_return_not_found_for_missing_versions_and_locations() {
 
 #[tokio::test]
 async fn download_routes_reject_truncated_stored_blob_bytes() {
+    /*
+     * Before serving either a complete current version or a ranged historical version, storage
+     * bytes must agree with the blob's recorded size. Truncated content produces an
+     * integrity error and no download history or state events.
+     */
     let (state, _temp_dir) = test_state().await;
     let readers = create_group(&state.db, "readers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -1724,6 +1814,11 @@ async fn download_routes_reject_truncated_stored_blob_bytes() {
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn preview_download_detects_same_length_corruption_and_requeues_the_job() {
+    /*
+     * Preview validation must compare content hashes, not just sizes, so equal-length tampering
+     * is detected before corrupted bytes are served. The bad rendition is removed and its
+     * ready job is reset to a fresh queued state for regeneration.
+     */
     let (state, _temp_dir) = test_state().await;
     let readers = create_group(&state.db, "readers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -1835,6 +1930,11 @@ async fn preview_download_detects_same_length_corruption_and_requeues_the_job() 
 
 #[tokio::test]
 async fn a_pruned_preview_url_recreates_its_missing_job() {
+    /*
+     * A previously issued preview URL may outlive maintenance that pruned its job and rendition
+     * rows. Requesting that stale URL returns not found but recreates one queued job so the
+     * preview can become available again.
+     */
     let (state, _temp_dir) = test_state().await;
     let readers = create_group(&state.db, "readers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -1885,6 +1985,11 @@ async fn a_pruned_preview_url_recreates_its_missing_job() {
 
 #[tokio::test]
 async fn checkout_document_returns_pinned_download_locks_and_records_event() {
+    /*
+     * Same-origin checkout pins the current version in a no-store download URL and acquires an
+     * active lock for the caller. It records checkout history and state, and the returned
+     * URL streams the exact version bytes with the original filename.
+     */
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -1990,6 +2095,12 @@ async fn checkout_document_returns_pinned_download_locks_and_records_event() {
 
 #[tokio::test]
 async fn checkout_requires_post_and_unambiguous_same_origin_provenance_without_mutation() {
+    /*
+     * Checkout accepts only POST requests with one unambiguous same-origin provenance signal;
+     * missing, conflicting, cross-site, or malformed origins are rejected. Provenance is
+     * checked before authentication, and every rejected request leaves locks and event tables
+     * untouched while preventing cached error responses.
+     */
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -2098,6 +2209,11 @@ async fn checkout_requires_post_and_unambiguous_same_origin_provenance_without_m
 
 #[tokio::test]
 async fn checkout_missing_blob_does_not_create_a_lock_or_events() {
+    /*
+     * Checkout verifies that the pinned version is physically readable before granting an edit
+     * lock or writing audit state. If the object has disappeared, the route reports missing
+     * storage and performs no checkout mutation.
+     */
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -2157,6 +2273,11 @@ async fn checkout_missing_blob_does_not_create_a_lock_or_events() {
 
 #[tokio::test]
 async fn checkout_document_rejects_archived_and_other_user_locks() {
+    /*
+     * Archived files cannot be checked out until restored, and a live lock owned by someone else
+     * cannot be replaced. Both failures occur without adding checkout events or altering the
+     * existing lock state.
+     */
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -2258,6 +2379,11 @@ async fn checkout_document_rejects_archived_and_other_user_locks() {
 
 #[tokio::test]
 async fn lock_unlock_routes_manage_locks_events_and_state() {
+    /*
+     * A writer can acquire and then release a document lock through the batch mutation routes.
+     * Each successful transition returns item-level results, updates the active lock, records
+     * audit history, and emits the corresponding state notification.
+     */
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -2317,6 +2443,12 @@ async fn lock_unlock_routes_manage_locks_events_and_state() {
 
 #[tokio::test]
 async fn lock_unlock_routes_return_item_level_failures() {
+    /*
+     * Batch lock operations report authorization, ownership, and unsupported-folder errors on
+     * the affected item rather than failing the whole request transport. A reader cannot
+     * lock, another writer cannot release the owner's lock, and the original active lock remains
+     * intact.
+     */
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let readers = create_group(&state.db, "readers").await;
@@ -2408,6 +2540,12 @@ async fn lock_unlock_routes_return_item_level_failures() {
 
 #[tokio::test]
 async fn lock_route_hides_inaccessible_folder_ids_without_blocking_authorized_items() {
+    /*
+     * Hidden and nonexistent folder selections must produce indistinguishable not-found item
+     * failures without leaking a hidden path. Those failures do not prevent an authorized
+     * document in the same batch from being locked, and no hidden descendant receives a lock or
+     * event.
+     */
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -2512,6 +2650,11 @@ async fn lock_route_hides_inaccessible_folder_ids_without_blocking_authorized_it
 
 #[tokio::test]
 async fn lock_route_prunes_child_documents_when_folder_is_selected() {
+    /*
+     * When a batch selects a folder and a document beneath it, normalization prunes the child
+     * document before applying the unsupported-folder lock operation. The folder failure
+     * therefore cannot accidentally leave the nested document locked or publish state.
+     */
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -2568,6 +2711,11 @@ async fn lock_route_prunes_child_documents_when_folder_is_selected() {
 
 #[tokio::test]
 async fn unlock_route_rechecks_current_folder_access_after_acl_move() {
+    /*
+     * Unlock authorization is derived from the document's current location, even if the lock was
+     * acquired while the document was accessible. After an external move beneath a hidden
+     * ACL, the route reports not found and preserves the active lock without a release event.
+     */
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -2640,6 +2788,11 @@ async fn unlock_route_rechecks_current_folder_access_after_acl_move() {
 
 #[tokio::test]
 async fn lock_routes_validate_payload_and_reject_archived_documents() {
+    /*
+     * An empty lock selection is invalid, while an archived document produces an item-level
+     * instruction to restore before editing. Neither rejected input may create an active
+     * lock, lock history, or state event.
+     */
     let (state, _temp_dir) = test_state().await;
     let project = get_or_create_folder_path(&state.db, Some("Project"))
         .await
@@ -2717,6 +2870,11 @@ async fn lock_routes_validate_payload_and_reject_archived_documents() {
 
 #[tokio::test]
 async fn my_edits_returns_owned_active_locks_sorted_by_path() {
+    /*
+     * The edits view contains only active locks owned by the requesting user, excluding another
+     * user's locked document. Returned documents are sorted by canonical path and include
+     * their current lock and write-access metadata.
+     */
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -2786,6 +2944,11 @@ async fn my_edits_returns_owned_active_locks_sorted_by_path() {
 
 #[tokio::test]
 async fn my_edits_requires_auth_and_hides_locks_without_current_write_access() {
+    /*
+     * The edits view rejects anonymous callers and re-evaluates folder permissions when listing
+     * an authenticated user's locks. A lock the user still owns disappears from the response
+     * after its document moves behind a confidential ACL.
+     */
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let confidential = create_group(&state.db, "confidential").await;
@@ -2851,6 +3014,12 @@ async fn my_edits_requires_auth_and_hides_locks_without_current_write_access() {
 
 #[tokio::test]
 async fn delete_forever_defaults_to_admin_only_and_deletes_archived_documents() {
+    /*
+     * With the default policy, even a writer with full Archive access cannot permanently delete;
+     * an administrator can delete an archived document. Successful deletion cascades through
+     * versions and dependent uploads, cleans temporary upload state, and invalidates every
+     * affected UI resource.
+     */
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -2955,6 +3124,10 @@ async fn delete_forever_defaults_to_admin_only_and_deletes_archived_documents() 
 
 #[tokio::test]
 async fn delete_forever_removes_the_last_local_blob_copy() {
+    /*
+     * Permanently deleting the sole document reference must garbage-collect the now-unreferenced
+     * blob. Its blob row, location row, and physical local object all disappear together.
+     */
     let (state, _temp_dir) = test_state().await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
         .await
@@ -3019,6 +3192,11 @@ async fn delete_forever_removes_the_last_local_blob_copy() {
 
 #[tokio::test]
 async fn retention_delete_followed_by_runtime_maintenance_removes_local_blob_copy() {
+    /*
+     * A delete-policy retention sweep removes an expired document but leaves physical object
+     * cleanup to runtime maintenance. Running that maintenance then deletes the orphaned
+     * blob metadata and its local bytes.
+     */
     let (state, _temp_dir) = test_state().await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
         .await
@@ -3082,6 +3260,11 @@ async fn retention_delete_followed_by_runtime_maintenance_removes_local_blob_cop
 
 #[tokio::test]
 async fn delete_forever_relaxed_policy_checks_access_archive_state_and_item_type() {
+    /*
+     * Allowing non-admin permanent deletion still requires write access to an archived file.
+     * Read-only files, active documents, and folder items each fail with their specific guard,
+     * and none of the documents are removed.
+     */
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let readers = create_group(&state.db, "readers").await;
@@ -3352,6 +3535,11 @@ async fn assert_restored_document_storage_intact(
 
 #[tokio::test]
 async fn delete_forever_rejects_restored_document_without_deleting_storage() {
+    /*
+     * A document that was archived and restored is active again, so permanent deletion must
+     * reject it despite its archive history. The restored row, version, blob location,
+     * physical bytes, and completed archive/restore audit trail remain intact.
+     */
     let (state, _temp_dir) = test_state().await;
     let (project_id, document_id) = create_stored_project_document(&state).await;
     let pool = state.db.clone();
@@ -3386,6 +3574,11 @@ async fn delete_forever_rejects_restored_document_without_deleting_storage() {
 
 #[tokio::test]
 async fn delete_forever_rejects_document_restored_after_folder_archive() {
+    /*
+     * Restoring a document after its entire source folder was archived recreates an active
+     * destination folder. Permanent deletion must recognize that current state, reject the
+     * request, and preserve the recreated folder plus all document storage and history.
+     */
     let (state, _temp_dir) = test_state().await;
     let (old_project_id, document_id) = create_stored_project_document(&state).await;
     let pool = state.db.clone();
@@ -3422,6 +3615,11 @@ async fn delete_forever_rejects_document_restored_after_folder_archive() {
 
 #[tokio::test]
 async fn delete_forever_rejects_document_locked_by_other_user() {
+    /*
+     * Even when policy permits a writer to delete from Archive, another user's active lock
+     * blocks permanent deletion. The document and its lock both remain present after the
+     * item-level failure.
+     */
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -3498,6 +3696,11 @@ async fn delete_forever_rejects_document_locked_by_other_user() {
 
 #[tokio::test]
 async fn delete_forever_rejects_folder_archived_document_locked_by_other_user() {
+    /*
+     * A document flattened into Archive by a folder-level archive remains protected if another
+     * user subsequently locks it. Failed permanent deletion preserves the archived row, its
+     * version, the active lock, and the already-removed source-folder state.
+     */
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -3605,6 +3808,11 @@ async fn delete_forever_rejects_folder_archived_document_locked_by_other_user() 
 
 #[tokio::test]
 async fn rename_document_updates_name_history_ttl_and_state() {
+    /*
+     * Renaming a document updates its path, records request provenance in move history, and
+     * publishes the batch rename event. Because the mutation changes activity time, stale
+     * expiry metadata is recomputed from the folder's inherited archive policy.
+     */
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -3697,6 +3905,11 @@ async fn rename_document_updates_name_history_ttl_and_state() {
 
 #[tokio::test]
 async fn rename_document_in_delete_ttl_scope_refreshes_expiry_before_sweep() {
+    /*
+     * Renaming an already-expired document under a delete TTL counts as fresh activity and moves
+     * its deadline into the future. An immediate retention sweep must therefore leave the
+     * renamed document in place.
+     */
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -3783,6 +3996,11 @@ async fn rename_document_in_delete_ttl_scope_refreshes_expiry_before_sweep() {
 
 #[tokio::test]
 async fn rename_document_rejects_archived_locked_and_duplicate_targets() {
+    /*
+     * Rename refuses archived files, files locked by another user, invalid destination paths,
+     * and names already occupied at the destination. Every failed item retains its original
+     * name and location.
+     */
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -3920,6 +4138,11 @@ async fn assert_document_rename_duplicate_target(app: Router, source_doc: i64) {
 
 #[tokio::test]
 async fn move_document_updates_folder_history_ttl_and_state() {
+    /*
+     * Moving a writable document changes its folder without changing its name and adopts the
+     * destination's archive TTL. The operation records the complete old and new paths in
+     * document history and publishes one batch move state event.
+     */
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -4005,6 +4228,11 @@ async fn move_document_updates_folder_history_ttl_and_state() {
 
 #[tokio::test]
 async fn move_document_out_of_delete_ttl_scope_clears_expiry_before_sweep() {
+    /*
+     * Moving an expired document from a delete-policy folder into a folder with no retention
+     * policy must clear both expiry fields. A sweep immediately after the move confirms that
+     * the rescued document is not deleted.
+     */
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -4088,6 +4316,11 @@ async fn move_document_out_of_delete_ttl_scope_clears_expiry_before_sweep() {
 
 #[tokio::test]
 async fn move_document_rejects_duplicate_locked_and_archive_root_moves() {
+    /*
+     * Ordinary move rejects destination name collisions, locks owned by someone else, and
+     * attempts to enter Archive without the archive workflow. All three source documents
+     * remain in their original folder after the item-level failures.
+     */
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -4183,6 +4416,11 @@ async fn move_document_rejects_duplicate_locked_and_archive_root_moves() {
 
 #[tokio::test]
 async fn move_document_rejects_archived_document_without_creating_destination() {
+    /*
+     * An archived document cannot be moved into a normal folder or an invented Archive subfolder
+     * through the generic move endpoint. Validation occurs before destination creation,
+     * metadata changes, move history, or state publication.
+     */
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -4372,6 +4610,11 @@ async fn assert_document_restored_with_archive_events(
 
 #[tokio::test]
 async fn archive_restore_document_round_trip_preserves_metadata_and_events() {
+    /*
+     * Archiving moves a document into the flat Archive, captures its original path metadata, and
+     * releases its edit lock. Restoring returns it to the source folder, clears archive
+     * metadata, and leaves an ordered archive/unarchive audit and state trail.
+     */
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -4428,6 +4671,11 @@ async fn archive_restore_document_round_trip_preserves_metadata_and_events() {
 
 #[tokio::test]
 async fn bulk_move_reports_prior_success_when_second_outbox_write_fails() {
+    /*
+     * Batch items commit independently: a document move and its outbox event may succeed before
+     * a forced event-write failure on the following folder. The response reports that prior
+     * success accurately while rolling back the failed folder's row and history.
+     */
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -4525,6 +4773,11 @@ async fn bulk_move_reports_prior_success_when_second_outbox_write_fails() {
 
 #[tokio::test]
 async fn archived_document_hidden_when_source_acl_snapshot_denies_access() {
+    /*
+     * Archive visibility follows the access snapshot captured from a document's source folder,
+     * not merely access to the Archive root. A user denied at the source cannot see the
+     * archived row even though its preserved origin metadata remains stored for restoration.
+     */
     let (state, _temp_dir) = test_state().await;
     let outsiders = create_group(&state.db, "outsiders").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -4601,6 +4854,12 @@ async fn archived_document_hidden_when_source_acl_snapshot_denies_access() {
 
 #[tokio::test]
 async fn restore_document_preserves_current_vault_folder_acl() {
+    /*
+     * Restoring a document into an existing source folder must respect that folder's current ACL
+     * rather than replaying the archived access snapshot onto it. The document's archive
+     * fields are cleared, while a newly added deny remains in place and continues to hide the
+     * folder.
+     */
     let (state, _temp_dir) = test_state().await;
     let outsiders = create_group(&state.db, "outsiders").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -4787,6 +5046,11 @@ async fn assert_folder_properties_keep_stable_location_modified(app: Router, pat
 
 #[tokio::test]
 async fn archive_restore_document_rows_keep_version_commit_modified_time() {
+    /*
+     * User-facing `modified_at` values come from the latest version commit, not the document
+     * row's location-change timestamp. That stable value must survive archive and restore
+     * across detail, contents, and aggregate folder-properties responses.
+     */
     let (state, _temp_dir, document_id) = location_timestamp_test_state().await;
     let pool = state.db.clone();
     let app = http::router(state);
@@ -4858,6 +5122,11 @@ async fn archive_restore_document_rows_keep_version_commit_modified_time() {
 
 #[tokio::test]
 async fn archive_restore_document_returns_item_level_failures() {
+    /*
+     * Archive and restore batches report state mismatches per item: already archived, not
+     * archived, or missing required restore metadata. These domain failures remain
+     * successful HTTP batch responses rather than becoming transport-level errors.
+     */
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -4931,6 +5200,11 @@ async fn archive_restore_document_returns_item_level_failures() {
 
 #[tokio::test]
 async fn restore_document_rejects_duplicate_target_name() {
+    /*
+     * Restore cannot overwrite an active document that already uses the archived file's original
+     * name in the destination folder. The conflicting item remains in Archive after the
+     * failure.
+     */
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)

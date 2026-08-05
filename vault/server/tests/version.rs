@@ -2,6 +2,11 @@ use vault_server::version::{app_version, changelog_release_notes, parse_changelo
 
 #[test]
 fn changelog_parser_returns_only_numbered_release_sections() {
+    /*
+     * Feeds the parser unreleased text, two numbered releases, and an entry outside any release.
+     * It checks that only versioned sections survive, labeled entries keep their kinds, and
+     * plain release text becomes a note.
+     */
     let changelog = r"
 ========
 
@@ -41,6 +46,11 @@ feat: A new feature.
 
 #[test]
 fn bundled_changelog_contains_the_current_app_version() {
+    /*
+     * Loads the release notes embedded in the server and the version reported by the
+     * application. It requires a matching changelog section so a build cannot advertise a
+     * version with no corresponding release notes.
+     */
     let sections = changelog_release_notes();
 
     assert!(

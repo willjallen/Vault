@@ -2017,6 +2017,12 @@ fn le_u64(bytes: &[u8], offset: usize) -> u64 {
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // One parameterized disclosure regression covers both routes.
 async fn folder_id_export_and_download_hide_inaccessible_folders_as_missing() {
+    /*
+     * Both export entry points make an inaccessible folder id indistinguishable from a
+     * nonexistent one and disclose none of its path or filenames. Rejected selections create
+     * no jobs or artifacts, while granting access allows the same id to queue and complete
+     * normally.
+     */
     for (endpoint, authorized_status) in [
         ("/api/exports", StatusCode::OK),
         ("/api/download", StatusCode::ACCEPTED),
@@ -2125,6 +2131,11 @@ async fn folder_id_export_and_download_hide_inaccessible_folders_as_missing() {
 
 #[tokio::test]
 async fn export_job_creates_downloadable_zip_for_folder() {
+    /*
+     * Selecting a readable folder queues a two-file job, advances its item counts, and publishes
+     * one downloadable artifact with audit events. The completed ZIP supports byte ranges
+     * and contains both files beneath the expected project path.
+     */
     let (state, _temp_dir) = test_state().await;
     let readers = create_group(&state.db, "readers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -2219,6 +2230,12 @@ async fn export_job_creates_downloadable_zip_for_folder() {
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // One coupled E2E scenario covers source and artifact failover.
 async fn export_sources_and_artifacts_fail_over_before_exposing_bytes() {
+    /*
+     * Export generation encounters a bad first source location and successfully opens the
+     * healthy replica before writing any entry bytes. Artifact download repeats the same
+     * preflight failover, yielding an intact one-entry ZIP and the expected location-attempt
+     * order without duplicated source data.
+     */
     let (mut state, _temp_dir) = test_state().await;
     let stream_calls = Arc::new(Mutex::new(Vec::new()));
     state.storage = Arc::new(FailoverExportStorage {
@@ -2338,6 +2355,11 @@ async fn export_sources_and_artifacts_fail_over_before_exposing_bytes() {
 
 #[tokio::test]
 async fn export_job_prunes_child_documents_from_folder_selection() {
+    /*
+     * A request selects both a folder and a document already contained within that folder.
+     * Admission canonicalizes the job to the folder alone, preventing duplicate ZIP entries and
+     * counting the nested document once.
+     */
     let (state, _temp_dir) = test_state().await;
     let readers = create_group(&state.db, "readers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -2398,6 +2420,11 @@ async fn export_job_prunes_child_documents_from_folder_selection() {
 
 #[tokio::test]
 async fn folder_export_excludes_inaccessible_descendant_documents() {
+    /*
+     * A readable folder contains one public file and a permission-isolated child subtree with a
+     * secret file. Planning, progress, audit count, and ZIP contents include only the
+     * visible document and leak neither the private path nor bytes.
+     */
     let (state, _temp_dir) = test_state().await;
     let readers = create_group(&state.db, "readers").await;
     let confidential = create_group(&state.db, "confidential").await;
@@ -2489,6 +2516,12 @@ async fn folder_export_excludes_inaccessible_descendant_documents() {
 
 #[tokio::test]
 async fn archived_folder_export_keeps_its_subtree_and_excludes_independent_archive_entries() {
+    /*
+     * Archives one document independently and then archives its former parent folder with
+     * another file. Exporting the archived folder produces a one-item ZIP containing only
+     * the folder-owned subtree, excluding the separate archive entry and recording one
+     * export event.
+     */
     let (state, _temp_dir) = test_state().await;
     let readers = create_group(&state.db, "readers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -2591,6 +2624,11 @@ async fn archived_folder_export_keeps_its_subtree_and_excludes_independent_archi
 
 #[tokio::test]
 async fn api_download_multi_selection_returns_accepted_export_job() {
+    /*
+     * Multi-item `/api/download` uses the asynchronous export pipeline and immediately returns
+     * 202 with intentionally deferred totals. The worker later resolves both documents,
+     * completes their counts, and exposes an export-artifact download URL.
+     */
     let (state, _temp_dir) = test_state().await;
     let readers = create_group(&state.db, "readers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -2665,6 +2703,11 @@ async fn api_download_multi_selection_returns_accepted_export_job() {
 
 #[tokio::test]
 async fn bulk_export_with_an_empty_file_completes_and_reports_activity_timestamps() {
+    /*
+     * A bulk export combines a nonempty file with a legitimate zero-byte file and maintains
+     * monotonic RFC 3339 activity timestamps. Progress counts both entries but only nonempty
+     * source bytes, and the resulting ZIP round-trips both payloads correctly.
+     */
     let (state, _temp_dir) = test_state().await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
         .await
@@ -2757,6 +2800,11 @@ async fn bulk_export_with_an_empty_file_completes_and_reports_activity_timestamp
 
 #[tokio::test]
 async fn export_dispatcher_contains_job_panic_and_serves_the_next_job() {
+    /*
+     * One storage source deliberately panics while a healthy export waits behind it.
+     * The dispatcher converts that panic into a retryable-looking job failure, removes its
+     * partial ZIP and artifacts, then continues to complete the next job.
+     */
     let (mut state, _temp_dir) = test_state().await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
         .await
@@ -2849,6 +2897,12 @@ async fn export_dispatcher_contains_job_panic_and_serves_the_next_job() {
 
 #[tokio::test]
 async fn api_download_empty_folder_completes_as_empty_zip() {
+    /*
+     * The direct export API rejects a selection with no downloadable files, but the
+     * compatibility download endpoint accepts an empty folder asynchronously.
+     * Its job completes with zero progress and publishes the canonical 22-byte empty ZIP end
+     * record.
+     */
     let (state, _temp_dir) = test_state().await;
     let readers = create_group(&state.db, "readers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -2932,6 +2986,11 @@ async fn api_download_empty_folder_completes_as_empty_zip() {
 
 #[tokio::test]
 async fn api_download_folder_selection_excludes_inaccessible_descendants() {
+    /*
+     * Compatibility download defers folder enumeration to its worker while preserving descendant
+     * ACL boundaries. Final counts and ZIP data include the visible file only, with no
+     * confidential path or content leakage.
+     */
     let (state, _temp_dir) = test_state().await;
     let readers = create_group(&state.db, "readers").await;
     let confidential = create_group(&state.db, "confidential").await;
@@ -3028,6 +3087,12 @@ async fn api_download_folder_selection_excludes_inaccessible_descendants() {
 
 #[tokio::test]
 async fn export_job_counts_readable_unversioned_documents_before_worker_skips_them() {
+    /*
+     * Admission can see and count a readable document that has no current version, whether
+     * selected directly or through a folder. Worker resolution safely drops that unavailable
+     * entry, revises final totals to zero, and produces an empty archive rather than failing or
+     * leaking metadata.
+     */
     let (state, _temp_dir) = test_state().await;
     let readers = create_group(&state.db, "readers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -3119,6 +3184,11 @@ async fn export_job_counts_readable_unversioned_documents_before_worker_skips_th
 
 #[tokio::test]
 async fn api_download_multi_selection_defers_inconsistent_version_failure_to_worker() {
+    /*
+     * Compatibility download accepts a multi-selection before resolving detailed version
+     * metadata. The worker detects one broken current-version pointer, marks the job failed
+     * with the precise consistency error, and publishes no artifact.
+     */
     let (state, _temp_dir) = test_state().await;
     let readers = create_group(&state.db, "readers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -3201,6 +3271,11 @@ async fn api_download_multi_selection_defers_inconsistent_version_failure_to_wor
 
 #[tokio::test]
 async fn export_job_rejects_visible_only_document_without_queueing_work() {
+    /*
+     * Folder visibility does not grant permission to export a document's content when read
+     * access is absent. The request is forbidden before any job, artifact, audit record, or
+     * state event is created.
+     */
     let (state, _temp_dir) = test_state().await;
     let viewers = create_group(&state.db, "viewers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -3260,6 +3335,11 @@ async fn export_job_rejects_visible_only_document_without_queueing_work() {
 
 #[tokio::test]
 async fn export_routes_hide_other_users_jobs_and_cancel_queued_jobs() {
+    /*
+     * A job owned by one user appears not found to another, preventing export-id enumeration.
+     * Its owner can cancel it while queued, after which download reports the noncomplete
+     * conflict and no artifact exists.
+     */
     let (state, _temp_dir) = test_state().await;
     let readers = create_group(&state.db, "readers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -3334,6 +3414,11 @@ async fn export_routes_hide_other_users_jobs_and_cancel_queued_jobs() {
 
 #[tokio::test]
 async fn export_job_reports_finalizing_while_artifact_is_promoted() {
+    /*
+     * Artifact storage is paused after ZIP generation but before publication returns.
+     * Status remains visibly `finalizing` during that window and changes to `complete` only
+     * after promotion is released.
+     */
     let (mut state, _temp_dir) = test_state().await;
     let entered_put_file = Arc::new(Notify::new());
     let release_put_file = Arc::new(Notify::new());
@@ -3400,6 +3485,11 @@ async fn export_job_reports_finalizing_while_artifact_is_promoted() {
     reason = "the admission contract and cleanup assertions share one blocked-worker scenario"
 )]
 async fn export_admission_bounds_active_jobs_globally_and_per_user() {
+    /*
+     * A blocked finalizing job consumes one user's per-user allowance, while a second user fills
+     * the remaining global slot. Further submissions receive distinct per-user and global
+     * overload statuses with retry guidance, and cancelling queued work leaves no artifact.
+     */
     let (mut state, _temp_dir) =
         test_state_with_export_limits(86_400, 1, 3 * 1024 * 1024 * 1024, 1, 2, 1).await;
     let entered_put_file = Arc::new(Notify::new());
@@ -3538,6 +3628,11 @@ async fn export_admission_bounds_active_jobs_globally_and_per_user() {
     reason = "the concurrent admission race must inspect and clean every accepted response"
 )]
 async fn concurrent_export_admission_never_oversubscribes_the_global_cap() {
+    /*
+     * Sixteen users submit simultaneously against a global active-job cap of four.
+     * Transactional admission accepts exactly four, rejects every excess request with retry
+     * guidance, and cancellation cleans all accepted partial work without artifacts.
+     */
     const SUBMISSIONS: usize = 16;
     const GLOBAL_CAP: usize = 4;
     let (mut state, _temp_dir) = test_state_with_export_limits(
@@ -3657,6 +3752,11 @@ async fn concurrent_export_admission_never_oversubscribes_the_global_cap() {
     reason = "shutdown ordering, queue preservation, and publication cleanup form one scenario"
 )]
 async fn graceful_dispatcher_shutdown_drains_finalizing_work_and_exact_temp() {
+    /*
+     * Shutdown begins while one job is blocked in artifact promotion and another remains queued.
+     * The dispatcher waits for finalizing work to commit and clear its exact temp and
+     * publication lease, but claims no new job after the shutdown request.
+     */
     let (mut state, _temp_dir) = test_state().await;
     let entered_put_file = Arc::new(Notify::new());
     let release_put_file = Arc::new(Notify::new());
@@ -3786,6 +3886,11 @@ async fn graceful_dispatcher_shutdown_drains_finalizing_work_and_exact_temp() {
     reason = "the atomic-claim fixture and exactly-once assertions are intentionally colocated"
 )]
 async fn concurrent_dispatcher_workers_claim_each_queued_job_once() {
+    /*
+     * Four workers race to claim twelve prequeued exports from the same source document.
+     * Atomic claiming completes every job exactly once, producing one artifact and one download
+     * audit per job with no failures.
+     */
     const JOBS: i64 = 12;
     let (state, _temp_dir) =
         test_state_with_export_settings(86_400, 4, 3 * 1024 * 1024 * 1024, 1).await;
@@ -3897,6 +4002,12 @@ async fn concurrent_dispatcher_workers_claim_each_queued_job_once() {
 
 #[tokio::test]
 async fn cancelled_export_cleans_object_promoted_before_artifact_metadata() {
+    /*
+     * Storage finishes promoting the ZIP object but delays returning it long enough for the job
+     * to be cancelled before artifact metadata exists. When the race resumes, cleanup
+     * removes the unclaimed object and associated lifecycle state while retaining only original
+     * source keys.
+     */
     let (mut state, _temp_dir) = test_state().await;
     let stored_file = Arc::new(Notify::new());
     let release_return = Arc::new(Notify::new());
@@ -3965,6 +4076,11 @@ async fn cancelled_export_cleans_object_promoted_before_artifact_metadata() {
 
 #[tokio::test]
 async fn export_artifact_failure_rolls_back_blob_and_location_metadata() {
+    /*
+     * A trigger rejects artifact metadata after the ZIP has crossed the storage publication
+     * boundary. The failed job removes its temp and promoted object and leaves no artifact,
+     * orphan blob, or extra location beyond the source.
+     */
     let (mut state, _temp_dir) = test_state().await;
     let entered_put_file = Arc::new(Notify::new());
     let release_put_file = Arc::new(Notify::new());
@@ -4064,6 +4180,12 @@ async fn export_artifact_failure_rolls_back_blob_and_location_metadata() {
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // One transaction-fault test keeps all rollback surfaces together.
 async fn export_completion_rolls_back_when_a_later_audit_insert_fails() {
+    /*
+     * A two-document export reaches completion, but a trigger aborts the second download-audit
+     * insertion. The completion transaction rolls back both audits, the outbox event,
+     * artifact metadata, and terminal timestamp, while cleanup removes publication rows, ZIP
+     * bytes, and temp data.
+     */
     let (state, _temp_dir) = test_state().await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
         .await
@@ -4201,6 +4323,12 @@ async fn export_completion_rolls_back_when_a_later_audit_insert_fails() {
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // One pending-open race retains all drop and cleanup assertions.
 async fn cancelled_export_drops_pending_source_open_and_cleans_temp() {
+    /*
+     * Cancellation occurs while the source stream is still pending during open, before a single
+     * frame can be polled.
+     * The worker drops that future and removes its partial ZIP and artifact state without
+     * falling back to a whole-object read or touching the source object.
+     */
     let (mut state, _temp_dir) = test_state().await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
         .await
@@ -4313,6 +4441,11 @@ async fn cancelled_export_drops_pending_source_open_and_cleans_temp() {
 
 #[tokio::test]
 async fn cancelled_export_during_streaming_entry_write_cleans_partial_zip() {
+    /*
+     * The job becomes cancelled after streaming has begun writing a large ZIP entry.
+     * Worker teardown removes the partially written archive and all nascent artifact state while
+     * preserving the source object set.
+     */
     let (mut state, _temp_dir) = test_state().await;
     let job_id_slot = Arc::new(AsyncMutex::new(None));
     let entered_read = Arc::new(Notify::new());
@@ -4374,6 +4507,12 @@ async fn cancelled_export_during_streaming_entry_write_cleans_partial_zip() {
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // One cancellation race must retain all stream and cleanup assertions.
 async fn logical_five_gib_export_cancels_while_source_stream_is_pending() {
+    /*
+     * A logical five-gibibyte source supplies only a bounded prefix before its stream becomes
+     * pending, proving export does not buffer the whole entry. Cancellation drops that
+     * pending stream, avoids the legacy read path, and cleans the partial ZIP and metadata
+     * without deleting unrelated physical objects.
+     */
     let (mut state, _temp_dir) = test_state().await;
     let logical_object_key = "logical/five-gib-text".to_string();
     let legacy_read_count = Arc::new(AtomicUsize::new(0));
@@ -4504,6 +4643,11 @@ async fn logical_five_gib_export_cancels_while_source_stream_is_pending() {
 
 #[tokio::test]
 async fn large_stored_export_reports_byte_progress_before_entry_finishes() {
+    /*
+     * A 34 MiB entry is paused after at least one 32 MiB progress interval but before the entry
+     * completes. The running job reports partial bytes with zero completed items, then
+     * reaches exact byte and item totals after streaming resumes.
+     */
     let (mut state, _temp_dir) = test_state().await;
     let entered_after_progress = Arc::new(Notify::new());
     let release_range = Arc::new(Notify::new());
@@ -4592,6 +4736,11 @@ async fn large_stored_export_reports_byte_progress_before_entry_finishes() {
 
 #[tokio::test]
 async fn expired_export_artifact_download_returns_gone_and_sweep_deletes_artifact() {
+    /*
+     * A completed artifact is manually aged beyond its expiration before download.
+     * The route returns Gone, and transfer sweeping subsequently removes the job, artifact
+     * metadata, blob location, and stored ZIP.
+     */
     let (state, _temp_dir) = test_state().await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
         .await
@@ -4654,6 +4803,11 @@ async fn expired_export_artifact_download_returns_gone_and_sweep_deletes_artifac
 
 #[tokio::test]
 async fn export_route_uses_configured_ttl_for_created_jobs() {
+    /*
+     * Export lifetime is configured to two minutes for this application state.
+     * The queued response's RFC 3339 expiration lands within a small scheduling tolerance of
+     * that configured duration.
+     */
     let before = OffsetDateTime::now_utc();
     let (state, _temp_dir) =
         test_state_with_export_settings(120, 1, 3 * 1024 * 1024 * 1024, 1).await;
@@ -4695,6 +4849,11 @@ async fn export_route_uses_configured_ttl_for_created_jobs() {
 
 #[tokio::test]
 async fn export_route_streams_configured_compression_with_data_descriptor() {
+    /*
+     * A large compressible text file is read only through streaming storage and deflated
+     * according to runtime ZIP settings. Its entry uses a data descriptor and records
+     * correct CRC and sizes while decompressing back to the original text.
+     */
     let (mut state, _temp_dir) = test_state_with_export_settings(86_400, 1, 1, 1).await;
     state.storage = Arc::new(StreamOnlyExportStorage {
         inner: LocalBlobStorage::new(state.config.objects_path(), &state.config.storage_prefix),
@@ -4780,6 +4939,11 @@ async fn export_route_streams_configured_compression_with_data_descriptor() {
 
 #[tokio::test]
 async fn export_streams_multiple_incompressible_deflate_batches_without_losing_output() {
+    /*
+     * Nine MiB of deterministic pseudorandom text forces the deflater to emit several large
+     * batches with little size reduction. ZIP64 descriptor fields, CRC, compressed sizes,
+     * and decompressed bytes remain correct across every streamed batch.
+     */
     let (mut state, _temp_dir) = test_state_with_export_settings(86_400, 1, 1, 1).await;
     state.storage = Arc::new(StreamOnlyExportStorage {
         inner: LocalBlobStorage::new(state.config.objects_path(), &state.config.storage_prefix),
@@ -4865,6 +5029,12 @@ async fn export_streams_multiple_incompressible_deflate_batches_without_losing_o
 
 #[tokio::test]
 async fn export_runtime_settings_are_normalized_in_app_state() {
+    /*
+     * Deliberately out-of-range TTL, worker, compression-threshold, and compression-level
+     * settings are loaded into runtime state. Safety normalization applies the minimum
+     * lifetime and worker count, default admission caps, a zero threshold, and maximum deflate
+     * level.
+     */
     let (state, _temp_dir) = test_state_with_export_settings(10, -2, -1, 12).await;
     let settings = state.export_execution.settings();
 
@@ -4878,6 +5048,11 @@ async fn export_runtime_settings_are_normalized_in_app_state() {
 
 #[tokio::test]
 async fn export_zip_deflates_text_and_stores_precompressed_entries_when_threshold_allows() {
+    /*
+     * The same archive contains compressible text and an already compressed PNG above the
+     * configured threshold. MIME-aware ZIP writing deflates the text but stores the PNG
+     * verbatim, with both entries round-tripping exactly.
+     */
     let (state, _temp_dir) = test_state_with_export_settings(86_400, 1, 1, 1).await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
         .await

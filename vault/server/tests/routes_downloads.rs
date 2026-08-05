@@ -646,6 +646,11 @@ async fn insert_downloadable_document_metadata(
 
 #[tokio::test]
 async fn browser_range_probe_does_not_read_full_blob() {
+    /*
+     * A one-byte browser probe must be served through the storage range stream with correct
+     * partial-content headers. The legacy whole-object read path is instrumented and must
+     * remain untouched.
+     */
     let full_read_called = Arc::new(AtomicBool::new(false));
     let object_key = "fixture-object".to_string();
     let data = b"hello world".to_vec();
@@ -683,6 +688,12 @@ async fn browser_range_probe_does_not_read_full_blob() {
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // The cases intentionally share one ETag and backend call counter.
 async fn download_range_contract_handles_suffix_if_range_and_malformed_headers() {
+    /*
+     * Download ranges support suffix, open-ended, case-insensitive units, and matching If-Range
+     * validators, while a mismatched validator falls back to the whole object. Nested units,
+     * multiple or duplicate ranges, unsatisfiable offsets, and non-UTF-8 values return 416
+     * without opening another backend stream.
+     */
     let object_key = "range-contract".to_string();
     let stream_calls = Arc::new(AtomicUsize::new(0));
     let storage = Arc::new(RangeOnlyStorage {
@@ -807,6 +818,11 @@ async fn download_range_contract_handles_suffix_if_range_and_malformed_headers()
 
 #[tokio::test]
 async fn empty_download_is_stream_validated_and_rejects_byte_ranges() {
+    /*
+     * A zero-byte document still opens its storage stream once so backend size and availability
+     * are validated before success. Its normal response is empty with length zero, while any
+     * byte range is unsatisfiable and does not touch storage again.
+     */
     let object_key = "empty-object".to_string();
     let stream_calls = Arc::new(AtomicUsize::new(0));
     let storage = Arc::new(RangeOnlyStorage {
@@ -847,6 +863,11 @@ async fn empty_download_is_stream_validated_and_rejects_byte_ranges() {
 
 #[tokio::test]
 async fn logical_five_gibibyte_download_streams_before_eof_and_releases_capacity_on_drop() {
+    /*
+     * A logically five-gibibyte source returns headers and its first bounded chunk without
+     * buffering or waiting for source EOF. The single-download capacity limit rejects a
+     * concurrent request, then cancellation drops the source and permits a replacement.
+     */
     let logical_size = 5 * 1024 * 1024 * 1024_u64;
     let active_streams = Arc::new(AtomicUsize::new(0));
     let dropped_streams = Arc::new(AtomicUsize::new(0));
@@ -939,6 +960,11 @@ async fn logical_five_gibibyte_download_streams_before_eof_and_releases_capacity
 
 #[tokio::test]
 async fn midstream_storage_failure_is_not_reported_as_clean_eof_and_releases_capacity() {
+    /*
+     * Storage succeeds for the prefetched frame and then fails while the response body is in
+     * flight. The body surfaces an error rather than clean EOF, releases its capacity slot,
+     * retains the already-recorded download-start event, and allows retry.
+     */
     let logical_size = 128 * 1024_u64;
     let active_streams = Arc::new(AtomicUsize::new(0));
     let object_key = "midstream-failure".to_string();
@@ -994,6 +1020,12 @@ async fn midstream_storage_failure_is_not_reported_as_clean_eof_and_releases_cap
 
 #[tokio::test]
 async fn download_prefers_active_bucket_and_fails_over_before_exposing_bytes() {
+    /*
+     * Location selection tries exact active-bucket copies first, skipping a missing object and a
+     * bad initial frame before choosing a healthy one. Only when every exact copy is
+     * unavailable does it try a legacy bucketless location, and no bytes from rejected
+     * candidates are exposed.
+     */
     let data = b"healthy failover bytes".to_vec();
     let calls = Arc::new(Mutex::new(Vec::new()));
     let storage = Arc::new(FailoverStorage {
@@ -1078,6 +1110,11 @@ async fn download_prefers_active_bucket_and_fails_over_before_exposing_bytes() {
 
 #[tokio::test]
 async fn download_never_switches_locations_after_the_first_frame() {
+    /*
+     * Once a location has yielded its first frame, that source owns the response body.
+     * A later storage failure is propagated to the client without splicing remaining bytes from
+     * the next healthy replica.
+     */
     let data = b"midstream failover must not splice".to_vec();
     let calls = Arc::new(Mutex::new(Vec::new()));
     let storage = Arc::new(FailoverStorage {
@@ -1126,6 +1163,11 @@ async fn download_never_switches_locations_after_the_first_frame() {
 
 #[tokio::test]
 async fn transient_alternate_failure_is_not_masked_by_a_missing_copy() {
+    /*
+     * Candidate probing encounters one missing replica followed by a temporarily busy replica.
+     * The retryable failure wins over not-found, producing service unavailable with Retry-After
+     * rather than falsely declaring the document absent.
+     */
     let data = b"busy failover".to_vec();
     let calls = Arc::new(Mutex::new(Vec::new()));
     let storage = Arc::new(FailoverStorage {
@@ -1166,6 +1208,11 @@ async fn transient_alternate_failure_is_not_masked_by_a_missing_copy() {
 
 #[tokio::test]
 async fn oversized_backend_frame_is_rejected_and_releases_capacity() {
+    /*
+     * A backend violates the streaming contract by emitting one frame larger than the configured
+     * chunk bound. The route fails before serving it and immediately releases the occupied
+     * download slot.
+     */
     let logical_size = u64::try_from(STORAGE_CHUNK_SIZE + 1).expect("logical size");
     let active_streams = Arc::new(AtomicUsize::new(0));
     let object_key = "oversized-frame".to_string();
@@ -1203,6 +1250,11 @@ async fn oversized_backend_frame_is_rejected_and_releases_capacity() {
 
 #[tokio::test]
 async fn final_frame_releases_source_but_holds_capacity_until_body_drop() {
+    /*
+     * Consuming a single final frame closes the underlying storage stream, but response-level
+     * concurrency ownership lasts for the body object's lifetime. A second download stays
+     * blocked until that body is dropped, after which capacity is available again.
+     */
     let logical_size = 64 * 1024_u64;
     let active_streams = Arc::new(AtomicUsize::new(0));
     let object_key = "single-frame".to_string();

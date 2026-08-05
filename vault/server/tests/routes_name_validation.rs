@@ -230,6 +230,11 @@ async fn stored_upload_mime(pool: &sqlx::SqlitePool, session_id: &str) -> String
 
 #[tokio::test]
 async fn folder_creation_rejects_control_characters_and_archive_paths() {
+    /*
+     * Sends authenticated folder-creation forms containing an embedded newline and a path under
+     * the reserved Archive root. It checks both requests fail before creation and return
+     * distinct guidance for malformed paths versus attempts to create content in Archive.
+     */
     let (state, _temp_dir) = test_state().await;
     grant_writer_root(&state.db).await;
     let app = http::router(state);
@@ -256,6 +261,11 @@ async fn folder_creation_rejects_control_characters_and_archive_paths() {
 
 #[tokio::test]
 async fn upload_session_rejects_control_character_file_names_and_archive_paths() {
+    /*
+     * Attempts to start uploads with a newline in the filename and with Archive as the
+     * destination. It checks that the route rejects the invalid name and reserved
+     * destination independently, returning the appropriate client-facing error for each.
+     */
     let (state, _temp_dir) = test_state().await;
     grant_writer_root(&state.db).await;
     let app = http::router(state);
@@ -300,6 +310,11 @@ async fn upload_session_rejects_control_character_file_names_and_archive_paths()
 
 #[tokio::test]
 async fn upload_session_sanitizes_non_ascii_mime_types() {
+    /*
+     * Creates sessions with a valid textual MIME type and several non-ASCII values on different
+     * file extensions. It checks that valid metadata is preserved, Markdown receives its safe
+     * extension-derived type, and untrusted binary or log metadata falls back to octet-stream.
+     */
     let (state, _temp_dir) = test_state().await;
     grant_writer_root(&state.db).await;
     let pool = state.db.clone();
@@ -331,6 +346,12 @@ async fn upload_session_sanitizes_non_ascii_mime_types() {
 
 #[tokio::test]
 async fn downloads_sanitize_legacy_filenames_and_malformed_mime_types() {
+    /*
+     * Seeds legacy documents whose filenames or stored MIME values contain controls, Unicode, or
+     * invalid characters, then downloads each through the normal route. It checks that response
+     * headers cannot be injected, Unicode names get safe ASCII and RFC 5987 forms, and MIME
+     * fallbacks remain appropriate to the filename.
+     */
     let (state, _temp_dir) = test_state().await;
     grant_writer_root(&state.db).await;
     let bad_name_id =

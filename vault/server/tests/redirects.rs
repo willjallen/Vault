@@ -2,6 +2,11 @@ use vault_server::redirects::safe_redirect;
 
 #[test]
 fn safe_redirect_preserves_valid_origin_relative_spelling() {
+    /*
+     * Passes valid local paths containing queries, fragments, percent escapes, Unicode, and dot
+     * segments through redirect validation. It checks that safe inputs remain byte-for-byte
+     * unchanged instead of being decoded or normalized into a different destination.
+     */
     for value in [
         "/",
         "/Project",
@@ -18,6 +23,11 @@ fn safe_redirect_preserves_valid_origin_relative_spelling() {
 
 #[test]
 fn safe_redirect_rejects_external_and_ambiguous_forms() {
+    /*
+     * Tries absolute URLs, protocol-relative forms, user-info tricks, backslashes, and missing
+     * or empty targets. It checks that every destination that could escape or ambiguously
+     * reinterpret the current origin falls back to the site root.
+     */
     for value in [
         "",
         "Project",
@@ -37,6 +47,11 @@ fn safe_redirect_rejects_external_and_ambiguous_forms() {
 
 #[test]
 fn safe_redirect_rejects_raw_and_percent_encoded_controls_or_separators() {
+    /*
+     * Supplies raw controls, encoded controls, invalid UTF-8, and encoded slash or backslash
+     * separators in both paths and queries. It checks that none can smuggle a second authority,
+     * header, or path interpretation through the redirect validator.
+     */
     for value in [
         "/line\nfeed",
         "/carriage\rreturn",
@@ -62,6 +77,11 @@ fn safe_redirect_rejects_raw_and_percent_encoded_controls_or_separators() {
 
 #[test]
 fn safe_redirect_rejects_nested_encoded_controls_and_separators() {
+    /*
+     * Wraps dangerous separators and control bytes in multiple layers of percent encoding. It
+     * checks that recursive decoding cannot turn an apparently local target into an external or
+     * control-bearing redirect.
+     */
     for value in [
         "/%252fevil.example.com",
         "/%25252fevil.example.com",
@@ -78,6 +98,11 @@ fn safe_redirect_rejects_nested_encoded_controls_and_separators() {
 
 #[test]
 fn safe_redirect_rejects_malformed_percent_triplets() {
+    /*
+     * Exercises incomplete and non-hexadecimal percent escapes at several positions in a target.
+     * It checks that malformed encodings are rejected to the root rather than passed through for
+     * a browser or proxy to interpret differently.
+     */
     for value in ["/%", "/%2", "/%GG", "/path?value=%Q0", "/trailing%"] {
         assert_eq!(safe_redirect(Some(value)), "/", "{value}");
     }

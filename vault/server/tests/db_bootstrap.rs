@@ -31,6 +31,11 @@ async fn assert_startup_rejected(path: &std::path::Path, detail: &str) {
 
 #[tokio::test]
 async fn initializes_sqlite_schema_with_root_folders() {
+    /*
+     * Opens a brand-new database through the production connection path. It checks startup
+     * applies the configured busy timeout, seeds exactly the Vault and Archive roots, and
+     * records the full initial migration chain.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let pool = db::connect(&temp_dir.path().join("vault.db"))
         .await
@@ -61,6 +66,12 @@ async fn initializes_sqlite_schema_with_root_folders() {
 
 #[tokio::test]
 async fn unversioned_pre_v2_schema_is_rejected_without_mutation() {
+    /*
+     * Removes preview tables and the migration ledger from an otherwise valid database to
+     * resemble an unsupported pre-v2 schema, while adding sentinel user data. It checks
+     * startup refuses the database without recreating any missing table or changing the
+     * sentinel.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let db_path = temp_dir.path().join("vault.db");
     initialize_valid_database(&db_path).await;
@@ -111,6 +122,11 @@ async fn unversioned_pre_v2_schema_is_rejected_without_mutation() {
 
 #[tokio::test]
 async fn nonexact_unversioned_schema_is_rejected_before_migration() {
+    /*
+     * Builds an unversioned pre-v2-shaped database with one unknown extension table. It checks
+     * the extra schema object prevents baseline inference and that startup does not create a
+     * migration ledger before refusing the database.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let db_path = temp_dir.path().join("vault.db");
     initialize_valid_database(&db_path).await;
@@ -147,6 +163,11 @@ async fn nonexact_unversioned_schema_is_rejected_before_migration() {
 
 #[tokio::test]
 async fn incompatible_existing_schema_is_rejected_without_dropping_data() {
+    /*
+     * Creates an unrelated `documents` table with a schema and row that conflict with Vault's
+     * model. It checks startup recognizes the database as occupied, refuses automatic takeover,
+     * and preserves the existing table and data.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let db_path = temp_dir.path().join("vault.db");
     let raw = raw_pool(&db_path).await;
@@ -173,6 +194,11 @@ async fn incompatible_existing_schema_is_rejected_without_dropping_data() {
 
 #[tokio::test]
 async fn view_only_database_is_not_mistaken_for_an_empty_database() {
+    /*
+     * Creates a SQLite database containing only a view and then opens it through Vault startup.
+     * It checks any existing schema object prevents fresh initialization, while the view
+     * remains usable and no Vault tables are added.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let db_path = temp_dir.path().join("vault.db");
     let raw = raw_pool(&db_path).await;
@@ -202,6 +228,11 @@ async fn view_only_database_is_not_mistaken_for_an_empty_database() {
 
 #[tokio::test]
 async fn noncanonical_schema_is_rejected_without_additive_changes() {
+    /*
+     * Removes several columns and a table that an older bootstrap path might have added back,
+     * then stores a sentinel user. It checks current startup refuses structural drift
+     * without performing additive repair or altering existing rows.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let db_path = temp_dir.path().join("vault.db");
     initialize_valid_database(&db_path).await;
@@ -278,6 +309,11 @@ async fn noncanonical_schema_is_rejected_without_additive_changes() {
 
 #[tokio::test]
 async fn legacy_share_link_schema_is_rejected_without_mutation() {
+    /*
+     * Replaces the current share-link table with a populated legacy definition and snapshots its
+     * SQL, columns, and row. It checks startup refuses the mismatch without rebuilding the table
+     * or changing any legacy share data.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let db_path = temp_dir.path().join("vault.db");
     initialize_valid_database(&db_path).await;
@@ -378,6 +414,11 @@ async fn legacy_share_link_schema_is_rejected_without_mutation() {
 
 #[tokio::test]
 async fn missing_required_column_is_rejected_without_repairing_table() {
+    /*
+     * Drops the required current-version column from the documents table before restart. It
+     * checks schema validation refuses startup and leaves the altered table untouched rather
+     * than adding the column back automatically.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let db_path = temp_dir.path().join("vault.db");
     initialize_valid_database(&db_path).await;
@@ -403,6 +444,11 @@ async fn missing_required_column_is_rejected_without_repairing_table() {
 
 #[tokio::test]
 async fn unexpected_model_column_is_rejected_without_rebuilding_table() {
+    /*
+     * Recreates the groups table with an additional required legacy column. It checks startup
+     * treats extra model columns as incompatible drift and preserves the altered definition
+     * instead of destructively rebuilding it.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let db_path = temp_dir.path().join("vault.db");
     initialize_valid_database(&db_path).await;
@@ -443,6 +489,11 @@ async fn unexpected_model_column_is_rejected_without_rebuilding_table() {
 
 #[tokio::test]
 async fn missing_or_wrong_unique_index_is_rejected_on_startup() {
+    /*
+     * Replaces the partial unique active-lock index with an ordinary index on the same column.
+     * It checks validation compares index semantics—not just its name or columns—and refuses
+     * startup when concurrent lock uniqueness is no longer enforced.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let db_path = temp_dir.path().join("vault.db");
     initialize_valid_database(&db_path).await;
@@ -468,6 +519,11 @@ async fn missing_or_wrong_unique_index_is_rejected_on_startup() {
 
 #[tokio::test]
 async fn unexpected_unique_index_is_rejected_on_startup() {
+    /*
+     * Adds a global uniqueness rule for document names that is absent from the canonical model.
+     * It checks startup rejects the extra data constraint and leaves the index in place for
+     * explicit operator review.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let db_path = temp_dir.path().join("vault.db");
     initialize_valid_database(&db_path).await;
@@ -498,6 +554,11 @@ async fn unexpected_unique_index_is_rejected_on_startup() {
 
 #[tokio::test]
 async fn unique_constraint_and_primary_key_drift_are_rejected_on_startup() {
+    /*
+     * Builds separate group tables with the required unique constraint missing, attached to the
+     * wrong column, or paired with no primary key. It checks startup rejects each independently,
+     * proving table identity constraints are validated structurally.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let missing_unique_path = temp_dir.path().join("missing-unique.db");
     initialize_valid_database(&missing_unique_path).await;
@@ -573,6 +634,11 @@ async fn unique_constraint_and_primary_key_drift_are_rejected_on_startup() {
 
 #[tokio::test]
 async fn foreign_key_drift_is_rejected_on_startup() {
+    /*
+     * Creates one model table without its required parent reference and another with an
+     * unexpected cascading reference. It checks both missing and surplus foreign-key
+     * behavior are considered incompatible schema drift.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let missing_fk_path = temp_dir.path().join("missing-fk.db");
     initialize_valid_database(&missing_fk_path).await;
@@ -632,6 +698,12 @@ async fn foreign_key_drift_is_rejected_on_startup() {
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn nullability_type_and_check_constraint_drift_are_rejected_on_startup() {
+    /*
+     * Constructs databases with a newly nullable column, a changed SQLite type, a changed
+     * default, an extra check, a modified check expression, and a case-changed string
+     * literal. It checks startup detects every semantic form of column or constraint drift,
+     * including differences that superficial SQL normalization could hide.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let nullable_path = temp_dir.path().join("nullable.db");
     initialize_valid_database(&nullable_path).await;
@@ -817,6 +889,11 @@ async fn nullability_type_and_check_constraint_drift_are_rejected_on_startup() {
 
 #[tokio::test]
 async fn unexpected_trigger_on_model_table_is_rejected_on_startup() {
+    /*
+     * Adds a destructive trigger to an otherwise canonical model table. It checks startup
+     * refuses hidden database behavior not declared by the application and preserves the
+     * trigger rather than executing or silently dropping it.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let db_path = temp_dir.path().join("vault.db");
     initialize_valid_database(&db_path).await;

@@ -117,6 +117,11 @@ fn gzip_decode(bytes: &[u8]) -> String {
 
 #[tokio::test]
 async fn security_headers_are_applied_to_health_and_hsts_follows_https_public_url() {
+    /*
+     * Requests the health endpoint under plain HTTP, an HTTPS public URL, and a forwarded HTTPS
+     * scheme. It checks the baseline browser protections and nonce-based CSP are always present,
+     * while HSTS appears only when the effective public request is secure.
+     */
     let (state, _temp_dir) = test_state(AuthSettings::default()).await;
     let app = http::router(state);
 
@@ -183,6 +188,11 @@ async fn security_headers_are_applied_to_health_and_hsts_follows_https_public_ur
 
 #[tokio::test]
 async fn network_boundary_rejects_untrusted_identity_before_any_identity_writes() {
+    /*
+     * Sends identical header-authenticated requests from an untrusted address, with no peer
+     * address, and from a configured trusted proxy. It checks the first two are rejected before
+     * users, groups, or permissions can be written, while the trusted request reaches the route.
+     */
     let auth = AuthSettings {
         trusted_proxies: TrustedProxySet::parse("127.0.0.1/32"),
         bootstrap_admin_emails: ["admin@example.com".to_string()].into_iter().collect(),
@@ -242,6 +252,11 @@ async fn network_boundary_rejects_untrusted_identity_before_any_identity_writes(
 
 #[tokio::test]
 async fn header_mode_never_falls_back_to_dev_auth_for_an_untrusted_peer() {
+    /*
+     * Enables development authentication while the server remains in trusted-proxy header mode,
+     * then sends an unauthenticated request from outside the proxy boundary. It checks that the
+     * request stays unauthorized and that no development user or permission records are created.
+     */
     let auth = AuthSettings {
         dev_mode: true,
         dev_auth_enabled: true,
@@ -288,6 +303,11 @@ async fn header_mode_never_falls_back_to_dev_auth_for_an_untrusted_peer() {
 
 #[tokio::test]
 async fn network_boundary_sanitizes_forwarded_proto_before_security_headers() {
+    /*
+     * Presents the same forwarded HTTPS header from untrusted and trusted peer addresses. It
+     * checks that an untrusted peer cannot induce HSTS, while a trusted proxy can establish the
+     * effective secure scheme used by the response middleware.
+     */
     let auth = AuthSettings {
         trusted_proxies: TrustedProxySet::parse("127.0.0.1/32"),
         ..AuthSettings::default()
@@ -327,6 +347,11 @@ async fn network_boundary_sanitizes_forwarded_proto_before_security_headers() {
 
 #[tokio::test]
 async fn app_shell_script_nonce_matches_content_security_policy() {
+    /*
+     * Renders the authenticated application shell and extracts the nonce placed on its inline
+     * scripts. It checks that the exact nonce is authorized by the response CSP and reused by
+     * all required bootstrap script blocks.
+     */
     let (state, _temp_dir) = test_state(AuthSettings::default()).await;
     let app = http::router(state);
 
@@ -352,6 +377,11 @@ async fn app_shell_script_nonce_matches_content_security_policy() {
 
 #[tokio::test]
 async fn security_headers_can_be_disabled_and_csp_can_be_overridden() {
+    /*
+     * Builds one router with security headers disabled and another with a custom CSP template.
+     * It checks disabling removes the managed headers, while overriding preserves the policy
+     * text and substitutes a real nonce instead of leaking the template marker.
+     */
     let (state, _temp_dir) = test_state(AuthSettings {
         security_headers: SecurityHeaderSettings {
             enabled: false,
@@ -391,6 +421,11 @@ async fn security_headers_can_be_disabled_and_csp_can_be_overridden() {
 
 #[tokio::test]
 async fn gzip_runtime_config_matches_python_middleware_behavior() {
+    /*
+     * Requests a tiny health response with gzip forced on, left at the normal size threshold,
+     * and explicitly disabled. It checks compressed responses decode correctly and carry
+     * negotiation headers, while below-threshold or disabled responses remain plain.
+     */
     let (state, _temp_dir) = test_state_with_gzip(AuthSettings::default(), 1, 6).await;
     let response = http::router(state)
         .oneshot(request_with_headers(

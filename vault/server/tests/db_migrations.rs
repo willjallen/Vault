@@ -301,6 +301,12 @@ async fn set_legacy_vault_root(pool: &SqlitePool) -> i64 {
 
 #[tokio::test]
 async fn exact_v2_0_0_fixture_upgrades_to_current_without_changing_baseline_data() {
+    /*
+     * Snapshots the released v2.0.0 fixture's ledger, rows, preview data, and folder hierarchy
+     * before opening it with the current server. It checks pending migrations append the
+     * exact known history without changing released data or root identities and leave no
+     * foreign-key violations.
+     */
     let fixture = v2_0_0_fixture().await;
     let db_path = fixture.db_path().to_path_buf();
     let raw = raw_pool(&db_path).await;
@@ -362,6 +368,11 @@ async fn exact_v2_0_0_fixture_upgrades_to_current_without_changing_baseline_data
 
 #[tokio::test]
 async fn v2_1_0_upgrade_invalidates_ambiguous_create_uploads_and_preserves_checkins() {
+    /*
+     * Upgrades the pinned v2.1.0 fixture through the upload-target identity migration. It checks
+     * the new column and foreign key, preserves check-ins and completed creates, fails ambiguous
+     * in-flight creates with restart guidance, and requires identity on future active creates.
+     */
     let fixture = v2_1_0_fixture().await;
     let db_path = fixture.db_path().to_path_buf();
     let raw = raw_pool(&db_path).await;
@@ -465,6 +476,12 @@ async fn v2_1_0_upgrade_invalidates_ambiguous_create_uploads_and_preserves_check
 
 #[tokio::test]
 async fn archive_identity_migration_normalizes_legacy_rows_without_permanent_compatibility_state() {
+    /*
+     * Seeds a legacy archived document that uses the old source-folder and original-name fields,
+     * then upgrades it. It checks migration creates canonical archive identity and origin
+     * metadata, removes the compatibility columns, and records the current migration
+     * history.
+     */
     let fixture = v2_1_0_fixture().await;
     let db_path = fixture.db_path().to_path_buf();
     let raw = raw_pool(&db_path).await;
@@ -554,6 +571,11 @@ async fn archive_identity_migration_normalizes_legacy_rows_without_permanent_com
 
 #[tokio::test]
 async fn derived_v2_0_0_incident_state_normalizes_legacy_root_without_replacing_descendants() {
+    /*
+     * Derives the historical named Vault-root incident from the v2.0.0 fixture and adds a child
+     * tied to that root ID. It checks migration normalizes the existing root in place, preserves
+     * its descendant and unrelated baseline data, and produces exactly one canonical Vault root.
+     */
     let fixture = v2_0_0_fixture().await;
     let db_path = fixture.db_path().to_path_buf();
     let raw = raw_pool(&db_path).await;
@@ -656,6 +678,12 @@ async fn derived_v2_0_0_incident_state_normalizes_legacy_root_without_replacing_
 
 #[tokio::test]
 async fn migration_two_rolls_back_root_normalization_and_ledger_on_final_validation_failure() {
+    /*
+     * Combines the legacy root representation with a preexisting orphan event that will fail
+     * final foreign-key validation. It checks the entire migration transaction rolls back:
+     * the root name, ledger, preview data, orphan row, and original violation all remain
+     * exactly as they were.
+     */
     let fixture = v2_0_0_fixture().await;
     let db_path = fixture.db_path().to_path_buf();
     let raw = raw_pool(&db_path).await;
@@ -758,6 +786,11 @@ impl InvalidHistory {
 
 #[tokio::test]
 async fn migration_history_must_be_an_exact_known_prefix() {
+    /*
+     * Restarts fixtures whose migration history is empty, has a gap, changes a known name, or
+     * contains a future entry. It checks each unsupported ledger shape gets its specific refusal
+     * and that failed startup never rewrites the supplied history.
+     */
     for invalid_history in [
         InvalidHistory::Empty,
         InvalidHistory::Gap,
@@ -825,6 +858,11 @@ async fn migration_history_must_be_an_exact_known_prefix() {
 
 #[tokio::test]
 async fn v2_shaped_database_without_baseline_ledger_is_rejected_without_inference() {
+    /*
+     * Removes only the migration ledger from an otherwise exact v2.0.0 fixture after
+     * snapshotting all data. It checks startup will not infer provenance from schema shape
+     * and does not recreate the ledger or mutate any baseline or preview rows.
+     */
     let fixture = v2_0_0_fixture().await;
     let db_path = fixture.db_path().to_path_buf();
     let raw = raw_pool(&db_path).await;
@@ -860,6 +898,11 @@ async fn v2_shaped_database_without_baseline_ledger_is_rejected_without_inferenc
 
 #[tokio::test]
 async fn restarting_an_already_current_database_is_idempotent() {
+    /*
+     * Upgrades a v2.0.0 fixture once, snapshots its migration history, data, previews, and
+     * roots, then opens it again. It checks a current database receives no repeated
+     * migration effects and retains exactly the same two roots and rows across restart.
+     */
     let fixture = v2_0_0_fixture().await;
     let db_path = fixture.db_path().to_path_buf();
     let first_pool = db::connect(&db_path).await.expect("first startup");
@@ -915,6 +958,11 @@ async fn restarting_an_already_current_database_is_idempotent() {
 
 #[tokio::test]
 async fn current_database_with_nonboolean_root_flag_refuses_restart_without_repair() {
+    /*
+     * Corrupts the Vault root flag after bringing a fixture fully current, then attempts another
+     * startup. It checks invariant validation reports the precise bad root, preserves the
+     * invalid value for diagnosis, and leaves migration history unchanged.
+     */
     let fixture = v2_0_0_fixture().await;
     let db_path = fixture.db_path().to_path_buf();
     let pool = db::connect(&db_path)
@@ -952,6 +1000,11 @@ async fn current_database_with_nonboolean_root_flag_refuses_restart_without_repa
 
 #[tokio::test]
 async fn malformed_hierarchy_refuses_upgrade_without_committing_pending_migration() {
+    /*
+     * Gives a v2.0.0 fixture both the migratable legacy root and a folder whose parent does not
+     * exist. It checks final hierarchy validation aborts the pending migration, leaving the old
+     * root spelling, ledger, preview data, and malformed row untouched.
+     */
     let fixture = v2_0_0_fixture().await;
     let db_path = fixture.db_path().to_path_buf();
     let raw = raw_pool(&db_path).await;
@@ -1001,6 +1054,11 @@ async fn malformed_hierarchy_refuses_upgrade_without_committing_pending_migratio
 
 #[tokio::test]
 async fn missing_required_root_refuses_upgrade_without_seeding_a_replacement() {
+    /*
+     * Deletes the Vault root from a v2.0.0 fixture before current startup. It checks the
+     * required root-count invariant aborts migration without inventing a replacement or
+     * advancing the ledger and preview schema.
+     */
     let fixture = v2_0_0_fixture().await;
     let db_path = fixture.db_path().to_path_buf();
     let raw = raw_pool(&db_path).await;
@@ -1033,6 +1091,12 @@ async fn missing_required_root_refuses_upgrade_without_seeding_a_replacement() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_startups_serialize_the_same_pending_migration_chain() {
+    /*
+     * Opens the same legacy-root fixture concurrently on two runtime threads while one migration
+     * chain is pending. It checks startup serialization lets both callers succeed with one
+     * complete ledger, exactly two roots, and a single normalized Vault root rather than
+     * racing duplicate migration effects.
+     */
     let fixture = v2_0_0_fixture().await;
     let db_path = fixture.db_path().to_path_buf();
     let raw = raw_pool(&db_path).await;

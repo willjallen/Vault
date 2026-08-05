@@ -108,6 +108,10 @@ async fn deterministic_multipart_part_keys(
 
 #[tokio::test]
 async fn put_bytes_is_content_addressed_and_deduped() {
+    /*
+     * Storing identical bytes twice must produce the SHA-256-derived key and the same metadata
+     * both times. The payload remains readable and only one physical object is listed.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let storage = test_storage(&temp_dir.path().join("store"));
     let expected_digest = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
@@ -134,6 +138,11 @@ async fn put_bytes_is_content_addressed_and_deduped() {
 
 #[tokio::test]
 async fn put_bytes_repairs_existing_digest_key_with_wrong_bytes() {
+    /*
+     * A file already occupying the correct digest-derived path is deliberately filled with
+     * different bytes. Publishing the real payload must replace that corruption and return
+     * the expected key.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let storage = test_storage(&temp_dir.path().join("store"));
     let content = b"correct bytes";
@@ -161,6 +170,11 @@ async fn put_bytes_repairs_existing_digest_key_with_wrong_bytes() {
 
 #[tokio::test]
 async fn object_keys_reject_path_traversal() {
+    /*
+     * A caller must not be able to escape the storage root by supplying parent-directory
+     * components. Reading such a key is rejected as invalid before any outside file can be
+     * accessed.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let storage = test_storage(&temp_dir.path().join("store"));
 
@@ -174,6 +188,10 @@ async fn object_keys_reject_path_traversal() {
 
 #[tokio::test]
 async fn range_reader_reads_exact_slice() {
+    /*
+     * Both buffered and streaming range APIs must return exactly the requested "world" slice.
+     * The stream then ends cleanly, while an inverted byte interval is rejected.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let storage = test_storage(temp_dir.path());
     let blob = storage.put_bytes(b"hello world").await.expect("put bytes");
@@ -211,6 +229,11 @@ async fn range_reader_reads_exact_slice() {
 
 #[tokio::test]
 async fn ranked_zero_length_stream_can_be_polled_after_its_probe() {
+    /*
+     * Opening a ranked location for an empty object must yield a stable, already-finished
+     * stream. Repeated polls stay at EOF instead of panicking or manufacturing an empty
+     * frame.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let storage = test_storage(temp_dir.path());
     let blob = storage.put_bytes(b"").await.expect("empty object");
@@ -238,6 +261,11 @@ async fn ranked_zero_length_stream_can_be_polled_after_its_probe() {
 
 #[tokio::test]
 async fn range_stream_rejects_object_size_drift_before_returning_headers() {
+    /*
+     * The stored file is lengthened after its metadata says it contains five bytes.
+     * Range setup must detect that size drift immediately so callers do not commit response
+     * headers for mismatched content.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let storage = test_storage(temp_dir.path());
     let blob = storage.put_bytes(b"hello").await.expect("put bytes");
@@ -261,6 +289,11 @@ async fn range_stream_rejects_object_size_drift_before_returning_headers() {
 
 #[tokio::test]
 async fn verified_part_files_promote_to_manifest_without_listing_parts() {
+    /*
+     * Verified input chunks are published behind one content-addressed manifest that supports
+     * whole reads, cross-part ranges, and bounded streaming. Internal part files stay out of
+     * normal object listings and are removed along with the manifest.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let part_dir = temp_dir.path().join("parts");
     tokio::fs::create_dir_all(&part_dir)
@@ -351,6 +384,12 @@ async fn verified_part_files_promote_to_manifest_without_listing_parts() {
 
 #[tokio::test]
 async fn multipart_ranges_prevalidate_only_the_parts_they_can_expose() {
+    /*
+     * Removing the second chunk must not break a range wholly contained in the healthy first
+     * chunk, but a crossing range must fail before yielding bytes. A full ranked read can
+     * therefore abandon the broken multipart location and return the intact fallback without
+     * mixing sources.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let (sources, digest) = multipart_sources(&temp_dir.path().join("sources")).await;
     let storage = test_storage(&temp_dir.path().join("store"));
@@ -439,6 +478,11 @@ async fn multipart_ranges_prevalidate_only_the_parts_they_can_expose() {
 
 #[tokio::test]
 async fn multipart_publication_rolls_back_parts_created_before_a_later_conflict() {
+    /*
+     * Publication is forced to encounter a directory where its second part file should go.
+     * The earlier part created by this attempt is rolled back, while the conflicting directory
+     * and unpublished manifest state are preserved.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let (sources, digest) = multipart_sources(&temp_dir.path().join("sources")).await;
     let part_keys =
@@ -470,6 +514,11 @@ async fn multipart_publication_rolls_back_parts_created_before_a_later_conflict(
 
 #[tokio::test]
 async fn multipart_rollback_preserves_existing_and_replaced_part_targets() {
+    /*
+     * The first destination begins either valid or corrupt, and a later destination is made
+     * impossible to publish. Rollback must leave the first destination containing the valid
+     * bytes in both cases rather than deleting or restoring corruption.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let (sources, digest) = multipart_sources(&temp_dir.path().join("sources")).await;
     let part_keys =
@@ -509,6 +558,11 @@ async fn multipart_rollback_preserves_existing_and_replaced_part_targets() {
 
 #[tokio::test]
 async fn multipart_manifest_publication_failure_rolls_back_all_created_parts() {
+    /*
+     * A directory at the final manifest path makes the commit point fail after part
+     * materialization. Every part created for the attempted object is removed without
+     * disturbing the preexisting conflict.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let (sources, digest) = multipart_sources(&temp_dir.path().join("sources")).await;
     let part_keys =
@@ -536,6 +590,11 @@ async fn multipart_manifest_publication_failure_rolls_back_all_created_parts() {
 
 #[tokio::test]
 async fn multipart_publication_persists_parts_before_the_manifest_commit_point() {
+    /*
+     * Recorded durability barriers must place every part-file and part-directory sync before the
+     * manifest file is committed. The manifest directory and staging directory follow in
+     * order, and deduplicated publication still performs all required barriers.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let (sources, digest) = multipart_sources(&temp_dir.path().join("sources")).await;
     let durability = Arc::new(RecordingDurability::new(None));
@@ -592,6 +651,11 @@ async fn multipart_publication_persists_parts_before_the_manifest_commit_point()
 
 #[tokio::test]
 async fn multipart_manifest_sync_failure_rolls_back_uncommitted_parts() {
+    /*
+     * Failure is injected while syncing the manifest file, before publication can be
+     * acknowledged. The incomplete manifest and all newly materialized parts must disappear,
+     * leaving no reachable partial object.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let (sources, digest) = multipart_sources(&temp_dir.path().join("sources")).await;
     let part_keys =
@@ -628,6 +692,10 @@ async fn multipart_manifest_sync_failure_rolls_back_uncommitted_parts() {
 
 #[tokio::test]
 async fn object_sync_failure_is_reported_before_publication_succeeds() {
+    /*
+     * A durability failure while syncing a newly written object must be returned to the caller.
+     * No object key may become visible when the file itself has not crossed that barrier.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let durability = Arc::new(RecordingDurability::new(Some(
         LocalDurabilityPoint::ObjectFile,
@@ -652,6 +720,11 @@ async fn object_sync_failure_is_reported_before_publication_succeeds() {
 
 #[tokio::test]
 async fn object_directory_sync_failure_is_reported_after_atomic_publication() {
+    /*
+     * Failure after the atomic rename but during parent-directory synchronization creates an
+     * intentionally ambiguous durability result. The API reports the error even though the
+     * correctly named object is already present with intact bytes.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let durability = Arc::new(RecordingDurability::new(Some(
         LocalDurabilityPoint::ObjectDirectory,
@@ -684,6 +757,11 @@ async fn object_directory_sync_failure_is_reported_after_atomic_publication() {
 
 #[tokio::test]
 async fn multipart_directory_sync_failure_never_reports_publication_success() {
+    /*
+     * A manifest can be atomically visible before synchronizing its containing directory fails.
+     * The caller still receives an error, while the unacknowledged multipart object remains
+     * internally valid and readable.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let (sources, digest) = multipart_sources(&temp_dir.path().join("sources")).await;
     let durability = Arc::new(RecordingDurability::new(Some(
@@ -713,6 +791,11 @@ async fn multipart_directory_sync_failure_never_reports_publication_success() {
 
 #[tokio::test]
 async fn put_file_sync_failure_preserves_the_source_for_retry() {
+    /*
+     * Injecting an object-file sync failure during a move-based upload must not consume the
+     * caller's source. The original bytes remain available for retry and no destination is
+     * advertised.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let source = temp_dir.path().join("source.bin");
     tokio::fs::write(&source, b"retryable source")
@@ -746,6 +829,11 @@ async fn put_file_sync_failure_preserves_the_source_for_retry() {
 
 #[tokio::test]
 async fn assembled_part_file_sync_failure_leaves_no_visible_object() {
+    /*
+     * Unverified chunks are assembled into a regular object, with failure injected at its
+     * file-sync barrier. The operation reports the I/O error and leaves no object visible
+     * through inventory.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let (sources, _) = multipart_sources(&temp_dir.path().join("sources")).await;
     let durability = Arc::new(RecordingDurability::new(Some(
@@ -771,6 +859,11 @@ async fn assembled_part_file_sync_failure_leaves_no_visible_object() {
 
 #[tokio::test]
 async fn assembled_part_staging_sync_failure_never_reports_publication_success() {
+    /*
+     * Failure at the final staging-directory barrier occurs after the assembled object can
+     * already be renamed into place. The write is reported as failed, but the unacknowledged
+     * digest-keyed payload is complete and readable.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let (sources, digest) = multipart_sources(&temp_dir.path().join("sources")).await;
     let durability = Arc::new(RecordingDurability::new(Some(
@@ -800,6 +893,12 @@ async fn assembled_part_staging_sync_failure_never_reports_publication_success()
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // One ordered concurrency scenario must retain both live streams.
 async fn multipart_stream_lease_blocks_only_its_own_object_deletion() {
+    /*
+     * An active multipart stream keeps deletion of that same object waiting and prevents new
+     * readers from slipping in ahead of the writer. Reads and deletion for another object
+     * proceed independently, and the deferred deletion completes only after the original stream
+     * releases its lease.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let part_dir = temp_dir.path().join("parts");
     tokio::fs::create_dir_all(&part_dir)
@@ -921,6 +1020,11 @@ async fn multipart_stream_lease_blocks_only_its_own_object_deletion() {
 
 #[tokio::test]
 async fn multipart_delete_rejects_manifest_that_points_at_another_blobs_parts() {
+    /*
+     * One manifest is tampered to reference a part owned by a different digest layout.
+     * Reads reject the invalid ownership, and deletion removes only the bad manifest without
+     * following the pointer or damaging the other object.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let source_dir = temp_dir.path().join("parts");
     tokio::fs::create_dir_all(&source_dir)
@@ -997,6 +1101,11 @@ async fn multipart_delete_rejects_manifest_that_points_at_another_blobs_parts() 
 
 #[tokio::test]
 async fn verified_part_files_repair_corrupt_existing_manifest_parts() {
+    /*
+     * After a published multipart chunk is corrupted in place, the same verified payload is
+     * submitted again. Deduplicated publication repairs the bad part behind the existing
+     * manifest key and restores the complete content.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let part_dir = temp_dir.path().join("parts");
     tokio::fs::create_dir_all(&part_dir)
@@ -1050,6 +1159,11 @@ async fn verified_part_files_repair_corrupt_existing_manifest_parts() {
 
 #[tokio::test]
 async fn verified_part_files_with_different_chunking_use_distinct_part_layouts() {
+    /*
+     * Two uploads contain identical whole-object bytes but divide them at different boundaries.
+     * They share the content-addressed manifest key while using distinct part-layout keys, so
+     * the newer manifest reads the correct sequence without collisions.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let part_dir = temp_dir.path().join("parts");
     tokio::fs::create_dir_all(&part_dir)
@@ -1113,6 +1227,11 @@ async fn verified_part_files_with_different_chunking_use_distinct_part_layouts()
 
 #[tokio::test]
 async fn unverified_part_files_are_assembled_into_content_addressed_blob() {
+    /*
+     * Without a caller-supplied digest, chunk files must be concatenated and hashed as one
+     * ordinary blob. The resulting key, digest, bytes, and inventory entry all describe that
+     * assembled payload rather than a multipart manifest.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let part_dir = temp_dir.path().join("parts");
     tokio::fs::create_dir_all(&part_dir)
@@ -1155,6 +1274,11 @@ async fn unverified_part_files_are_assembled_into_content_addressed_blob() {
 
 #[tokio::test]
 async fn multipart_inventory_preserves_legacy_storage_prefix_spelling() {
+    /*
+     * A historically permissive prefix containing repeated separators and dot components is
+     * normalized only as existing behavior requires. After restart, inventory still
+     * discovers every part under that spelling and the manifest remains readable.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let (sources, digest) = multipart_sources(&temp_dir.path().join("sources")).await;
     let root = temp_dir.path().join("store");
@@ -1199,6 +1323,11 @@ async fn multipart_inventory_preserves_legacy_storage_prefix_spelling() {
 
 #[tokio::test]
 async fn multipart_inventory_is_bounded_strict_and_symlink_safe() {
+    /*
+     * Inventory is paged one result at a time and should return only valid legacy or
+     * layout-scoped part filenames. Lookalike names and symlinked layouts are ignored,
+     * preventing traversal to an outside sentinel.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let storage = test_storage(&temp_dir.path().join("store"));
     let digest = sha256_hex(b"inventory");

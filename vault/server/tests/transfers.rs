@@ -395,6 +395,12 @@ async fn wait_for_export_status(pool: &sqlx::SqlitePool, job_id: &str, expected:
 
 #[tokio::test]
 async fn recovery_resumes_recoverable_completing_uploads_and_fails_missing_parts() {
+    /*
+     * Startup recovery compares two uploads interrupted during completion: one has a valid part
+     * and sidecar, while the other has no recoverable layout. It resets verification and
+     * resumes the valid session, marks the missing one failed without erasing its directory, and
+     * removes transient S3 assembly files from both.
+     */
     let (state, _temp_dir) = test_state(AuthSettings::default()).await;
     insert_upload_session_with_expiration(&state.db, "recoverable-upload", "completing", FUTURE_AT)
         .await;
@@ -490,6 +496,11 @@ async fn recovery_resumes_recoverable_completing_uploads_and_fails_missing_parts
 
 #[tokio::test]
 async fn recovery_rejects_invalid_layouts_without_deleting_staging() {
+    /*
+     * Noncanonical part numbering and an oversized metadata sidecar are treated as unsafe
+     * recovery layouts, while a legitimate zero-byte upload can resume. Invalid sessions
+     * become failed but retain their staged parts for normal expiry and investigation.
+     */
     let (state, _temp_dir) = test_state(AuthSettings::default()).await;
     for session_id in [
         "noncanonical-upload",
@@ -564,6 +575,11 @@ async fn recovery_rejects_invalid_layouts_without_deleting_staging() {
 
 #[tokio::test]
 async fn recovery_requeues_interrupted_exports_and_removes_partial_artifacts() {
+    /*
+     * A running export at process restart may have a temporary ZIP and even a published partial
+     * artifact. Recovery returns the job to queued and removes the temp file, artifact row,
+     * unreferenced blob metadata, and storage object before retry.
+     */
     let (state, _temp_dir) = test_state(AuthSettings::default()).await;
     insert_export_job_with_expiration(&state.db, "running-export", "running", FUTURE_AT).await;
     let (blob_id, stored) = insert_stored_blob(&state, b"partial export bytes").await;
@@ -623,6 +639,11 @@ async fn recovery_requeues_interrupted_exports_and_removes_partial_artifacts() {
 
 #[tokio::test]
 async fn recovery_requiring_a_dispatcher_fails_before_mutating_state() {
+    /*
+     * Startup is told that recovered exports require a persistent dispatcher, but no dispatcher
+     * runtime is supplied. Recovery fails closed before requeueing the running job or
+     * deleting its partial file.
+     */
     let (state, _temp_dir) = test_state(AuthSettings::default()).await;
     insert_export_job_with_expiration(&state.db, "untouched-export", "running", FUTURE_AT).await;
     let transfers_path = state.config.transfers_path();
@@ -654,6 +675,11 @@ async fn recovery_requiring_a_dispatcher_fails_before_mutating_state() {
 
 #[tokio::test]
 async fn recovery_starts_pending_queued_exports() {
+    /*
+     * A durable queued export exists before the dispatcher runtime starts.
+     * Recovery launches the dispatcher, which claims the job, builds the archive from its stored
+     * request, and publishes one artifact.
+     */
     let (state, _temp_dir) = test_state(AuthSettings::default()).await;
     let document_id =
         insert_document_with_current_version(&state, "startup.txt", b"startup bytes").await;
@@ -727,6 +753,11 @@ async fn recovery_starts_pending_queued_exports() {
 
 #[tokio::test]
 async fn recovery_dispatcher_drains_beyond_the_legacy_startup_page() {
+    /*
+     * More than one thousand queued jobs exceed the former one-page startup discovery limit.
+     * The persistent dispatcher continues claiming batches until every deliberately invalid job
+     * has run and reached a terminal failed state.
+     */
     const QUEUED_JOBS: i64 = 1_001;
     let (state, _temp_dir) = test_state(AuthSettings::default()).await;
     let mut transaction = state.db.begin().await.expect("queue transaction");
@@ -793,6 +824,11 @@ async fn recovery_dispatcher_drains_beyond_the_legacy_startup_page() {
 
 #[tokio::test]
 async fn idle_dispatcher_polls_for_db_only_queued_jobs() {
+    /*
+     * A queued export is inserted directly into the database after the dispatcher's startup
+     * notification has already drained. Its periodic poll still discovers and executes that
+     * durable work without an in-process wake-up.
+     */
     let (state, _temp_dir) = test_state(AuthSettings::default()).await;
     let transfers_path = state.config.transfers_path();
     let execution = vault_server::exports::ExportExecutionContext::new_with_poll_interval(
@@ -845,6 +881,11 @@ async fn idle_dispatcher_polls_for_db_only_queued_jobs() {
 
 #[tokio::test]
 async fn shutdown_requested_before_start_never_claims_queued_work() {
+    /*
+     * Shutdown is requested before the dispatcher is started while a queued row is waiting.
+     * Starting and then joining the context returns promptly without spawning workers or
+     * changing the job's queued status.
+     */
     let (state, _temp_dir) = test_state(AuthSettings::default()).await;
     sqlx::query(
         r"
@@ -892,6 +933,11 @@ async fn shutdown_requested_before_start_never_claims_queued_work() {
 
 #[tokio::test]
 async fn sweep_expired_uploads_marks_active_and_removes_terminal_sessions() {
+    /*
+     * Expired active uploads become terminally expired, whereas already failed sessions are
+     * deleted outright. Both lose scratch directories and hash-coordinator state, while a
+     * future timestamp in Python's legacy shape remains active.
+     */
     let (state, _temp_dir) = test_state(AuthSettings::default()).await;
     insert_upload_session(&state.db, "active-upload", "active").await;
     insert_upload_session(&state.db, "failed-upload", "failed").await;
@@ -961,6 +1007,11 @@ async fn sweep_expired_uploads_marks_active_and_removes_terminal_sessions() {
 
 #[tokio::test]
 async fn orphan_upload_sweep_removes_only_old_validated_unreferenced_directories() {
+    /*
+     * Orphan cleanup first respects the age grace period, then removes only an old directory
+     * whose name is a valid unreferenced session id. Live rows, lookalike names, symlinks,
+     * and external sentinel data are preserved.
+     */
     let (state, _temp_dir) = test_state(AuthSettings::default()).await;
     insert_upload_session_with_expiration(&state.db, "live-upload", "active", FUTURE_AT).await;
     let upload_root = state.config.transfers_path().join("uploads");
@@ -1033,6 +1084,11 @@ async fn orphan_upload_sweep_removes_only_old_validated_unreferenced_directories
 
 #[tokio::test]
 async fn orphan_upload_sweep_advances_a_bounded_cursor_across_calls() {
+    /*
+     * Cleanup is limited to one orphan directory per invocation.
+     * Its persisted scan cursor advances across calls so all three candidates are eventually
+     * removed instead of repeatedly inspecting the first entry.
+     */
     let (state, _temp_dir) = test_state(AuthSettings::default()).await;
     let upload_root = state.config.transfers_path().join("uploads");
     for session_id in ["orphan-a", "orphan-b", "orphan-c"] {
@@ -1062,6 +1118,11 @@ async fn orphan_upload_sweep_advances_a_bounded_cursor_across_calls() {
 #[cfg(unix)]
 #[tokio::test]
 async fn upload_cleanup_refuses_a_symlinked_upload_root() {
+    /*
+     * The entire uploads root is replaced with a symlink to a directory outside the configured
+     * transfer tree. Direct session cleanup and orphan sweeping refuse to follow it, leaving
+     * the external sentinel untouched.
+     */
     let (state, _temp_dir) = test_state(AuthSettings::default()).await;
     let transfers_path = state.config.data_dir.join("symlinked-transfers");
     let external_root = state.config.data_dir.join("external-upload-root");
@@ -1106,6 +1167,11 @@ async fn upload_cleanup_refuses_a_symlinked_upload_root() {
 
 #[tokio::test]
 async fn sweep_expired_uploads_ignores_stale_status_and_expiration_snapshots() {
+    /*
+     * A trigger changes later candidates' status or expiry after the sweep has selected an
+     * initial batch. Each row is revalidated before mutation, so only the unchanged driver
+     * expires and every modified session keeps its row and scratch data.
+     */
     let (state, _temp_dir) = test_state(AuthSettings::default()).await;
     insert_upload_session_with_expiration(
         &state.db,
@@ -1209,6 +1275,11 @@ async fn sweep_expired_uploads_ignores_stale_status_and_expiration_snapshots() {
 
 #[tokio::test]
 async fn sweep_expired_exports_cancels_active_and_deletes_terminal_artifacts() {
+    /*
+     * Expired queued work is cancelled in place, while an expired complete export is removed.
+     * Deleting the terminal job also reclaims its unreferenced artifact row, blob metadata, and
+     * stored object.
+     */
     let (state, _temp_dir) = test_state(AuthSettings::default()).await;
     insert_export_job(&state.db, "queued-export", "queued").await;
     insert_export_job(&state.db, "complete-export", "complete").await;
@@ -1254,6 +1325,11 @@ async fn sweep_expired_exports_cancels_active_and_deletes_terminal_artifacts() {
 
 #[tokio::test]
 async fn sweep_expired_exports_ignores_stale_status_and_expiration_snapshots() {
+    /*
+     * During a sweep, a trigger changes later exports from the statuses or expiration times
+     * originally selected. Revalidation cancels only the unchanged driver and preserves
+     * every modified row, temp file, artifact, blob, and object.
+     */
     let (state, _temp_dir) = test_state(AuthSettings::default()).await;
     insert_export_job_with_expiration(&state.db, "driver-export", "queued", "1997-01-01T00:00:00Z")
         .await;
@@ -1352,6 +1428,11 @@ async fn sweep_expired_exports_ignores_stale_status_and_expiration_snapshots() {
 
 #[tokio::test]
 async fn sweep_expired_export_preserves_artifact_blob_when_document_references_it() {
+    /*
+     * An expired export artifact and a document version share the same content-addressed blob.
+     * Removing the export job releases only its reference; the blob location and readable object
+     * remain for the document.
+     */
     let (state, _temp_dir) = test_state(AuthSettings::default()).await;
     insert_export_job(&state.db, "complete-export", "complete").await;
     let (blob_id, stored) = insert_stored_blob(&state, b"shared bytes").await;
@@ -1421,6 +1502,11 @@ async fn sweep_expired_export_preserves_artifact_blob_when_document_references_i
 
 #[tokio::test]
 async fn debug_sweep_ttl_route_returns_real_transfer_cleanup_result() {
+    /*
+     * The development TTL endpoint runs actual transfer maintenance against an expired active
+     * upload. Its response includes that session in the transfer sweep's expired list rather
+     * than returning canned diagnostics.
+     */
     let (state, _temp_dir) = test_state(dev_auth()).await;
     insert_upload_session(&state.db, "route-upload", "active").await;
     let app = http::router(state);

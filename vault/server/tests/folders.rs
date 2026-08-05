@@ -46,6 +46,11 @@ fn user(groups: &[&str], is_admin: bool) -> UserContext {
 
 #[tokio::test]
 async fn public_folder_paths_match_python_normalization() {
+    /*
+     * Normalizes mixed separators and surrounding whitespace for Vault and Archive paths. It
+     * checks root selection and public-path reconstruction match the compatibility rules while
+     * parent traversal remains invalid.
+     */
     let archive =
         parse_public_folder_path(Some(" /Archive/2026\\June ")).expect("archive public path");
     let vault = parse_public_folder_path(Some(" Project\\Plans/ ")).expect("vault public path");
@@ -74,6 +79,11 @@ async fn public_folder_paths_match_python_normalization() {
 
 #[tokio::test]
 async fn get_or_create_folder_path_creates_vault_folders_and_rebuilds_paths() {
+    /*
+     * Creates a two-level Vault path, asks for it again, and probes the same operation beneath
+     * Archive. It checks only the missing Vault segments are created, their path can be rebuilt,
+     * and Archive remains a flat document container with no child folders.
+     */
     let pool = test_pool().await;
 
     let created = get_or_create_folder_path_with_created(&pool, Some("Project/Private"))
@@ -103,6 +113,12 @@ async fn get_or_create_folder_path_creates_vault_folders_and_rebuilds_paths() {
 
 #[tokio::test]
 async fn read_only_folder_path_resolver_handles_roots_deep_paths_and_missing_segments() {
+    /*
+     * Resolves normalized deep paths, both logical roots, missing intermediate segments, an
+     * impossible Archive child, and a traversal path without creating anything. It checks valid
+     * rows are returned, absent paths stay absent, and malformed paths return a validation
+     * error.
+     */
     let pool = test_pool().await;
     let project = get_or_create_folder_path(&pool, Some("Project/Private"))
         .await
@@ -152,6 +168,11 @@ async fn read_only_folder_path_resolver_handles_roots_deep_paths_and_missing_seg
 
 #[tokio::test]
 async fn folder_path_cache_handles_roots_children_and_missing_parents() {
+    /*
+     * Builds a path cache from the complete folder table containing both roots and a nested
+     * Vault hierarchy. It checks cached reconstruction produces the public spelling for a
+     * child, descendant, and the Archive root.
+     */
     let pool = test_pool().await;
     let project = get_or_create_folder_path(&pool, Some("Project"))
         .await
@@ -183,6 +204,11 @@ async fn folder_path_cache_handles_roots_children_and_missing_parents() {
 
 #[tokio::test]
 async fn folder_path_helpers_tolerate_corrupt_parent_cycle() {
+    /*
+     * Manually creates a two-folder parent cycle and runs the cache, subtree, and document-path
+     * helpers over it. It checks each traversal terminates with bounded, nonempty output and
+     * includes each cyclic folder once rather than looping indefinitely.
+     */
     let pool = test_pool().await;
     let first_id = sqlx::query(
         r"
@@ -245,6 +271,11 @@ async fn folder_path_helpers_tolerate_corrupt_parent_cycle() {
 
 #[tokio::test]
 async fn visible_folder_resolver_returns_only_viewable_canonical_paths() {
+    /*
+     * Grants view access at the root and resolves a nested folder once by ID and once through a
+     * noncanonical input spelling. It checks both paths return the same visible record with its
+     * canonical public path.
+     */
     let pool = test_pool().await;
     let root = get_root_folder(&pool, VAULT_ROOT_KEY).await.expect("root");
     let viewers = create_group(&pool, "viewers").await;
@@ -273,6 +304,11 @@ async fn visible_folder_resolver_returns_only_viewable_canonical_paths() {
 
 #[tokio::test]
 async fn delete_empty_folder_rechecks_contents_after_waiting_for_writer_gate() {
+    /*
+     * Starts deletion of an empty folder behind a writer lock, then commits a child folder and
+     * document before deletion proceeds. It checks the operation re-evaluates emptiness,
+     * preserves all three rows, and emits no deletion event after losing the race.
+     */
     let pool = test_pool().await;
     let folder = get_or_create_folder_path(&pool, Some("Race"))
         .await
@@ -354,6 +390,11 @@ async fn delete_empty_folder_rechecks_contents_after_waiting_for_writer_gate() {
 
 #[tokio::test]
 async fn visible_folder_resolver_conceals_hidden_and_missing_folders() {
+    /*
+     * Resolves a directly hidden folder and nonexistent IDs or paths as an ordinary viewer, then
+     * probes a missing ID as an administrator. It checks all absent or concealed targets produce
+     * the same `None` result without disclosing which case occurred.
+     */
     let pool = test_pool().await;
     let root = get_root_folder(&pool, VAULT_ROOT_KEY).await.expect("root");
     let viewers = create_group(&pool, "viewers").await;
@@ -401,6 +442,12 @@ async fn visible_folder_resolver_conceals_hidden_and_missing_folders() {
 
 #[tokio::test]
 async fn visible_folder_resolver_reports_visible_broken_ancestry_after_access_check() {
+    /*
+     * Inserts a detached folder with a direct viewer grant and resolves it as a hidden outsider,
+     * an authorized viewer, and an administrator. It checks malformed ancestry stays concealed
+     * from unauthorized callers but surfaces as an invariant error once the row is legitimately
+     * visible.
+     */
     let pool = test_pool().await;
     let viewers = create_group(&pool, "viewers").await;
     let detached_id = sqlx::query(
@@ -438,6 +485,11 @@ async fn visible_folder_resolver_reports_visible_broken_ancestry_after_access_ch
 
 #[tokio::test]
 async fn visible_folder_resolver_rejects_a_nonbinary_fake_root() {
+    /*
+     * Inserts a parentless Vault row whose root flag is neither false nor true, then resolves it
+     * as an administrator. It checks the resolver rejects the row as corrupt hierarchy
+     * rather than accepting it as an additional canonical root.
+     */
     let pool = test_pool().await;
     let fake_root_id = sqlx::query(
         "INSERT INTO folders (root_key, parent_id, name, is_root) VALUES ('vault', NULL, '', 2)",
@@ -455,6 +507,11 @@ async fn visible_folder_resolver_rejects_a_nonbinary_fake_root() {
 
 #[tokio::test]
 async fn folder_access_uses_nearest_direct_acl_and_admin_override() {
+    /*
+     * Combines inherited root grants with a direct deny on a nested boundary and evaluates users
+     * above and below that boundary. It checks the nearest direct ACL replaces inherited access,
+     * while administrator status still yields full access.
+     */
     let pool = test_pool().await;
     let root = get_root_folder(&pool, VAULT_ROOT_KEY).await.expect("root");
     let writers = create_group(&pool, "writers").await;
@@ -507,6 +564,12 @@ async fn folder_access_uses_nearest_direct_acl_and_admin_override() {
 
 #[tokio::test]
 async fn folder_access_batch_preserves_boundary_group_and_flag_semantics() {
+    /*
+     * Evaluates duplicated folder IDs for users whose group names differ in case and Unicode
+     * whitespace across inherited, direct, denied, and reopened ACL boundaries. It checks batch
+     * results deduplicate IDs, normalize memberships, preserve read versus write levels, and
+     * allow a deeper direct grant to reopen access.
+     */
     let pool = test_pool().await;
     let root = get_root_folder(&pool, VAULT_ROOT_KEY).await.expect("root");
     let root_users = create_group(&pool, "root-users").await;
@@ -578,6 +641,11 @@ async fn folder_access_batch_preserves_boundary_group_and_flag_semantics() {
 
 #[tokio::test]
 async fn folder_access_batch_handles_cycles_and_more_than_sqlite_bind_limit() {
+    /*
+     * Evaluates a cyclic hierarchy together with 1,100 ordinary folders and a missing ID. It
+     * checks batching crosses SQLite's bind limit without looping, retains the cycle's nearest
+     * grant, omits missing rows, and preserves the administrator short circuit.
+     */
     let pool = test_pool().await;
     let root = get_root_folder(&pool, VAULT_ROOT_KEY).await.expect("root");
     let readers = create_group(&pool, "readers").await;
@@ -659,6 +727,11 @@ async fn folder_access_batch_handles_cycles_and_more_than_sqlite_bind_limit() {
 
 #[tokio::test]
 async fn folder_access_helpers_preserve_read_write_and_hidden_semantics() {
+    /*
+     * Calls the read and write guards for view-only, reader, writer, outsider, and directly
+     * denied users. It checks visible-but-insufficient callers receive an access error,
+     * completely hidden folders appear missing, and the writer alone passes mutation checks.
+     */
     let pool = test_pool().await;
     let root = get_root_folder(&pool, VAULT_ROOT_KEY).await.expect("root");
     let viewers = create_group(&pool, "viewers").await;
@@ -719,6 +792,11 @@ async fn folder_access_helpers_preserve_read_write_and_hidden_semantics() {
 
 #[test]
 fn permission_flag_validation_matches_api_contract() {
+    /*
+     * Converts every valid cumulative view/read/write combination into its numeric access level.
+     * It also checks impossible combinations are rejected because write requires read and view,
+     * and read requires view.
+     */
     assert_eq!(access_level(true, true, true), 3);
     assert_eq!(access_level(true, true, false), 2);
     assert_eq!(access_level(true, false, false), 1);

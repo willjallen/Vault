@@ -459,6 +459,11 @@ fn unix_timestamp_now() -> i64 {
 
 #[tokio::test]
 async fn oidc_mode_returns_api_401_and_browser_login_redirect_without_session() {
+    /*
+     * Missing OIDC sessions are handled differently for machine and browser surfaces.
+     * APIs return a JSON authentication error, while a share page redirects to login with its
+     * path and query preserved as the return destination.
+     */
     let (state, _temp_dir) = test_state(oidc_auth("https://idp.example.com/auth")).await;
     let app = http::router(state);
 
@@ -483,6 +488,11 @@ async fn oidc_mode_returns_api_401_and_browser_login_redirect_without_session() 
 
 #[tokio::test]
 async fn non_oidc_auth_routes_preserve_python_redirect_and_cookie_behavior() {
+    /*
+     * Header-auth deployments keep the legacy Python behavior for OIDC-shaped routes: login and
+     * callback simply return home without setting cookies. Logout still honors a safe local
+     * destination and expires both conventional authentication cookies.
+     */
     let (state, _temp_dir) = test_state(AuthSettings::default()).await;
     let app = http::router(state);
 
@@ -528,6 +538,12 @@ async fn non_oidc_auth_routes_preserve_python_redirect_and_cookie_behavior() {
 
 #[tokio::test]
 async fn oidc_login_redirects_to_provider_and_sets_signed_state_cookie() {
+    /*
+     * Login constructs the provider authorization request with the configured client, callback,
+     * scopes, and fresh state and nonce values. A signed, HTTP-only, short-lived state
+     * cookie binds those values to the local return path with the expected SameSite and
+     * transport attributes.
+     */
     let auth = oidc_auth("https://idp.example.com/auth");
     let (state, _temp_dir) = test_state(auth.clone()).await;
     let app = http::router(state);
@@ -565,6 +581,11 @@ async fn oidc_login_redirects_to_provider_and_sets_signed_state_cookie() {
 
 #[tokio::test]
 async fn oidc_login_preserves_safe_redirects_and_rejects_ambiguous_or_external_forms() {
+    /*
+     * A normal local path may retain its query and fragment through the signed login state.
+     * Scheme-relative, credentialed, absolute, backslash, multiply encoded, and header-injection
+     * destinations are all reduced to the safe root fallback.
+     */
     let auth = oidc_auth("https://idp.example.com/auth");
     let (state, _temp_dir) = test_state(auth.clone()).await;
     let app = http::router(state);
@@ -607,6 +628,11 @@ async fn oidc_login_preserves_safe_redirects_and_rejects_ambiguous_or_external_f
 
 #[test]
 fn oidc_state_cookie_accepts_a_bounded_previous_signing_root() {
+    /*
+     * Rotating the signing root can keep existing login state valid through an explicitly
+     * configured previous key. The same cookie fails verification once that bounded
+     * compatibility key is no longer present.
+     */
     let mut old_auth = oidc_auth("https://idp.example.com/auth");
     old_auth.signing_keys = SigningKeyring::from_configured(PREVIOUS_SIGNING_ROOT, vec![]);
     let state_cookie = signed_state_cookie(&old_auth, "state-123", "nonce-123", "/Project");
@@ -622,6 +648,11 @@ fn oidc_state_cookie_accepts_a_bounded_previous_signing_root() {
 
 #[tokio::test]
 async fn oidc_login_uses_configured_nonce_byte_count_for_state_and_nonce() {
+    /*
+     * The configured entropy byte count controls both CSRF state and OpenID nonce generation.
+     * Their URL-safe encodings have the exact unpadded length and are copied unchanged into the
+     * signed cookie.
+     */
     let mut auth = oidc_auth("https://idp.example.com/auth");
     auth.oidc_nonce_bytes = 18;
     let (state, _temp_dir) = test_state(auth.clone()).await;
@@ -646,6 +677,11 @@ async fn oidc_login_uses_configured_nonce_byte_count_for_state_and_nonce() {
 
 #[tokio::test]
 async fn custom_oidc_cookie_names_are_used_for_login_callback_and_logout() {
+    /*
+     * Custom state and session cookie names must replace the defaults throughout the entire
+     * login lifecycle. Login sets the custom state, callback clears it and sets the custom
+     * session, and logout expires both custom names without leaking default-name cookies.
+     */
     let provider = start_mock_provider(
         "nonce-123",
         json!({
@@ -732,6 +768,11 @@ async fn custom_oidc_cookie_names_are_used_for_login_callback_and_logout() {
 
 #[tokio::test]
 async fn oidc_login_derives_redirect_uri_from_forwarded_host_and_proto() {
+    /*
+     * With no configured public callback, login derives one from the trusted first forwarded
+     * protocol and host values. Internal host values later in the proxy lists do not replace
+     * the externally visible HTTPS origin.
+     */
     let auth = oidc_auth_without_configured_redirect("https://idp.example.com/auth");
     let (state, _temp_dir) = test_state(auth).await;
     let app = http::router(state);
@@ -762,6 +803,11 @@ async fn oidc_login_derives_redirect_uri_from_forwarded_host_and_proto() {
 
 #[tokio::test]
 async fn oidc_state_cookie_secure_flag_follows_public_url_forwarded_proto_and_overrides() {
+    /*
+     * Automatic Secure handling for the transient state cookie recognizes either an HTTPS public
+     * URL or trusted forwarded HTTPS. Explicit true and false settings override that
+     * inference in both directions.
+     */
     let mut https_public_url = oidc_auth("https://idp.example.com/auth");
     https_public_url.public_url = "https://vault.example.com".to_string();
     let cookie = login_state_cookie(https_public_url, &[]).await;
@@ -785,6 +831,11 @@ async fn oidc_state_cookie_secure_flag_follows_public_url_forwarded_proto_and_ov
 
 #[tokio::test]
 async fn oidc_session_cookie_secure_flag_follows_public_url_forwarded_proto_and_overrides() {
+    /*
+     * The long-lived session cookie uses the same transport-policy inputs as login state after a
+     * successful callback. HTTPS public or forwarded origins enable Secure automatically,
+     * while explicit configuration remains authoritative.
+     */
     let provider = start_mock_provider(
         "nonce-123",
         json!({
@@ -818,6 +869,11 @@ async fn oidc_session_cookie_secure_flag_follows_public_url_forwarded_proto_and_
 
 #[tokio::test]
 async fn oidc_login_rejects_insecure_nonlocal_authorization_endpoint() {
+    /*
+     * Redirecting credentials to a cleartext authorization endpoint on a nonlocal host is
+     * forbidden. Login reports the provider configuration failure instead of issuing an
+     * unsafe redirect.
+     */
     let (state, _temp_dir) = test_state(oidc_auth("http://idp.example.com/auth")).await;
     let app = http::router(state);
 
@@ -834,6 +890,11 @@ async fn oidc_login_rejects_insecure_nonlocal_authorization_endpoint() {
 
 #[tokio::test]
 async fn oidc_login_rejects_discovery_without_authorization_endpoint() {
+    /*
+     * Provider discovery returns token and verification metadata but omits the endpoint needed
+     * to begin authorization. Login fails with the specific missing-endpoint diagnostic
+     * rather than building a malformed redirect.
+     */
     let provider = start_mock_provider_with_discovery(
         json!({}),
         |_issuer| json!({}),
@@ -863,6 +924,11 @@ async fn oidc_login_rejects_discovery_without_authorization_endpoint() {
 
 #[tokio::test]
 async fn oidc_discovery_is_cached_for_configured_ttl() {
+    /*
+     * Two login attempts occur within a one-hour provider metadata lifetime.
+     * Both redirects succeed while discovery is fetched only once and served from the shared
+     * cache thereafter.
+     */
     let provider = start_mock_provider(
         "nonce-123",
         json!({
@@ -896,6 +962,10 @@ async fn oidc_discovery_is_cached_for_configured_ttl() {
 
 #[tokio::test]
 async fn oidc_discovery_zero_ttl_refetches_provider_metadata() {
+    /*
+     * A zero discovery lifetime deliberately disables metadata reuse.
+     * Consecutive logins both succeed and each performs its own discovery request.
+     */
     let provider = start_mock_provider(
         "nonce-123",
         json!({
@@ -929,6 +999,12 @@ async fn oidc_discovery_zero_ttl_refetches_provider_metadata() {
 
 #[tokio::test]
 async fn logout_deletes_session_and_state_cookies_and_uses_safe_redirects() {
+    /*
+     * A same-origin POST logout expires both session and in-progress OIDC state, disables
+     * response caching, and preserves a valid local return path. An absolute external
+     * destination is replaced with the root while cookie deletion and no-store headers still
+     * apply.
+     */
     let (state, _temp_dir) = test_state(oidc_auth("https://idp.example.com/auth")).await;
     let app = http::router(state);
 
@@ -973,6 +1049,11 @@ async fn logout_deletes_session_and_state_cookies_and_uses_safe_redirects() {
 
 #[tokio::test]
 async fn logout_preserves_safe_redirects_and_rejects_encoded_external_forms() {
+    /*
+     * Logout retains a local destination containing a query and fragment.
+     * Multiple encoded open-redirect and response-splitting forms all fall back to root while
+     * still clearing both cookies safely.
+     */
     let (state, _temp_dir) = test_state(oidc_auth("https://idp.example.com/auth")).await;
     let app = http::router(state);
 
@@ -1013,6 +1094,11 @@ async fn logout_preserves_safe_redirects_and_rejects_encoded_external_forms() {
 
 #[tokio::test]
 async fn logout_requires_post_and_unambiguous_same_origin_provenance_without_deleting_cookies() {
+    /*
+     * Logout is state-changing, so GET is disallowed and POST requires unambiguous same-origin
+     * evidence from Origin or fetch metadata. Missing, null, cross-site, contradictory, or
+     * duplicate provenance is forbidden without redirecting or expiring any cookies.
+     */
     let (state, _temp_dir) = test_state(oidc_auth("https://idp.example.com/auth")).await;
     let app = http::router(state);
 
@@ -1066,6 +1152,11 @@ async fn logout_requires_post_and_unambiguous_same_origin_provenance_without_del
 
 #[tokio::test]
 async fn logout_matches_normalized_public_and_trusted_effective_request_origins() {
+    /*
+     * Same-origin comparison normalizes host casing, default HTTPS ports, and irrelevant
+     * public-URL path components. When no public URL is set, it also accepts an Origin
+     * matching the trusted forwarded effective request scheme.
+     */
     let mut public_auth = oidc_auth("https://idp.example.com/auth");
     public_auth.public_url = "https://VAULT.example.com:443/base".to_string();
     let (state, _temp_dir) = test_state(public_auth).await;
@@ -1096,6 +1187,12 @@ async fn logout_matches_normalized_public_and_trusted_effective_request_origins(
 
 #[tokio::test]
 async fn oidc_callback_preserves_safe_redirects_and_rejects_encoded_external_forms() {
+    /*
+     * Callback uses the return destination protected inside signed state, preserving a
+     * legitimate local query and fragment. Even a validly signed state cannot turn
+     * ambiguous, external, backslash, multiply encoded, or injection-shaped destinations into an
+     * open redirect.
+     */
     let provider = start_mock_provider("nonce-123", json!({"sub": "kevin"})).await;
     let auth = oidc_provider_auth(&provider.issuer);
     let (state, _temp_dir) = test_state(auth.clone()).await;
@@ -1151,6 +1248,12 @@ async fn oidc_callback_preserves_safe_redirects_and_rejects_encoded_external_for
 
 #[tokio::test]
 async fn oidc_callback_verifies_provider_token_syncs_user_and_sets_session_cookie() {
+    /*
+     * A complete authorization-code callback exchanges with HTTP Basic client authentication,
+     * validates the ID token and nonce, and reconciles the userinfo profile and groups.
+     * It persists login metadata, issues a signed session, clears transient state, and returns
+     * to the protected local destination.
+     */
     let provider = start_mock_provider(
         "nonce-123",
         json!({
@@ -1229,6 +1332,11 @@ async fn oidc_callback_verifies_provider_token_syncs_user_and_sets_session_cooki
 
 #[tokio::test]
 async fn oidc_callback_rejects_non_boolean_email_verification_as_an_admin_credential() {
+    /*
+     * A bootstrap-admin email appears in token claims with verification missing, false, or
+     * represented by non-boolean values. None of those forms is trusted as an email
+     * identity, so no email is stored and no administrative privilege is granted.
+     */
     let profiles = [
         (
             "missing",
@@ -1305,6 +1413,12 @@ async fn oidc_callback_rejects_non_boolean_email_verification_as_an_admin_creden
 
 #[tokio::test]
 async fn oidc_callback_does_not_splice_or_override_verified_email_claims() {
+    /*
+     * An unverified userinfo email cannot override a separately verified ID-token email or
+     * confer bootstrap administration. Conversely, an email from one claim source cannot
+     * borrow a verification flag from another source; that cross-source combination stores no
+     * email.
+     */
     let provider = start_mock_provider(
         "nonce-123",
         json!({
@@ -1384,6 +1498,11 @@ async fn oidc_callback_does_not_splice_or_override_verified_email_claims() {
 
 #[tokio::test]
 async fn oidc_bootstrap_admin_subject_grants_admin_without_persisting_an_admin_flag() {
+    /*
+     * An exactly configured OIDC subject receives effective bootstrap administration and can
+     * open the admin directory. This configuration-derived authority does not write a
+     * permanent admin bit into the user's database row.
+     */
     let provider =
         start_mock_provider("nonce-123", json!({"sub": "kevin", "groups": ["artists"]})).await;
     let mut auth = oidc_provider_auth(&provider.issuer);
@@ -1424,6 +1543,11 @@ async fn oidc_bootstrap_admin_subject_grants_admin_without_persisting_an_admin_f
 
 #[tokio::test]
 async fn oidc_bootstrap_subject_preserves_whitespace_as_part_of_the_opaque_identifier() {
+    /*
+     * OIDC subjects are opaque identifiers, so surrounding whitespace is preserved rather than
+     * normalized away. The subject `" kevin "` therefore remains distinct from configured
+     * bootstrap subject `"kevin"` and receives no admin access.
+     */
     let provider = start_mock_provider_with_token_response(
         json!({"sub": " kevin ", "groups": ["artists"]}),
         |issuer| {
@@ -1467,6 +1591,11 @@ async fn oidc_bootstrap_subject_preserves_whitespace_as_part_of_the_opaque_ident
 
 #[tokio::test]
 async fn oidc_callback_rejects_whitespace_distinct_id_token_issuer() {
+    /*
+     * Issuer comparison is exact because whitespace changes the identity-provider identifier
+     * rather than being harmless formatting. A correctly signed token with a padded issuer
+     * is rejected during ID-token validation.
+     */
     let provider = start_mock_provider_with_token_response(json!({"sub": "kevin"}), |issuer| {
         json!({
             "id_token": signed_id_token_with_profile(
@@ -1500,6 +1629,11 @@ async fn oidc_callback_rejects_whitespace_distinct_id_token_issuer() {
 
 #[tokio::test]
 async fn oidc_callback_rejects_state_mismatch_before_provider_exchange() {
+    /*
+     * The callback state differs from the value bound into its signed cookie.
+     * Validation fails locally before attempting discovery or token exchange against the
+     * deliberately unreachable provider.
+     */
     let auth = oidc_provider_auth("http://127.0.0.1:9");
     let state_cookie = signed_state_cookie(&auth, "expected-state", "nonce-123", "/Project");
     let (state, _temp_dir) = test_state(auth.clone()).await;
@@ -1523,6 +1657,10 @@ async fn oidc_callback_rejects_state_mismatch_before_provider_exchange() {
 
 #[tokio::test]
 async fn oidc_callback_rejects_provider_error_before_provider_exchange() {
+    /*
+     * An authorization error returned by the provider is surfaced as a failed login immediately.
+     * The callback does not attempt a code exchange when the provider has already denied access.
+     */
     let auth = oidc_provider_auth("http://127.0.0.1:9");
     let state_cookie = signed_state_cookie(&auth, "state-123", "nonce-123", "/Project");
     let (state, _temp_dir) = test_state(auth.clone()).await;
@@ -1546,6 +1684,10 @@ async fn oidc_callback_rejects_provider_error_before_provider_exchange() {
 
 #[tokio::test]
 async fn oidc_callback_rejects_missing_code_or_state_before_provider_exchange() {
+    /*
+     * Both the authorization code and matching state are mandatory callback inputs.
+     * Omitting either fails local state validation without contacting the unreachable provider.
+     */
     let auth = oidc_provider_auth("http://127.0.0.1:9");
     let state_cookie = signed_state_cookie(&auth, "state-123", "nonce-123", "/Project");
     let (state, _temp_dir) = test_state(auth.clone()).await;
@@ -1571,6 +1713,11 @@ async fn oidc_callback_rejects_missing_code_or_state_before_provider_exchange() 
 
 #[tokio::test]
 async fn oidc_callback_rejects_token_response_without_id_token() {
+    /*
+     * The provider accepts the code but returns only an access token.
+     * Because authenticated identity requires a verifiable ID token, the callback rejects the
+     * response after exactly one exchange.
+     */
     let provider = start_mock_provider_with_token_response(
         json!({
             "sub": "kevin",
@@ -1604,6 +1751,10 @@ async fn oidc_callback_rejects_token_response_without_id_token() {
 
 #[tokio::test]
 async fn oidc_callback_rejects_discovery_without_token_endpoint_before_token_exchange() {
+    /*
+     * Discovery supplies authorization and verification URLs but no token endpoint.
+     * Callback reports that configuration error before sending the authorization code anywhere.
+     */
     let provider = start_mock_provider_with_discovery(
         json!({}),
         |_issuer| json!({}),
@@ -1641,6 +1792,10 @@ async fn oidc_callback_rejects_discovery_without_token_endpoint_before_token_exc
 
 #[tokio::test]
 async fn oidc_callback_rejects_userinfo_subject_mismatch() {
+    /*
+     * The signed ID token identifies one subject while userinfo returns a different account.
+     * Callback rejects the profile rather than merging claims across two identities.
+     */
     let provider = start_mock_provider(
         "nonce-123",
         json!({
@@ -1672,6 +1827,11 @@ async fn oidc_callback_rejects_userinfo_subject_mismatch() {
 
 #[tokio::test]
 async fn oidc_callback_rejects_non_string_userinfo_subject() {
+    /*
+     * Userinfo returns a numeric subject even though OpenID subject identifiers must be strings
+     * matching the token. The malformed value is treated as an identity mismatch and
+     * authentication stops.
+     */
     let provider = start_mock_provider(
         "nonce-123",
         json!({
@@ -1703,6 +1863,11 @@ async fn oidc_callback_rejects_non_string_userinfo_subject() {
 
 #[tokio::test]
 async fn oidc_callback_rejects_whitespace_distinct_userinfo_subject() {
+    /*
+     * Userinfo pads the otherwise familiar subject with whitespace.
+     * Exact opaque-identifier comparison prevents normalization from conflating it with the ID
+     * token's account.
+     */
     let provider = start_mock_provider(
         "nonce-123",
         json!({
@@ -1734,6 +1899,11 @@ async fn oidc_callback_rejects_whitespace_distinct_userinfo_subject() {
 
 #[tokio::test]
 async fn oidc_callback_client_auth_none_does_not_send_client_secret() {
+    /*
+     * A public-client configuration performs the code exchange without HTTP authorization or a
+     * client secret form field. The callback still includes the public client identifier and
+     * completes successfully.
+     */
     let provider = start_mock_provider(
         "nonce-123",
         json!({
@@ -1766,6 +1936,10 @@ async fn oidc_callback_client_auth_none_does_not_send_client_secret() {
 
 #[tokio::test]
 async fn oidc_callback_client_secret_post_sends_secret_in_form_without_basic_auth() {
+    /*
+     * The client_secret_post mode puts both client id and secret into the token request form.
+     * It deliberately omits HTTP Basic authorization and still completes the callback.
+     */
     let provider = start_mock_provider(
         "nonce-123",
         json!({

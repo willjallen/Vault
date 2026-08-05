@@ -354,6 +354,11 @@ async fn blob_metadata_counts(pool: &SqlitePool, blob_id: i64) -> (i64, i64) {
 
 #[tokio::test]
 async fn collection_removes_local_object_and_metadata() {
+    /*
+     * A fully published blob with no document, export, or other live reference is eligible for
+     * collection. One pass removes its local bytes, location row, and blob row and reports
+     * each deletion without deferral or failure.
+     */
     let state = test_state().await;
     let (blob_id, stored) =
         publish_unreferenced(&state.pool, &state.storage, b"disposable bytes").await;
@@ -385,6 +390,11 @@ async fn collection_removes_local_object_and_metadata() {
 
 #[tokio::test]
 async fn active_publication_lease_prevents_gc_until_reference_commit() {
+    /*
+     * Collection runs while storage has finished but the publisher still owns its lease, so the
+     * apparently unreferenced blob must be protected. After metadata and a document
+     * reference commit, later collection also preserves the object for the durable reference.
+     */
     let state = test_state().await;
     let (publication, stored) =
         begin_and_store(&state.pool, &state.storage, b"publication race bytes").await;
@@ -430,6 +440,11 @@ async fn active_publication_lease_prevents_gc_until_reference_commit() {
 
 #[tokio::test]
 async fn collection_drains_every_known_location_before_removing_blob_metadata() {
+    /*
+     * An unreferenced blob is given both its canonical local object and an additional replica
+     * location. Garbage collection deletes every copy before removing the shared blob
+     * metadata and reports both object keys.
+     */
     let state = test_state().await;
     let (blob_id, stored) =
         publish_unreferenced(&state.pool, &state.storage, b"replicated bytes").await;
@@ -469,6 +484,11 @@ async fn collection_drains_every_known_location_before_removing_blob_metadata() 
 
 #[tokio::test]
 async fn collection_removes_multipart_manifest_and_all_hidden_parts() {
+    /*
+     * The unreferenced object is represented by a visible manifest plus internal part files that
+     * are absent from ordinary inventory. Collecting the manifest must cascade through its
+     * validated layout, removing every hidden part as well as the database metadata.
+     */
     let state = test_state().await;
     let first = state.temp_dir.path().join("first.part");
     let second = state.temp_dir.path().join("second.part");
@@ -541,6 +561,11 @@ async fn collection_removes_multipart_manifest_and_all_hidden_parts() {
 
 #[tokio::test]
 async fn collection_preserves_shared_document_and_export_references_until_the_last_is_deleted() {
+    /*
+     * The same blob is rooted by a document and an export artifact, so removing only the
+     * document must not collect it. Once the export reference is also deleted, the next pass
+     * removes the object and all blob metadata.
+     */
     let state = test_state().await;
     let (publication, stored) = begin_and_store(&state.pool, &state.storage, b"shared bytes").await;
     let mut transaction = state.pool.begin().await.expect("metadata transaction");
@@ -598,6 +623,11 @@ async fn collection_preserves_shared_document_and_export_references_until_the_la
 
 #[tokio::test]
 async fn failed_delete_preserves_metadata_and_retries_on_the_next_collection() {
+    /*
+     * The storage backend fails its first deletion, so collection must retain the object and
+     * metadata together and install a tombstone that blocks key reuse. A later pass retries
+     * idempotently, succeeds, and only then removes the database records.
+     */
     let state = test_state().await;
     let delete_attempts = Arc::new(AtomicUsize::new(0));
     let storage = FailOnceDeleteStorage {
@@ -655,6 +685,11 @@ async fn failed_delete_preserves_metadata_and_retries_on_the_next_collection() {
 
 #[tokio::test]
 async fn permanently_failing_location_does_not_starve_other_blob_locations() {
+    /*
+     * One replica is configured to fail every deletion while a second location remains
+     * removable. Repeated collection still drains the healthy replica, retaining only the
+     * failed location and its parent blob metadata for future retries.
+     */
     let state = test_state().await;
     let delete_attempts = Arc::new(AtomicUsize::new(0));
     let primary_key = state
@@ -713,6 +748,11 @@ async fn permanently_failing_location_does_not_starve_other_blob_locations() {
 
 #[tokio::test]
 async fn lost_delete_response_survives_database_reconnect_and_retries_idempotently() {
+    /*
+     * Storage deletes the bytes but simulates losing the success response, leaving a durable
+     * deletion tombstone in the database. After closing and reopening the database,
+     * collection safely retries the absent object and completes metadata cleanup.
+     */
     let state = test_state().await;
     let database_path = state.temp_dir.path().join("vault.db");
     let delete_attempts = Arc::new(AtomicUsize::new(0));
@@ -747,6 +787,11 @@ async fn lost_delete_response_survives_database_reconnect_and_retries_idempotent
 
 #[tokio::test]
 async fn stale_cancelled_publication_is_pruned_without_harming_retry_reference() {
+    /*
+     * A cancelled publication and a successful retry share the same content-addressed blob
+     * identity. Aging the cancelled pending marker lets maintenance prune that marker while
+     * preserving the retry's canonical location, document reference, and bytes.
+     */
     let state = test_state().await;
     let content = b"cancelled then retried";
     let (cancelled_publication, _cancelled_stored) =
@@ -805,6 +850,11 @@ async fn stale_cancelled_publication_is_pruned_without_harming_retry_reference()
 
 #[tokio::test]
 async fn fresh_publication_is_deferred_while_abandoned_and_stale_publications_are_collected() {
+    /*
+     * A newly dropped publication remains protected for its grace period, whereas explicit
+     * abandonment makes another payload immediately collectible. Once the fresh marker is
+     * aged to represent a crashed publisher, collection removes its object and metadata too.
+     */
     let state = test_state().await;
     let (fresh_publication, fresh_stored) =
         begin_and_store(&state.pool, &state.storage, b"fresh pending bytes").await;

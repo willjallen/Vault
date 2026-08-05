@@ -25,6 +25,11 @@ fn user(groups: &[&str], is_admin: bool) -> UserContext {
 
 #[test]
 fn resolve_rejects_duplicate_document_ids_and_invalid_versions() {
+    /*
+     * A preview-resolution batch must identify each document once and bind it to a nonblank
+     * version. Duplicate document entries and whitespace-only version identifiers are both
+     * rejected before authorization or lookup.
+     */
     let duplicate = ResolvePreviewRequest {
         documents: vec![
             ResolvePreviewDocumentRequest {
@@ -56,6 +61,11 @@ fn resolve_rejects_duplicate_document_ids_and_invalid_versions() {
 
 #[test]
 fn semantic_icons_cover_previewable_and_common_fallback_types() {
+    /*
+     * Filename extensions and MIME hints should map common creative, image, PDF, archive, and
+     * source-code files to stable semantic icons. Unknown binary content falls back to the
+     * generic file icon.
+     */
     assert_eq!(semantic_icon_key("scene.blend", None), "app-blender");
     assert_eq!(semantic_icon_key("texture.PNG", None), "file-image");
     assert_eq!(
@@ -181,6 +191,11 @@ async fn seed_rendition(
 
 #[tokio::test]
 async fn preview_identity_survives_rename_move_and_shared_content() {
+    /*
+     * Preview work is keyed by source blob content rather than a document's name, folder, or
+     * version row. Renaming and moving one of two documents sharing that blob leaves both
+     * with pending descriptors backed by a single preview job.
+     */
     let temp = tempfile::tempdir().expect("tempdir");
     let pool = db::connect(&temp.path().join("vault.db"))
         .await
@@ -264,6 +279,11 @@ async fn preview_identity_survives_rename_move_and_shared_content() {
 
 #[tokio::test]
 async fn resolve_requires_read_access_in_one_bounded_batch() {
+    /*
+     * Folder visibility alone is insufficient to resolve a content preview because doing so
+     * exposes document bytes. A view-only group member is denied, while an administrator can
+     * resolve the same requested document and version.
+     */
     let temp = tempfile::tempdir().expect("tempdir");
     let pool = db::connect(&temp.path().join("vault.db"))
         .await
@@ -319,6 +339,11 @@ async fn resolve_requires_read_access_in_one_bounded_batch() {
 
 #[tokio::test]
 async fn rendition_blobs_are_strong_references_until_last_shared_source_is_deleted() {
+    /*
+     * A rendition remains rooted by its preview job while any document still references the
+     * shared source blob. Deleting the last source document cascades the job, after which a
+     * subsequent collection can reclaim the rendition blob.
+     */
     let temp = tempfile::tempdir().expect("tempdir");
     let pool = db::connect(&temp.path().join("vault.db"))
         .await
@@ -421,6 +446,11 @@ async fn rendition_blobs_are_strong_references_until_last_shared_source_is_delet
 
 #[tokio::test]
 async fn a_rendition_deduplicated_to_its_source_does_not_create_a_gc_cycle() {
+    /*
+     * A generated rendition may deduplicate to exactly the same blob row as its source.
+     * Once the source document is deleted, that self-reference must not keep either the preview
+     * job or blob alive indefinitely.
+     */
     let temp = tempfile::tempdir().expect("tempdir");
     let pool = db::connect(&temp.path().join("vault.db"))
         .await
@@ -480,6 +510,11 @@ async fn a_rendition_deduplicated_to_its_source_does_not_create_a_gc_cycle() {
 
 #[tokio::test]
 async fn pruning_releases_derivatives_without_touching_sources_and_expires_old_recipes() {
+    /*
+     * Quota pruning removes a current preview job and releases its derivative without deleting
+     * the source blob or document. Separately, age pruning removes an obsolete unsupported
+     * recipe even when the cache is otherwise under budget.
+     */
     let temp = tempfile::tempdir().expect("tempdir");
     let pool = db::connect(&temp.path().join("vault.db"))
         .await
@@ -568,6 +603,11 @@ async fn pruning_releases_derivatives_without_touching_sources_and_expires_old_r
 
 #[tokio::test]
 async fn quota_pruning_excludes_document_and_export_rooted_renditions() {
+    /*
+     * Rendition blobs that are also rooted by a live document or export artifact cannot be
+     * reclaimed merely to satisfy preview-cache quota. Even a zero-byte budget therefore
+     * leaves their preview job and blob references intact.
+     */
     let temp = tempfile::tempdir().expect("tempdir");
     let pool = db::connect(&temp.path().join("vault.db"))
         .await
@@ -650,6 +690,11 @@ async fn quota_pruning_excludes_document_and_export_rooted_renditions() {
 
 #[tokio::test]
 async fn quota_pruning_stops_after_the_minimum_lru_jobs_reach_the_budget() {
+    /*
+     * Three ready previews consume equal space and have distinct access times, while the budget
+     * permits two. Pruning releases only the oldest job and stops as soon as the remaining
+     * cache reaches the target.
+     */
     let temp = tempfile::tempdir().expect("tempdir");
     let pool = db::connect(&temp.path().join("vault.db"))
         .await
@@ -711,6 +756,11 @@ async fn quota_pruning_stops_after_the_minimum_lru_jobs_reach_the_budget() {
 
 #[tokio::test]
 async fn quota_pruning_does_not_evict_a_job_for_output_still_shared_by_a_live_job() {
+    /*
+     * The oldest ready job shares its output with a still-running job, so deleting it would not
+     * actually release that storage. Quota enforcement skips that ineffective candidate and
+     * evicts the independently owned ready rendition instead.
+     */
     let temp = tempfile::tempdir().expect("tempdir");
     let pool = db::connect(&temp.path().join("vault.db"))
         .await
@@ -805,6 +855,11 @@ async fn quota_pruning_does_not_evict_a_job_for_output_still_shared_by_a_live_jo
 
 #[tokio::test]
 async fn an_unavailable_shared_rendition_requeues_every_affected_job() {
+    /*
+     * Two ready preview jobs point at the same rendition blob when one consumer reports that
+     * output unavailable. Invalidating the shared blob removes every rendition link, returns
+     * the released blob id, and queues both producers for regeneration.
+     */
     let temp = tempfile::tempdir().expect("tempdir");
     let pool = db::connect(&temp.path().join("vault.db"))
         .await

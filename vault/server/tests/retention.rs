@@ -210,6 +210,11 @@ async fn assert_retention_race_state(
 
 #[tokio::test]
 async fn expired_archive_ttl_moves_document_to_flat_archive_and_restore_reapplies_policy() {
+    /*
+     * An expired document under an archive policy moves into the flat Archive root while
+     * retaining enough origin metadata for restoration. Restoring it returns it to the
+     * original folder and recalculates a future expiration under that folder's policy.
+     */
     let (state, _temp_dir) = test_state(AuthSettings::default()).await;
     let project = get_or_create_folder_path(&state.db, Some("Project"))
         .await
@@ -297,6 +302,11 @@ async fn expired_archive_ttl_moves_document_to_flat_archive_and_restore_reapplie
 
 #[tokio::test]
 async fn expired_delete_ttl_deletes_unlocked_documents_and_skips_locked_documents() {
+    /*
+     * A delete-policy sweep removes the unlocked expired document and terminates its dependent
+     * check-in upload. A locked peer is reported as skipped and keeps both its row and
+     * expiration policy for a later attempt.
+     */
     let (state, _temp_dir) = test_state(AuthSettings::default()).await;
     let temp = get_or_create_folder_path(&state.db, Some("Temp"))
         .await
@@ -358,6 +368,10 @@ async fn expired_delete_ttl_deletes_unlocked_documents_and_skips_locked_document
 
 #[tokio::test]
 async fn plain_folders_do_not_expire_old_documents_or_emit_state() {
+    /*
+     * Age alone must not make a document eligible when its folder has no retention policy.
+     * Sweeping leaves the row unchanged and emits no retention event.
+     */
     let (state, _temp_dir) = test_state(AuthSettings::default()).await;
     let safe = get_or_create_folder_path(&state.db, Some("Safe"))
         .await
@@ -397,6 +411,11 @@ async fn plain_folders_do_not_expire_old_documents_or_emit_state() {
 
 #[tokio::test]
 async fn child_folder_inherits_parent_delete_ttl_without_expiring_plain_siblings() {
+    /*
+     * A nested folder inherits its parent's delete policy, while an equally old document in an
+     * unrelated plain folder receives no expiration. The sweep deletes only the
+     * inherited-policy document and preserves the sibling outside that subtree.
+     */
     let (state, _temp_dir) = test_state(AuthSettings::default()).await;
     let temp = get_or_create_folder_path(&state.db, Some("Temp"))
         .await
@@ -480,6 +499,11 @@ async fn child_folder_inherits_parent_delete_ttl_without_expiring_plain_siblings
 
 #[tokio::test]
 async fn debug_sweep_ttl_route_returns_real_document_retention_result() {
+    /*
+     * The development-only admin endpoint must invoke the production document-retention sweep
+     * rather than return a placeholder. Its JSON reports the expired document moved into
+     * Archive under the configured policy.
+     */
     let (state, _temp_dir) = test_state(dev_auth()).await;
     let project = get_or_create_folder_path(&state.db, Some("Project"))
         .await
@@ -504,6 +528,12 @@ async fn debug_sweep_ttl_route_returns_real_document_retention_result() {
 
 #[tokio::test]
 async fn sweep_rechecks_renewed_locked_and_moved_documents_after_writer_gate() {
+    /*
+     * A sweep is held behind SQLite's writer gate while three initially expired rows are
+     * renewed, locked, or moved out of policy scope. After acquiring the gate it rechecks
+     * live state, skips only the locked row, and neither deletes nor emits expiration state for
+     * stale candidates.
+     */
     let (state, _temp_dir) = test_state(AuthSettings::default()).await;
     let temp = get_or_create_folder_path(&state.db, Some("Temp"))
         .await

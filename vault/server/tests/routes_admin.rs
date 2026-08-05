@@ -299,6 +299,11 @@ fn authed_request(
 
 #[tokio::test]
 async fn admin_group_routes_manage_groups_members_and_state_events() {
+    /*
+     * The group API normalizes names and descriptions while supporting the full create,
+     * add-member, update, remove-member, and delete lifecycle. Each successful mutation is
+     * reflected in the returned directory and emits its corresponding ordered state event.
+     */
     let (state, _temp_dir) = test_state().await;
     let pool = state.db.clone();
     let app = http::router(state);
@@ -410,6 +415,12 @@ async fn admin_group_routes_manage_groups_members_and_state_events() {
 
 #[tokio::test]
 async fn admin_group_routes_allow_bootstrap_admin_email_without_stored_admin_flag() {
+    /*
+     * An identity configured by bootstrap email can create a group and manage membership even
+     * though its persisted user row is not marked admin. Responses expose its effective
+     * authorization without silently converting that configuration-derived privilege into a
+     * stored flag.
+     */
     let (state, _temp_dir) = test_state_with_auth(AuthSettings {
         bootstrap_admin_emails: ["owner@example.com".to_string()].into_iter().collect(),
         ..AuthSettings::default()
@@ -470,6 +481,11 @@ async fn admin_group_routes_allow_bootstrap_admin_email_without_stored_admin_fla
 
 #[tokio::test]
 async fn admin_directory_user_timestamps_use_python_datetime_iso_shape() {
+    /*
+     * Directory serialization receives SQLite timestamps in space-separated, UTC-Z, and
+     * explicit-offset forms with fractional seconds. All are returned in the ISO shapes used
+     * by the Python implementation, preserving precision and offsets.
+     */
     let (state, _temp_dir) = test_state().await;
     sqlx::query(
         r"
@@ -520,6 +536,11 @@ async fn admin_directory_user_timestamps_use_python_datetime_iso_shape() {
 
 #[tokio::test]
 async fn admin_settings_route_enforces_admin_validation_persistence_and_state_event() {
+    /*
+     * Non-admin callers and unknown setting keys are rejected without changing the default or
+     * emitting state. A valid admin patch persists for ordinary readers and records an
+     * admin-settings event with the expected resource set.
+     */
     let (state, _temp_dir) = test_state().await;
     let pool = state.db.clone();
     let app = http::router(state);
@@ -613,6 +634,11 @@ async fn admin_settings_route_enforces_admin_validation_persistence_and_state_ev
 
 #[tokio::test]
 async fn admin_user_routes_toggle_flags_and_preserve_active_admin() {
+    /*
+     * User updates may deactivate an administrator, but an attempted demotion is constrained so
+     * effective admin coverage remains. Once only the backup is active, deactivating that
+     * final administrator is rejected.
+     */
     let (state, _temp_dir) = test_state().await;
     let pool = state.db.clone();
     let app = http::router(state);
@@ -666,6 +692,11 @@ async fn admin_user_routes_toggle_flags_and_preserve_active_admin() {
 
 #[tokio::test]
 async fn admin_user_routes_allow_bootstrap_admin_email_without_stored_admin_flag() {
+    /*
+     * A bootstrap-email administrator can deactivate another account through the user API.
+     * Its directory entry shows effective admin access while the underlying stored admin bit
+     * remains false, and the mutation emits state.
+     */
     let (state, _temp_dir) = test_state_with_auth(AuthSettings {
         bootstrap_admin_emails: ["owner@example.com".to_string()].into_iter().collect(),
         ..AuthSettings::default()
@@ -709,6 +740,11 @@ async fn admin_user_routes_allow_bootstrap_admin_email_without_stored_admin_flag
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_stored_admin_demotions_preserve_one_active_admin() {
+    /*
+     * Two stored administrators are demoted concurrently across repeated race attempts.
+     * Transactional guarding permits exactly one update, rejects the other as the last-admin
+     * reduction, and emits only the successful event.
+     */
     for attempt in 0..CONCURRENT_ADMIN_RACE_ATTEMPTS {
         let (state, _temp_dir) = test_state().await;
         let pool = state.db.clone();
@@ -755,6 +791,11 @@ async fn concurrent_stored_admin_demotions_preserve_one_active_admin() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_stored_admin_deactivations_preserve_one_active_admin() {
+    /*
+     * Two active stored administrators are deactivated at the same time to stress the last-admin
+     * check. Exactly one account becomes inactive while both keep their admin flags and only
+     * one update event commits.
+     */
     for attempt in 0..CONCURRENT_ADMIN_RACE_ATTEMPTS {
         let (state, _temp_dir) = test_state().await;
         let pool = state.db.clone();
@@ -801,6 +842,11 @@ async fn concurrent_stored_admin_deactivations_preserve_one_active_admin() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_vault_admin_membership_removals_preserve_one_active_admin() {
+    /*
+     * Two users derive admin access solely from membership in a case-varied Vault-Admin group,
+     * and both memberships are removed concurrently. Serialization leaves one membership in
+     * place, rejects the competing removal, and records only the committed change.
+     */
     for attempt in 0..CONCURRENT_ADMIN_RACE_ATTEMPTS {
         let (state, _temp_dir) = test_state().await;
         let pool = state.db.clone();
@@ -846,6 +892,11 @@ async fn concurrent_vault_admin_membership_removals_preserve_one_active_admin() 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_cross_path_admin_reductions_preserve_one_active_admin() {
+    /*
+     * One transaction demotes a stored administrator while another removes a different user's
+     * admin-group membership. Even across those separate mutation paths, exactly one
+     * reduction succeeds and one effective active administrator survives.
+     */
     for attempt in 0..CONCURRENT_ADMIN_RACE_ATTEMPTS {
         let (state, _temp_dir) = test_state().await;
         let pool = state.db.clone();
@@ -918,6 +969,11 @@ async fn concurrent_cross_path_admin_reductions_preserve_one_active_admin() {
 
 #[tokio::test]
 async fn sole_stored_admin_can_clear_flag_when_normalized_group_keeps_effective_admin() {
+    /*
+     * The only stored administrator also belongs to a differently cased spelling of the
+     * configured admin group. Clearing the stored bit is safe because normalized group
+     * membership continues to provide active admin access.
+     */
     let (state, _temp_dir) = test_state().await;
     let pool = state.db.clone();
     let auth = state.auth.clone();
@@ -963,6 +1019,11 @@ async fn sole_stored_admin_can_clear_flag_when_normalized_group_keeps_effective_
 
 #[tokio::test]
 async fn admin_last_admin_guard_normalizes_persisted_group_names() {
+    /*
+     * A user's sole admin status comes from a persisted group whose casing differs from the
+     * configured name. Deactivation is still blocked after name normalization, and the
+     * rejected update changes neither the account nor the event log.
+     */
     let (state, _temp_dir) = test_state().await;
     let pool = state.db.clone();
     let auth = state.auth.clone();
@@ -1019,6 +1080,11 @@ async fn admin_last_admin_guard_normalizes_persisted_group_names() {
 
 #[tokio::test]
 async fn admin_group_last_admin_guards_normalize_persisted_group_names() {
+    /*
+     * Deleting, renaming, or leaving a case-varied admin group would each remove the system's
+     * last effective administrator. All three operations are rejected atomically, preserving
+     * the group, membership, and empty event log.
+     */
     let (state, _temp_dir) = test_state().await;
     let pool = state.db.clone();
     let auth = state.auth.clone();
@@ -1088,6 +1154,11 @@ async fn admin_group_last_admin_guards_normalize_persisted_group_names() {
 
 #[tokio::test]
 async fn admin_group_routes_validate_errors_and_last_admin_guards() {
+    /*
+     * Group routes map malformed names, duplicates, last-admin reductions, and permission-bound
+     * deletion to their distinct client errors. Rejected requests cannot rename the admin
+     * group, remove its sole member, or delete a group still used by folder ACLs.
+     */
     let (state, _temp_dir) = test_state().await;
     let pool = state.db.clone();
     let app = http::router(state);
@@ -1190,6 +1261,11 @@ async fn admin_group_routes_validate_errors_and_last_admin_guards() {
 
 #[tokio::test]
 async fn admin_mutation_rolls_back_when_outbox_insert_fails() {
+    /*
+     * A database trigger forces insertion of the group-created state event to fail.
+     * The API returns an internal error and the surrounding transaction rolls back both the new
+     * group and its outbox entry.
+     */
     let (state, _temp_dir) = test_state().await;
     let pool = state.db.clone();
     let app = http::router(state);

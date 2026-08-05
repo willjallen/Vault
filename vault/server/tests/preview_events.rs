@@ -42,6 +42,11 @@ async fn start_context(
 
 #[tokio::test]
 async fn pruning_jobs_without_renditions_coalesces_a_preview_event() {
+    /*
+     * Applies two prune results that delete jobs but release no rendition blobs in rapid
+     * succession. It checks that the asynchronous notifier still reports the changes while
+     * coalescing them into one preview event instead of emitting an event per result.
+     */
     let temp = tempfile::tempdir().expect("tempdir");
     let pool = db::connect(&temp.path().join("vault.db"))
         .await
@@ -70,6 +75,11 @@ async fn pruning_jobs_without_renditions_coalesces_a_preview_event() {
 
 #[tokio::test]
 async fn failed_preview_event_insert_is_retried() {
+    /*
+     * Removes the state-event table, requests a preview notification, and waits long enough for
+     * the first insert to fail before recreating the table. It checks that the pending
+     * notification is retried and eventually persisted exactly once after the database recovers.
+     */
     let temp = tempfile::tempdir().expect("tempdir");
     let pool = db::connect(&temp.path().join("vault.db"))
         .await

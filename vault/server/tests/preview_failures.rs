@@ -28,6 +28,12 @@ impl PreviewProvider for FailingProvider {
 
 #[tokio::test]
 async fn enqueue_revives_only_cooled_down_transient_failures() {
+    /*
+     * Seeds preview jobs representing an old storage failure, a recent storage failure, and an
+     * old deterministic source failure, then enqueues the same sources again. It checks that
+     * only the cooled-down transient job returns to the queue with its attempt count reset,
+     * while the other failures retain their state.
+     */
     let temp = tempfile::tempdir().expect("tempdir");
     let pool = db::connect(&temp.path().join("vault.db"))
         .await
@@ -113,6 +119,12 @@ async fn enqueue_revives_only_cooled_down_transient_failures() {
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn a_terminal_worker_failure_releases_partial_rendition_references() {
+    /*
+     * Gives a queued preview job a preexisting partial rendition, then processes it with a
+     * provider that always fails terminally. It waits for the worker to mark the job failed
+     * and confirms the partial rendition row is removed so abandoned output no longer
+     * remains referenced.
+     */
     let temp = tempfile::tempdir().expect("tempdir");
     let pool = db::connect(&temp.path().join("vault.db"))
         .await

@@ -247,6 +247,11 @@ fn lower_hex(bytes: &[u8]) -> String {
 
 #[tokio::test]
 async fn share_routes_resolve_current_targets_and_enforce_access() {
+    /*
+     * Document and folder links resolve by stable target identity, so a later folder rename
+     * appears through both links at its current path. Resolution still enforces current
+     * access and treats malformed, disabled, or expired codes as not found.
+     */
     let (state, _temp_dir) = test_state(None).await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
         .await
@@ -331,6 +336,11 @@ async fn share_routes_resolve_current_targets_and_enforce_access() {
 
 #[tokio::test]
 async fn document_share_rechecks_current_folder_access_after_move() {
+    /*
+     * A document link is initially usable by a group with access to its original folder.
+     * Moving the document into a confidential folder hides that same link from the group while
+     * preserving it for an administrator and updating its path.
+     */
     let (state, _temp_dir) = test_state(None).await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
         .await
@@ -388,6 +398,11 @@ async fn document_share_rechecks_current_folder_access_after_move() {
 
 #[tokio::test]
 async fn share_creation_uses_public_url_and_rejects_bad_targets() {
+    /*
+     * Creation validates target type, required identifiers, existence, and current access
+     * without revealing hidden folders or documents. Valid aliases and id-based folder
+     * targets work, and generated links use the configured absolute public base URL.
+     */
     let (state, _temp_dir) = test_state(Some("https://vault.example.com/")).await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
         .await
@@ -480,6 +495,11 @@ async fn share_creation_uses_public_url_and_rejects_bad_targets() {
 
 #[tokio::test]
 async fn folder_share_stats_exclude_inaccessible_descendants_and_recheck_access() {
+    /*
+     * Folder-link statistics count only bytes in descendants visible to the resolving user,
+     * excluding a permission-isolated subtree. Moving the shared folder beneath an
+     * inaccessible parent makes the link itself unresolvable on the next request.
+     */
     let (state, _temp_dir) = test_state(None).await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
         .await
@@ -551,6 +571,11 @@ async fn folder_share_stats_exclude_inaccessible_descendants_and_recheck_access(
 
 #[tokio::test]
 async fn deleted_share_targets_cascade_links() {
+    /*
+     * Separate links are created for a document and its containing folder.
+     * Deleting those targets cascades their link rows, so both codes become not found and no
+     * stale share metadata remains.
+     */
     let (state, _temp_dir) = test_state(None).await;
     let folder = get_or_create_folder_path(&state.db, Some("Temp"))
         .await

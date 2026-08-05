@@ -259,6 +259,11 @@ fn authed_request(
 
 #[tokio::test]
 async fn preferences_get_returns_defaults() {
+    /*
+     * A first-time user receives the full canonical preference object rather than a sparse or
+     * null record. The assertions pin UI defaults for appearance, interactions, downloads,
+     * favorites, per-folder views, and sidebar layout.
+     */
     let (state, _temp_dir) = test_state().await;
     let app = http::router(state);
 
@@ -292,6 +297,11 @@ async fn preferences_get_returns_defaults() {
 
 #[tokio::test]
 async fn preferences_patch_persists_canonical_ids_and_returns_enriched_favorites() {
+    /*
+     * Preference writes persist favorites as stable type-and-id pairs and keep presentation
+     * paths out of stored JSON. Responses and later reads enrich those ids with current
+     * accessible metadata, while the update emits a preferences invalidation event.
+     */
     let (state, _temp_dir) = test_state().await;
     let artists = create_group(&state.db, "artists").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -376,6 +386,10 @@ async fn preferences_patch_persists_canonical_ids_and_returns_enriched_favorites
 
 #[tokio::test]
 async fn preferences_patch_allows_missing_preferences_as_noop() {
+    /*
+     * A PATCH body without the optional preferences member is a successful no-op.
+     * It preserves the user's prior theme and does not create a redundant state event.
+     */
     let (state, _temp_dir) = test_state().await;
     let pool = state.db.clone();
     let app = http::router(state);
@@ -429,6 +443,11 @@ async fn preferences_patch_allows_missing_preferences_as_noop() {
 
 #[tokio::test]
 async fn preferences_patch_merges_contents_views_by_folder_path() {
+    /*
+     * Per-folder content views are merged across separate patches instead of replacing the
+     * entire map. Existing root settings survive while a new nested-folder icon size is
+     * clamped to the supported maximum.
+     */
     let (state, _temp_dir) = test_state().await;
     let app = http::router(state);
 
@@ -481,6 +500,11 @@ async fn preferences_patch_merges_contents_views_by_folder_path() {
 
 #[tokio::test]
 async fn preference_update_rolls_back_when_outbox_insert_fails() {
+    /*
+     * A trigger rejects the state event associated with a theme change.
+     * Because preferences and their outbox event share a transaction, the API error leaves both
+     * the stored JSON and event table unchanged.
+     */
     let (state, _temp_dir) = test_state().await;
     let pool = state.db.clone();
     let app = http::router(state);
@@ -567,6 +591,11 @@ fn assert_favorites_after_rename(
 
 #[tokio::test]
 async fn favorites_resolve_current_targets_after_folder_rename() {
+    /*
+     * Favorites are saved by ids for a parent folder, child folder, and document before the
+     * parent is renamed through the API. Subsequent resolution follows the renamed hierarchy
+     * for every item, while old paths disappear and the new document path works.
+     */
     let (state, _temp_dir) = test_state().await;
     let art = get_or_create_folder_path(&state.db, Some("Art"))
         .await
@@ -662,6 +691,11 @@ async fn favorites_resolve_current_targets_after_folder_rename() {
 
 #[tokio::test]
 async fn preferences_filter_folder_favorite_after_current_parent_becomes_inaccessible() {
+    /*
+     * A folder favorite is visible when created, then the target is moved beneath a parent
+     * restricted to another group. Reading preferences rechecks the current ancestor chain
+     * and omits the now-hidden favorite.
+     */
     let (state, _temp_dir) = test_state().await;
     let readers = create_group(&state.db, "readers").await;
     let confidential = create_group(&state.db, "confidential").await;
@@ -723,6 +757,11 @@ async fn preferences_filter_folder_favorite_after_current_parent_becomes_inacces
 
 #[tokio::test]
 async fn preferences_filter_document_favorite_after_current_folder_becomes_inaccessible() {
+    /*
+     * A document favorite is initially readable but later moves into a confidential folder.
+     * Preference enrichment applies current folder access and removes that target from the
+     * caller's returned favorites.
+     */
     let (state, _temp_dir) = test_state().await;
     let readers = create_group(&state.db, "readers").await;
     let confidential = create_group(&state.db, "confidential").await;
@@ -785,6 +824,12 @@ async fn preferences_filter_document_favorite_after_current_folder_becomes_inacc
 
 #[tokio::test]
 async fn archive_folder_favorite_excludes_inaccessible_document_metadata() {
+    /*
+     * The Archive root contains visible and hidden documents, with the hidden row carrying
+     * larger and newer metadata plus an inconsistent version pointer. Folder aggregation
+     * exposes only the accessible document's size, author, and timestamp, preventing both
+     * leakage and unrelated corruption from affecting the result.
+     */
     let (state, _temp_dir) = test_state().await;
     let readers = create_group(&state.db, "readers").await;
     let confidential = create_group(&state.db, "confidential").await;
@@ -876,6 +921,11 @@ async fn archive_folder_favorite_excludes_inaccessible_document_metadata() {
 
 #[tokio::test]
 async fn favorite_resolution_ignores_inconsistent_documents_outside_its_scope() {
+    /*
+     * A sibling document outside the requested favorite has a broken current-version pointer.
+     * Resolving one valid document remains successful because enrichment scopes its joins to
+     * requested targets rather than scanning unrelated rows.
+     */
     let (state, _temp_dir) = test_state().await;
     let readers = create_group(&state.db, "readers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -921,6 +971,11 @@ async fn favorite_resolution_ignores_inconsistent_documents_outside_its_scope() 
 
 #[tokio::test]
 async fn overlapping_folder_favorites_do_not_double_count_descendant_sizes() {
+    /*
+     * Both a parent folder and its child are favorites, and each contains a small document.
+     * Their statistics are computed independently: the parent includes its subtree once and the
+     * child reports only its own content.
+     */
     let (state, _temp_dir) = test_state().await;
     let readers = create_group(&state.db, "readers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -969,6 +1024,12 @@ async fn overlapping_folder_favorites_do_not_double_count_descendant_sizes() {
 
 #[tokio::test]
 async fn preferences_patch_rejects_invalid_payloads_without_changing_existing_values() {
+    /*
+     * Validation covers unsupported values and keys, malformed favorites, wrong sidebar types,
+     * noncanonical paths, invalid view shapes, and bad version text. Every case returns its
+     * specific client error, and none overwrites the previously stored valid theme or introduces
+     * unknown fields.
+     */
     let (state, _temp_dir) = test_state().await;
     let app = http::router(state);
     let initial = app

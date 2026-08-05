@@ -166,6 +166,11 @@ fn authed_get(uri: &str, user: &str, groups: &str) -> Request<Body> {
 
 #[tokio::test]
 async fn dev_auth_mode_rejects_when_disabled_even_with_identity_headers() {
+    /*
+     * Selecting development authentication does not authorize anyone unless its explicit enable
+     * switch is also on. Supplying forged proxy identity and admin-group headers cannot
+     * bypass that startup safety control.
+     */
     let auth = AuthSettings {
         mode: AuthMode::Dev,
         auth_mode_raw: "dev".to_string(),
@@ -188,6 +193,11 @@ async fn dev_auth_mode_rejects_when_disabled_even_with_identity_headers() {
 
 #[tokio::test]
 async fn dev_auth_mode_ignores_identity_headers_and_uses_configured_local_user() {
+    /*
+     * Enabled development authentication constructs identity solely from the configured local
+     * user. Incoming proxy headers are ignored, so a spoofed admin group cannot alter the
+     * subject, profile, groups, or privilege returned by bootstrap.
+     */
     let auth = AuthSettings {
         mode: AuthMode::Dev,
         auth_mode_raw: "dev".to_string(),
@@ -220,6 +230,12 @@ async fn dev_auth_mode_ignores_identity_headers_and_uses_configured_local_user()
 
 #[tokio::test]
 async fn bootstrap_returns_runtime_user_preferences_settings_and_current_folder() {
+    /*
+     * An authorized folder bootstrap combines runtime identity, deployment metadata, release
+     * notes, defaults, server settings, and the requested current folder. The response
+     * exposes the complete initial client contract rather than requiring separate startup
+     * requests.
+     */
     let (state, _temp_dir) = test_state().await;
     let artists = create_group(&state.db, "artists").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -282,6 +298,11 @@ async fn bootstrap_returns_runtime_user_preferences_settings_and_current_folder(
 
 #[tokio::test]
 async fn bootstrap_hides_inaccessible_folder_as_not_found() {
+    /*
+     * A requested folder exists but grants access only to a different group.
+     * Bootstrap returns the same not-found response used for absent folders so callers cannot
+     * enumerate hidden paths.
+     */
     let (state, _temp_dir) = test_state().await;
     let viewers = create_group(&state.db, "viewers").await;
     let outsiders = create_group(&state.db, "outsiders").await;
@@ -319,6 +340,11 @@ async fn bootstrap_hides_inaccessible_folder_as_not_found() {
 
 #[tokio::test]
 async fn bootstrap_expands_visible_favorites_and_filters_inaccessible_targets() {
+    /*
+     * Stored favorites include accessible folders and documents alongside hidden and nonexistent
+     * targets. Bootstrap enriches only the visible entries with current paths and access
+     * metadata while retaining unrelated preference values.
+     */
     let (state, _temp_dir) = test_state().await;
     let artists = create_group(&state.db, "artists").await;
     let confidential = create_group(&state.db, "confidential").await;

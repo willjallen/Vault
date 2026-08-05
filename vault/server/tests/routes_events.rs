@@ -77,6 +77,11 @@ const FULL_STATE_EVENT_RESOURCES_JSON: &str = r#"["admin","contents","document_d
 
 #[tokio::test]
 async fn state_event_compaction_keeps_one_marker_and_a_bounded_replay_suffix() {
+    /*
+     * An empty log gains one full-state marker, and compacting it again is idempotent.
+     * Once the replay limit is exceeded, the boundary event becomes the sole marker and exactly
+     * the newest permitted suffix remains.
+     */
     let (state, _temp_dir) = test_state().await;
     let policy = StateEventRetentionPolicy::new(3, Duration::from_hours(168));
 
@@ -145,6 +150,11 @@ async fn state_event_compaction_keeps_one_marker_and_a_bounded_replay_suffix() {
 
 #[tokio::test]
 async fn state_event_compaction_uses_the_newer_age_or_count_boundary() {
+    /*
+     * Events are made old enough for age retention while the count policy independently
+     * preserves a recent suffix. Compaction chooses the newer cutoff, replaces that boundary
+     * with a marker, and retains only events after it.
+     */
     let (state, _temp_dir) = test_state().await;
     compact_state_events_with_policy(
         &state.db,
@@ -189,6 +199,11 @@ async fn state_event_compaction_uses_the_newer_age_or_count_boundary() {
 
 #[tokio::test]
 async fn state_event_compaction_waits_for_concurrent_event_writers() {
+    /*
+     * A state event is inserted inside an uncommitted immediate transaction while compaction
+     * begins concurrently. Compaction waits for the writer gate and, after commit, preserves
+     * the event rather than planning from an inconsistent snapshot.
+     */
     let (state, _temp_dir) = test_state().await;
     let policy = StateEventRetentionPolicy::new(3, Duration::from_hours(168));
     compact_state_events_with_policy(&state.db, policy)
@@ -241,6 +256,11 @@ async fn state_event_compaction_waits_for_concurrent_event_writers() {
 
 #[tokio::test]
 async fn state_event_writes_store_python_normalized_resources() {
+    /*
+     * Resource names are trimmed, deduplicated, sorted, and serialized in the canonical format
+     * shared with the Python implementation. An event containing only blank resources
+     * becomes a no-op instead of an empty invalidation record.
+     */
     let (state, _temp_dir) = test_state().await;
 
     record_state_event(
@@ -301,6 +321,11 @@ fn authed_stream_request(last_event_id: Option<i64>) -> Request<Body> {
 
 #[tokio::test]
 async fn event_stream_replays_events_after_last_event_id() {
+    /*
+     * A client cursor behind a committed event receives that event immediately over an SSE
+     * response. The frame contains its database id, state event name, and normalized unique
+     * resources.
+     */
     let (state, _temp_dir) = test_state().await;
     let event_id = insert_state_event(
         &state.db,
@@ -333,6 +358,11 @@ async fn event_stream_replays_events_after_last_event_id() {
 
 #[tokio::test]
 async fn event_stream_rewinds_stale_and_future_cursors_to_the_compaction_marker() {
+    /*
+     * Cursors outside the retained window, whether too old or implausibly ahead, are rewound to
+     * the full-state compaction marker. A cursor exactly on the marker instead resumes with
+     * the following retained event and does not replay the marker twice.
+     */
     let (state, _temp_dir) = test_state().await;
     let policy = StateEventRetentionPolicy::new(2, Duration::from_hours(168));
     compact_state_events_with_policy(&state.db, policy)
@@ -391,6 +421,11 @@ async fn event_stream_rewinds_stale_and_future_cursors_to_the_compaction_marker(
 
 #[tokio::test]
 async fn event_stream_starts_at_latest_without_last_event_id_and_wakes_on_notify() {
+    /*
+     * A newly opened stream without a cursor begins at the current tail rather than replaying
+     * historical events. After commit notification it emits only the subsequently inserted
+     * event.
+     */
     let (state, _temp_dir) = test_state().await;
     insert_state_event(&state.db, "old.commit", r#"["contents"]"#).await;
     let pool = state.db.clone();
@@ -415,6 +450,11 @@ async fn event_stream_starts_at_latest_without_last_event_id_and_wakes_on_notify
 
 #[tokio::test]
 async fn event_stream_invalid_last_event_id_starts_at_latest_and_wakes_on_notify() {
+    /*
+     * A malformed Last-Event-ID is treated like a fresh subscription instead of failing the
+     * connection or replaying history. The stream waits at the current tail and wakes for
+     * the next notified commit.
+     */
     let (state, _temp_dir) = test_state().await;
     insert_state_event(&state.db, "old.commit", r#"["contents"]"#).await;
     let pool = state.db.clone();
@@ -439,6 +479,11 @@ async fn event_stream_invalid_last_event_id_starts_at_latest_and_wakes_on_notify
 
 #[tokio::test]
 async fn idle_event_streams_wait_for_notifications_without_blocking_health() {
+    /*
+     * Ten simultaneous idle SSE clients must sleep without producing frames or exhausting
+     * request capacity needed by health checks. One commit notification then wakes every
+     * stream with the same newly persisted event.
+     */
     let (state, _temp_dir) = test_state().await;
     let pool = state.db.clone();
     let app = http::router(state);

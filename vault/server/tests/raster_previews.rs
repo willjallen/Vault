@@ -22,6 +22,11 @@ fn source_png(width: u32, height: u32) -> Vec<u8> {
 
 #[test]
 fn raster_support_uses_safe_mime_and_extension_hints() {
+    /*
+     * Probes raster detection with trusted MIME types, case-insensitive extensions, real PNG
+     * bytes, SVG, an unrelated extension, and junk data. It checks that safe raster hints and
+     * recognizable content are accepted without treating vector or arbitrary files as images.
+     */
     let provider = RasterPreviewProvider::default();
     assert!(provider.supports(Some("image/png"), None));
     assert!(provider.supports(Some("application/octet-stream"), Some("asset.JPEG")));
@@ -34,6 +39,11 @@ fn raster_support_uses_safe_mime_and_extension_hints() {
 
 #[tokio::test]
 async fn raster_provider_generates_complete_bounded_webp_set() {
+    /*
+     * Renders a 640-by-320 PNG through the raster preview provider. It checks that all three
+     * named WebP renditions are nonempty, decodable, preserve the source aspect ratio, and
+     * stop at their configured 128-, 256-, and 512-pixel bounds.
+     */
     let outputs = RasterPreviewProvider::default()
         .render(PreviewRenderRequest {
             source_bytes: source_png(640, 320),
@@ -64,6 +74,11 @@ async fn raster_provider_generates_complete_bounded_webp_set() {
 
 #[tokio::test]
 async fn raster_provider_rejects_corrupt_and_unapproved_formats() {
+    /*
+     * Sends the renderer a corrupt PNG and a GIF disguised with PNG metadata. It distinguishes
+     * invalid approved content from a recognizable but unsupported format, ensuring neither
+     * input is rendered merely because its filename or MIME type claims PNG.
+     */
     let provider = RasterPreviewProvider::default();
     let corrupt = provider
         .render(PreviewRenderRequest {

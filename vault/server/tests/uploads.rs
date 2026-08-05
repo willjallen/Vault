@@ -5,6 +5,11 @@ use vault_server::uploads::UploadHashCoordinator;
 
 #[tokio::test]
 async fn upload_hash_coordinator_keeps_active_states_at_the_cache_bound() {
+    /*
+     * Seeds one more active upload than the hash coordinator can cache, then fills the cache
+     * before scheduling the extra session. It checks that the existing active entries remain
+     * available and that admitting new work never pushes the cache past its hard bound.
+     */
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let pool = db::connect(&temp_dir.path().join("vault.db"))
         .await

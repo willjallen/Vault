@@ -23,6 +23,7 @@ use vault_server::integrity_check::lock::{
     InstanceLock, InstanceLockError, LockPurpose, lock_path,
 };
 use vault_server::integrity_check::report::{CheckState, IntegrityResult, ReportBuilder, Severity};
+use vault_server::previews::PREVIEW_RECIPE;
 use vault_server::storage::{LocalBlobStorage, StoredBlob, object_key_for_hash, sha256_hex};
 
 fn isolated_config(data_dir: &Path) -> Config {
@@ -423,7 +424,12 @@ async fn unreadable_rowids_end_a_table_scan_as_incomplete() {
 }
 
 #[tokio::test]
-async fn raster_preview_payload_is_decoded_when_shared_with_an_unknown_non_webp_rendition() {
+async fn current_raster_preview_metadata_and_payload_are_validated() {
+    /*
+     * Gives a current-recipe job an incomplete rendition set backed by invalid WebP bytes, while
+     * an unknown future recipe shares that blob. Both current metadata and payload checks must
+     * still run without treating the unknown recipe's non-WebP rendition as raster output.
+     */
     let data_dir = tempfile::tempdir().expect("temporary Vault");
     let config = initialize_vault(data_dir.path()).await;
     let storage = LocalBlobStorage::new(config.objects_path(), &config.storage_prefix);
@@ -441,14 +447,15 @@ async fn raster_preview_payload_is_decoded_when_shared_with_an_unknown_non_webp_
         .expect("open preview fixture database");
     let job_id = sqlx::query(
         "INSERT INTO preview_jobs (source_blob_id, recipe, status, completed_at) \
-         VALUES (?, 'raster-v1', 'ready', CURRENT_TIMESTAMP)",
+         VALUES (?, ?, 'ready', CURRENT_TIMESTAMP)",
     )
     .bind(blob_id)
+    .bind(PREVIEW_RECIPE)
     .execute(&mut connection)
     .await
     .expect("insert ready preview job")
     .last_insert_rowid();
-    for variant in ["small", "medium", "large"] {
+    for variant in ["small", "medium"] {
         sqlx::query(
             "INSERT INTO preview_renditions \
              (preview_job_id, variant, blob_id, mime_type, width, height) \
@@ -485,6 +492,10 @@ async fn raster_preview_payload_is_decoded_when_shared_with_an_unknown_non_webp_
     let report = integrity_check::run(&config, 100).await;
 
     assert_eq!(report.result, IntegrityResult::Warnings, "{report:#?}");
+    assert!(
+        finding_codes(&report).contains(&"preview.raster_renditions_invalid"),
+        "{report:#?}"
+    );
     assert!(
         finding_codes(&report).contains(&"preview.payload_invalid_webp"),
         "{report:#?}"

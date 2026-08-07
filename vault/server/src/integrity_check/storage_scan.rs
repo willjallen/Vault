@@ -947,7 +947,7 @@ async fn verify_preview_rendition_payloads(
     let raster_job_ids = database
         .preview_jobs
         .iter()
-        .filter(|job| job.recipe == "raster-v1")
+        .filter(|job| matches!(job.recipe.as_str(), "raster-v1" | "raster-v2"))
         .map(|job| job.id)
         .collect::<HashSet<_>>();
     let mut renditions_by_blob = BTreeMap::<i64, Vec<_>>::new();

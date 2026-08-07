@@ -2507,7 +2507,7 @@ async fn check_previews(
               WHERE (j.status != 'ready' AND
                      EXISTS (SELECT 1 FROM preview_renditions r WHERE r.preview_job_id = j.id))
                  OR (
-                    j.recipe = 'raster-v1' AND j.status = 'ready' AND (
+                    j.recipe IN ('raster-v1', 'raster-v2') AND j.status = 'ready' AND (
                        (SELECT COUNT(*) FROM preview_renditions r
                         WHERE r.preview_job_id = j.id) != 3
                        OR (SELECT COUNT(DISTINCT r.variant) FROM preview_renditions r
@@ -2524,7 +2524,7 @@ async fn check_previews(
                     )
                  )
               ORDER BY j.id",
-            "raster-v1 preview state and rendition set disagree",
+            "raster preview state and rendition set disagree",
         ),
     ] {
         report_row_query(

@@ -14,6 +14,7 @@ use vault_server::folders::{
     get_root_folder,
 };
 use vault_server::http::{self, AppState};
+use vault_server::previews::PREVIEW_RECIPE;
 use vault_server::storage::LocalBlobStorage;
 
 async fn test_state() -> (AppState, tempfile::TempDir) {
@@ -1860,7 +1861,7 @@ fn assert_document_row_payload_shape(document_row: &Value, document_id: i64) {
     assert_eq!(document_row["size_display"], "6 B");
     assert_eq!(document_row["visual"]["icon_key"], "file-lines");
     assert_eq!(document_row["visual"]["preview"]["status"], "pending");
-    assert_eq!(document_row["visual"]["preview"]["recipe"], "raster-v1");
+    assert_eq!(document_row["visual"]["preview"]["recipe"], PREVIEW_RECIPE);
     assert_eq!(document_row["visual"]["preview"]["variants"], json!([]));
     assert_eq!(
         document_row["visual"]["preview"]["version_id"],

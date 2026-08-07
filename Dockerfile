@@ -30,7 +30,7 @@ ENV TZ=UTC \
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && apt-get install -y --no-install-recommends ca-certificates curl fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system vault \
     && useradd --system --gid vault --home-dir /app --shell /usr/sbin/nologin vault \

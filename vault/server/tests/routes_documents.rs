@@ -14,6 +14,7 @@ use vault_server::folders::{
     get_root_folder,
 };
 use vault_server::http::{self, AppState};
+use vault_server::previews::PREVIEW_RECIPE;
 use vault_server::storage::{LocalBlobStorage, SharedBlobStorage};
 use vault_server::transfers::sweep_expired_transfers;
 use vault_server::uploads::UploadHashCoordinator;
@@ -1871,9 +1872,10 @@ async fn preview_download_detects_same_length_corruption_and_requeues_the_job() 
     .await
     .expect("preview location");
     let job_id = sqlx::query(
-        "INSERT INTO preview_jobs (source_blob_id, recipe, status) VALUES (?, 'raster-v1', 'ready')",
+        "INSERT INTO preview_jobs (source_blob_id, recipe, status) VALUES (?, ?, 'ready')",
     )
     .bind(source_blob_id)
+    .bind(PREVIEW_RECIPE)
     .execute(&state.db)
     .await
     .expect("preview job")
@@ -1902,7 +1904,7 @@ async fn preview_download_detects_same_length_corruption_and_requeues_the_job() 
     let response = app
         .oneshot(authed_get(
             &format!(
-                "/api/documents/{document_id}/versions/stored-version-one/previews/raster-v1/small"
+                "/api/documents/{document_id}/versions/stored-version-one/previews/{PREVIEW_RECIPE}/small"
             ),
             "reader",
             "readers",
@@ -1960,7 +1962,7 @@ async fn a_pruned_preview_url_recreates_its_missing_job() {
     let response = app
         .oneshot(authed_get(
             &format!(
-                "/api/documents/{document_id}/versions/stored-version-one/previews/raster-v1/small"
+                "/api/documents/{document_id}/versions/stored-version-one/previews/{PREVIEW_RECIPE}/small"
             ),
             "reader",
             "readers",
@@ -1973,10 +1975,11 @@ async fn a_pruned_preview_url_recreates_its_missing_job() {
         SELECT COUNT(*)
         FROM preview_jobs pj
         JOIN document_versions v ON v.blob_id = pj.source_blob_id
-        WHERE v.document_id = ? AND pj.recipe = 'raster-v1' AND pj.status = 'queued'
+        WHERE v.document_id = ? AND pj.recipe = ? AND pj.status = 'queued'
         ",
     )
     .bind(document_id)
+    .bind(PREVIEW_RECIPE)
     .fetch_one(&pool)
     .await
     .expect("queued preview job");

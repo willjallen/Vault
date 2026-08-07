@@ -39,7 +39,7 @@ mod raster;
 
 pub use raster::RasterPreviewProvider;
 
-pub const PREVIEW_RECIPE: &str = "raster-v1";
+pub const PREVIEW_RECIPE: &str = "raster-v2";
 pub const PREVIEW_VARIANT_SMALL: &str = "small";
 pub const PREVIEW_VARIANT_MEDIUM: &str = "medium";
 pub const PREVIEW_VARIANT_LARGE: &str = "large";
@@ -57,7 +57,7 @@ pub fn is_supported_preview_rendition(recipe: &str, variant: &str) -> bool {
 const PREVIEW_LEASE_SECONDS: i64 = 300;
 const PREVIEW_RETRY_LIMIT: i64 = 3;
 const PREVIEW_TERMINAL_RETRY_COOLDOWN: &str = "-15 minutes";
-const PREVIEW_SNIFF_BYTES: u64 = 32;
+const PREVIEW_SNIFF_BYTES: u64 = 4 * 1024;
 const PREVIEW_SNIFF_TIMEOUT: Duration = Duration::from_secs(10);
 const PREVIEW_SOURCE_MAX_BYTES: u64 = 128 * 1024 * 1024;
 const PREVIEW_OUTPUT_MAX_BYTES: usize = 16 * 1024 * 1024;

@@ -2,6 +2,9 @@ mod invariants;
 mod migrations;
 mod schema_validation;
 
+pub(crate) use migrations::{expected_current_history, expected_current_schema};
+pub(crate) use schema_validation::{schema_differences, schema_metadata};
+
 use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;

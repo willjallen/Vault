@@ -6,13 +6,15 @@ use std::time::{Duration, SystemTime};
 
 use axum::Router;
 use axum::body::{Body, Bytes, to_bytes};
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
 use axum::routing::{any, delete, get, head, put};
 use futures_util::StreamExt;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
+use tokio::process::Command;
 use tokio::sync::{Mutex, Notify};
 use tokio::time::timeout;
 use vault_server::blob_lifecycle::{begin_blob_publication, collect_unreferenced_blobs};
@@ -36,6 +38,26 @@ struct ReadinessMockState {
     head_status: StatusCode,
     head_calls: Arc<AtomicUsize>,
     mutation_calls: Arc<AtomicUsize>,
+}
+
+#[derive(Clone, Copy)]
+enum InventoryMockScenario {
+    Paginated,
+    PrefixBoundary,
+    CyclicToken,
+    OutOfPrefixKey,
+    MissingTruncationFlag,
+    MissingStableIdentity,
+    EmptyStable,
+    NonEmptyStable,
+    ChangesBetweenPasses,
+    ListingDenied,
+}
+
+#[derive(Clone)]
+struct InventoryMockState {
+    scenario: InventoryMockScenario,
+    queries: Arc<Mutex<Vec<HashMap<String, String>>>>,
 }
 
 #[tokio::test]
@@ -110,6 +132,239 @@ async fn s3_compatible_storage_puts_reads_ranges_and_deletes_objects() {
         storage.read_bytes(&stored.object_key).await,
         Err(StorageError::NotFound),
     ));
+}
+
+#[tokio::test]
+async fn s3_object_inventory_collects_and_sorts_every_page() {
+    /*
+     * Remote inventory follows the provider's continuation token through a second page and
+     * returns a deterministic key order. The mock also records the exact prefix and token sent
+     * on each request so pagination cannot silently restart from the first page.
+     */
+    let (endpoint_url, state) = start_s3_inventory_mock(InventoryMockScenario::Paginated).await;
+    let storage = s3_inventory_storage(&endpoint_url, "tenant-a").await;
+
+    let inventory = storage
+        .inventory_objects()
+        .await
+        .expect("paginated object inventory");
+
+    assert_eq!(inventory.len(), 2);
+    assert_eq!(inventory[0].object_key, "tenant-a/sha256/aaa");
+    assert_eq!(inventory[0].size_bytes, 3);
+    assert_eq!(inventory[0].etag.as_deref(), Some("\"etag-a\""));
+    assert_eq!(inventory[1].object_key, "tenant-a/sha256/zzz");
+    assert_eq!(inventory[1].size_bytes, 9);
+    assert_eq!(inventory[1].etag.as_deref(), Some("\"etag-z\""));
+
+    let queries = state.queries.lock().await;
+    assert_eq!(queries.len(), 2);
+    assert_eq!(
+        queries[0].get("prefix").map(String::as_str),
+        Some("tenant-a/")
+    );
+    assert!(!queries[0].contains_key("continuation-token"));
+    assert_eq!(
+        queries[1].get("continuation-token").map(String::as_str),
+        Some("page-two"),
+    );
+    assert_eq!(
+        queries[1].get("prefix").map(String::as_str),
+        Some("tenant-a/")
+    );
+}
+
+#[tokio::test]
+async fn s3_object_inventory_uses_a_prefix_path_boundary() {
+    /*
+     * The configured `objects` namespace must be listed as `objects/`. The mock applies the
+     * supplied prefix to a catalog containing an adjacent `objectscape` key, proving that the
+     * inventory cannot absorb another namespace which merely shares its leading characters.
+     */
+    let (endpoint_url, state) =
+        start_s3_inventory_mock(InventoryMockScenario::PrefixBoundary).await;
+    let storage = s3_inventory_storage(&endpoint_url, "objects").await;
+
+    let inventory = storage
+        .inventory_objects()
+        .await
+        .expect("boundary-safe object inventory");
+
+    assert_eq!(inventory.len(), 1);
+    assert_eq!(inventory[0].object_key, "objects/sha256/inside");
+    let queries = state.queries.lock().await;
+    assert_eq!(queries.len(), 1);
+    assert_eq!(
+        queries[0].get("prefix").map(String::as_str),
+        Some("objects/")
+    );
+}
+
+#[tokio::test]
+async fn s3_object_inventory_rejects_a_cyclic_continuation_token() {
+    /*
+     * A broken provider repeats the same continuation token while claiming both responses are
+     * truncated. Inventory must stop with a remote error after the repeat instead of looping or
+     * repeatedly appending the same objects.
+     */
+    let (endpoint_url, state) = start_s3_inventory_mock(InventoryMockScenario::CyclicToken).await;
+    let storage = s3_inventory_storage(&endpoint_url, "objects").await;
+
+    let error = storage
+        .inventory_objects()
+        .await
+        .expect_err("cyclic continuation token must fail");
+
+    match error {
+        StorageError::Remote(message) => {
+            assert!(message.contains("cycled a continuation token"));
+        }
+        other => panic!("expected remote inventory error, got {other:?}"),
+    }
+    let queries = state.queries.lock().await;
+    assert_eq!(queries.len(), 2);
+    assert!(!queries[0].contains_key("continuation-token"));
+    assert_eq!(
+        queries[1].get("continuation-token").map(String::as_str),
+        Some("repeat-me"),
+    );
+}
+
+#[tokio::test]
+async fn s3_object_inventory_rejects_a_provider_key_outside_the_requested_prefix() {
+    /*
+     * Even with the correct `objects/` request, a faulty provider returns an adjacent
+     * `objectscape` key. Inventory must reject the response instead of trusting remote prefix
+     * filtering and treating the foreign key as managed Vault data.
+     */
+    let (endpoint_url, state) =
+        start_s3_inventory_mock(InventoryMockScenario::OutOfPrefixKey).await;
+    let storage = s3_inventory_storage(&endpoint_url, "objects").await;
+
+    let error = storage
+        .inventory_objects()
+        .await
+        .expect_err("out-of-prefix provider key must fail");
+
+    assert!(matches!(error, StorageError::Remote(_)));
+    let queries = state.queries.lock().await;
+    assert_eq!(queries.len(), 1);
+    assert_eq!(
+        queries[0].get("prefix").map(String::as_str),
+        Some("objects/")
+    );
+}
+
+#[tokio::test]
+async fn integrity_check_completes_two_stable_remote_inventory_passes() {
+    let (endpoint_url, state) = start_s3_inventory_mock(InventoryMockScenario::EmptyStable).await;
+
+    let (status, report) = run_s3_integrity_check(&endpoint_url).await;
+
+    assert_eq!(status, Some(0), "{report:#}");
+    assert_eq!(report["result"], "pass");
+    assert_eq!(state.queries.lock().await.len(), 2);
+}
+
+#[tokio::test]
+async fn integrity_check_accepts_a_stable_nonempty_remote_inventory_snapshot() {
+    /*
+     * A noncanonical key deliberately produces a warning without requiring a GET. More
+     * importantly, its unchanged ETag-backed identity must compare equal across both listing
+     * passes; an empty-only stability test cannot detect entry-fingerprint asymmetry.
+     */
+    let (endpoint_url, state) =
+        start_s3_inventory_mock(InventoryMockScenario::NonEmptyStable).await;
+
+    let (status, report) = run_s3_integrity_check(&endpoint_url).await;
+
+    assert_eq!(status, Some(1), "{report:#}");
+    assert_eq!(report["result"], "warnings");
+    assert!(
+        report["findings"]
+            .as_array()
+            .expect("findings array")
+            .iter()
+            .all(|finding| finding["code"] != "storage.remote_inventory_changed")
+    );
+    assert_eq!(state.queries.lock().await.len(), 2);
+}
+
+#[tokio::test]
+async fn integrity_check_marks_remote_inventory_changes_incomplete() {
+    let (endpoint_url, state) =
+        start_s3_inventory_mock(InventoryMockScenario::ChangesBetweenPasses).await;
+
+    let (status, report) = run_s3_integrity_check(&endpoint_url).await;
+
+    assert_eq!(status, Some(2), "{report:#}");
+    assert_eq!(report["result"], "incomplete");
+    assert!(
+        report["findings"]
+            .as_array()
+            .expect("findings array")
+            .iter()
+            .any(|finding| finding["code"] == "storage.remote_inventory_changed")
+    );
+    assert_eq!(state.queries.lock().await.len(), 2);
+}
+
+#[tokio::test]
+async fn integrity_check_marks_denied_remote_listing_incomplete() {
+    let (endpoint_url, state) = start_s3_inventory_mock(InventoryMockScenario::ListingDenied).await;
+
+    let (status, report) = run_s3_integrity_check(&endpoint_url).await;
+
+    assert_eq!(status, Some(2), "{report:#}");
+    assert_eq!(report["result"], "incomplete");
+    assert!(
+        report["findings"]
+            .as_array()
+            .expect("findings array")
+            .iter()
+            .any(|finding| finding["code"] == "storage.remote_inventory_unavailable")
+    );
+    assert_eq!(state.queries.lock().await.len(), 1);
+}
+
+#[tokio::test]
+async fn s3_object_inventory_requires_an_explicit_truncation_flag() {
+    /*
+     * A response which omits `IsTruncated` leaves pagination completeness unknowable.
+     * Inventory must fail closed rather than interpreting the absent field as the final page and
+     * reporting a potentially incomplete object set.
+     */
+    let (endpoint_url, state) =
+        start_s3_inventory_mock(InventoryMockScenario::MissingTruncationFlag).await;
+    let storage = s3_inventory_storage(&endpoint_url, "objects").await;
+
+    let error = storage
+        .inventory_objects()
+        .await
+        .expect_err("missing truncation flag must fail");
+
+    assert!(matches!(error, StorageError::Remote(_)));
+    let queries = state.queries.lock().await;
+    assert_eq!(queries.len(), 1);
+    assert_eq!(
+        queries[0].get("prefix").map(String::as_str),
+        Some("objects/")
+    );
+}
+
+#[tokio::test]
+async fn s3_object_inventory_requires_a_stable_object_identity() {
+    let (endpoint_url, state) =
+        start_s3_inventory_mock(InventoryMockScenario::MissingStableIdentity).await;
+    let storage = s3_inventory_storage(&endpoint_url, "objects").await;
+
+    let error = storage
+        .inventory_objects()
+        .await
+        .expect_err("object without ETag or modification time must fail");
+
+    assert!(matches!(error, StorageError::Remote(_)));
+    assert_eq!(state.queries.lock().await.len(), 1);
 }
 
 #[tokio::test]
@@ -915,6 +1170,193 @@ async fn blob_lifecycle_garbage_collection_deletes_s3_object_and_metadata() {
 async fn start_s3_mock() -> String {
     start_s3_mock_with_objects().await.0
 }
+
+async fn s3_inventory_storage(endpoint_url: &str, prefix: &str) -> S3CompatibleBlobStorage {
+    S3CompatibleBlobStorage::from_settings(S3StorageSettings {
+        name: "s3".to_string(),
+        bucket: "vault-test".to_string(),
+        region: "us-east-1".to_string(),
+        endpoint_url: Some(endpoint_url.to_string()),
+        allow_insecure_local_http: true,
+        access_key_id: Some("test-access".to_string()),
+        secret_access_key: Some("test-secret".to_string()),
+        session_token: None,
+        prefix: prefix.to_string(),
+    })
+    .await
+    .expect("S3 inventory storage")
+}
+
+async fn run_s3_integrity_check(endpoint_url: &str) -> (Option<i32>, Value) {
+    let data_dir = tempfile::tempdir().expect("temporary remote Vault");
+    let pool = db::connect(&data_dir.path().join("vault.db"))
+        .await
+        .expect("initialize remote Vault database");
+    pool.close().await;
+    std::fs::create_dir(data_dir.path().join("transfers")).expect("create transfer root");
+    let output = Command::new(env!("CARGO_BIN_EXE_vault-server"))
+        .args([
+            "--data-dir",
+            data_dir.path().to_str().expect("UTF-8 temporary path"),
+            "--storage-backend",
+            "s3",
+            "integrity-check",
+            "--format",
+            "json",
+        ])
+        .env("VAULT_S3_BUCKET", "vault-test")
+        .env("VAULT_STORAGE_PREFIX", "objects")
+        .env("VAULT_S3_REGION", "us-east-1")
+        .env("VAULT_S3_ENDPOINT_URL", endpoint_url)
+        .env("VAULT_S3_ALLOW_INSECURE_LOCAL_HTTP", "true")
+        .env("VAULT_S3_ACCESS_KEY_ID", "test-access")
+        .env("VAULT_S3_SECRET_ACCESS_KEY", "test-secret")
+        .env_remove("VAULT_DB_PATH")
+        .env_remove("VAULT_OBJECTS_PATH")
+        .env_remove("VAULT_TRANSFERS_PATH")
+        .output()
+        .await
+        .expect("run remote integrity check");
+    let report = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "remote integrity output was not JSON: {error}; stdout={:?}; stderr={:?}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    (output.status.code(), report)
+}
+
+async fn start_s3_inventory_mock(scenario: InventoryMockScenario) -> (String, InventoryMockState) {
+    let state = InventoryMockState {
+        scenario,
+        queries: Arc::new(Mutex::new(Vec::new())),
+    };
+    let app = Router::new()
+        .route("/{bucket}", get(mock_list_objects))
+        .route("/{bucket}/", get(mock_list_objects))
+        .with_state(state.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let addr = listener.local_addr().expect("listener address");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("S3 inventory mock");
+    });
+    (endpoint_url(addr), state)
+}
+
+async fn mock_list_objects(
+    State(state): State<InventoryMockState>,
+    Path(_bucket): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let request_number = {
+        let mut queries = state.queries.lock().await;
+        queries.push(query.clone());
+        queries.len()
+    };
+    if matches!(state.scenario, InventoryMockScenario::ListingDenied) {
+        return empty_response(StatusCode::FORBIDDEN);
+    }
+    let continuation_token = query.get("continuation-token").map(String::as_str);
+    let body = match (state.scenario, continuation_token) {
+        (InventoryMockScenario::Paginated, None) => PAGINATED_INVENTORY_FIRST_PAGE,
+        (InventoryMockScenario::Paginated, Some("page-two")) => PAGINATED_INVENTORY_SECOND_PAGE,
+        (InventoryMockScenario::PrefixBoundary, None) => {
+            if query.get("prefix").map(String::as_str) == Some("objects/") {
+                BOUNDARY_SAFE_INVENTORY
+            } else {
+                BOUNDARY_UNSAFE_INVENTORY
+            }
+        }
+        (InventoryMockScenario::CyclicToken, None | Some("repeat-me")) => {
+            CYCLIC_TOKEN_INVENTORY_PAGE
+        }
+        (InventoryMockScenario::OutOfPrefixKey, None) => OUT_OF_PREFIX_INVENTORY_PAGE,
+        (InventoryMockScenario::MissingTruncationFlag, None) => {
+            MISSING_TRUNCATION_FLAG_INVENTORY_PAGE
+        }
+        (InventoryMockScenario::MissingStableIdentity, None) => {
+            MISSING_STABLE_IDENTITY_INVENTORY_PAGE
+        }
+        (InventoryMockScenario::EmptyStable, None) => EMPTY_INVENTORY_PAGE,
+        (InventoryMockScenario::NonEmptyStable, None) => STABLE_NONEMPTY_INVENTORY_PAGE,
+        (InventoryMockScenario::ChangesBetweenPasses, None) if request_number == 1 => {
+            EMPTY_INVENTORY_PAGE
+        }
+        (InventoryMockScenario::ChangesBetweenPasses, None) => CHANGED_INVENTORY_PAGE,
+        _ => return empty_response(StatusCode::BAD_REQUEST),
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/xml")
+        .body(Body::from(body))
+        .expect("list objects response")
+}
+
+const PAGINATED_INVENTORY_FIRST_PAGE: &str = r#"<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+<Name>vault-test</Name><Prefix>tenant-a/</Prefix><KeyCount>1</KeyCount><MaxKeys>1</MaxKeys>
+<IsTruncated>true</IsTruncated><NextContinuationToken>page-two</NextContinuationToken>
+<Contents><Key>tenant-a/sha256/zzz</Key><ETag>&quot;etag-z&quot;</ETag><Size>9</Size></Contents>
+</ListBucketResult>"#;
+
+const PAGINATED_INVENTORY_SECOND_PAGE: &str = r#"<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+<Name>vault-test</Name><Prefix>tenant-a/</Prefix><KeyCount>1</KeyCount><MaxKeys>1</MaxKeys>
+<IsTruncated>false</IsTruncated>
+<Contents><Key>tenant-a/sha256/aaa</Key><ETag>&quot;etag-a&quot;</ETag><Size>3</Size></Contents>
+</ListBucketResult>"#;
+
+const BOUNDARY_SAFE_INVENTORY: &str = r#"<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+<Name>vault-test</Name><Prefix>objects/</Prefix><KeyCount>1</KeyCount><MaxKeys>1000</MaxKeys>
+<IsTruncated>false</IsTruncated>
+<Contents><Key>objects/sha256/inside</Key><ETag>&quot;inside&quot;</ETag><Size>6</Size></Contents>
+</ListBucketResult>"#;
+
+const BOUNDARY_UNSAFE_INVENTORY: &str = r#"<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+<Name>vault-test</Name><Prefix>objects</Prefix><KeyCount>2</KeyCount><MaxKeys>1000</MaxKeys>
+<IsTruncated>false</IsTruncated>
+<Contents><Key>objects/sha256/inside</Key><ETag>&quot;inside&quot;</ETag><Size>6</Size></Contents>
+<Contents><Key>objectscape/outside</Key><ETag>&quot;outside&quot;</ETag><Size>7</Size></Contents>
+</ListBucketResult>"#;
+
+const CYCLIC_TOKEN_INVENTORY_PAGE: &str = r#"<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+<Name>vault-test</Name><Prefix>objects/</Prefix><KeyCount>1</KeyCount><MaxKeys>1</MaxKeys>
+<IsTruncated>true</IsTruncated><NextContinuationToken>repeat-me</NextContinuationToken>
+<Contents><Key>objects/sha256/repeated</Key><ETag>&quot;repeat&quot;</ETag><Size>8</Size></Contents>
+</ListBucketResult>"#;
+
+const OUT_OF_PREFIX_INVENTORY_PAGE: &str = r#"<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+<Name>vault-test</Name><Prefix>objects/</Prefix><KeyCount>1</KeyCount><MaxKeys>1000</MaxKeys>
+<IsTruncated>false</IsTruncated>
+<Contents><Key>objectscape/outside</Key><ETag>&quot;outside&quot;</ETag><Size>7</Size></Contents>
+</ListBucketResult>"#;
+
+const MISSING_TRUNCATION_FLAG_INVENTORY_PAGE: &str = r#"<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+<Name>vault-test</Name><Prefix>objects/</Prefix><KeyCount>1</KeyCount><MaxKeys>1000</MaxKeys>
+<Contents><Key>objects/sha256/inside</Key><ETag>&quot;inside&quot;</ETag><Size>6</Size></Contents>
+</ListBucketResult>"#;
+
+const MISSING_STABLE_IDENTITY_INVENTORY_PAGE: &str = r#"<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+<Name>vault-test</Name><Prefix>objects/</Prefix><KeyCount>1</KeyCount><MaxKeys>1000</MaxKeys>
+<IsTruncated>false</IsTruncated>
+<Contents><Key>objects/unidentified</Key><Size>6</Size></Contents>
+</ListBucketResult>"#;
+
+const EMPTY_INVENTORY_PAGE: &str = r#"<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+<Name>vault-test</Name><Prefix>objects/</Prefix><KeyCount>0</KeyCount><MaxKeys>1000</MaxKeys>
+<IsTruncated>false</IsTruncated>
+</ListBucketResult>"#;
+
+const STABLE_NONEMPTY_INVENTORY_PAGE: &str = r#"<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+<Name>vault-test</Name><Prefix>objects/</Prefix><KeyCount>1</KeyCount><MaxKeys>1000</MaxKeys>
+<IsTruncated>false</IsTruncated>
+<Contents><Key>objects/noncanonical</Key><ETag>&quot;stable&quot;</ETag><Size>6</Size></Contents>
+</ListBucketResult>"#;
+
+const CHANGED_INVENTORY_PAGE: &str = r#"<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+<Name>vault-test</Name><Prefix>objects/</Prefix><KeyCount>1</KeyCount><MaxKeys>1000</MaxKeys>
+<IsTruncated>false</IsTruncated>
+<Contents><Key>objects/sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa</Key><ETag>&quot;changed&quot;</ETag><Size>1</Size></Contents>
+</ListBucketResult>"#;
 
 async fn start_s3_readiness_mock(status: StatusCode) -> (String, ReadinessMockState) {
     let state = ReadinessMockState {

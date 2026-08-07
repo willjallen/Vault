@@ -51,6 +51,30 @@ pub struct BlobLocation {
     pub object_key: String,
 }
 
+/// Stable metadata returned by a non-mutating object inventory pass.
+///
+/// The `ETag` is retained only as a change token. Callers must not interpret it
+/// as a content digest because multipart uploads and server-side encryption do
+/// not preserve that relationship.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct StorageObjectInventoryEntry {
+    pub object_key: String,
+    pub size_bytes: u64,
+    pub etag: Option<String>,
+    pub last_modified_secs: Option<i64>,
+    pub last_modified_subsec_nanos: Option<u32>,
+}
+
+/// One bounded page from a read-only object inventory.
+///
+/// A continuation token is present only when another page is mandatory. The
+/// token is opaque and must be passed back to the same backend unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageObjectInventoryPage {
+    pub entries: Vec<StorageObjectInventoryEntry>,
+    pub continuation_token: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlobReadRange {
     pub expected_size: u64,
@@ -232,6 +256,43 @@ pub trait BlobStorageBackend: std::fmt::Debug + Send + Sync {
     ) -> Result<BlobByteStream, StorageError>;
 
     async fn list_object_keys(&self) -> Result<Vec<String>, StorageError>;
+
+    /// Returns one bounded page inside the backend's configured managed prefix
+    /// without creating buckets, directories, or readiness artifacts.
+    async fn inventory_object_page(
+        &self,
+        _continuation_token: Option<&str>,
+    ) -> Result<StorageObjectInventoryPage, StorageError> {
+        Err(StorageError::UnsupportedOperation(
+            "read-only object inventory is not implemented for this backend".to_string(),
+        ))
+    }
+
+    /// Convenience collector for callers whose object count is already known
+    /// to be small. Integrity auditing consumes [`Self::inventory_object_page`]
+    /// directly so its remote-inventory memory does not grow with the bucket.
+    async fn inventory_objects(&self) -> Result<Vec<StorageObjectInventoryEntry>, StorageError> {
+        let mut continuation_token = None;
+        let mut seen_continuation_tokens = HashSet::new();
+        let mut inventory = Vec::new();
+        loop {
+            let page = self
+                .inventory_object_page(continuation_token.as_deref())
+                .await?;
+            inventory.extend(page.entries);
+            let Some(next) = page.continuation_token else {
+                break;
+            };
+            if !seen_continuation_tokens.insert(next.clone()) {
+                return Err(StorageError::Remote(
+                    "remote inventory cycled a continuation token".to_string(),
+                ));
+            }
+            continuation_token = Some(next);
+        }
+        inventory.sort();
+        Ok(inventory)
+    }
 
     async fn delete_object(&self, object_key: &str) -> Result<(), StorageError>;
 
@@ -2462,6 +2523,104 @@ impl BlobStorageBackend for S3CompatibleBlobStorage {
         Err(StorageError::UnsupportedOperation(
             "Object listing is only implemented for local storage".to_string(),
         ))
+    }
+
+    async fn inventory_object_page(
+        &self,
+        continuation_token: Option<&str>,
+    ) -> Result<StorageObjectInventoryPage, StorageError> {
+        let prefix = (!self.prefix.is_empty()).then(|| format!("{}/", self.prefix));
+        let mut request = self
+            .client
+            .list_objects_v2()
+            .bucket(self.bucket())
+            .max_keys(1000);
+        if let Some(prefix) = prefix.as_deref() {
+            request = request.prefix(prefix);
+        }
+        if let Some(token) = continuation_token {
+            request = request.continuation_token(token);
+        }
+        let output = request.send().await.map_err(remote_storage_error)?;
+        let mut entries = Vec::with_capacity(output.contents().len());
+        for object in output.contents() {
+            let Some(object_key) = object.key() else {
+                return Err(StorageError::Remote(
+                    "remote inventory returned an object without a key".to_string(),
+                ));
+            };
+            if prefix
+                .as_deref()
+                .is_some_and(|prefix| !object_key.starts_with(prefix))
+            {
+                return Err(StorageError::Remote(
+                    "remote inventory returned an object outside the requested prefix".to_string(),
+                ));
+            }
+            let size_bytes = object
+                .size()
+                .and_then(|size| u64::try_from(size).ok())
+                .ok_or_else(|| {
+                    StorageError::Remote(format!(
+                        "remote inventory returned an invalid size for {object_key}"
+                    ))
+                })?;
+            let etag = object
+                .e_tag()
+                .filter(|value| !value.trim().is_empty())
+                .map(ToOwned::to_owned);
+            let last_modified = object.last_modified();
+            if etag.is_none() && last_modified.is_none() {
+                return Err(StorageError::Remote(format!(
+                    "remote inventory returned no stable change token for {object_key}"
+                )));
+            }
+            entries.push(StorageObjectInventoryEntry {
+                object_key: object_key.to_string(),
+                size_bytes,
+                etag,
+                last_modified_secs: last_modified.map(aws_sdk_s3::primitives::DateTime::secs),
+                last_modified_subsec_nanos: last_modified
+                    .map(aws_sdk_s3::primitives::DateTime::subsec_nanos),
+            });
+        }
+        if entries.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(StorageError::Remote(
+                "remote inventory page returned duplicate or out-of-order keys".to_string(),
+            ));
+        }
+        let continuation_token = match output.is_truncated() {
+            Some(false) => {
+                if output.next_continuation_token().is_some() {
+                    return Err(StorageError::Remote(
+                        "remote inventory returned a continuation token for a complete page"
+                            .to_string(),
+                    ));
+                }
+                None
+            }
+            Some(true) => Some(
+                output
+                    .next_continuation_token()
+                    .filter(|token| !token.is_empty())
+                    .ok_or_else(|| {
+                        StorageError::Remote(
+                            "remote inventory was truncated without a continuation token"
+                                .to_string(),
+                        )
+                    })?
+                    .to_string(),
+            ),
+            None => {
+                return Err(StorageError::Remote(
+                    "remote inventory omitted its pagination completion state".to_string(),
+                ));
+            }
+        };
+        Ok(StorageObjectInventoryPage {
+            entries,
+            continuation_token,
+        })
     }
 
     async fn delete_object(&self, object_key: &str) -> Result<(), StorageError> {

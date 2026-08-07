@@ -8,6 +8,7 @@ pub mod documents;
 pub mod exports;
 pub mod folders;
 pub mod http;
+pub mod integrity_check;
 pub mod oidc;
 pub mod preferences;
 pub mod previews;

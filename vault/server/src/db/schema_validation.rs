@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use sqlx::{Row, Sqlite, SqliteConnection, Transaction};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct SchemaMetadata {
+pub(crate) struct SchemaMetadata {
     tables: BTreeMap<String, TableMetadata>,
     views: BTreeMap<String, ViewMetadata>,
     triggers: BTreeMap<String, TriggerMetadata>,
@@ -65,7 +65,7 @@ pub(super) struct UserSchemaObject {
 
 /// A connection whose schema can be inspected without acquiring another pool
 /// connection between the migration and its validation.
-pub(super) trait SchemaConnection {
+pub(crate) trait SchemaConnection {
     fn as_sqlite_connection(&mut self) -> &mut SqliteConnection;
 }
 
@@ -81,7 +81,7 @@ impl SchemaConnection for Transaction<'_, Sqlite> {
     }
 }
 
-pub(super) async fn schema_metadata<C>(source: &mut C) -> anyhow::Result<SchemaMetadata>
+pub(crate) async fn schema_metadata<C>(source: &mut C) -> anyhow::Result<SchemaMetadata>
 where
     C: SchemaConnection + ?Sized,
 {
@@ -169,6 +169,136 @@ pub(super) fn validate_schema_metadata_exact(
         )));
     }
     Ok(())
+}
+
+/// Returns every top-level schema object whose persisted definition differs
+/// from the expected migration contract. Startup remains fail-fast, while the
+/// integrity checker can retain one actionable finding for every object.
+pub(crate) fn schema_differences(expected: &SchemaMetadata, live: &SchemaMetadata) -> Vec<String> {
+    let mut differences = Vec::new();
+    for name in expected.tables.keys() {
+        if !live.tables.contains_key(name) {
+            differences.push(format!("missing table {name}"));
+        }
+    }
+    for name in live.tables.keys() {
+        if !expected.tables.contains_key(name) {
+            differences.push(format!("unexpected table {name}"));
+        }
+    }
+    for (name, expected_table) in &expected.tables {
+        if let Some(live_table) = live.tables.get(name) {
+            collect_table_differences(name, expected_table, live_table, &mut differences);
+        }
+    }
+    collect_object_differences("view", &expected.views, &live.views, &mut differences);
+    collect_object_differences(
+        "trigger",
+        &expected.triggers,
+        &live.triggers,
+        &mut differences,
+    );
+    differences
+}
+
+fn collect_table_differences(
+    table: &str,
+    expected: &TableMetadata,
+    live: &TableMetadata,
+    differences: &mut Vec<String>,
+) {
+    if expected.create_sql != live.create_sql {
+        differences.push(format!("CREATE definition mismatch for table {table}"));
+    }
+    collect_nested_object_differences(
+        "column",
+        table,
+        &expected.columns,
+        &live.columns,
+        differences,
+    );
+    collect_nested_object_differences(
+        "index",
+        table,
+        &expected.named_indexes,
+        &live.named_indexes,
+        differences,
+    );
+    for columns in expected
+        .unique_constraints
+        .difference(&live.unique_constraints)
+    {
+        differences.push(format!(
+            "missing unique constraint on table {table} ({})",
+            columns.join(", ")
+        ));
+    }
+    for columns in live
+        .unique_constraints
+        .difference(&expected.unique_constraints)
+    {
+        differences.push(format!(
+            "unexpected unique constraint on table {table} ({})",
+            columns.join(", ")
+        ));
+    }
+    for foreign_key in expected.foreign_keys.difference(&live.foreign_keys) {
+        differences.push(format!(
+            "missing foreign key on table {table}: {} -> {}.{}",
+            foreign_key.from_column, foreign_key.foreign_table, foreign_key.foreign_column
+        ));
+    }
+    for foreign_key in live.foreign_keys.difference(&expected.foreign_keys) {
+        differences.push(format!(
+            "unexpected foreign key on table {table}: {} -> {}.{}",
+            foreign_key.from_column, foreign_key.foreign_table, foreign_key.foreign_column
+        ));
+    }
+}
+
+fn collect_nested_object_differences<T: PartialEq>(
+    object_type: &str,
+    table: &str,
+    expected: &BTreeMap<String, T>,
+    live: &BTreeMap<String, T>,
+    differences: &mut Vec<String>,
+) {
+    for name in expected.keys() {
+        match live.get(name) {
+            None => differences.push(format!("missing {object_type} {table}.{name}")),
+            Some(actual) if actual != &expected[name] => differences.push(format!(
+                "definition mismatch for {object_type} {table}.{name}"
+            )),
+            Some(_) => {}
+        }
+    }
+    for name in live.keys() {
+        if !expected.contains_key(name) {
+            differences.push(format!("unexpected {object_type} {table}.{name}"));
+        }
+    }
+}
+
+fn collect_object_differences<T: PartialEq>(
+    object_type: &str,
+    expected: &BTreeMap<String, T>,
+    live: &BTreeMap<String, T>,
+    differences: &mut Vec<String>,
+) {
+    for name in expected.keys() {
+        match live.get(name) {
+            None => differences.push(format!("missing {object_type} {name}")),
+            Some(actual) if actual != &expected[name] => {
+                differences.push(format!("definition mismatch for {object_type} {name}"));
+            }
+            Some(_) => {}
+        }
+    }
+    for name in live.keys() {
+        if !expected.contains_key(name) {
+            differences.push(format!("unexpected {object_type} {name}"));
+        }
+    }
 }
 
 fn first_schema_difference(expected: &SchemaMetadata, live: &SchemaMetadata) -> String {

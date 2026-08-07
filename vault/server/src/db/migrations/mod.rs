@@ -216,6 +216,19 @@ fn expected_history_entry(index: usize) -> Option<(i64, &'static str)> {
         .map(|migration| (migration.version, migration.name))
 }
 
+pub(crate) fn expected_current_history() -> Vec<(i64, &'static str)> {
+    (0..KNOWN_HISTORY_LENGTH)
+        .filter_map(expected_history_entry)
+        .collect()
+}
+
+pub(crate) async fn expected_current_schema() -> anyhow::Result<SchemaMetadata> {
+    expected_schema_metadata_by_version()
+        .await?
+        .pop()
+        .ok_or_else(|| anyhow::anyhow!("migration registry did not produce a current schema"))
+}
+
 fn validate_registry() -> anyhow::Result<()> {
     if BASELINE.migration_version < 1
         || BASELINE.migration_name.trim().is_empty()

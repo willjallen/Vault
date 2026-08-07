@@ -19,6 +19,37 @@ For local development with the built image, dev mode, and dev auth enabled:
 docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 ```
 
+## Integrity checks
+
+Vault can perform an exhaustive, offline integrity check of its SQLite
+metadata, stored object contents, and transfer working data. Stop the server so
+the database and objects form one stable dataset, run the check in a one-off
+container, and then restart it:
+
+```sh
+docker compose stop vault
+docker compose run --rm --no-deps vault /app/vault-server integrity-check
+docker compose start vault
+```
+
+The command is diagnostic and read-only: it does not migrate, recover, delete,
+or repair data. Its empty advisory-lock sidecar beside the database is the only
+permitted filesystem side effect. Servers from releases predating integrity
+checks do not acquire this lock, so they must still be stopped explicitly. A
+nonempty SQLite WAL or rollback journal is reported as incomplete rather than
+being recovered or silently ignored.
+
+The check hashes every referenced stored object, so large local Vaults can take
+substantial disk I/O and S3/R2 Vaults can incur download time and egress
+charges. Use `--format json` for a versioned machine-readable report; progress
+and diagnostics remain on stderr. Exit status `0` means the complete check
+passed, `1` means it completed with warnings or errors, `2` means coverage was
+incomplete, and `130` means it was interrupted. Preserve a backup before acting
+on remediation guidance. Remote inventories are consumed in bounded 1,000-key
+pages. If a local tree or buffered database domain analysis exceeds one million
+entries, the command reports incomplete coverage instead of
+silently sampling or risking a false pass.
+
 Do not use the dev override for production. `VAULT_DEV_MODE=1` exposes admin-only debug tools and the app shows prominent development warnings. Production deployments must set `VAULT_SESSION_SECRET` to exactly 32 random bytes encoded as 64 hexadecimal characters and either run behind a trusted header-auth proxy or configure `VAULT_AUTH_MODE=oidc` with the OIDC variables in `.env.example`. Arbitrary passwords and low-diversity values are rejected.
 
 To rotate the signing root without immediately invalidating sessions or resumable-upload tokens, generate a new `VAULT_SESSION_SECRET`, move the old value into the comma-separated `VAULT_SESSION_SECRET_PREVIOUS` list, and restart Vault. New tokens use only the new root; prior roots are accepted only for verification. Keep an old root for at least the greater of `VAULT_SESSION_MAX_AGE_SECONDS` and `VAULT_TRANSFER_SESSION_TTL_SECONDS`, then remove it. At most four prior roots are accepted. The first release with domain-separated signing keys intentionally does not accept tokens created by older raw-HMAC releases, so users must sign in again after that upgrade and active resumable uploads may need to fetch a fresh token through their authenticated session.

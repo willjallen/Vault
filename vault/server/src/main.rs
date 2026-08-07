@@ -1,6 +1,8 @@
 use std::future::IntoFuture;
+use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::process::ExitCode;
 use std::time::Duration;
 
 use tokio::net::TcpListener;
@@ -11,6 +13,9 @@ use vault_server::auth::AuthSettings;
 use vault_server::config::Config;
 use vault_server::documents;
 use vault_server::http::{self, AppState};
+use vault_server::integrity_check;
+use vault_server::integrity_check::cli::{ApplicationCli, ApplicationCommand, OutputFormat};
+use vault_server::integrity_check::lock::{InstanceLock, LockPurpose};
 use vault_server::reconciliation;
 use vault_server::state_events::{compact_state_events, notify_state_event_committed};
 use vault_server::storage::{configured_blob_storage, sweep_legacy_s3_stage_files};
@@ -22,10 +27,81 @@ const SERVER_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 const STATE_EVENT_COMPACTION_INTERVAL: Duration = Duration::from_mins(1);
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    init_tracing();
+async fn main() -> ExitCode {
+    match Box::pin(run_application()).await {
+        Ok(exit_code) => exit_code,
+        Err(error) => {
+            eprintln!("{error:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
 
-    let config = Config::from_env();
+async fn run_application() -> anyhow::Result<ExitCode> {
+    let cli = ApplicationCli::from_env();
+    match cli.command {
+        Some(ApplicationCommand::IntegrityCheck(args)) => {
+            let progress =
+                integrity_check::IntegrityProgress::new(&cli.config, args.max_findings_per_code);
+            let check = integrity_check::run_with_progress(
+                &cli.config,
+                args.max_findings_per_code,
+                &progress,
+            );
+            tokio::pin!(check);
+            let (report, exit_code) = tokio::select! {
+                report = &mut check => {
+                    let exit_code = report.exit_code();
+                    (report, exit_code)
+                }
+                signal = wait_for_integrity_interrupt() => {
+                    match signal {
+                        Ok(()) => (progress.interrupted_report(), 130),
+                        Err(error) => {
+                            eprintln!("failed to install integrity-check signal handler: {error}");
+                            let report = check.await;
+                            let exit_code = report.exit_code();
+                            (report, exit_code)
+                        }
+                    }
+                }
+            };
+            let rendered = match args.format {
+                OutputFormat::Human => report.render_human(),
+                OutputFormat::Json => report.render_json()?,
+            };
+            let mut stdout = std::io::stdout().lock();
+            stdout.write_all(rendered.as_bytes())?;
+            if !rendered.ends_with('\n') {
+                stdout.write_all(b"\n")?;
+            }
+            stdout.flush()?;
+            Ok(ExitCode::from(exit_code))
+        }
+        None => {
+            init_tracing();
+            serve(cli.config).await?;
+            Ok(ExitCode::SUCCESS)
+        }
+    }
+}
+
+async fn wait_for_integrity_interrupt() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await
+}
+
+async fn serve(config: Config) -> anyhow::Result<()> {
+    let _instance_lock = InstanceLock::acquire(&config.db_path(), LockPurpose::Server)?;
     let auth = AuthSettings::from_env();
     auth.validate_runtime_config()?;
     let db = db::connect(&config.db_path()).await?;

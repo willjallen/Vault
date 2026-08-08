@@ -1,6 +1,6 @@
 ========================================================================
 
-Unreleased
+v2.2.0
 
 feat: Add an offline integrity check that validates SQLite metadata and stored object contents, reports findings, and exits without repairs.
 feat: Render responsive thumbnails for SVG files while blocking external resource access.

@@ -967,7 +967,7 @@ export function App({ initial }) {
           onClose: closeSettings,
           onDebugError: setError,
           onPalettePreferenceChange: handlePalettePreferenceChange,
-          onResetWhatsNew: () => handleWhatsNewAcknowledgedVersionChange(""),
+          onShowWhatsNew: handleWhatsNewAcknowledgedVersionChange,
           onSiteSettingsChange: setSiteSettings,
           onThemePreferenceChange: handleThemePreferenceChange,
           openFoldersOnClick,
@@ -976,6 +976,8 @@ export function App({ initial }) {
           siteName: initialBootstrap.site_name || "Vault",
           siteSettings,
           themePreference,
+          releaseNotes: initialBootstrap.release_notes,
+          whatsNewAcknowledgedVersion,
         })
       : null,
     folderPropertiesTarget

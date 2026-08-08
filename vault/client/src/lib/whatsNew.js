@@ -62,6 +62,15 @@ export function releaseNotesSince(releaseNotes, currentVersion, acknowledgedVers
   return foundAcknowledgement ? unseen : [currentSection];
 }
 
+export function releaseVersionsBeforeCurrent(releaseNotes, currentVersion) {
+  const sections = normalizeReleaseNotes(releaseNotes);
+  const currentIndex = sections.findIndex((section) => section.version === currentVersion);
+  if (currentIndex < 0) {
+    return [];
+  }
+  return sections.slice(currentIndex + 1).map((section) => section.version);
+}
+
 export function releaseNoteVisual(kind) {
   return NOTE_VISUALS.get(kind) || { icon: "star", tone: "technical" };
 }

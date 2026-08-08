@@ -1,4 +1,5 @@
 import { classNames } from "../../lib/utils.js";
+import { releaseVersionsBeforeCurrent } from "../../lib/whatsNew.js";
 import { Icon } from "../common/Icon.js";
 import { responseError } from "./http.js";
 
@@ -18,9 +19,20 @@ function DebugActionButton({ disabled, icon, label, onClick, tone = "" }) {
   );
 }
 
-export function DebugPanel({ apiFetch, onDebugError, onResetWhatsNew }) {
+export function DebugPanel({
+  acknowledgedVersion = "",
+  apiFetch,
+  currentVersion = "",
+  onDebugError,
+  onShowWhatsNew,
+  releaseNotes = [],
+}) {
   const [pendingAction, setPendingAction] = useState("");
   const [result, setResult] = useState(null);
+  const priorReleaseVersions = releaseVersionsBeforeCurrent(releaseNotes, currentVersion);
+  const [whatsNewVersion, setWhatsNewVersion] = useState(() =>
+    priorReleaseVersions.includes(acknowledgedVersion) ? acknowledgedVersion : ""
+  );
 
   const completeAction = useCallback((label, payload) => {
     setResult({
@@ -76,10 +88,13 @@ export function DebugPanel({ apiFetch, onDebugError, onResetWhatsNew }) {
     runDebugRequest("Reset database", "/api/admin/debug/reset-database");
   }, [runDebugRequest]);
 
-  const resetWhatsNew = useCallback(() => {
-    onResetWhatsNew?.();
-    completeAction("Reset What's New", { acknowledgement: "cleared" });
-  }, [completeAction, onResetWhatsNew]);
+  const showWhatsNew = useCallback(() => {
+    onShowWhatsNew?.(whatsNewVersion);
+    completeAction("Show What's New", {
+      acknowledged_version: whatsNewVersion || null,
+      current_version: currentVersion,
+    });
+  }, [completeAction, currentVersion, onShowWhatsNew, whatsNewVersion]);
 
   const disabled = Boolean(pendingAction);
   const errorButtons = [
@@ -131,7 +146,6 @@ export function DebugPanel({ apiFetch, onDebugError, onResetWhatsNew }) {
     ],
   ];
   const utilityButtons = [
-    ["Show What's New", "rocket", resetWhatsNew],
     [
       "Seed sample file",
       "seedling",
@@ -197,6 +211,41 @@ export function DebugPanel({ apiFetch, onDebugError, onResetWhatsNew }) {
             h("h3", { key: "title" }, "Utilities"),
             h("p", { className: "muted tiny", key: "note" }, "Mutate or inspect this dev vault."),
           ]),
+        ]),
+        h("div", { className: "debug-whats-new-control", key: "whats-new" }, [
+          h("label", { className: "debug-whats-new-field", key: "field" }, [
+            h("span", { key: "label" }, "Last version seen"),
+            h(
+              "select",
+              {
+                "aria-label": "Last What's New version seen",
+                disabled,
+                key: "select",
+                onChange: (changeEvent) => setWhatsNewVersion(changeEvent.target.value),
+                value: whatsNewVersion,
+              },
+              [
+                h("option", { key: "first-visit", value: "" }, "None — current release only"),
+                ...priorReleaseVersions.map((version) =>
+                  h("option", { key: version, value: version }, `Version ${version}`)
+                ),
+              ]
+            ),
+          ]),
+          h(DebugActionButton, {
+            disabled: disabled || !onShowWhatsNew,
+            icon: "rocket",
+            key: "show",
+            label: "Show What's New",
+            onClick: showWhatsNew,
+          }),
+          h(
+            "p",
+            { className: "debug-whats-new-copy muted tiny", key: "copy" },
+            whatsNewVersion
+              ? `Shows every release after v${whatsNewVersion} through v${currentVersion}.`
+              : `Shows v${currentVersion} as a first-time viewer.`
+          ),
         ]),
         h(
           "div",

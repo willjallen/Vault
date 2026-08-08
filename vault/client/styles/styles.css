@@ -4905,6 +4905,51 @@ input[type="file"]::file-selector-button:hover {
   padding: 16px 18px 18px;
 }
 
+.debug-whats-new-control {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 10px;
+  margin: 16px 18px 0;
+  border: 1px solid var(--border-extra-subtle);
+  border-radius: 12px;
+  padding: 12px;
+  background: var(--surface-raised);
+}
+
+.debug-whats-new-field {
+  min-width: 0;
+  display: grid;
+  gap: 6px;
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  font-weight: 800;
+}
+
+.debug-whats-new-field select {
+  min-width: 0;
+  height: 38px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px;
+  padding: 0 10px;
+  outline: 0;
+  background: var(--surface-panel);
+  color: var(--text);
+  font: inherit;
+  font-size: 0.8rem;
+}
+
+.debug-whats-new-field select:focus-visible {
+  border-color: var(--accent-border);
+  box-shadow: var(--shadow-focus);
+}
+
+.debug-whats-new-copy {
+  grid-column: 1 / -1;
+  margin: 0;
+}
+
 .debug-action-button {
   min-width: 0;
   min-height: 38px;
@@ -5994,6 +6039,10 @@ input[type="file"]::file-selector-button:hover {
 
   .debug-panel-grid,
   .debug-action-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .debug-whats-new-control {
     grid-template-columns: 1fr;
   }
 

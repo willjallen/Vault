@@ -659,6 +659,7 @@ function AdminPanel({ apiFetch, currentUser, onSiteSettingsChange, siteSettings 
 }
 
 function SectionPanel({
+  appVersion,
   alternateRows,
   activeSection,
   apiFetch,
@@ -669,20 +670,29 @@ function SectionPanel({
   onDoubleClickDownloadChange,
   onOpenFoldersOnClickChange,
   onPalettePreferenceChange,
-  onResetWhatsNew,
+  onShowWhatsNew,
   onSiteSettingsChange,
   onThemePreferenceChange,
   openFoldersOnClick,
   palettePreference,
+  releaseNotes,
   siteSettings,
   themePreference,
+  whatsNewAcknowledgedVersion,
 }) {
   if (activeSection === "admin") {
     return h(AdminPanel, { apiFetch, currentUser, onSiteSettingsChange, siteSettings });
   }
 
   if (activeSection === "debug") {
-    return h(DebugPanel, { apiFetch, onDebugError, onResetWhatsNew });
+    return h(DebugPanel, {
+      acknowledgedVersion: whatsNewAcknowledgedVersion,
+      apiFetch,
+      currentVersion: appVersion,
+      onDebugError,
+      onShowWhatsNew,
+      releaseNotes,
+    });
   }
 
   if (activeSection === "files") {
@@ -786,13 +796,15 @@ export function SettingsModal({
   onOpenFoldersOnClickChange,
   onSiteSettingsChange,
   onPalettePreferenceChange,
-  onResetWhatsNew,
+  onShowWhatsNew,
   onThemePreferenceChange,
   openFoldersOnClick = true,
   palettePreference = "cozy",
+  releaseNotes = [],
   siteName = "Vault",
   siteSettings = {},
   themePreference = "system",
+  whatsNewAcknowledgedVersion = "",
 }) {
   const sections = [
     ...personalSections,
@@ -899,6 +911,7 @@ export function SettingsModal({
             ]),
           ]),
           h(SectionPanel, {
+            appVersion,
             alternateRows,
             activeSection,
             apiFetch,
@@ -910,13 +923,15 @@ export function SettingsModal({
             onDoubleClickDownloadChange,
             onOpenFoldersOnClickChange,
             onPalettePreferenceChange,
-            onResetWhatsNew,
+            onShowWhatsNew,
             onSiteSettingsChange,
             onThemePreferenceChange,
             openFoldersOnClick,
             palettePreference,
+            releaseNotes,
             siteSettings,
             themePreference,
+            whatsNewAcknowledgedVersion,
           }),
         ]),
       ]

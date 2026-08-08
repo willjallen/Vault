@@ -290,9 +290,17 @@ pub async fn lock_document(
     sqlx::query(
         r"
         INSERT INTO document_locks
-            (document_id, locked_by, locked_by_name, locked_ip, locked_user_agent, force_acquired)
+            (
+                document_id,
+                locked_by,
+                locked_by_name,
+                locked_ip,
+                locked_user_agent,
+                force_acquired,
+                locked_at
+            )
         VALUES
-            (?, ?, ?, ?, ?, 0)
+            (?, ?, ?, ?, ?, 0, strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'))
         ",
     )
     .bind(document.id)
@@ -334,7 +342,7 @@ pub async fn unlock_document(
     sqlx::query(
         r"
         UPDATE document_locks
-        SET is_active = 0, released_at = CURRENT_TIMESTAMP, released_by = ?
+        SET is_active = 0, released_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'), released_by = ?
         WHERE id = ?
         ",
     )
@@ -703,9 +711,17 @@ pub async fn record_checkout_event_and_lock(
         sqlx::query(
             r"
             INSERT INTO document_locks
-                (document_id, locked_by, locked_by_name, locked_ip, locked_user_agent, force_acquired)
+                (
+                    document_id,
+                    locked_by,
+                    locked_by_name,
+                    locked_ip,
+                    locked_user_agent,
+                    force_acquired,
+                    locked_at
+                )
             VALUES
-                (?, ?, ?, ?, ?, 0)
+                (?, ?, ?, ?, ?, 0, strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'))
             ",
         )
         .bind(document.id)
@@ -814,7 +830,7 @@ pub async fn restore_document(
         r"
         UPDATE documents
         SET
-            latest_modified_at = CURRENT_TIMESTAMP,
+            latest_modified_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'),
             latest_modified_by = ?,
             archived_at = NULL,
             archived_origin_path = NULL,
@@ -910,7 +926,7 @@ pub async fn archive_folder(
         r"
         UPDATE folders
         SET
-            archived_at = CURRENT_TIMESTAMP,
+            archived_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'),
             archived_origin_path = ?,
             archived_access = ?
         WHERE id = ?
@@ -1252,7 +1268,7 @@ async fn move_or_rename_document(
         SET
             folder_id = ?,
             name = ?,
-            latest_modified_at = CURRENT_TIMESTAMP,
+            latest_modified_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'),
             latest_modified_by = ?
         WHERE id = ?
           AND folder_id = ?
@@ -1830,9 +1846,9 @@ async fn archive_expired_document_in_tx(
         r"
         UPDATE documents
         SET
-            latest_modified_at = CURRENT_TIMESTAMP,
+            latest_modified_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'),
             latest_modified_by = ?,
-            archived_at = CURRENT_TIMESTAMP,
+            archived_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'),
             archived_origin_path = ?,
             archived_access = ?
         WHERE id = ?
@@ -1928,8 +1944,8 @@ async fn terminate_document_uploads_in_tx(
         r"
         UPDATE upload_sessions
         SET status = 'aborted',
-            aborted_at = CURRENT_TIMESTAMP,
-            updated_at = CURRENT_TIMESTAMP
+            aborted_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'),
+            updated_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now')
         WHERE document_id = ?
           AND status IN ('active', 'completing')
         ",
@@ -1993,8 +2009,8 @@ async fn terminate_create_uploads_in_folders_in_tx(
             UPDATE upload_sessions
             SET
                 status = 'aborted',
-                aborted_at = CURRENT_TIMESTAMP,
-                updated_at = CURRENT_TIMESTAMP
+                aborted_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now')
             WHERE status IN ('active', 'completing')
               AND target_folder_id IN (
                   SELECT CAST(value AS INTEGER) FROM json_each(?)
@@ -2013,8 +2029,12 @@ async fn record_retention_expired_state_in_tx(
 ) -> Result<(), DocumentError> {
     sqlx::query(
         r"
-        INSERT INTO state_events (event_type, resources)
-        VALUES ('retention.expired', ?)
+        INSERT INTO state_events (event_type, resources, created_at)
+        VALUES (
+            'retention.expired',
+            ?,
+            strftime('%Y-%m-%dT%H:%M:%f000Z', 'now')
+        )
         ",
     )
     .bind(state_event_resources_json(&[
@@ -2082,7 +2102,7 @@ async fn release_lock_in_tx(
     sqlx::query(
         r"
         UPDATE document_locks
-        SET is_active = 0, released_at = CURRENT_TIMESTAMP, released_by = ?
+        SET is_active = 0, released_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'), released_by = ?
         WHERE id = ?
         ",
     )
@@ -2155,9 +2175,9 @@ async fn archive_document_in_tx(
         r"
         UPDATE documents
         SET
-            latest_modified_at = CURRENT_TIMESTAMP,
+            latest_modified_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'),
             latest_modified_by = ?,
-            archived_at = CURRENT_TIMESTAMP,
+            archived_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'),
             archived_origin_path = ?,
             archived_access = ?
         WHERE id = ?
@@ -2235,8 +2255,10 @@ async fn record_folder_event_for_archive_in_tx(
 ) -> Result<(), DocumentError> {
     sqlx::query(
         r"
-        INSERT INTO folder_events (folder_id, event_type, actor, actor_name, message)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO folder_events
+            (folder_id, event_type, actor, actor_name, message, created_at)
+        VALUES
+            (?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'))
         ",
     )
     .bind(folder_id)
@@ -2260,9 +2282,19 @@ async fn record_document_event_in_tx(
     sqlx::query(
         r"
         INSERT INTO document_events
-            (document_id, event_type, actor, actor_name, message, result, ip, user_agent)
+            (
+                document_id,
+                event_type,
+                actor,
+                actor_name,
+                message,
+                result,
+                ip,
+                user_agent,
+                created_at
+            )
         VALUES
-            (?, ?, ?, ?, ?, 'ok', ?, ?)
+            (?, ?, ?, ?, ?, 'ok', ?, ?, strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'))
         ",
     )
     .bind(document_id)
@@ -2284,8 +2316,8 @@ async fn record_document_state_in_tx(
 ) -> Result<(), DocumentError> {
     sqlx::query(
         r"
-        INSERT INTO state_events (event_type, resources)
-        VALUES (?, ?)
+        INSERT INTO state_events (event_type, resources, created_at)
+        VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'))
         ",
     )
     .bind(format!("document.{event_type}"))

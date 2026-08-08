@@ -3711,10 +3711,15 @@ async fn insert_debug_document_row(
 ) -> Result<i64, ApiError> {
     Ok(sqlx::query(
         r"
-        INSERT INTO documents
-            (folder_id, name, created_by, created_by_name, latest_modified_by)
-        VALUES
-            (?, ?, ?, ?, ?)
+        INSERT INTO documents (
+            folder_id, name, created_by, created_by_name, latest_modified_by, created_at,
+            latest_modified_at
+        )
+        VALUES (
+            ?1, ?2, ?3, ?4, ?5,
+            strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'),
+            strftime('%Y-%m-%dT%H:%M:%f000Z', 'now')
+        )
         ",
     )
     .bind(folder_id)
@@ -3737,21 +3742,14 @@ async fn insert_debug_document_version_and_event(
     let version_id = Uuid::new_v4().to_string();
     sqlx::query(
         r"
-        INSERT INTO document_versions
-            (
-                id,
-                document_id,
-                blob_id,
-                version_number,
-                committed_by,
-                committed_by_name,
-                message,
-                mime_type,
-                original_filename,
-                created_via
-            )
-        VALUES
-            (?, ?, ?, 1, ?, ?, 'Debug seed', 'text/plain', ?, 'upload')
+        INSERT INTO document_versions (
+            id, document_id, blob_id, version_number, committed_by, committed_by_name, message,
+            mime_type, original_filename, created_via, committed_at
+        )
+        VALUES (
+            ?1, ?2, ?3, 1, ?4, ?5, 'Debug seed', 'text/plain', ?6, 'upload',
+            strftime('%Y-%m-%dT%H:%M:%f000Z', 'now')
+        )
         ",
     )
     .bind(&version_id)
@@ -3779,9 +3777,17 @@ async fn insert_debug_document_version_and_event(
     sqlx::query(
         r"
         INSERT INTO document_events
-            (document_id, event_type, actor, actor_name, message, result)
+            (document_id, event_type, actor, actor_name, message, result, created_at)
         VALUES
-            (?, 'upload', ?, ?, 'Debug seed', 'ok')
+            (
+                ?,
+                'upload',
+                ?,
+                ?,
+                'Debug seed',
+                'ok',
+                strftime('%Y-%m-%dT%H:%M:%f000Z', 'now')
+            )
         ",
     )
     .bind(document_id)
@@ -4231,7 +4237,7 @@ fn upload_error_response(error: UploadError) -> (StatusCode, String) {
         | UploadError::CompletionStateTransition(_)
         | UploadError::Io(_)
         | UploadError::Json(_)
-        | UploadError::TimeFormat(_)
+        | UploadError::Timestamp(_)
         | UploadError::TimeParse(_)) => {
             tracing::error!(?error, "upload request failed");
             (

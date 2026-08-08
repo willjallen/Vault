@@ -17,8 +17,8 @@ use vault_server::transfers::{
     sweep_expired_transfers, sweep_orphaned_upload_directories,
 };
 
-const EXPIRED_AT: &str = "2000-01-01T00:00:00Z";
-const FUTURE_AT: &str = "2999-01-01T00:00:00Z";
+const EXPIRED_AT: &str = "2000-01-01T00:00:00.000000Z";
+const FUTURE_AT: &str = "2999-01-01T00:00:00.000000Z";
 
 async fn test_state(auth: AuthSettings) -> (AppState, tempfile::TempDir) {
     let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -936,16 +936,16 @@ async fn sweep_expired_uploads_marks_active_and_removes_terminal_sessions() {
     /*
      * Expired active uploads become terminally expired, whereas already failed sessions are
      * deleted outright. Both lose scratch directories and hash-coordinator state, while a
-     * future timestamp in Python's legacy shape remains active.
+     * future canonical UTC timestamp remains active.
      */
     let (state, _temp_dir) = test_state(AuthSettings::default()).await;
     insert_upload_session(&state.db, "active-upload", "active").await;
     insert_upload_session(&state.db, "failed-upload", "failed").await;
     insert_upload_session_with_expiration(
         &state.db,
-        "future-python-timestamp-upload",
+        "future-canonical-timestamp-upload",
         "active",
-        "2999-01-01 00:00:00",
+        "2999-01-01T00:00:00.000000Z",
     )
     .await;
     let transfers_path = state.config.transfers_path();
@@ -984,7 +984,7 @@ async fn sweep_expired_uploads_marks_active_and_removes_terminal_sessions() {
         .expect("failed count");
     let future_status: String =
         sqlx::query_scalar("SELECT status FROM upload_sessions WHERE id = ?")
-            .bind("future-python-timestamp-upload")
+            .bind("future-canonical-timestamp-upload")
             .fetch_one(&state.db)
             .await
             .expect("future status");
@@ -1177,21 +1177,21 @@ async fn sweep_expired_uploads_ignores_stale_status_and_expiration_snapshots() {
         &state.db,
         "driver-upload",
         "active",
-        "1997-01-01T00:00:00Z",
+        "1997-01-01T00:00:00.000000Z",
     )
     .await;
     insert_upload_session_with_expiration(
         &state.db,
         "status-changed-upload",
         "active",
-        "1998-01-01T00:00:00Z",
+        "1998-01-01T00:00:00.000000Z",
     )
     .await;
     insert_upload_session_with_expiration(
         &state.db,
         "renewed-upload",
         "active",
-        "1999-01-01T00:00:00Z",
+        "1999-01-01T00:00:00.000000Z",
     )
     .await;
     insert_upload_session_with_expiration(
@@ -1211,7 +1211,7 @@ async fn sweep_expired_uploads_ignores_stale_status_and_expiration_snapshots() {
             SET status = 'complete'
             WHERE id = 'status-changed-upload';
             UPDATE upload_sessions
-            SET expires_at = '2999-01-01T00:00:00Z'
+            SET expires_at = '2999-01-01T00:00:00.000000Z'
             WHERE id = 'renewed-upload';
             UPDATE upload_sessions
             SET status = 'active'
@@ -1254,7 +1254,7 @@ async fn sweep_expired_uploads_ignores_stale_status_and_expiration_snapshots() {
             (
                 "status-changed-upload".to_string(),
                 "complete".to_string(),
-                "1998-01-01T00:00:00Z".to_string(),
+                "1998-01-01T00:00:00.000000Z".to_string(),
             ),
             (
                 "terminal-changed-upload".to_string(),
@@ -1331,20 +1331,25 @@ async fn sweep_expired_exports_ignores_stale_status_and_expiration_snapshots() {
      * every modified row, temp file, artifact, blob, and object.
      */
     let (state, _temp_dir) = test_state(AuthSettings::default()).await;
-    insert_export_job_with_expiration(&state.db, "driver-export", "queued", "1997-01-01T00:00:00Z")
-        .await;
+    insert_export_job_with_expiration(
+        &state.db,
+        "driver-export",
+        "queued",
+        "1997-01-01T00:00:00.000000Z",
+    )
+    .await;
     insert_export_job_with_expiration(
         &state.db,
         "status-changed-export",
         "running",
-        "1998-01-01T00:00:00Z",
+        "1998-01-01T00:00:00.000000Z",
     )
     .await;
     insert_export_job_with_expiration(
         &state.db,
         "renewed-export",
         "queued",
-        "1999-01-01T00:00:00Z",
+        "1999-01-01T00:00:00.000000Z",
     )
     .await;
     insert_export_job(&state.db, "terminal-changed-export", "complete").await;
@@ -1360,7 +1365,7 @@ async fn sweep_expired_exports_ignores_stale_status_and_expiration_snapshots() {
             SET status = 'complete'
             WHERE id = 'status-changed-export';
             UPDATE export_jobs
-            SET expires_at = '2999-01-01T00:00:00Z'
+            SET expires_at = '2999-01-01T00:00:00.000000Z'
             WHERE id = 'renewed-export';
             UPDATE export_jobs
             SET status = 'cancelled'
@@ -1405,7 +1410,7 @@ async fn sweep_expired_exports_ignores_stale_status_and_expiration_snapshots() {
             (
                 "status-changed-export".to_string(),
                 "complete".to_string(),
-                "1998-01-01T00:00:00Z".to_string(),
+                "1998-01-01T00:00:00.000000Z".to_string(),
             ),
             (
                 "terminal-changed-export".to_string(),

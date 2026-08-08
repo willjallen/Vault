@@ -41,6 +41,7 @@ use crate::state_events::state_event_resources_json;
 use crate::storage::{
     BlobStorageBackend, BlobWriteKind, STORAGE_MULTIPART_MAX_PARTS, StorageError, StoredBlob,
 };
+use crate::timestamps::{TimestampError, format_utc, now_utc};
 
 const MAX_UPLOAD_BYTES: i64 = 5 * 1024 * 1024 * 1024;
 const TRANSFER_CHUNK_BYTES: i64 = 32 * 1024 * 1024;
@@ -251,7 +252,7 @@ pub enum UploadError {
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error(transparent)]
-    TimeFormat(#[from] time::error::Format),
+    Timestamp(#[from] TimestampError),
     #[error(transparent)]
     TimeParse(#[from] time::error::Parse),
 }
@@ -692,10 +693,10 @@ pub async fn create_upload_session(
     };
     let session_dir = upload_session_dir(transfers_path, &session_id)?;
     create_durable_upload_session_dir(transfers_path, &session_dir).await?;
-    let now = now_rfc3339()?;
-    let expires_at = (OffsetDateTime::now_utc()
-        + Duration::seconds(settings.transfer_session_ttl_seconds))
-    .format(&Rfc3339)?;
+    let now = now_utc();
+    let expires_at = format_utc(
+        OffsetDateTime::now_utc() + Duration::seconds(settings.transfer_session_ttl_seconds),
+    )?;
     let mut user_context = serde_json::to_value(user)?;
     if let (Some(identity), Some(context)) = (
         resume_identity_sha256.as_ref(),
@@ -1537,7 +1538,7 @@ pub async fn abort_upload_session(
         .await?
         .ok_or(UploadError::UploadSessionNotFound)?;
     require_transfer_owner(&session, user)?;
-    let now = now_rfc3339()?;
+    let now = now_utc();
     let aborted = sqlx::query(
         r"
         UPDATE upload_sessions
@@ -1691,8 +1692,8 @@ async fn complete_upload_session_after_store(
     )
     .bind(session.total_size)
     .bind(session.total_size)
-    .bind(now_rfc3339()?)
-    .bind(now_rfc3339()?)
+    .bind(now_utc())
+    .bind(now_utc())
     .bind(result.id)
     .bind(&result.version)
     .bind(&result.path)
@@ -1733,17 +1734,15 @@ async fn complete_create_upload_in_tx(
         .await?;
     let inserted = sqlx::query(
         r"
-        INSERT INTO documents
-            (
-                folder_id,
-                name,
-                created_by,
-                created_by_name,
-                latest_modified_by,
-                latest_modified_at
-            )
-        VALUES
-            (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        INSERT INTO documents (
+            folder_id, name, created_by, created_by_name, latest_modified_by, created_at,
+            latest_modified_at
+        )
+        VALUES (
+            ?1, ?2, ?3, ?4, ?5,
+            strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'),
+            strftime('%Y-%m-%dT%H:%M:%f000Z', 'now')
+        )
         ",
     )
     .bind(target_folder.id)
@@ -1886,7 +1885,7 @@ async fn release_checkin_lock_in_tx(
         r"
         UPDATE documents
         SET name = ?,
-            latest_modified_at = CURRENT_TIMESTAMP,
+            latest_modified_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'),
             latest_modified_by = ?
         WHERE id = ?
         ",
@@ -1901,7 +1900,7 @@ async fn release_checkin_lock_in_tx(
         r"
         UPDATE document_locks
         SET is_active = 0,
-            released_at = CURRENT_TIMESTAMP,
+            released_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'),
             released_by = ?
         WHERE id = ?
         ",
@@ -1943,23 +1942,12 @@ async fn create_document_version_in_tx(
     let version_id = new_version_id();
     sqlx::query(
         r"
-        INSERT INTO document_versions
-            (
-                id,
-                document_id,
-                blob_id,
-                version_number,
-                committed_by,
-                committed_by_name,
-                message,
-                mime_type,
-                original_filename,
-                upload_ip,
-                upload_user_agent,
-                created_via
-            )
-        VALUES
-            (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO document_versions (
+            id, document_id, blob_id, version_number, committed_by, committed_by_name,
+            message, mime_type, original_filename, upload_ip, upload_user_agent, created_via,
+            committed_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
         ",
     )
     .bind(&version_id)
@@ -1974,6 +1962,7 @@ async fn create_document_version_in_tx(
     .bind(version.upload_ip)
     .bind(version.upload_user_agent)
     .bind(version.created_via)
+    .bind(now_utc())
     .execute(&mut **transaction)
     .await?;
     enqueue_preview_job_in_tx(transaction, version.blob_id).await?;
@@ -1981,7 +1970,7 @@ async fn create_document_version_in_tx(
         r"
         UPDATE documents
         SET current_version_id = ?,
-            latest_modified_at = CURRENT_TIMESTAMP,
+            latest_modified_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'),
             latest_modified_by = ?,
             latest_version_number = ?,
             version_count = CASE
@@ -2916,9 +2905,19 @@ async fn record_document_event_in_tx(
     sqlx::query(
         r"
         INSERT INTO document_events
-            (document_id, event_type, actor, actor_name, message, result, ip, user_agent)
+            (
+                document_id,
+                event_type,
+                actor,
+                actor_name,
+                message,
+                result,
+                ip,
+                user_agent,
+                created_at
+            )
         VALUES
-            (?, ?, ?, ?, ?, 'ok', ?, ?)
+            (?, ?, ?, ?, ?, 'ok', ?, ?, strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'))
         ",
     )
     .bind(document_id)
@@ -2940,8 +2939,8 @@ async fn record_state_event_in_tx(
 ) -> Result<(), UploadError> {
     sqlx::query(
         r"
-        INSERT INTO state_events (event_type, resources)
-        VALUES (?, ?)
+        INSERT INTO state_events (event_type, resources, created_at)
+        VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'))
         ",
     )
     .bind(event_type)
@@ -2969,7 +2968,7 @@ async fn mark_upload_completing(
     )
     .bind(total_bytes)
     .bind(processed_bytes.clamp(0, total_bytes))
-    .bind(now_rfc3339()?)
+    .bind(now_utc())
     .bind(session_id)
     .execute(pool)
     .await?;
@@ -3031,7 +3030,7 @@ async fn record_upload_verification_progress(
         ",
     )
     .bind(processed_bytes)
-    .bind(now_rfc3339()?)
+    .bind(now_utc())
     .bind(session_id)
     .bind(processed_bytes)
     .execute(pool)
@@ -3055,7 +3054,7 @@ async fn reset_upload_completion_for_retry(
         WHERE id = ? AND status = 'completing'
         ",
     )
-    .bind(now_rfc3339()?)
+    .bind(now_utc())
     .bind(session_id)
     .execute(pool)
     .await?;
@@ -3096,7 +3095,7 @@ async fn ensure_session_not_expired(
     if OffsetDateTime::parse(&session.expires_at, &Rfc3339)? > now {
         return Ok(());
     }
-    let now = now.format(&Rfc3339)?;
+    let now = format_utc(now)?;
     let expired = sqlx::query(
         r"
         UPDATE upload_sessions
@@ -3148,7 +3147,7 @@ async fn mark_upload_failed(
         ",
     )
     .bind(message)
-    .bind(now_rfc3339()?)
+    .bind(now_utc())
     .bind(session_id)
     .execute(pool)
     .await?;
@@ -3583,10 +3582,6 @@ fn trim_to_option(value: Option<&str>) -> Option<String> {
 
 fn default_upload_mode() -> String {
     "create".to_string()
-}
-
-fn now_rfc3339() -> Result<String, UploadError> {
-    Ok(OffsetDateTime::now_utc().format(&Rfc3339)?)
 }
 
 fn new_version_id() -> String {

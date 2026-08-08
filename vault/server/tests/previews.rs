@@ -586,7 +586,13 @@ async fn pruning_releases_derivatives_without_touching_sources_and_expires_old_r
         r"
         INSERT INTO preview_jobs
             (source_blob_id, recipe, status, updated_at, completed_at)
-        VALUES (?, 'raster-obsolete', 'unsupported', '2000-01-01', '2000-01-01')
+        VALUES (
+            ?,
+            'raster-obsolete',
+            'unsupported',
+            '2000-01-01T00:00:00.000000Z',
+            '2000-01-01T00:00:00.000000Z'
+        )
         ",
     )
     .bind(source_blob_id)
@@ -650,7 +656,7 @@ async fn quota_pruning_excludes_document_and_export_rooted_renditions() {
         INSERT INTO export_jobs
             (id, status, filename, total_items, total_bytes, created_by, user_context, expires_at)
         VALUES ('export-preview-root', 'ready', 'rooted.zip', 1, 500, 'admin', '{}',
-                datetime('now', '+1 day'))
+                strftime('%Y-%m-%dT%H:%M:%f000Z', 'now', '+1 day'))
         ",
     )
     .execute(&pool)
@@ -661,7 +667,7 @@ async fn quota_pruning_excludes_document_and_export_rooted_renditions() {
         INSERT INTO export_artifacts
             (job_id, blob_id, filename, mime_type, size_bytes, hash, expires_at)
         VALUES ('export-preview-root', ?, 'rooted.zip', 'application/zip', 500, ?,
-                datetime('now', '+1 day'))
+                strftime('%Y-%m-%dT%H:%M:%f000Z', 'now', '+1 day'))
         ",
     )
     .bind(export_blob_id)
@@ -825,9 +831,9 @@ async fn quota_pruning_does_not_evict_a_job_for_output_still_shared_by_a_live_jo
     )
     .await;
     for (job_id, status, last_accessed_at) in [
-        (job_ids[0], "ready", "2000-01-01 00:00:00"),
-        (job_ids[1], "running", "2000-01-03 00:00:00"),
-        (job_ids[2], "ready", "2000-01-02 00:00:00"),
+        (job_ids[0], "ready", "2000-01-01T00:00:00.000000Z"),
+        (job_ids[1], "running", "2000-01-03T00:00:00.000000Z"),
+        (job_ids[2], "ready", "2000-01-02T00:00:00.000000Z"),
     ] {
         sqlx::query("UPDATE preview_jobs SET status = ?, last_accessed_at = ? WHERE id = ?")
             .bind(status)

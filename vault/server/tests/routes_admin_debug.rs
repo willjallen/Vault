@@ -392,7 +392,7 @@ async fn dev_database_reset_cleans_tracked_upload_resources() {
             )
         VALUES
             (?, 'create', 'active', ?, 'reset.txt', 1, 1, 1,
-             'dev', '{}', '2999-01-01T00:00:00Z')
+             'dev', '{}', '2999-01-01T00:00:00.000000Z')
         ",
     )
     .bind(upload_id)

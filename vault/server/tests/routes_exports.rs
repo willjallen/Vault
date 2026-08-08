@@ -489,8 +489,8 @@ impl BlobStorageBackend for CancelAfterReadStorage {
                                 r"
                     UPDATE export_jobs
                     SET status = 'cancelled',
-                        cancelled_at = CURRENT_TIMESTAMP,
-                        updated_at = CURRENT_TIMESTAMP
+                        cancelled_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'),
+                        updated_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now')
                     WHERE id = ?
                     ",
                             )
@@ -1690,16 +1690,18 @@ async fn export_artifact_location(pool: &sqlx::SqlitePool, job_id: &str) -> (i64
 }
 
 async fn expire_export_job_and_artifacts(pool: &sqlx::SqlitePool, job_id: &str) {
-    sqlx::query("UPDATE export_jobs SET expires_at = '2001-01-01T00:00:00Z' WHERE id = ?")
+    sqlx::query("UPDATE export_jobs SET expires_at = '2001-01-01T00:00:00.000000Z' WHERE id = ?")
         .bind(job_id)
         .execute(pool)
         .await
         .expect("expire export job");
-    sqlx::query("UPDATE export_artifacts SET expires_at = '2001-01-01T00:00:00Z' WHERE job_id = ?")
-        .bind(job_id)
-        .execute(pool)
-        .await
-        .expect("expire export artifact");
+    sqlx::query(
+        "UPDATE export_artifacts SET expires_at = '2001-01-01T00:00:00.000000Z' WHERE job_id = ?",
+    )
+    .bind(job_id)
+    .execute(pool)
+    .await
+    .expect("expire export artifact");
 }
 
 async fn assert_expired_export_swept(
@@ -3362,7 +3364,7 @@ async fn export_routes_hide_other_users_jobs_and_cancel_queued_jobs() {
         INSERT INTO export_jobs
             (id, status, filename, total_items, created_by, created_by_name, user_context, expires_at)
         VALUES
-            ('queued-export', 'queued', 'queued.zip', 1, '42', 'owner', '{}', '2999-01-01T00:00:00Z')
+            ('queued-export', 'queued', 'queued.zip', 1, '42', 'owner', '{}', '2999-01-01T00:00:00.000000Z')
         ",
     )
     .execute(&state.db)
@@ -3937,7 +3939,7 @@ async fn concurrent_dispatcher_workers_claim_each_queued_job_once() {
                     request_payload,
                     expires_at
                 )
-            VALUES (?, 'queued', 'claim.zip', 1, 18, ?, ?, ?, ?, '2999-01-01T00:00:00Z')
+            VALUES (?, 'queued', 'claim.zip', 1, 18, ?, ?, ?, ?, '2999-01-01T00:00:00.000000Z')
             ",
         )
         .bind(format!("atomic-claim-{index:02}"))

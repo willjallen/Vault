@@ -169,7 +169,7 @@ async fn state_event_compaction_uses_the_newer_age_or_count_boundary() {
             insert_state_event(&state.db, &format!("test.aged.{index}"), r#"["contents"]"#).await,
         );
     }
-    sqlx::query("UPDATE state_events SET created_at = '2000-01-01 00:00:00' WHERE id <= ?")
+    sqlx::query("UPDATE state_events SET created_at = '2000-01-01T00:00:00.000000Z' WHERE id <= ?")
         .bind(event_ids[3])
         .execute(&state.db)
         .await

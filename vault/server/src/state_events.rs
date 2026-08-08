@@ -148,7 +148,7 @@ pub async fn compact_state_events_with_policy(
         SELECT MAX(id)
         FROM state_events
         WHERE event_type <> ?
-          AND created_at < datetime('now', ?)
+          AND datetime(created_at) < datetime('now', ?)
         ",
     )
     .bind(STATE_EVENT_COMPACTED_TYPE)
@@ -221,8 +221,8 @@ pub async fn record_state_event(
     }
     sqlx::query(
         r"
-        INSERT INTO state_events (event_type, resources)
-        VALUES (?, ?)
+        INSERT INTO state_events (event_type, resources, created_at)
+        VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'))
         ",
     )
     .bind(event_type)
@@ -243,8 +243,8 @@ pub async fn record_state_event_in_tx(
     }
     sqlx::query(
         r"
-        INSERT INTO state_events (event_type, resources)
-        VALUES (?, ?)
+        INSERT INTO state_events (event_type, resources, created_at)
+        VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'))
         ",
     )
     .bind(event_type)
@@ -259,8 +259,8 @@ pub(crate) async fn replace_state_events_with_compaction_marker_in_tx(
 ) -> Result<i64, sqlx::Error> {
     let result = sqlx::query(
         r"
-        INSERT INTO state_events (event_type, resources)
-        VALUES (?, ?)
+        INSERT INTO state_events (event_type, resources, created_at)
+        VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'))
         ",
     )
     .bind(STATE_EVENT_COMPACTED_TYPE)

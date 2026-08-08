@@ -7,8 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{FromRow, SqlitePool};
 use thiserror::Error;
-use time::format_description::well_known::Rfc3339;
-use time::{OffsetDateTime, PrimitiveDateTime, UtcOffset};
+use time::OffsetDateTime;
 
 use crate::auth::UserContext;
 use crate::documents::{
@@ -26,6 +25,7 @@ use crate::preferences::{PreferenceError, preferences_for_user};
 use crate::previews::{self, PreviewError, VisualPayload, VisualSource};
 use crate::root_folders::VAULT_PUBLIC_NAME;
 use crate::site_settings::{SiteSettingsError, site_settings_for_db};
+use crate::timestamps::{canonicalize, parse_utc};
 use crate::version::{ReleaseNotesSection, app_version, changelog_release_notes};
 
 const SIZE_UNITS: [(&str, i128); 4] = [
@@ -3489,58 +3489,11 @@ fn python_title(value: &str) -> String {
 
 fn payload_timestamp(timestamp: Option<&str>) -> Option<String> {
     let timestamp = timestamp.filter(|value| !value.trim().is_empty())?;
-    Some(
-        parse_utc_timestamp(timestamp).map_or_else(|| timestamp.to_string(), format_python_iso_utc),
-    )
+    Some(canonicalize(timestamp).unwrap_or_else(|_| timestamp.to_string()))
 }
 
 fn payload_datetime_iso(timestamp: Option<&str>) -> Option<String> {
-    let timestamp = timestamp.filter(|value| !value.trim().is_empty())?;
-    if let Ok(parsed) = OffsetDateTime::parse(timestamp.trim(), &Rfc3339) {
-        return Some(format_python_iso_utc(parsed));
-    }
-    Some(
-        parse_utc_timestamp(timestamp)
-            .map_or_else(|| timestamp.to_string(), format_python_naive_iso_utc),
-    )
-}
-
-fn format_python_iso_utc(timestamp: OffsetDateTime) -> String {
-    let timestamp = timestamp.to_offset(UtcOffset::UTC);
-    let base = format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
-        timestamp.year(),
-        timestamp.month() as u8,
-        timestamp.day(),
-        timestamp.hour(),
-        timestamp.minute(),
-        timestamp.second(),
-    );
-    let nanosecond = timestamp.nanosecond();
-    if nanosecond == 0 {
-        return format!("{base}+00:00");
-    }
-    let microsecond = nanosecond / 1_000;
-    format!("{base}.{microsecond:06}+00:00")
-}
-
-fn format_python_naive_iso_utc(timestamp: OffsetDateTime) -> String {
-    let timestamp = timestamp.to_offset(UtcOffset::UTC);
-    let base = format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
-        timestamp.year(),
-        timestamp.month() as u8,
-        timestamp.day(),
-        timestamp.hour(),
-        timestamp.minute(),
-        timestamp.second(),
-    );
-    let nanosecond = timestamp.nanosecond();
-    if nanosecond == 0 {
-        return base;
-    }
-    let microsecond = nanosecond / 1_000;
-    format!("{base}.{microsecond:06}")
+    payload_timestamp(timestamp)
 }
 
 fn timestamp_is_later(candidate: Option<&str>, latest: Option<&str>) -> bool {
@@ -3559,27 +3512,7 @@ fn timestamp_is_later(candidate: Option<&str>, latest: Option<&str>) -> bool {
 }
 
 fn parse_utc_timestamp(timestamp: &str) -> Option<OffsetDateTime> {
-    let trimmed = timestamp.trim();
-    if let Ok(parsed) = OffsetDateTime::parse(trimmed, &Rfc3339) {
-        return Some(parsed.to_offset(UtcOffset::UTC));
-    }
-    parse_sqlite_timestamp(trimmed, "[year]-[month]-[day] [hour]:[minute]:[second]")
-        .or_else(|| {
-            parse_sqlite_timestamp(
-                trimmed,
-                "[year]-[month]-[day] [hour]:[minute]:[second].[subsecond]",
-            )
-        })
-        .or_else(|| {
-            parse_sqlite_timestamp(trimmed, "[year]-[month]-[day]T[hour]:[minute]:[second]")
-        })
-}
-
-fn parse_sqlite_timestamp(timestamp: &str, format: &str) -> Option<OffsetDateTime> {
-    let description = time::format_description::parse_borrowed::<1>(format).ok()?;
-    PrimitiveDateTime::parse(timestamp, &description)
-        .ok()
-        .map(PrimitiveDateTime::assume_utc)
+    parse_utc(timestamp).ok()
 }
 
 fn month_name(timestamp: OffsetDateTime) -> &'static str {

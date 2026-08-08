@@ -480,11 +480,11 @@ async fn admin_group_routes_allow_bootstrap_admin_email_without_stored_admin_fla
 }
 
 #[tokio::test]
-async fn admin_directory_user_timestamps_use_python_datetime_iso_shape() {
+async fn admin_directory_user_timestamps_use_canonical_utc_shape() {
     /*
-     * Directory serialization receives SQLite timestamps in space-separated, UTC-Z, and
-     * explicit-offset forms with fractional seconds. All are returned in the ISO shapes used
-     * by the Python implementation, preserving precision and offsets.
+     * Seeds each user timestamp with the persisted fixed-width UTC representation. Directory
+     * serialization must return that same canonical shape without dropping microseconds or the
+     * explicit UTC marker needed for local-time rendering in the client.
      */
     let (state, _temp_dir) = test_state().await;
     sqlx::query(
@@ -509,9 +509,9 @@ async fn admin_directory_user_timestamps_use_python_datetime_iso_shape() {
                 'Artist',
                 0,
                 1,
-                '2026-06-26 19:03:00.123456',
-                '2026-06-26T19:04:00Z',
-                '2026-06-26T19:05:00.654321+00:00'
+                '2026-06-26T19:03:00.123456Z',
+                '2026-06-26T19:04:00.000000Z',
+                '2026-06-26T19:05:00.654321Z'
             )
         ",
     )
@@ -529,9 +529,9 @@ async fn admin_directory_user_timestamps_use_python_datetime_iso_shape() {
     let artist = user_named(&json, "artist");
 
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(artist["created_at"], "2026-06-26T19:03:00.123456");
-    assert_eq!(artist["last_login_at"], "2026-06-26T19:04:00+00:00");
-    assert_eq!(artist["last_seen_at"], "2026-06-26T19:05:00.654321+00:00",);
+    assert_eq!(artist["created_at"], "2026-06-26T19:03:00.123456Z");
+    assert_eq!(artist["last_login_at"], "2026-06-26T19:04:00.000000Z");
+    assert_eq!(artist["last_seen_at"], "2026-06-26T19:05:00.654321Z",);
 }
 
 #[tokio::test]

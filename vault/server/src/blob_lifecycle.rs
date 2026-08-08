@@ -115,7 +115,7 @@ impl PendingBlobPublication {
                     match sqlx::query(
                         r"
                         UPDATE blob_locations
-                        SET created_at = CURRENT_TIMESTAMP
+                        SET created_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now')
                         WHERE id = ? AND blob_id = ? AND backend = ? AND bucket = ? AND object_key = ?
                         ",
                     )
@@ -270,8 +270,8 @@ pub async fn begin_blob_publication(
     );
     let lease_id = sqlx::query(
         r"
-        INSERT INTO blob_locations (blob_id, backend, bucket, object_key)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO blob_locations (blob_id, backend, bucket, object_key, created_at)
+        VALUES (?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'))
         ",
     )
     .bind(blob_id)
@@ -544,15 +544,23 @@ pub(crate) async fn collect_untracked_blob_object(
     }
 
     let reservation = Uuid::new_v4().simple().to_string();
-    let blob_id = sqlx::query("INSERT INTO blobs (hash_algo, hash, size_bytes) VALUES (?, ?, 0)")
-        .bind(UNTRACKED_RESERVATION_HASH_ALGO)
-        .bind(&reservation)
-        .execute(&mut *transaction)
-        .await?
-        .last_insert_rowid();
+    let blob_id = sqlx::query(
+        r"
+        INSERT INTO blobs (hash_algo, hash, size_bytes, created_at)
+        VALUES (?, ?, 0, strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'))
+        ",
+    )
+    .bind(UNTRACKED_RESERVATION_HASH_ALGO)
+    .bind(&reservation)
+    .execute(&mut *transaction)
+    .await?
+    .last_insert_rowid();
     let deleting_backend = format!("{DELETING_BACKEND_PREFIX}{reservation}:{}", storage.name());
     sqlx::query(
-        "INSERT INTO blob_locations (blob_id, backend, bucket, object_key) VALUES (?, ?, ?, ?)",
+        r"
+        INSERT INTO blob_locations (blob_id, backend, bucket, object_key, created_at)
+        VALUES (?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'))
+        ",
     )
     .bind(blob_id)
     .bind(deleting_backend)
@@ -736,7 +744,7 @@ async fn collect_blob_candidate(
         let claimed = sqlx::query(
             r"
             UPDATE blob_locations
-            SET backend = ?, created_at = CURRENT_TIMESTAMP
+            SET backend = ?, created_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now')
             WHERE id = ? AND blob_id = ? AND backend = ?
             ",
         )
@@ -800,7 +808,7 @@ async fn collect_blob_candidate(
         delete_blob_if_empty_in_tx(&mut finalization, blob_id).await?
     } else {
         sqlx::query(
-            "UPDATE blob_locations SET created_at = CURRENT_TIMESTAMP WHERE id = ? AND backend = ?",
+            "UPDATE blob_locations SET created_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now') WHERE id = ? AND backend = ?",
         )
         .bind(location.id)
         .bind(&deleting_backend)
@@ -867,8 +875,8 @@ async fn get_or_create_blob_in_tx(
         i64::try_from(stored.size_bytes).map_err(|_| BlobLifecycleError::BlobSizeOutOfRange)?;
     sqlx::query(
         r"
-        INSERT OR IGNORE INTO blobs (hash_algo, hash, size_bytes)
-        VALUES (?, ?, ?)
+        INSERT OR IGNORE INTO blobs (hash_algo, hash, size_bytes, created_at)
+        VALUES (?, ?, ?, strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'))
         ",
     )
     .bind(&stored.hash_algo)
@@ -921,8 +929,9 @@ async fn insert_canonical_location_in_tx(
     ensure_location_available_in_tx(transaction, blob_id, stored).await?;
     sqlx::query(
         r"
-        INSERT OR IGNORE INTO blob_locations (blob_id, backend, bucket, object_key)
-        VALUES (?, ?, ?, ?)
+        INSERT OR IGNORE INTO blob_locations
+            (blob_id, backend, bucket, object_key, created_at)
+        VALUES (?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'))
         ",
     )
     .bind(blob_id)

@@ -45,11 +45,11 @@ pub async fn update_admin_site_settings(
         sqlx::query(
             r"
             INSERT INTO vault_settings (key, value, updated_at)
-            VALUES (?, ?, CURRENT_TIMESTAMP)
+            VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'))
             ON CONFLICT(key)
             DO UPDATE SET
                 value = excluded.value,
-                updated_at = CURRENT_TIMESTAMP
+                updated_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now')
             ",
         )
         .bind(key)
@@ -59,8 +59,12 @@ pub async fn update_admin_site_settings(
     }
     sqlx::query(
         r"
-        INSERT INTO state_events (event_type, resources)
-        VALUES ('admin.settings.updated', ?)
+        INSERT INTO state_events (event_type, resources, created_at)
+        VALUES (
+            'admin.settings.updated',
+            ?,
+            strftime('%Y-%m-%dT%H:%M:%f000Z', 'now')
+        )
         ",
     )
     .bind(state_event_resources_json(&["admin", "settings"]))

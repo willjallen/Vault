@@ -715,8 +715,14 @@ pub async fn enqueue_preview_job_in_tx(
 ) -> Result<bool, sqlx::Error> {
     Ok(sqlx::query(
         r"
-        INSERT OR IGNORE INTO preview_jobs (source_blob_id, recipe, status)
-        VALUES (?, ?, 'queued')
+        INSERT OR IGNORE INTO preview_jobs (
+            source_blob_id, recipe, status, created_at, updated_at
+        )
+        VALUES (
+            ?1, ?2, 'queued',
+            strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'),
+            strftime('%Y-%m-%dT%H:%M:%f000Z', 'now')
+        )
         ",
     )
     .bind(source_blob_id)
@@ -746,8 +752,14 @@ pub async fn enqueue_preview_jobs(
     let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
     let inserted = sqlx::query(
         r"
-        INSERT OR IGNORE INTO preview_jobs (source_blob_id, recipe, status)
-        SELECT DISTINCT CAST(value AS INTEGER), ?, 'queued'
+        INSERT OR IGNORE INTO preview_jobs
+            (source_blob_id, recipe, status, created_at, updated_at)
+        SELECT DISTINCT
+            CAST(value AS INTEGER),
+            ?,
+            'queued',
+            strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'),
+            strftime('%Y-%m-%dT%H:%M:%f000Z', 'now')
         FROM json_each(?)
         ",
     )
@@ -765,7 +777,7 @@ pub async fn enqueue_preview_jobs(
             lease_expires_at = NULL,
             next_attempt_at = NULL,
             completed_at = NULL,
-            updated_at = CURRENT_TIMESTAMP,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'),
             last_error_code = NULL,
             last_error_detail = NULL
         WHERE recipe = ?
@@ -922,7 +934,7 @@ pub async fn recover_interrupted_jobs(pool: &SqlitePool) -> Result<u64, PreviewE
             lease_token = NULL,
             lease_expires_at = NULL,
             next_attempt_at = NULL,
-            updated_at = CURRENT_TIMESTAMP,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'),
             last_error_code = 'worker_interrupted'
         WHERE status = 'running'
           AND (lease_expires_at IS NULL OR datetime(lease_expires_at) <= datetime('now'))
@@ -970,7 +982,7 @@ pub async fn rendition_for_source(
     sqlx::query(
         r"
         UPDATE preview_jobs
-        SET last_accessed_at = CURRENT_TIMESTAMP
+        SET last_accessed_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now')
         WHERE source_blob_id = ? AND recipe = ?
           AND (
               last_accessed_at IS NULL
@@ -1038,7 +1050,7 @@ pub async fn requeue_rendition_blob(
             lease_expires_at = NULL,
             next_attempt_at = NULL,
             completed_at = NULL,
-            updated_at = CURRENT_TIMESTAMP,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'),
             last_error_code = 'rendition_unavailable',
             last_error_detail = NULL
         WHERE id IN (SELECT CAST(value AS INTEGER) FROM json_each(?))
@@ -1370,9 +1382,9 @@ async fn claim_preview_job(pool: &SqlitePool) -> Result<Option<ClaimedPreviewJob
         SET status = 'running',
             attempt_count = attempt_count + 1,
             lease_token = ?,
-            lease_expires_at = datetime('now', ?),
+            lease_expires_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now', ?),
             next_attempt_at = NULL,
-            updated_at = CURRENT_TIMESTAMP,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'),
             last_error_code = NULL,
             last_error_detail = NULL
         WHERE id = ?
@@ -1663,9 +1675,13 @@ async fn publish_renditions(
                 .await?;
             sqlx::query(
                 r"
-                INSERT INTO preview_renditions
-                    (preview_job_id, variant, blob_id, mime_type, width, height)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO preview_renditions (
+                    preview_job_id, variant, blob_id, mime_type, width, height, created_at
+                )
+                VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6,
+                    strftime('%Y-%m-%dT%H:%M:%f000Z', 'now')
+                )
                 ",
             )
             .bind(job.id)
@@ -1690,8 +1706,8 @@ async fn publish_renditions(
                 lease_token = NULL,
                 lease_expires_at = NULL,
                 next_attempt_at = NULL,
-                completed_at = CURRENT_TIMESTAMP,
-                updated_at = CURRENT_TIMESTAMP,
+                completed_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'),
                 last_error_code = NULL,
                 last_error_detail = NULL
             WHERE id = ? AND status = 'running' AND lease_token = ?
@@ -1719,7 +1735,9 @@ async fn renew_job_lease(pool: &SqlitePool, job: &ClaimedPreviewJob) -> Result<(
     let updated = sqlx::query(
         r"
         UPDATE preview_jobs
-        SET lease_expires_at = datetime('now', ?), updated_at = CURRENT_TIMESTAMP
+        SET
+            lease_expires_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now', ?),
+            updated_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now')
         WHERE id = ? AND status = 'running' AND lease_token = ?
         ",
     )
@@ -1751,8 +1769,8 @@ async fn mark_job_unsupported(
             lease_token = NULL,
             lease_expires_at = NULL,
             next_attempt_at = NULL,
-            completed_at = CURRENT_TIMESTAMP,
-            updated_at = CURRENT_TIMESTAMP,
+            completed_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'),
+            updated_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'),
             last_error_code = ?,
             last_error_detail = NULL
         WHERE id = ? AND status = 'running' AND lease_token = ?
@@ -1809,9 +1827,12 @@ async fn finish_job_after_error(
         SET status = 'failed',
             lease_token = NULL,
             lease_expires_at = NULL,
-            next_attempt_at = CASE WHEN ? THEN datetime('now', ?) ELSE NULL END,
-            updated_at = CURRENT_TIMESTAMP,
-            completed_at = CASE WHEN ? THEN NULL ELSE CURRENT_TIMESTAMP END,
+            next_attempt_at = CASE
+                WHEN ? THEN strftime('%Y-%m-%dT%H:%M:%f000Z', 'now', ?)
+                ELSE NULL
+            END,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'),
+            completed_at = CASE WHEN ? THEN NULL ELSE strftime('%Y-%m-%dT%H:%M:%f000Z', 'now') END,
             last_error_code = ?,
             last_error_detail = ?
         WHERE id = ? AND status = 'running' AND lease_token = ?

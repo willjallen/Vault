@@ -254,7 +254,7 @@ async fn insert_active_create_upload(pool: &sqlx::SqlitePool, id: &str, folder_p
             )
         VALUES
             (?, 'create', 'active', ?, ?, 'pending.txt', 1, 1, 1,
-             'writer', 'Writer', '{}', '2999-01-01T00:00:00Z')
+             'writer', 'Writer', '{}', '2999-01-01T00:00:00.000000Z')
         ",
     )
     .bind(id)
@@ -990,7 +990,7 @@ async fn folder_contents_rejects_visible_inconsistent_current_version_metadata()
         &state.db,
         project.id,
         "corrupt.txt",
-        "2026-06-26T18:00:00Z",
+        "2026-06-26T18:00:00.000000Z",
         "Author",
     )
     .await;
@@ -1269,7 +1269,7 @@ async fn recursive_search_does_not_double_count_overlapping_folder_summaries() {
         &state.db,
         parent.id,
         "parent.txt",
-        "2026-01-01T00:00:00Z",
+        "2026-01-01T00:00:00.000000Z",
         "Parent Author",
     )
     .await;
@@ -1277,7 +1277,7 @@ async fn recursive_search_does_not_double_count_overlapping_folder_summaries() {
         &state.db,
         child.id,
         "child.txt",
-        "2026-01-02T00:00:00Z",
+        "2026-01-02T00:00:00.000000Z",
         "Child Author",
     )
     .await;
@@ -1344,7 +1344,7 @@ async fn folder_summaries_exclude_hidden_descendants_and_include_deeper_reopened
         &state.db,
         container.id,
         "container.txt",
-        "2026-01-01T00:00:00Z",
+        "2026-01-01T00:00:00.000000Z",
         "Container Author",
     )
     .await;
@@ -1352,7 +1352,7 @@ async fn folder_summaries_exclude_hidden_descendants_and_include_deeper_reopened
         &state.db,
         hidden.id,
         "hidden.txt",
-        "2026-01-03T00:00:00Z",
+        "2026-01-03T00:00:00.000000Z",
         "Hidden Author",
     )
     .await;
@@ -1360,7 +1360,7 @@ async fn folder_summaries_exclude_hidden_descendants_and_include_deeper_reopened
         &state.db,
         reopened.id,
         "reopened.txt",
-        "2026-01-02T00:00:00Z",
+        "2026-01-02T00:00:00.000000Z",
         "Reopened Author",
     )
     .await;
@@ -1385,7 +1385,7 @@ async fn folder_summaries_exclude_hidden_descendants_and_include_deeper_reopened
     assert_eq!(status, StatusCode::OK);
     assert_eq!(container_row["size_bytes"], 12);
     assert_eq!(container_row["latest_by"], "Reopened Author");
-    assert_eq!(container_row["modified_at"], "2026-01-02T00:00:00+00:00");
+    assert_eq!(container_row["modified_at"], "2026-01-02T00:00:00.000000Z");
 }
 
 #[tokio::test]
@@ -1477,7 +1477,7 @@ async fn folder_contents_ignores_inconsistent_documents_outside_the_requested_sc
         &state.db,
         sibling.id,
         "corrupt-sibling.txt",
-        "2026-06-26T18:00:00Z",
+        "2026-06-26T18:00:00.000000Z",
         "Author",
     )
     .await;
@@ -1613,7 +1613,7 @@ async fn folder_contents_and_properties_default_to_vault_root() {
         &state.db,
         root_id,
         "root.txt",
-        "2026-06-26T18:00:00Z",
+        "2026-06-26T18:00:00.000000Z",
         "Root Author",
     )
     .await;
@@ -1621,7 +1621,7 @@ async fn folder_contents_and_properties_default_to_vault_root() {
         &state.db,
         project.id,
         "project.txt",
-        "2026-06-26T19:00:00Z",
+        "2026-06-26T19:00:00.000000Z",
         "Project Author",
     )
     .await;
@@ -1690,7 +1690,7 @@ async fn seed_payload_shape_fixture(state: &AppState) -> PayloadShapeFixture {
         &state.db,
         project.id,
         "project-overview.txt",
-        "2026-06-26T18:00:00Z",
+        "2026-06-26T18:00:00.000000Z",
         "Project Author",
     )
     .await;
@@ -1698,7 +1698,7 @@ async fn seed_payload_shape_fixture(state: &AppState) -> PayloadShapeFixture {
         &state.db,
         assets.id,
         "asset.txt",
-        "2026-06-26 19:03:00",
+        "2026-06-26T19:03:00.000000Z",
         "Asset Author",
     )
     .await;
@@ -1793,7 +1793,7 @@ fn assert_folder_summary_payload_shape(folder_row: &Value) {
     assert_eq!(folder_row["color"], "#445566");
     assert_eq!(folder_row["icon"], "palette");
     assert_eq!(folder_row["latest_by"], "Asset Author");
-    assert_eq!(folder_row["modified_at"], "2026-06-26T19:03:00+00:00");
+    assert_eq!(folder_row["modified_at"], "2026-06-26T19:03:00.000000Z");
     assert_eq!(folder_row["modified_display"], "Jun 26, 2026 at 7:03 pm");
     assert_eq!(folder_row["size_bytes"], 6);
     assert_eq!(folder_row["size_display"], "6 B");
@@ -1849,7 +1849,7 @@ fn assert_document_row_payload_shape(document_row: &Value, document_id: i64) {
     assert_eq!(document_row["archived_from_folder"], "");
     assert_eq!(document_row["archived_original_name"], "");
     assert_eq!(document_row["archived_original_path"], "");
-    assert_eq!(document_row["modified_at"], "2026-06-26T18:00:00+00:00");
+    assert_eq!(document_row["modified_at"], "2026-06-26T18:00:00.000000Z");
     assert_eq!(document_row["modified_display"], "Jun 26, 2026 at 6:00 pm");
     assert_eq!(document_row["latest_by"], "Project Author");
     assert_eq!(document_row["latest_message"], "Uploaded display asset");
@@ -1916,11 +1916,11 @@ async fn folder_sidebar_and_contents_payloads_expose_python_compatible_shape() {
 }
 
 #[tokio::test]
-async fn folder_contents_and_properties_use_python_modified_display_format() {
+async fn folder_contents_and_properties_return_canonical_utc_timestamps() {
     /*
-     * RFC3339 and SQLite-style source timestamps must normalize to the same UTC ISO value and
-     * Python-compatible display text. The formatting and latest-author calculation must
-     * agree across child summaries, document rows, and folder properties.
+     * Canonical UTC timestamps must remain identical across child summaries, document rows, and
+     * folder properties while their compatibility display text and latest-author calculation
+     * continue to agree.
      */
     let (state, _temp_dir) = test_state().await;
     let readers = create_group(&state.db, "readers").await;
@@ -1946,7 +1946,7 @@ async fn folder_contents_and_properties_use_python_modified_display_format() {
         &state.db,
         concept.id,
         "rfc.txt",
-        "2026-06-26T18:00:00Z",
+        "2026-06-26T18:00:00.000000Z",
         "Rfc Author",
     )
     .await;
@@ -1954,7 +1954,7 @@ async fn folder_contents_and_properties_use_python_modified_display_format() {
         &state.db,
         concept.id,
         "clock.txt",
-        "2026-06-26 19:03:00",
+        "2026-06-26T19:03:00.000000Z",
         "Sqlite Author",
     )
     .await;
@@ -1976,7 +1976,7 @@ async fn folder_contents_and_properties_use_python_modified_display_format() {
     );
     assert_eq!(
         project_json["folders"][0]["modified_at"],
-        "2026-06-26T19:03:00+00:00",
+        "2026-06-26T19:03:00.000000Z",
     );
     assert_eq!(project_json["folders"][0]["latest_by"], "Sqlite Author");
 
@@ -1996,7 +1996,7 @@ async fn folder_contents_and_properties_use_python_modified_display_format() {
     );
     assert_eq!(
         concept_json["documents"][0]["modified_at"],
-        "2026-06-26T19:03:00+00:00",
+        "2026-06-26T19:03:00.000000Z",
     );
 
     let properties = app
@@ -2012,7 +2012,10 @@ async fn folder_contents_and_properties_use_python_modified_display_format() {
         properties_json["modified_display"],
         "Jun 26, 2026 at 7:03 pm",
     );
-    assert_eq!(properties_json["modified_at"], "2026-06-26T19:03:00+00:00",);
+    assert_eq!(
+        properties_json["modified_at"],
+        "2026-06-26T19:03:00.000000Z",
+    );
     assert_eq!(properties_json["latest_by"], "Sqlite Author");
     assert!(properties_json.get("access").is_none());
 }
@@ -2070,12 +2073,11 @@ async fn folder_properties_hide_inaccessible_descendant_stats() {
 }
 
 #[tokio::test]
-async fn folder_and_document_created_timestamps_use_python_datetime_iso_shape() {
+async fn folder_and_document_created_timestamps_use_canonical_utc_shape() {
     /*
-     * Naive SQLite timestamps with fractional seconds must be emitted in the same ISO shape as
-     * the Python service for folders, documents, and history. Empty display names and
-     * messages fall back to stable actor and event values while modified timestamps retain their
-     * UTC offset.
+     * Fixed-width UTC timestamps with fractional seconds must be emitted unchanged for folders,
+     * documents, and history. Empty display names and messages still fall back to stable actor
+     * and event values.
      */
     let (state, _temp_dir) = test_state().await;
     grant_writer_roots(&state.db).await;
@@ -2086,7 +2088,7 @@ async fn folder_and_document_created_timestamps_use_python_datetime_iso_shape() 
         &state.db,
         project.id,
         "plan.txt",
-        "2026-06-26 19:03:00",
+        "2026-06-26T19:03:00.000000Z",
         "Author",
     )
     .await;
@@ -2094,7 +2096,7 @@ async fn folder_and_document_created_timestamps_use_python_datetime_iso_shape() 
         r"
         UPDATE folders
         SET
-            created_at = '2026-06-26 17:00:00.654321',
+            created_at = '2026-06-26T17:00:00.654321Z',
             created_by = 'folder-creator',
             created_by_name = ''
         WHERE id = ?
@@ -2107,7 +2109,7 @@ async fn folder_and_document_created_timestamps_use_python_datetime_iso_shape() 
     sqlx::query(
         r"
         UPDATE documents
-        SET created_at = '2026-06-26 18:01:02.123456'
+        SET created_at = '2026-06-26T18:01:02.123456Z'
         WHERE id = ?
         ",
     )
@@ -2120,7 +2122,7 @@ async fn folder_and_document_created_timestamps_use_python_datetime_iso_shape() 
         INSERT INTO folder_events
             (folder_id, event_type, created_at, actor, actor_name, message)
         VALUES
-            (?, 'metadata', '2026-06-26 17:30:00', 'folder-actor', '', '')
+            (?, 'metadata', '2026-06-26T17:30:00.000000Z', 'folder-actor', '', '')
         ",
     )
     .bind(project.id)
@@ -2141,11 +2143,11 @@ async fn folder_and_document_created_timestamps_use_python_datetime_iso_shape() 
     let contents_json = response_json(contents).await;
     assert_eq!(
         contents_json["documents"][0]["created_at"],
-        "2026-06-26T18:01:02.123456",
+        "2026-06-26T18:01:02.123456Z",
     );
     assert_eq!(
         contents_json["documents"][0]["modified_at"],
-        "2026-06-26T19:03:00+00:00",
+        "2026-06-26T19:03:00.000000Z",
     );
 
     let properties = app
@@ -2157,13 +2159,13 @@ async fn folder_and_document_created_timestamps_use_python_datetime_iso_shape() 
         .await
         .expect("properties");
     let properties_json = response_json(properties).await;
-    assert_eq!(properties_json["created_at"], "2026-06-26T17:00:00.654321",);
+    assert_eq!(properties_json["created_at"], "2026-06-26T17:00:00.654321Z",);
     assert_eq!(properties_json["created_by_name"], "folder-creator");
     assert_eq!(properties_json["history"][0]["by"], "folder-actor");
     assert_eq!(properties_json["history"][0]["message"], "metadata");
     assert_eq!(
         properties_json["history"][0]["timestamp"],
-        "2026-06-26T17:30:00"
+        "2026-06-26T17:30:00.000000Z"
     );
 }
 
@@ -2546,6 +2548,8 @@ async fn folder_retention_put_reapplies_subtree_policy() {
      * throughout its subtree. Descendant payloads report the inherited policy, and the
      * mutation records history plus all state resources affected by the expiry change.
      */
+    const MODIFIED_AT: &str = "2026-06-01T00:00:00.000000Z";
+
     let (state, _temp_dir) = test_state().await;
     let writers = create_group(&state.db, "writers").await;
     let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
@@ -2560,8 +2564,7 @@ async fn folder_retention_put_reapplies_subtree_policy() {
     let concept = get_or_create_folder_path(&state.db, Some("Project/Concept"))
         .await
         .expect("concept");
-    let doc_id =
-        insert_document_modified(&state.db, concept.id, "sketch.png", "2026-06-01 00:00:00").await;
+    let doc_id = insert_document_modified(&state.db, concept.id, "sketch.png", MODIFIED_AT).await;
     let pool = state.db.clone();
     let app = http::router(state);
 
@@ -2600,7 +2603,7 @@ async fn folder_retention_put_reapplies_subtree_policy() {
     .fetch_one(&pool)
     .await
     .expect("stored doc");
-    assert_eq!(stored_doc.0, "2026-07-01 00:00:00");
+    assert_eq!(stored_doc.0, "2026-07-01T00:00:00.000000Z");
     assert_eq!(stored_doc.1, "archive");
 
     let state_event = sqlx::query_as::<_, (String, String)>(
@@ -2648,7 +2651,7 @@ async fn folder_retention_put_reapplies_subtree_policy() {
     assert_eq!(child_json["documents"][0]["expiry_action"], "archive");
     assert_eq!(
         child_json["documents"][0]["expires_at"],
-        "2026-07-01T00:00:00+00:00"
+        "2026-07-01T00:00:00.000000Z"
     );
 }
 
@@ -2673,8 +2676,13 @@ async fn folder_retention_put_clears_policy_and_document_expiry() {
     let concept = get_or_create_folder_path(&state.db, Some("Project/Concept"))
         .await
         .expect("concept");
-    let doc_id =
-        insert_document_modified(&state.db, concept.id, "sketch.png", "2026-06-01 00:00:00").await;
+    let doc_id = insert_document_modified(
+        &state.db,
+        concept.id,
+        "sketch.png",
+        "2026-06-01T00:00:00.000000Z",
+    )
+    .await;
     sqlx::query(
         "UPDATE folders SET default_ttl_days = 30, default_ttl_action = 'archive' WHERE id = ?",
     )
@@ -2683,7 +2691,7 @@ async fn folder_retention_put_clears_policy_and_document_expiry() {
     .await
     .expect("seed project ttl");
     sqlx::query(
-        "UPDATE documents SET expires_at = '2026-07-01 00:00:00', expiry_action = 'archive' WHERE id = ?",
+        "UPDATE documents SET expires_at = '2026-07-01T00:00:00.000000Z', expiry_action = 'archive' WHERE id = ?",
     )
     .bind(doc_id)
     .execute(&state.db)
@@ -2869,8 +2877,13 @@ async fn folder_retention_put_rejects_inaccessible_descendants_without_mutating(
     add_folder_permission(&state.db, private.id, confidential, true, true, true)
         .await
         .expect("confidential private");
-    let secret_id =
-        insert_document_modified(&state.db, private.id, "secret.txt", "2026-06-01 00:00:00").await;
+    let secret_id = insert_document_modified(
+        &state.db,
+        private.id,
+        "secret.txt",
+        "2026-06-01T00:00:00.000000Z",
+    )
+    .await;
     let pool = state.db.clone();
     let app = http::router(state);
 
@@ -3394,8 +3407,8 @@ async fn move_folder_out_of_delete_ttl_scope_clears_descendant_expiry_before_swe
     sqlx::query(
         r"
         UPDATE documents
-        SET latest_modified_at = '2025-06-01 00:00:00',
-            expires_at = '2025-06-02 00:00:00',
+        SET latest_modified_at = '2025-06-01T00:00:00.000000Z',
+            expires_at = '2025-06-02T00:00:00.000000Z',
             expiry_action = 'delete'
         WHERE id = ?
         ",

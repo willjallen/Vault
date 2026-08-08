@@ -638,7 +638,7 @@ async fn oidc_relogin_without_a_verified_email_preserves_the_existing_profile_em
     .await
     .expect("initial identity");
     sqlx::query(
-        "UPDATE vault_users SET last_login_at = '2000-01-01T00:00:00Z' WHERE subject = 'subject'",
+        "UPDATE vault_users SET last_login_at = '2000-01-01T00:00:00.000000Z' WHERE subject = 'subject'",
     )
     .execute(&pool)
     .await
@@ -661,7 +661,7 @@ async fn oidc_relogin_without_a_verified_email_preserves_the_existing_profile_em
             .fetch_one(&pool)
             .await
             .expect("OIDC login timestamp");
-    assert_ne!(last_login_at, "2000-01-01T00:00:00Z");
+    assert_ne!(last_login_at, "2000-01-01T00:00:00.000000Z");
 }
 
 #[tokio::test]
@@ -960,7 +960,7 @@ async fn stale_session_refreshes_once_then_fresh_session_is_read_only() {
      */
     let pool = test_pool().await;
     let settings = AuthSettings::default();
-    let stale_last_seen = "2000-01-01T00:00:00Z";
+    let stale_last_seen = "2000-01-01T00:00:00.000000Z";
     let user_id = sqlx::query(
         r"
         INSERT INTO vault_users

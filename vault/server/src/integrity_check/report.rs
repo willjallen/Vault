@@ -3,9 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
 use serde::Serialize;
-use time::OffsetDateTime;
-use time::format_description::well_known::Rfc3339;
 
+use crate::timestamps::now_utc;
 use crate::version::app_version;
 
 pub const REPORT_VERSION: u32 = 1;
@@ -214,9 +213,7 @@ pub struct ReportBuilder {
 impl ReportBuilder {
     #[must_use]
     pub fn new(backend: impl Into<String>, max_findings_per_code: usize) -> Self {
-        let started_at = OffsetDateTime::now_utc()
-            .format(&Rfc3339)
-            .unwrap_or_else(|_| "unknown".to_string());
+        let started_at = now_utc();
         Self {
             started: Instant::now(),
             started_at,

@@ -452,8 +452,8 @@ pub async fn get_or_create_folder_path_with_created(
         }
         let inserted = sqlx::query(
             r"
-            INSERT INTO folders (root_key, parent_id, name, is_root)
-            VALUES (?, ?, ?, 0)
+            INSERT INTO folders (root_key, parent_id, name, is_root, created_at)
+            VALUES (?, ?, ?, 0, strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'))
             ",
         )
         .bind(&parsed.root_key)
@@ -507,9 +507,17 @@ pub async fn create_folder_path(
     let inserted = sqlx::query(
         r"
         INSERT INTO folders
-            (root_key, parent_id, name, is_root, created_by, created_by_name)
+            (
+                root_key,
+                parent_id,
+                name,
+                is_root,
+                created_by,
+                created_by_name,
+                created_at
+            )
         VALUES
-            (?, ?, ?, 0, ?, ?)
+            (?, ?, ?, 0, ?, ?, strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'))
         ",
     )
     .bind(&parent.root_key)
@@ -618,10 +626,14 @@ pub async fn update_folder_permissions(
     for permission in permissions {
         sqlx::query(
             r"
-            INSERT INTO folder_permissions
-                (folder_id, group_id, can_view, can_read, can_write)
-            VALUES
-                (?, ?, ?, ?, ?)
+            INSERT INTO folder_permissions (
+                folder_id, group_id, can_view, can_read, can_write, created_at, updated_at
+            )
+            VALUES (
+                ?1, ?2, ?3, ?4, ?5,
+                strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'),
+                strftime('%Y-%m-%dT%H:%M:%f000Z', 'now')
+            )
             ",
         )
         .bind(folder.id)
@@ -946,7 +958,11 @@ pub async fn apply_effective_ttl_to_document_in_tx(
             r"
             UPDATE documents
             SET
-                expires_at = datetime(latest_modified_at, '+' || ? || ' days'),
+                expires_at = strftime(
+                    '%Y-%m-%dT%H:%M:%f000Z',
+                    latest_modified_at,
+                    '+' || ? || ' days'
+                ),
                 expiry_action = ?
             WHERE id = ?
             ",
@@ -1277,14 +1293,20 @@ pub async fn add_folder_permission(
     validate_permission_flags(can_view, can_read, can_write)?;
     sqlx::query(
         r"
-        INSERT INTO folder_permissions (folder_id, group_id, can_view, can_read, can_write)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO folder_permissions (
+            folder_id, group_id, can_view, can_read, can_write, created_at, updated_at
+        )
+        VALUES (
+            ?1, ?2, ?3, ?4, ?5,
+            strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'),
+            strftime('%Y-%m-%dT%H:%M:%f000Z', 'now')
+        )
         ON CONFLICT(folder_id, group_id)
         DO UPDATE SET
             can_view = excluded.can_view,
             can_read = excluded.can_read,
             can_write = excluded.can_write,
-            updated_at = CURRENT_TIMESTAMP
+            updated_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now')
         ",
     )
     .bind(folder_id)
@@ -1532,8 +1554,8 @@ async fn get_or_create_folder_path_parts_in_tx(
         }
         let inserted = sqlx::query(
             r"
-            INSERT INTO folders (root_key, parent_id, name, is_root)
-            VALUES (?, ?, ?, 0)
+            INSERT INTO folders (root_key, parent_id, name, is_root, created_at)
+            VALUES (?, ?, ?, 0, strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'))
             ",
         )
         .bind(root_key)
@@ -1645,8 +1667,10 @@ async fn record_folder_event_in_tx(
 ) -> Result<(), FolderError> {
     sqlx::query(
         r"
-        INSERT INTO folder_events (folder_id, event_type, actor, actor_name, message)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO folder_events
+            (folder_id, event_type, actor, actor_name, message, created_at)
+        VALUES
+            (?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'))
         ",
     )
     .bind(folder_id)
@@ -1674,8 +1698,8 @@ async fn record_folder_change_with_resources_in_tx(
 ) -> Result<(), FolderError> {
     sqlx::query(
         r"
-        INSERT INTO state_events (event_type, resources)
-        VALUES (?, ?)
+        INSERT INTO state_events (event_type, resources, created_at)
+        VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'))
         ",
     )
     .bind(format!("folder.{event_type}"))
@@ -1808,7 +1832,11 @@ async fn reapply_ttl_for_subtree_in_tx(
                 r"
                 UPDATE documents
                 SET
-                    expires_at = datetime(latest_modified_at, '+' || ? || ' days'),
+                    expires_at = strftime(
+                        '%Y-%m-%dT%H:%M:%f000Z',
+                        latest_modified_at,
+                        '+' || ? || ' days'
+                    ),
                     expiry_action = ?
                 WHERE id = ?
                 ",

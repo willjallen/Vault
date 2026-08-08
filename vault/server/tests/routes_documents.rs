@@ -75,7 +75,7 @@ async fn seed_tracked_checkin_upload(
             )
         VALUES
             (?, 'checkin', 'active', ?, 'plan.txt', 1, 1, 1,
-             'admin', 'Admin', '{}', '2999-01-01T00:00:00Z')
+             'admin', 'Admin', '{}', '2999-01-01T00:00:00.000000Z')
         ",
     )
     .bind(upload_id)
@@ -163,7 +163,7 @@ async fn insert_versioned_document(pool: &sqlx::SqlitePool, folder_id: i64) -> i
                 committed_at
             )
         VALUES
-            ('version-one', ?, ?, 1, 'admin', 'Admin', 'Uploaded plan.txt', 'text/plain', 'plan.txt', 'upload', '2026-06-26 19:03:00')
+            ('version-one', ?, ?, 1, 'admin', 'Admin', 'Uploaded plan.txt', 'text/plain', 'plan.txt', 'upload', '2026-06-26T19:03:00.000000Z')
         ",
     )
     .bind(document_id)
@@ -385,7 +385,7 @@ async fn mark_document_archived(
         r"
         UPDATE documents
         SET
-            archived_at = CURRENT_TIMESTAMP,
+            archived_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'),
             archived_origin_path = 'Project/' || name,
             archived_access = ?
         WHERE id = ?
@@ -644,7 +644,7 @@ fn assert_document_detail_history_payload(reader_json: &Value, document_id: i64)
     assert_eq!(reader_json["path"], "Project/plan.txt");
     assert_eq!(reader_json["access"]["read"], true);
     assert_eq!(reader_json["latest_by"], "admin");
-    assert_eq!(reader_json["modified_at"], "2026-06-26T19:03:00+00:00",);
+    assert_eq!(reader_json["modified_at"], "2026-06-26T19:03:00.000000Z",);
     assert_eq!(reader_json["modified_display"], "Jun 26, 2026 at 7:03 pm");
     assert_eq!(
         reader_json["versions"].as_array().expect("versions").len(),
@@ -654,7 +654,7 @@ fn assert_document_detail_history_payload(reader_json: &Value, document_id: i64)
     assert_eq!(reader_json["versions"][0]["type"], "note");
     assert_eq!(
         reader_json["versions"][0]["timestamp"],
-        "2026-06-26T19:04:00.123456",
+        "2026-06-26T19:04:00.123456Z",
     );
     assert_eq!(reader_json["versions"][0]["display"], "Jun 26, 2026 19:04");
     assert_eq!(reader_json["versions"][0]["by"], "admin");
@@ -663,7 +663,7 @@ fn assert_document_detail_history_payload(reader_json: &Value, document_id: i64)
     assert_eq!(reader_json["versions"][1]["type"], "version");
     assert_eq!(
         reader_json["versions"][1]["timestamp"],
-        "2026-06-26T19:03:00",
+        "2026-06-26T19:03:00.000000Z",
     );
     assert_eq!(reader_json["versions"][1]["display"], "Jun 26, 2026 19:03");
     assert_eq!(reader_json["versions"][1]["by"], "admin");
@@ -674,8 +674,11 @@ fn assert_document_detail_history_payload(reader_json: &Value, document_id: i64)
     );
     assert_eq!(reader_json["versions"][2]["id"], "event-2");
     assert_eq!(reader_json["versions"][2]["type"], "document.download");
-    assert_eq!(reader_json["versions"][2]["timestamp"], Value::Null);
-    assert_eq!(reader_json["versions"][2]["display"], "Document.Download");
+    assert_eq!(
+        reader_json["versions"][2]["timestamp"],
+        "2026-06-26T19:02:00.000000Z"
+    );
+    assert_eq!(reader_json["versions"][2]["display"], "Jun 26, 2026 19:02");
     assert_eq!(reader_json["versions"][2]["by"], "admin");
     assert_eq!(reader_json["versions"][2]["note"], "Legacy event");
 }
@@ -685,8 +688,8 @@ async fn document_detail_requires_read_access_and_returns_version_history() {
     /*
      * Document detail requires read permission, distinguishes a discoverable-but-unreadable
      * document from a hidden one, and never exposes history across that boundary.
-     * An authorized reader receives Python-compatible metadata plus versions and events merged
-     * in timestamp order with actor and display fallbacks.
+     * An authorized reader receives canonical UTC metadata plus versions and events merged in
+     * timestamp order with actor and display fallbacks.
      */
     let (state, _temp_dir) = test_state().await;
     let readers = create_group(&state.db, "readers").await;
@@ -722,7 +725,7 @@ async fn document_detail_requires_read_access_and_returns_version_history() {
         &state.db,
         document_id,
         "note",
-        "2026-06-26 19:04:00.123456",
+        "2026-06-26T19:04:00.123456Z",
         "",
         "Reviewed plan",
     )
@@ -731,7 +734,7 @@ async fn document_detail_requires_read_access_and_returns_version_history() {
         &state.db,
         document_id,
         "document.download",
-        "",
+        "2026-06-26T19:02:00.000000Z",
         "",
         "Legacy event",
     )
@@ -780,12 +783,11 @@ async fn document_detail_requires_read_access_and_returns_version_history() {
 }
 
 #[tokio::test]
-async fn document_detail_dedupes_matching_version_events_by_normalized_timestamp() {
+async fn document_detail_dedupes_matching_version_events() {
     /*
      * An upload event that describes the same version commit must not appear as a second history
-     * entry merely because its timestamp uses a different ISO representation.
-     * Timestamp normalization and trimmed message matching collapse the duplicate into the
-     * canonical version row.
+     * entry. Its canonical timestamp and trimmed message match the commit and collapse the
+     * duplicate into the version row.
      */
     let (state, _temp_dir) = test_state().await;
     let readers = create_group(&state.db, "readers").await;
@@ -807,7 +809,7 @@ async fn document_detail_dedupes_matching_version_events_by_normalized_timestamp
         INSERT INTO document_events
             (document_id, event_type, created_at, actor, actor_name, message)
         VALUES
-            (?, 'upload', '2026-06-26T19:03:00+00:00', 'admin', 'Admin', ' Uploaded plan.txt ')
+            (?, 'upload', '2026-06-26T19:03:00.000000Z', 'admin', 'Admin', ' Uploaded plan.txt ')
         ",
     )
     .bind(document_id)
@@ -890,8 +892,8 @@ async fn document_detail_dedupes_version_checksums_after_version_number_ordering
                 committed_at
             )
         VALUES
-            ('version-two', ?, ?, 2, 'admin', 'Admin', 'Uploaded second', 'text/plain', 'plan.txt', 'upload', '2026-06-26 19:05:00'),
-            ('version-three', ?, ?, 3, 'admin', 'Admin', 'Uploaded duplicate', 'text/plain', 'plan.txt', 'upload', '2026-06-26 19:04:00')
+            ('version-two', ?, ?, 2, 'admin', 'Admin', 'Uploaded second', 'text/plain', 'plan.txt', 'upload', '2026-06-26T19:05:00.000000Z'),
+            ('version-three', ?, ?, 3, 'admin', 'Admin', 'Uploaded duplicate', 'text/plain', 'plan.txt', 'upload', '2026-06-26T19:04:00.000000Z')
         ",
     )
     .bind(document_id)
@@ -939,11 +941,11 @@ async fn document_detail_dedupes_version_checksums_after_version_number_ordering
 }
 
 #[tokio::test]
-async fn document_detail_lock_payload_uses_python_datetime_iso_shape() {
+async fn document_detail_lock_payload_uses_canonical_utc_shape() {
     /*
-     * Active lock metadata is exposed with the Python service's naive ISO timestamp shape,
-     * including fractional seconds. The response must also preserve the lock owner, network
-     * provenance, user agent, and normal-versus-forced acquisition flag.
+     * Active lock metadata is exposed as fixed-width UTC with fractional seconds. The response
+     * must also preserve the lock owner, network provenance, user agent, and
+     * normal-versus-forced acquisition flag.
      */
     let (state, _temp_dir) = test_state().await;
     let readers = create_group(&state.db, "readers").await;
@@ -972,7 +974,7 @@ async fn document_detail_lock_payload_uses_python_datetime_iso_shape() {
                 locked_user_agent
             )
         VALUES
-            (?, 'editor', 'Editor', '2026-06-26 19:03:00.123456', '203.0.113.7', 'vault-test')
+            (?, 'editor', 'Editor', '2026-06-26T19:03:00.123456Z', '203.0.113.7', 'vault-test')
         ",
     )
     .bind(document_id)
@@ -995,7 +997,7 @@ async fn document_detail_lock_payload_uses_python_datetime_iso_shape() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["lock"]["by"], "editor");
     assert_eq!(json["lock"]["name"], "Editor");
-    assert_eq!(json["lock"]["at"], "2026-06-26T19:03:00.123456");
+    assert_eq!(json["lock"]["at"], "2026-06-26T19:03:00.123456Z");
     assert_eq!(json["lock"]["ip"], "203.0.113.7");
     assert_eq!(json["lock"]["user_agent"], "vault-test");
     assert_eq!(json["lock"]["force_acquired"], false);
@@ -2805,7 +2807,7 @@ async fn lock_routes_validate_payload_and_reject_archived_documents() {
         r"
         UPDATE documents
         SET
-            archived_at = CURRENT_TIMESTAMP,
+            archived_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'),
             archived_origin_path = 'Project/' || name,
             archived_access = '{}'
         WHERE id = ?
@@ -3227,7 +3229,7 @@ async fn retention_delete_followed_by_runtime_maintenance_removes_local_blob_cop
     sqlx::query(
         r"
         UPDATE documents
-        SET expires_at = '2000-01-01T00:00:00Z', expiry_action = 'delete'
+        SET expires_at = '2000-01-01T00:00:00.000000Z', expiry_action = 'delete'
         WHERE id = ?
         ",
     )
@@ -3839,8 +3841,8 @@ async fn rename_document_updates_name_history_ttl_and_state() {
     sqlx::query(
         r"
         UPDATE documents
-        SET latest_modified_at = '2026-06-01 00:00:00',
-            expires_at = '2026-06-02 00:00:00',
+        SET latest_modified_at = '2026-06-01T00:00:00.000000Z',
+            expires_at = '2026-06-02T00:00:00.000000Z',
             expiry_action = 'delete'
         WHERE id = ?
         ",
@@ -3895,7 +3897,7 @@ async fn rename_document_updates_name_history_ttl_and_state() {
 
     assert_eq!(document.0, "asset-renamed.fbx");
     assert_eq!(document.1, "archive");
-    assert_ne!(document.2.as_deref(), Some("2026-06-02 00:00:00"));
+    assert_ne!(document.2.as_deref(), Some("2026-06-02T00:00:00.000000Z"));
     assert_eq!(event.0, "move");
     assert_eq!(
         event.1,
@@ -3936,8 +3938,8 @@ async fn rename_document_in_delete_ttl_scope_refreshes_expiry_before_sweep() {
     sqlx::query(
         r"
         UPDATE documents
-        SET latest_modified_at = '2025-06-01 00:00:00',
-            expires_at = '2025-06-08 00:00:00',
+        SET latest_modified_at = '2025-06-01T00:00:00.000000Z',
+            expires_at = '2025-06-08T00:00:00.000000Z',
             expiry_action = 'delete'
         WHERE id = ?
         ",
@@ -4262,8 +4264,8 @@ async fn move_document_out_of_delete_ttl_scope_clears_expiry_before_sweep() {
     sqlx::query(
         r"
         UPDATE documents
-        SET latest_modified_at = '2025-06-01 00:00:00',
-            expires_at = '2025-06-02 00:00:00',
+        SET latest_modified_at = '2025-06-01T00:00:00.000000Z',
+            expires_at = '2025-06-02T00:00:00.000000Z',
             expiry_action = 'delete'
         WHERE id = ?
         ",
@@ -4958,8 +4960,8 @@ async fn restore_document_preserves_current_vault_folder_acl() {
     assert_eq!(restored, (secret.id, None, None, None));
 }
 
-const STABLE_LOCATION_COMMITTED_AT_SQL: &str = "2026-06-20 18:00:00";
-const STABLE_LOCATION_MODIFIED_AT: &str = "2026-06-20T18:00:00+00:00";
+const STABLE_LOCATION_COMMITTED_AT_SQL: &str = "2026-06-20T18:00:00.000000Z";
+const STABLE_LOCATION_MODIFIED_AT: &str = "2026-06-20T18:00:00.000000Z";
 const STABLE_LOCATION_MODIFIED_DISPLAY: &str = "Jun 20, 2026 at 6:00 pm";
 
 async fn location_timestamp_test_state() -> (AppState, tempfile::TempDir, i64) {
@@ -4998,7 +5000,7 @@ async fn location_timestamp_test_state() -> (AppState, tempfile::TempDir, i64) {
     sqlx::query(
         r"
         UPDATE documents
-        SET latest_modified_at = '2030-01-01 00:00:00'
+        SET latest_modified_at = '2030-01-01T00:00:00.000000Z'
         WHERE id = ?
         ",
     )

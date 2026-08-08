@@ -61,7 +61,7 @@ async fn initializes_sqlite_schema_with_root_folders() {
             .fetch_all(&pool)
             .await
             .expect("migration versions");
-    assert_eq!(migration_versions, [1, 2, 3]);
+    assert_eq!(migration_versions, [1, 2, 3, 4]);
 }
 
 #[tokio::test]
@@ -259,7 +259,8 @@ async fn noncanonical_schema_is_rejected_without_additive_changes() {
         INSERT INTO vault_users
             (issuer, subject, email, name, is_admin, is_active, created_at)
         VALUES
-            ('test', 'alice', 'alice@example.com', 'Alice', 0, 1, CURRENT_TIMESTAMP)
+            ('test', 'alice', 'alice@example.com', 'Alice', 0, 1,
+             strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'))
         ",
     )
     .execute(&raw)

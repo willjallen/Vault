@@ -506,7 +506,7 @@ async fn lock_rechecks_document_after_archive_wins_writer_gate() {
         r"
         UPDATE documents
         SET
-            archived_at = CURRENT_TIMESTAMP,
+            archived_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'),
             archived_origin_path = 'Project/locking.txt',
             archived_access = '{}'
         WHERE id = ?
@@ -576,7 +576,7 @@ async fn move_rechecks_document_after_archive_wins_writer_gate() {
         r"
         UPDATE documents
         SET
-            archived_at = CURRENT_TIMESTAMP,
+            archived_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'),
             archived_origin_path = 'Project/moving.txt',
             archived_access = '{}'
         WHERE id = ?
@@ -1255,7 +1255,7 @@ async fn archive_identity_model_folder_archive_blocks_an_active_bound_upload() {
             )
         VALUES
             ('bound-upload', 'create', 'active', ?, 'pending.bin', 1, 1, 1,
-             'admin', '{}', '2999-01-01T00:00:00Z')
+             'admin', '{}', '2999-01-01T00:00:00.000000Z')
         ",
     )
     .bind(child.id)

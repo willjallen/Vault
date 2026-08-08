@@ -1,5 +1,12 @@
 ========================================================================
 
+Unreleased
+
+fix: Canonicalize every stored and API timestamp as fixed-width UTC, migrate legacy values without losing microseconds, and render browser dates in local time.
+
+
+========================================================================
+
 v2.2.0
 
 feat: Add an offline integrity check that validates SQLite metadata and stored object contents, reports findings, and exits without repairs.

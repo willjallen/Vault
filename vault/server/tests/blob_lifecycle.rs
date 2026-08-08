@@ -312,7 +312,7 @@ async fn insert_export_reference(
              user_context, expires_at)
         VALUES
             ('shared-export', 'complete', 'shared.zip', 1, ?, 'owner', 'Owner', '{}',
-             '2999-01-01T00:00:00Z')
+             '2999-01-01T00:00:00.000000Z')
         ",
     )
     .bind(i64::try_from(stored.size_bytes).expect("export size"))
@@ -325,7 +325,7 @@ async fn insert_export_reference(
             (job_id, blob_id, filename, mime_type, size_bytes, hash_algo, hash, expires_at)
         VALUES
             ('shared-export', ?, 'shared.zip', 'application/zip', ?, ?, ?,
-             '2999-01-01T00:00:00Z')
+             '2999-01-01T00:00:00.000000Z')
         ",
     )
     .bind(blob_id)
@@ -818,7 +818,7 @@ async fn stale_cancelled_publication_is_pruned_without_harming_retry_reference()
     transaction.commit().await.expect("commit retry");
     drop(retry_publication);
     sqlx::query(
-        "UPDATE blob_locations SET created_at = '2000-01-01T00:00:00Z' WHERE backend GLOB '_vault_pending:*'",
+        "UPDATE blob_locations SET created_at = '2000-01-01T00:00:00.000000Z' WHERE backend GLOB '_vault_pending:*'",
     )
     .execute(&state.pool)
     .await
@@ -908,11 +908,13 @@ async fn fresh_publication_is_deferred_while_abandoned_and_stale_publications_ar
         (1, 1)
     );
 
-    sqlx::query("UPDATE blob_locations SET created_at = '2000-01-01T00:00:00Z' WHERE blob_id = ?")
-        .bind(fresh_blob_id)
-        .execute(&state.pool)
-        .await
-        .expect("age crashed publication");
+    sqlx::query(
+        "UPDATE blob_locations SET created_at = '2000-01-01T00:00:00.000000Z' WHERE blob_id = ?",
+    )
+    .bind(fresh_blob_id)
+    .execute(&state.pool)
+    .await
+    .expect("age crashed publication");
     let after_stale = collect_unreferenced_blobs(&state.pool, &state.storage)
         .await
         .expect("collection after publication became stale");

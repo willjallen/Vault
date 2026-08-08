@@ -283,6 +283,11 @@ async fn malformed_blob_and_foreign_key_are_non_passing_findings() {
 
 #[tokio::test]
 async fn malformed_timestamps_json_primary_keys_and_legacy_share_aliases_are_checked() {
+    /*
+     * Injects malformed timestamps, JSON, and key shapes into a database opened without foreign
+     * keys. The read-only audit must report each independent defect while retaining the supported
+     * legacy share target alias.
+     */
     let data_dir = tempfile::tempdir().expect("temporary Vault");
     let config = initialize_vault(data_dir.path()).await;
     let options = SqliteConnectOptions::new()
@@ -304,22 +309,29 @@ async fn malformed_timestamps_json_primary_keys_and_legacy_share_aliases_are_che
     .await
     .expect("insert minimum-rowid event");
     sqlx::query(
-        "INSERT INTO state_events (event_type, resources) VALUES ('test', '[\"contents\", 7]')",
+        "INSERT INTO state_events (event_type, resources, created_at) \
+         VALUES ('test', '[\"contents\", 7]', '2026-06-26T19:03:00.000000Z')",
     )
     .execute(&mut connection)
     .await
     .expect("insert mixed resource array");
     sqlx::query(
-        "INSERT INTO share_links (code, target_type, folder_id, expires_at, item_type, item_id) \
-         SELECT 'badexpiry', 'folder', id, '2026-99-99 88:77:66', 'folder', id \
+        "INSERT INTO share_links \
+             (code, target_type, folder_id, expires_at, item_type, item_id, created_at) \
+         SELECT 'badexpiry', 'folder', id, '2026-99-99 88:77:66', 'folder', id, \
+                '2026-06-26T19:03:00.000000Z' \
          FROM folders WHERE root_key = 'vault'",
     )
     .execute(&mut connection)
     .await
     .expect("insert malformed share expiry");
     sqlx::query(
-        "INSERT INTO share_links (code, target_type, document_id, item_type, item_id) \
-         VALUES ('legacyfile', 'document', 999999, 'file', 999999)",
+        "INSERT INTO share_links \
+             (code, target_type, document_id, item_type, item_id, created_at) \
+         VALUES ( \
+             'legacyfile', 'document', 999999, 'file', 999999, \
+             '2026-06-26T19:03:00.000000Z' \
+         )",
     )
     .execute(&mut connection)
     .await
@@ -383,6 +395,10 @@ async fn invalid_utf8_text_is_reported_instead_of_silently_skipped() {
 
 #[tokio::test]
 async fn unreadable_rowids_end_a_table_scan_as_incomplete() {
+    /*
+     * Replaces a model table with a full page of rows whose shadow rowids are null. The audit
+     * must stop the non-advancing scan, report it as incomplete, and avoid looping forever.
+     */
     let data_dir = tempfile::tempdir().expect("temporary Vault");
     let config = initialize_vault(data_dir.path()).await;
     let options = SqliteConnectOptions::new()
@@ -401,7 +417,7 @@ async fn unreadable_rowids_end_a_table_scan_as_incomplete() {
           WITH RECURSIVE sequence(item) AS
             (SELECT 1 UNION ALL SELECT item + 1 FROM sequence WHERE item < 500)
           SELECT printf('key-%03d', item) AS key, '{}' AS value,
-                 '2099-01-01T00:00:00Z' AS updated_at, NULL AS rowid
+                 '2099-01-01T00:00:00.000000Z' AS updated_at, NULL AS rowid
           FROM sequence",
     )
     .execute(&mut connection)
@@ -447,7 +463,7 @@ async fn current_raster_preview_metadata_and_payload_are_validated() {
         .expect("open preview fixture database");
     let job_id = sqlx::query(
         "INSERT INTO preview_jobs (source_blob_id, recipe, status, completed_at) \
-         VALUES (?, ?, 'ready', CURRENT_TIMESTAMP)",
+         VALUES (?, ?, 'ready', strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'))",
     )
     .bind(blob_id)
     .bind(PREVIEW_RECIPE)
@@ -470,7 +486,8 @@ async fn current_raster_preview_metadata_and_payload_are_validated() {
     }
     let unknown_job_id = sqlx::query(
         "INSERT INTO preview_jobs (source_blob_id, recipe, status, completed_at) \
-         VALUES (?, 'future-recipe-v1', 'ready', CURRENT_TIMESTAMP)",
+         VALUES (?, 'future-recipe-v1', 'ready', \
+                 strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'))",
     )
     .bind(blob_id)
     .execute(&mut connection)
@@ -599,6 +616,10 @@ async fn unsafe_local_storage_prefix_is_rejected_as_incomplete() {
 
 #[tokio::test]
 async fn retention_upload_and_blob_lifecycle_shapes_are_validated() {
+    /*
+     * Injects independent retention, upload-name, reservation, and storage-backend defects while
+     * keeping fixture timestamps valid. The audit must surface every targeted semantic finding.
+     */
     let data_dir = tempfile::tempdir().expect("temporary Vault");
     let config = initialize_vault(data_dir.path()).await;
     let options = SqliteConnectOptions::new()
@@ -624,9 +645,9 @@ async fn retention_upload_and_blob_lifecycle_shapes_are_validated() {
          (id, mode, status, target_folder_id, filename, total_size, chunk_size, part_count, \
           created_by, user_context, expires_at) \
          VALUES ('0123456789abcdef0123456789abcdef', 'create', 'active', ?, '../unsafe', \
-                 0, 1024, 0, 'tester', '{}', '2099-01-01T00:00:00Z'), \
+                 0, 1024, 0, 'tester', '{}', '2099-01-01T00:00:00.000000Z'), \
                 ('00112233445566778899aabbccddeeff', 'create', 'active', ?, ?, \
-                 0, 1024, 0, 'tester', '{}', '2099-01-01T00:00:00Z')",
+                 0, 1024, 0, 'tester', '{}', '2099-01-01T00:00:00.000000Z')",
     )
     .bind(vault_root)
     .bind(vault_root)
@@ -639,7 +660,7 @@ async fn retention_upload_and_blob_lifecycle_shapes_are_validated() {
          (id, mode, status, filename, total_size, chunk_size, part_count, created_by, \
           user_context, expires_at) \
          VALUES ('fedcba9876543210fedcba9876543210', 'create', 'complete', 'finished.bin', \
-                 0, 1024, 0, 'tester', '{}', '2099-01-01T00:00:00Z')",
+                 0, 1024, 0, 'tester', '{}', '2099-01-01T00:00:00.000000Z')",
     )
     .execute(&mut connection)
     .await
@@ -982,6 +1003,10 @@ async fn sqlite_sidecars_must_be_regular_files() {
 
 #[tokio::test]
 async fn nested_and_out_of_range_upload_parts_cannot_satisfy_session_geometry() {
+    /*
+     * Creates one nested part and one part beyond the declared range for a completing upload.
+     * Neither file may satisfy the missing canonical part required by the session geometry.
+     */
     let data_dir = tempfile::tempdir().expect("temporary Vault");
     let config = initialize_vault(data_dir.path()).await;
     let options = SqliteConnectOptions::new()
@@ -995,7 +1020,7 @@ async fn nested_and_out_of_range_upload_parts_cannot_satisfy_session_geometry() 
         "INSERT INTO upload_sessions (id, mode, status, target_folder_id, filename, total_size, \
          chunk_size, part_count, created_by, user_context, expires_at) \
          SELECT 'nested-upload', 'create', 'completing', id, 'fixture.bin', 4, 4, 1, \
-                'test-user', '{}', '2099-01-01T00:00:00Z' \
+                'test-user', '{}', '2099-01-01T00:00:00.000000Z' \
          FROM folders WHERE root_key = 'vault'",
     )
     .execute(&mut connection)
@@ -1032,6 +1057,11 @@ async fn nested_and_out_of_range_upload_parts_cannot_satisfy_session_geometry() 
 #[cfg(unix)]
 #[tokio::test]
 async fn binary_emits_incomplete_json_and_exits_130_when_interrupted() {
+    /*
+     * Starts the CLI audit against a sparse object large enough to keep hashing active, waits
+     * through its bounded database phase, then sends SIGINT. The process must emit a partial
+     * JSON report with recorded database progress and the documented interrupted exit status.
+     */
     let data_dir = tempfile::tempdir().expect("temporary Vault");
     let config = initialize_vault(data_dir.path()).await;
     let digest = "0".repeat(64);
@@ -1087,7 +1117,7 @@ async fn binary_emits_incomplete_json_and_exits_130_when_interrupted() {
     }
     // Let the bounded database phase complete, then interrupt while the large
     // sparse object's bytes are being hashed.
-    thread::sleep(Duration::from_millis(300));
+    thread::sleep(Duration::from_secs(1));
     let signal_status = Command::new("kill")
         .args(["-INT", &child.id().to_string()])
         .status()

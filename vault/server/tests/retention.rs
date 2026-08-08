@@ -108,7 +108,9 @@ async fn insert_expired_document(
         INSERT INTO documents
             (folder_id, name, latest_modified_at, expires_at, expiry_action)
         VALUES
-            (?, ?, datetime('now', '-31 days'), datetime('now', '-1 day'), ?)
+            (?, ?,
+             strftime('%Y-%m-%dT%H:%M:%f000Z', 'now', '-31 days'),
+             strftime('%Y-%m-%dT%H:%M:%f000Z', 'now', '-1 day'), ?)
         ",
     )
     .bind(folder_id)
@@ -323,7 +325,7 @@ async fn expired_delete_ttl_deletes_unlocked_documents_and_skips_locked_document
             )
         VALUES
             ('retention-checkin', 'checkin', 'active', ?, 'scratch.txt',
-             1, 1, 1, 'user', '{}', '2999-01-01T00:00:00Z')
+             1, 1, 1, 'user', '{}', '2999-01-01T00:00:00.000000Z')
         ",
     )
     .bind(deleted_id)
@@ -380,7 +382,7 @@ async fn plain_folders_do_not_expire_old_documents_or_emit_state() {
         &state.db,
         safe.id,
         "old-but-safe.txt",
-        "2025-06-01 00:00:00",
+        "2025-06-01T00:00:00.000000Z",
     )
     .await;
 
@@ -427,14 +429,18 @@ async fn child_folder_inherits_parent_delete_ttl_without_expiring_plain_siblings
     let safe = get_or_create_folder_path(&state.db, Some("Safe"))
         .await
         .expect("safe");
-    let child_document_id =
-        insert_document_modified_at(&state.db, child.id, "child-safe.txt", "2025-06-01 00:00:00")
-            .await;
+    let child_document_id = insert_document_modified_at(
+        &state.db,
+        child.id,
+        "child-safe.txt",
+        "2025-06-01T00:00:00.000000Z",
+    )
+    .await;
     let safe_document_id = insert_document_modified_at(
         &state.db,
         safe.id,
         "old-but-outside-scope.txt",
-        "2025-06-01 00:00:00",
+        "2025-06-01T00:00:00.000000Z",
     )
     .await;
     let mut transaction = state.db.begin().await.expect("transaction");
@@ -559,11 +565,15 @@ async fn sweep_rechecks_renewed_locked_and_moved_documents_after_writer_gate() {
     started_rx.await.expect("sweep started");
     assert_waiting_on_writer_gate(&mut sweep).await;
 
-    sqlx::query("UPDATE documents SET expires_at = datetime('now', '+30 days') WHERE id = ?")
-        .bind(renewed_id)
-        .execute(&mut *gate)
-        .await
-        .expect("renew document");
+    sqlx::query(
+        "UPDATE documents \
+         SET expires_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now', '+30 days') \
+         WHERE id = ?",
+    )
+    .bind(renewed_id)
+    .execute(&mut *gate)
+    .await
+    .expect("renew document");
     sqlx::query(
         "INSERT INTO document_locks (document_id, locked_by, is_active) VALUES (?, 'editor', 1)",
     )

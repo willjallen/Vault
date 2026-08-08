@@ -97,8 +97,14 @@ async fn insert_current_root_folders(
     for root in ROOT_FOLDERS {
         sqlx::query(
             r"
-            INSERT INTO folders (root_key, parent_id, name, is_root)
-            VALUES (?, NULL, ?, 1)
+            INSERT INTO folders (root_key, parent_id, name, is_root, created_at)
+            VALUES (
+                ?,
+                NULL,
+                ?,
+                1,
+                strftime('%Y-%m-%dT%H:%M:%f000Z', 'now')
+            )
             ",
         )
         .bind(root.key)

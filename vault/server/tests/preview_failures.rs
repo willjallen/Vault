@@ -68,7 +68,8 @@ async fn enqueue_revives_only_cooled_down_transient_failures() {
         r"
         UPDATE preview_jobs
         SET status = 'failed', attempt_count = 3, next_attempt_at = NULL,
-            completed_at = datetime('now', '-16 minutes'), last_error_code = 'storage'
+            completed_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now', '-16 minutes'),
+            last_error_code = 'storage'
         WHERE source_blob_id = ?
         ",
     )
@@ -80,7 +81,8 @@ async fn enqueue_revives_only_cooled_down_transient_failures() {
         r"
         UPDATE preview_jobs
         SET status = 'failed', attempt_count = 3, next_attempt_at = NULL,
-            completed_at = CURRENT_TIMESTAMP, last_error_code = 'storage'
+            completed_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'),
+            last_error_code = 'storage'
         WHERE source_blob_id = ?
         ",
     )
@@ -92,7 +94,8 @@ async fn enqueue_revives_only_cooled_down_transient_failures() {
         r"
         UPDATE preview_jobs
         SET status = 'failed', attempt_count = 3, next_attempt_at = NULL,
-            completed_at = datetime('now', '-16 minutes'), last_error_code = 'invalid_source'
+            completed_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now', '-16 minutes'),
+            last_error_code = 'invalid_source'
         WHERE source_blob_id = ?
         ",
     )

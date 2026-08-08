@@ -3,6 +3,7 @@ mod support;
 use std::path::Path;
 use std::str::FromStr;
 
+use serde_json::Value;
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use support::migration_fixtures::v2_0_0::{
@@ -12,12 +13,15 @@ use support::migration_fixtures::v2_1_0::{
     ACTIVE_CREATE_UPLOAD_ID, ARCHIVED_DOCUMENT_ID, COMPLETE_CREATE_UPLOAD_ID,
     COMPLETING_CREATE_UPLOAD_ID, EXISTING_PATH_ARCHIVED_DOCUMENT_ID, Fixture as V2_1_0Fixture,
 };
+use support::migration_fixtures::v2_2_0::Fixture as V2_2_0Fixture;
 use vault_server::db;
+use vault_server::timestamps::{canonicalize, is_canonical};
 
-const CURRENT_HISTORY: [(i64, &str); 3] = [
+const CURRENT_HISTORY: [(i64, &str); 4] = [
     (1, "content previews"),
     (2, "normalize root folders"),
     (3, "preserve stored item identities"),
+    (4, "canonicalize UTC timestamps"),
 ];
 const BASELINE_TABLES: [&str; 21] = [
     "folders",
@@ -190,6 +194,12 @@ async fn v2_1_0_fixture() -> V2_1_0Fixture {
         .expect("generate pinned v2.1.0 database")
 }
 
+async fn v2_2_0_fixture() -> V2_2_0Fixture {
+    V2_2_0Fixture::create()
+        .await
+        .expect("generate pinned v2.2.0 database")
+}
+
 async fn raw_pool(path: &Path) -> SqlitePool {
     let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))
         .expect("raw SQLite options")
@@ -215,6 +225,49 @@ async fn migration_history(pool: &SqlitePool) -> Vec<MigrationRow> {
     .expect("migration history")
 }
 
+fn assert_migration_row_canonicalized(after: &MigrationRow, before: &MigrationRow) {
+    assert_eq!((after.0, after.1.as_str()), (before.0, before.1.as_str()));
+    assert_eq!(
+        after.2,
+        canonicalize(&before.2).expect("released migration timestamp")
+    );
+}
+
+async fn assert_all_persisted_timestamps_are_canonical(pool: &SqlitePool) {
+    let columns: Vec<(String, String)> = sqlx::query_as(
+        r"
+        SELECT schema_object.name, table_column.name
+        FROM sqlite_schema schema_object
+        JOIN pragma_table_info(schema_object.name) table_column
+        WHERE schema_object.type = 'table'
+          AND schema_object.name NOT LIKE 'sqlite_%'
+          AND table_column.name GLOB '*_at'
+        ORDER BY schema_object.name, table_column.cid
+        ",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("timestamp columns");
+    assert!(!columns.is_empty(), "current schema timestamp columns");
+    for (table, column) in columns {
+        let table = table.replace('"', "\"\"");
+        let column = column.replace('"', "\"\"");
+        let values: Vec<String> = sqlx::query_scalar(&format!(
+            "SELECT CAST(\"{column}\" AS TEXT) FROM \"{table}\" \
+             WHERE \"{column}\" IS NOT NULL ORDER BY rowid"
+        ))
+        .fetch_all(pool)
+        .await
+        .unwrap_or_else(|error| panic!("read {table}.{column}: {error}"));
+        for value in values {
+            assert!(
+                is_canonical(&value),
+                "noncanonical value in {table}.{column}: {value:?}"
+            );
+        }
+    }
+}
+
 async fn baseline_row_counts(pool: &SqlitePool) -> Vec<(&'static str, i64)> {
     let mut counts = Vec::with_capacity(BASELINE_TABLES.len());
     for table in BASELINE_TABLES {
@@ -237,6 +290,53 @@ async fn baseline_data_snapshot(pool: &SqlitePool) -> BaselineDataSnapshot {
         snapshot.push((table, rows));
     }
     snapshot
+}
+
+fn canonicalize_json_timestamps(value: &mut Value) {
+    match value {
+        Value::String(value) => {
+            if let Ok(canonical) = canonicalize(value) {
+                *value = canonical;
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                canonicalize_json_timestamps(value);
+            }
+        }
+        Value::Object(values) => {
+            for value in values.values_mut() {
+                canonicalize_json_timestamps(value);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+fn canonicalized_json_row(row: &str) -> String {
+    let mut value = serde_json::from_str::<Value>(row).expect("snapshot JSON");
+    canonicalize_json_timestamps(&mut value);
+    serde_json::to_string(&value).expect("canonical snapshot JSON")
+}
+
+fn canonicalized_json_rows(rows: &[String]) -> Vec<String> {
+    rows.iter().map(|row| canonicalized_json_row(row)).collect()
+}
+
+fn canonicalized_named_rows(
+    snapshot: &[(&'static str, Vec<String>)],
+) -> Vec<(&'static str, Vec<String>)> {
+    snapshot
+        .iter()
+        .map(|(table, rows)| (*table, canonicalized_json_rows(rows)))
+        .collect()
+}
+
+fn canonicalized_preview_snapshot(snapshot: &PreviewDataSnapshot) -> PreviewDataSnapshot {
+    (
+        canonicalized_json_rows(&snapshot.0),
+        canonicalized_json_rows(&snapshot.1),
+    )
 }
 
 async fn preview_data_snapshot(pool: &SqlitePool) -> PreviewDataSnapshot {
@@ -513,12 +613,12 @@ async fn set_legacy_vault_root(pool: &SqlitePool) -> i64 {
 }
 
 #[tokio::test]
-async fn exact_v2_0_0_fixture_upgrades_to_current_without_changing_baseline_data() {
+async fn exact_v2_0_0_fixture_upgrades_without_changing_non_timestamp_data() {
     /*
      * Snapshots the released v2.0.0 fixture's ledger, rows, preview data, and folder hierarchy
      * before opening it with the current server. It checks pending migrations append the
-     * exact known history without changing released data or root identities and leave no
-     * foreign-key violations.
+     * exact known history while canonicalizing timestamps without changing other released data
+     * or root identities, and leaves no foreign-key violations.
      */
     let fixture = v2_0_0_fixture().await;
     let db_path = fixture.db_path().to_path_buf();
@@ -555,13 +655,16 @@ async fn exact_v2_0_0_fixture_upgrades_to_current_without_changing_baseline_data
     let pool = db::connect(&db_path).await.expect("upgrade v2.0.0 fixture");
     let history_after = migration_history(&pool).await;
     assert_current_history(&history_after);
-    assert_eq!(
-        history_after[0], history_before[0],
-        "the released v2.0.0 baseline ledger row must be preserved exactly"
-    );
+    assert_migration_row_canonicalized(&history_after[0], &history_before[0]);
     assert_eq!(baseline_row_counts(&pool).await, row_counts_before);
-    assert_eq!(baseline_data_snapshot(&pool).await, data_before);
-    assert_eq!(preview_data_snapshot(&pool).await, previews_before);
+    assert_eq!(
+        baseline_data_snapshot(&pool).await,
+        canonicalized_named_rows(&data_before)
+    );
+    assert_eq!(
+        preview_data_snapshot(&pool).await,
+        canonicalized_preview_snapshot(&previews_before)
+    );
 
     let folders_after: Vec<FolderRow> =
         sqlx::query_as("SELECT id, root_key, parent_id, name, is_root FROM folders ORDER BY id")
@@ -576,6 +679,76 @@ async fn exact_v2_0_0_fixture_upgrades_to_current_without_changing_baseline_data
             .await
             .expect("foreign-key check");
     assert_eq!(foreign_key_violations, 0);
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn v2_2_1_migration_canonicalizes_existing_timestamps_and_legacy_defaults() {
+    /*
+     * Starts from an independently pinned released v2.2.0 database, injects the whole-second,
+     * fractional SQLite, and offset-bearing RFC 3339 shapes written by supported releases, then
+     * verifies v2.2.1 converts every value and canonicalizes immutable SQLite defaults.
+     */
+    let fixture = v2_2_0_fixture().await;
+    let db_path = fixture.db_path().to_path_buf();
+
+    let raw = raw_pool(&db_path).await;
+    sqlx::query("UPDATE folders SET created_at = ? WHERE root_key = 'vault' AND is_root = 1")
+        .bind("2026-06-26 19:03:04.123456")
+        .execute(&raw)
+        .await
+        .expect("fractional SQLite timestamp");
+    sqlx::query("UPDATE folders SET created_at = ? WHERE root_key = 'archive'")
+        .bind("2026-06-26T14:03:04.654321-05:00")
+        .execute(&raw)
+        .await
+        .expect("offset RFC 3339 timestamp");
+    sqlx::query("UPDATE schema_migrations SET applied_at = ? WHERE version = 1")
+        .bind("2026-06-26 19:03:04")
+        .execute(&raw)
+        .await
+        .expect("whole-second SQLite timestamp");
+    raw.close().await;
+
+    let pool = db::connect(&db_path).await.expect("apply v2.2.1 migration");
+    assert_current_history(&migration_history(&pool).await);
+    let root_timestamps: Vec<(String, String)> = sqlx::query_as(
+        "SELECT root_key, created_at FROM folders WHERE is_root = 1 ORDER BY root_key",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("root timestamps");
+    assert_eq!(
+        root_timestamps,
+        [
+            (
+                "archive".to_string(),
+                "2026-06-26T19:03:04.654321Z".to_string(),
+            ),
+            (
+                "vault".to_string(),
+                "2026-06-26T19:03:04.123456Z".to_string(),
+            ),
+        ]
+    );
+    let baseline_applied_at: String =
+        sqlx::query_scalar("SELECT applied_at FROM schema_migrations WHERE version = 1")
+            .fetch_one(&pool)
+            .await
+            .expect("baseline migration timestamp");
+    assert_eq!(baseline_applied_at, "2026-06-26T19:03:04.000000Z");
+    assert_all_persisted_timestamps_are_canonical(&pool).await;
+
+    sqlx::query("INSERT INTO vault_settings (key, value) VALUES ('timestamp-test', 'default')")
+        .execute(&pool)
+        .await
+        .expect("legacy SQLite default is normalized");
+    let default_timestamp: String =
+        sqlx::query_scalar("SELECT updated_at FROM vault_settings WHERE key = 'timestamp-test'")
+            .fetch_one(&pool)
+            .await
+            .expect("normalized default timestamp");
+    assert!(is_canonical(&default_timestamp));
     pool.close().await;
 }
 
@@ -681,7 +854,10 @@ async fn assert_upload_timestamp_changes(pool: &SqlitePool, before: &[(String, S
         if before_id == ACTIVE_CREATE_UPLOAD_ID || before_id == COMPLETING_CREATE_UPLOAD_ID {
             assert_ne!(after_value, before_value);
         } else {
-            assert_eq!(after_value, before_value);
+            assert_eq!(
+                after_value,
+                &canonicalize(before_value).expect("released upload timestamp")
+            );
         }
     }
 }
@@ -696,7 +872,7 @@ async fn assert_active_create_requires_target(pool: &SqlitePool) {
         VALUES (
             'missing-target', 'create', 'active', 'Visual Assets',
             'missing.txt', 1, 1, 1, 'fixture:alice', '{}',
-            '2999-01-01T00:00:00Z'
+            '2999-01-01T00:00:00.000000Z'
         )
         ",
     )
@@ -738,15 +914,18 @@ async fn v2_1_0_upgrade_invalidates_ambiguous_create_uploads_and_preserves_check
     let pool = db::connect(&db_path).await.expect("upgrade v2.1.0 fixture");
     let history_after = migration_history(&pool).await;
     assert_current_history(&history_after);
-    assert_eq!(history_after[0], history_before[0]);
+    assert_migration_row_canonicalized(&history_after[0], &history_before[0]);
     assert_eq!(
         upload_session_relationship_snapshot(&pool).await,
-        upload_relationships_before
+        canonicalized_json_rows(&upload_relationships_before)
     );
-    assert_eq!(upload_parts_snapshot(&pool).await, upload_parts_before);
+    assert_eq!(
+        upload_parts_snapshot(&pool).await,
+        canonicalized_json_rows(&upload_parts_before)
+    );
     assert_eq!(
         document_locks_snapshot(&pool, DOCUMENT_ID).await,
-        checkin_locks_before
+        canonicalized_json_rows(&checkin_locks_before)
     );
     assert_upload_timestamp_changes(&pool, &upload_updated_at_before).await;
     assert_upload_target_schema(&pool).await;
@@ -828,23 +1007,23 @@ async fn assert_released_v2_1_archive_source(pool: &SqlitePool) {
 async fn assert_archive_snapshot_preserved(pool: &SqlitePool, before: &ArchiveSnapshot) {
     assert_eq!(
         archived_document_stable_snapshot(pool, ARCHIVED_DOCUMENT_ID).await,
-        before.missing_path_document
+        canonicalized_json_row(&before.missing_path_document)
     );
     assert_eq!(
         archived_document_stable_snapshot(pool, EXISTING_PATH_ARCHIVED_DOCUMENT_ID).await,
-        before.existing_path_document
+        canonicalized_json_row(&before.existing_path_document)
     );
     assert_eq!(
         archive_related_snapshot(pool, ARCHIVED_DOCUMENT_ID).await,
-        before.missing_path_related
+        canonicalized_named_rows(&before.missing_path_related)
     );
     assert_eq!(
         archive_related_snapshot(pool, EXISTING_PATH_ARCHIVED_DOCUMENT_ID).await,
-        before.existing_path_related
+        canonicalized_named_rows(&before.existing_path_related)
     );
     assert_eq!(
         archive_state_event_snapshot(pool).await,
-        before.state_events
+        canonicalized_json_rows(&before.state_events)
     );
 }
 
@@ -877,7 +1056,7 @@ async fn assert_reconstructed_archive_migrated(pool: &SqlitePool) {
             "Projects".to_string(),
             "Incoming".to_string(),
             "payload.bin".to_string(),
-            "2026-07-22T22:35:00Z".to_string(),
+            "2026-07-22T22:35:00.000000Z".to_string(),
             "Projects/Incoming/payload.bin".to_string(),
             r#"{"200":3,"201":2}"#.to_string(),
         )
@@ -908,7 +1087,7 @@ async fn assert_existing_path_archive_migrated(pool: &SqlitePool) {
         (
             MIGRATION_PREVIEWS_FOLDER_ID,
             "existing-path.bin".to_string(),
-            "2026-07-22T22:36:00Z".to_string(),
+            "2026-07-22T22:36:00.000000Z".to_string(),
             "Visual Assets/Migration Previews/existing-path.bin".to_string(),
             r#"{"200":3,"201":2}"#.to_string(),
             "vault".to_string(),
@@ -1035,7 +1214,7 @@ async fn archive_identity_migration_preserves_released_v2_1_document_graphs() {
         .expect("upgrade released v2.1 archive graphs");
     let history_after = migration_history(&pool).await;
     assert_current_history(&history_after);
-    assert_eq!(history_after[0], history_before[0]);
+    assert_migration_row_canonicalized(&history_after[0], &history_before[0]);
     assert_archive_snapshot_preserved(&pool, &archive_before).await;
     assert_reconstructed_archive_migrated(&pool).await;
     assert_existing_path_archive_migrated(&pool).await;
@@ -1080,8 +1259,11 @@ async fn derived_v2_0_0_incident_state_normalizes_legacy_root_without_replacing_
         .expect("upgrade derived legacy-root v2.0.0 database");
     let history_after = migration_history(&pool).await;
     assert_current_history(&history_after);
-    assert_eq!(history_after[0], history_before[0]);
-    assert_eq!(preview_data_snapshot(&pool).await, previews_before);
+    assert_migration_row_canonicalized(&history_after[0], &history_before[0]);
+    assert_eq!(
+        preview_data_snapshot(&pool).await,
+        canonicalized_preview_snapshot(&previews_before)
+    );
 
     let root: FolderRow = sqlx::query_as(
         r"
@@ -1144,7 +1326,8 @@ async fn derived_v2_0_0_incident_state_normalizes_legacy_root_without_replacing_
             continue;
         }
         assert_eq!(
-            rows_after, rows_before,
+            rows_after,
+            &canonicalized_json_rows(rows_before),
             "migration unexpectedly changed {table_before}"
         );
     }

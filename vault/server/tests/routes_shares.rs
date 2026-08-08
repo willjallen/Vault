@@ -317,16 +317,24 @@ async fn share_routes_resolve_current_targets_and_enforce_access() {
     let (status, _) = resolve_share_code(&app, "not-a-valid-code!", "admin", "vault-admin").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
-    sqlx::query("UPDATE share_links SET disabled_at = CURRENT_TIMESTAMP WHERE code = ?")
-        .bind(doc_code)
-        .execute(&pool)
-        .await
-        .expect("disable link");
-    sqlx::query("UPDATE share_links SET expires_at = datetime('now', '-1 second') WHERE code = ?")
-        .bind(folder_code)
-        .execute(&pool)
-        .await
-        .expect("expire link");
+    sqlx::query(
+        "UPDATE share_links \
+         SET disabled_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now') \
+         WHERE code = ?",
+    )
+    .bind(doc_code)
+    .execute(&pool)
+    .await
+    .expect("disable link");
+    sqlx::query(
+        "UPDATE share_links \
+         SET expires_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now', '-1 second') \
+         WHERE code = ?",
+    )
+    .bind(folder_code)
+    .execute(&pool)
+    .await
+    .expect("expire link");
 
     let (status, _) = resolve_share_code(&app, doc_code, "artist", "artists").await;
     assert_eq!(status, StatusCode::NOT_FOUND);

@@ -17,6 +17,7 @@ use sqlx::{ConnectOptions, Connection, Row, SqliteConnection};
 use super::report::{ReportBuilder, Severity};
 use crate::db;
 use crate::root_folders::ROOT_FOLDERS;
+use crate::timestamps::is_canonical;
 
 const CHECK_SQLITE: &str = "database.sqlite";
 const CHECK_SCHEMA: &str = "database.schema";
@@ -733,30 +734,18 @@ fn inspect_generic_row(
             continue;
         };
 
-        if column.name.ends_with("_at") && !valid_timestamp(&value) {
+        if column.name.ends_with("_at") && !is_canonical(&value) {
             finding(
                 report,
                 CHECK_ROWS,
                 "db.timestamp_malformed",
                 Severity::Error,
                 Some(row_entity(table, row_id.to_string())),
-                format!("column {} is not a recognized timestamp", column.name),
-                "Restore a valid persisted timestamp from backup.",
-            );
-        }
-        if column.name == "expires_at"
-            && matches!(table, "upload_sessions" | "export_jobs")
-            && time::OffsetDateTime::parse(&value, &time::format_description::well_known::Rfc3339)
-                .is_err()
-        {
-            finding(
-                report,
-                CHECK_ROWS,
-                "db.transfer_expiry_not_rfc3339",
-                Severity::Error,
-                Some(row_entity(table, row_id.to_string())),
-                "expires_at is not strict RFC 3339",
-                "Restore the transfer expiration timestamp using RFC 3339.",
+                format!(
+                    "column {} is not a canonical fixed-width UTC timestamp",
+                    column.name
+                ),
+                "Restore a valid canonical UTC timestamp from backup.",
             );
         }
         if is_boolean_column(table, &column.name)
@@ -2753,18 +2742,6 @@ fn parse_lifecycle_backend(value: &str) -> Option<(&str, &str)> {
         .or_else(|| value.strip_prefix("_vault_deleting:"))?;
     let (token, backend) = rest.split_once(':')?;
     (valid_simple_uuid(token) && safe_identifier(backend)).then_some((token, backend))
-}
-
-fn valid_timestamp(value: &str) -> bool {
-    if time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).is_ok() {
-        return true;
-    }
-    let Ok(description) = time::format_description::parse_borrowed::<1>(
-        "[year]-[month]-[day] [hour]:[minute]:[second]",
-    ) else {
-        return false;
-    };
-    time::PrimitiveDateTime::parse(value, &description).is_ok()
 }
 
 async fn id_set(connection: &mut SqliteConnection, table: &str) -> Option<HashSet<i64>> {

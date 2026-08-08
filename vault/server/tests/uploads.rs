@@ -32,7 +32,7 @@ async fn upload_hash_coordinator_keeps_active_states_at_the_cache_bound() {
                 )
             VALUES
                 (?, 'create', 'active', ?, 'bounded.txt', 1, 1, 1,
-                 'owner', '{}', '2999-01-01T00:00:00Z')
+                 'owner', '{}', '2999-01-01T00:00:00.000000Z')
             ",
         )
         .bind(format!("session-{index}"))

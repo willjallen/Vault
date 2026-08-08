@@ -6,8 +6,6 @@ use std::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, QueryBuilder, Sqlite, SqlitePool, Transaction};
 use thiserror::Error;
-use time::OffsetDateTime;
-use time::format_description::well_known::Rfc3339;
 use tokio::fs;
 use tokio::sync::Mutex;
 
@@ -16,6 +14,7 @@ use crate::exports::{ExportError, ExportExecutionContext};
 use crate::storage::{
     S3_UPLOAD_STAGE_FILENAME, SharedBlobStorage, StorageError, remove_s3_upload_stage_file,
 };
+use crate::timestamps::now_utc;
 use crate::uploads::{UploadHashCoordinator, clear_upload_session_files};
 
 const DEFAULT_SWEEP_LIMIT: i64 = 250;
@@ -63,8 +62,6 @@ pub enum TransferMaintenanceError {
     Storage(#[from] StorageError),
     #[error(transparent)]
     Export(#[from] ExportError),
-    #[error(transparent)]
-    TimeFormat(#[from] time::error::Format),
     #[error("export startup requires a persistent dispatcher runtime")]
     ExportDispatcherRequired,
 }
@@ -127,7 +124,7 @@ pub async fn sweep_expired_transfers_with_limit(
     maintenance: &TransferMaintenanceCoordinator,
     limit: i64,
 ) -> Result<TransferSweepResult, TransferMaintenanceError> {
-    let now = OffsetDateTime::now_utc().format(&Rfc3339)?;
+    let now = now_utc();
     let limit = limit.max(1);
     let uploads = expired_uploads(pool, &now, limit).await?;
     let exports = expired_exports(pool, &now, limit).await?;
@@ -350,7 +347,7 @@ async fn recover_interrupted_transfers_inner(
     if enqueue_exports && export_execution.is_none() {
         return Err(TransferMaintenanceError::ExportDispatcherRequired);
     }
-    let now = OffsetDateTime::now_utc().format(&Rfc3339)?;
+    let now = now_utc();
     let uploads = interrupted_uploads(pool, &now).await?;
     let exports = interrupted_exports(pool, &now).await?;
     let mut result = TransferRecoveryResult::default();
@@ -366,7 +363,7 @@ async fn recover_interrupted_transfers_inner(
                     verification_total_bytes = 0,
                     verification_processed_bytes = 0,
                     error = NULL,
-                    updated_at = CURRENT_TIMESTAMP
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now')
                 WHERE id = ?
                 ",
             )
@@ -382,7 +379,7 @@ async fn recover_interrupted_transfers_inner(
                     verification_total_bytes = 0,
                     verification_processed_bytes = 0,
                     error = 'Upload completion interrupted and staged parts are missing or invalid',
-                    updated_at = CURRENT_TIMESTAMP
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now')
                 WHERE id = ?
                 ",
             )
@@ -405,7 +402,7 @@ async fn recover_interrupted_transfers_inner(
                 processed_items = 0,
                 processed_bytes = 0,
                 error = NULL,
-                updated_at = CURRENT_TIMESTAMP
+                updated_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now')
             WHERE id = ?
             ",
         )
@@ -674,7 +671,7 @@ async fn sweep_upload_rows(
                 r"
                 UPDATE upload_sessions
                 SET status = 'expired',
-                    updated_at = CURRENT_TIMESTAMP
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now')
                 WHERE id = ?
                   AND status = ?
                   AND datetime(expires_at) <= datetime(?)
@@ -722,7 +719,7 @@ async fn sweep_export_rows(
                 r"
                 UPDATE export_jobs
                 SET status = 'cancelled',
-                    updated_at = CURRENT_TIMESTAMP
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now')
                 WHERE id = ?
                   AND status = ?
                   AND datetime(expires_at) <= datetime(?)

@@ -736,7 +736,18 @@ async fn restore_missing_local_locations(
             .await?;
             if exact_pair_exists == 0 && object_key_claimed == 0 {
                 sqlx::query(
-                    "INSERT INTO blob_locations (blob_id, backend, bucket, object_key) VALUES (?, 'local', '', ?)",
+                    r"
+                    INSERT INTO blob_locations
+                        (blob_id, backend, bucket, object_key, created_at)
+                    VALUES
+                        (
+                            ?,
+                            'local',
+                            '',
+                            ?,
+                            strftime('%Y-%m-%dT%H:%M:%f000Z', 'now')
+                        )
+                    ",
                 )
                 .bind(blob_id)
                 .bind(object_key)

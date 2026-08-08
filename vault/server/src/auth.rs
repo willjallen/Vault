@@ -16,7 +16,8 @@ use sha2::Sha256;
 use sqlx::{FromRow, Row, Sqlite, SqlitePool, Transaction};
 use thiserror::Error;
 use time::OffsetDateTime;
-use time::format_description::well_known::Rfc3339;
+
+use crate::timestamps::{TimestampError, format_utc};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -653,7 +654,7 @@ pub enum AuthError {
     #[error(transparent)]
     Database(#[from] sqlx::Error),
     #[error(transparent)]
-    Time(#[from] time::error::Format),
+    Timestamp(#[from] TimestampError),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 }
@@ -1048,15 +1049,26 @@ async fn upsert_vault_user_once(
         let result = sqlx::query(
             r"
             INSERT INTO vault_users
-                (issuer, subject, email, name, is_admin, is_active, last_login_at, last_seen_at)
+                (
+                    issuer,
+                    subject,
+                    email,
+                    name,
+                    is_admin,
+                    is_active,
+                    created_at,
+                    last_login_at,
+                    last_seen_at
+                )
             VALUES
-                (?, ?, ?, ?, 0, 1, ?, ?)
+                (?, ?, ?, ?, 0, 1, ?, ?, ?)
             ",
         )
         .bind(issuer)
         .bind(subject)
         .bind(email)
         .bind(&display_name)
+        .bind(&now)
         .bind(if mode == IdentitySyncMode::OidcLogin {
             Some(now.as_str())
         } else {
@@ -1126,11 +1138,16 @@ async fn sync_vault_groups(
     let existing: BTreeSet<i64> = existing_group_ids.into_iter().collect();
     for group_id in target_group_ids {
         if !existing.contains(&group_id) {
-            sqlx::query("INSERT INTO vault_group_memberships (user_id, group_id) VALUES (?, ?)")
-                .bind(user_id)
-                .bind(group_id)
-                .execute(&mut **tx)
-                .await?;
+            sqlx::query(
+                r"
+                INSERT INTO vault_group_memberships (user_id, group_id, created_at)
+                VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'))
+                ",
+            )
+            .bind(user_id)
+            .bind(group_id)
+            .execute(&mut **tx)
+            .await?;
         }
     }
     Ok(())
@@ -1148,10 +1165,15 @@ async fn ensure_group(
     {
         return Ok(group_id);
     }
-    let result = sqlx::query("INSERT INTO vault_groups (name) VALUES (?)")
-        .bind(group_name)
-        .execute(&mut **tx)
-        .await?;
+    let result = sqlx::query(
+        r"
+        INSERT INTO vault_groups (name, created_at)
+        VALUES (?, strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'))
+        ",
+    )
+    .bind(group_name)
+    .execute(&mut **tx)
+    .await?;
     Ok(result.last_insert_rowid())
 }
 
@@ -1166,8 +1188,23 @@ async fn sync_group_root_permissions(
         sqlx::query(
             r"
             INSERT INTO folder_permissions
-                (folder_id, group_id, can_view, can_read, can_write)
-            SELECT ?, ?, 1, 1, 1
+                (
+                    folder_id,
+                    group_id,
+                    can_view,
+                    can_read,
+                    can_write,
+                    created_at,
+                    updated_at
+                )
+            SELECT
+                ?,
+                ?,
+                1,
+                1,
+                1,
+                strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'),
+                strftime('%Y-%m-%dT%H:%M:%f000Z', 'now')
             WHERE NOT EXISTS (
                 SELECT 1 FROM folder_permissions WHERE folder_id = ? AND group_id = ?
             )
@@ -1661,16 +1698,17 @@ fn unix_timestamp_now() -> f64 {
         .map_or(0.0, |duration| duration.as_secs_f64())
 }
 
-fn last_seen_cutoff() -> Result<String, time::error::Format> {
-    (OffsetDateTime::now_utc() - time::Duration::seconds(LAST_SEEN_REFRESH_INTERVAL_SECONDS))
-        .format(&Rfc3339)
+fn last_seen_cutoff() -> Result<String, TimestampError> {
+    format_utc(
+        OffsetDateTime::now_utc() - time::Duration::seconds(LAST_SEEN_REFRESH_INTERVAL_SECONDS),
+    )
 }
 
-fn last_seen_write_times() -> Result<(String, String), time::error::Format> {
+fn last_seen_write_times() -> Result<(String, String), TimestampError> {
     let now = OffsetDateTime::now_utc();
     Ok((
-        now.format(&Rfc3339)?,
-        (now - time::Duration::seconds(LAST_SEEN_REFRESH_INTERVAL_SECONDS)).format(&Rfc3339)?,
+        format_utc(now)?,
+        format_utc(now - time::Duration::seconds(LAST_SEEN_REFRESH_INTERVAL_SECONDS))?,
     ))
 }
 

@@ -4,12 +4,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{FromRow, Sqlite, SqlitePool, Transaction};
 use thiserror::Error;
-use time::format_description::well_known::Rfc3339;
-use time::{OffsetDateTime, PrimitiveDateTime, UtcOffset};
 
 use crate::auth::{AuthSettings, effective_admin_from_parts};
 use crate::site_settings::{SiteSettingsError, site_settings_for_db};
 use crate::state_events::record_state_event_in_tx;
+use crate::timestamps::canonicalize;
 
 #[derive(Debug, Error)]
 pub enum AdminError {
@@ -250,13 +249,18 @@ pub async fn create_group(
         return Err(AdminError::GroupAlreadyExists);
     }
     let mut transaction = pool.begin().await?;
-    sqlx::query("INSERT INTO vault_groups (name, description) VALUES (?, ?)")
-        .bind(name)
-        .bind(normalize_optional_description(
-            request.description.as_deref(),
-        ))
-        .execute(&mut *transaction)
-        .await?;
+    sqlx::query(
+        r"
+        INSERT INTO vault_groups (name, description, created_at)
+        VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'))
+        ",
+    )
+    .bind(name)
+    .bind(normalize_optional_description(
+        request.description.as_deref(),
+    ))
+    .execute(&mut *transaction)
+    .await?;
     record_admin_change(&mut transaction, "admin.group.created", &["admin"]).await?;
     transaction.commit().await?;
     Ok(())
@@ -351,8 +355,8 @@ pub async fn add_group_member(
     let mut transaction = pool.begin().await?;
     sqlx::query(
         r"
-        INSERT OR IGNORE INTO vault_group_memberships (user_id, group_id)
-        VALUES (?, ?)
+        INSERT OR IGNORE INTO vault_group_memberships (user_id, group_id, created_at)
+        VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'))
         ",
     )
     .bind(request.user_id)
@@ -456,65 +460,7 @@ fn user_payload(
 
 fn payload_datetime_iso(timestamp: Option<&str>) -> Option<String> {
     let timestamp = timestamp.filter(|value| !value.trim().is_empty())?;
-    let trimmed = timestamp.trim();
-    if let Ok(parsed) = OffsetDateTime::parse(trimmed, &Rfc3339) {
-        return Some(format_python_aware_iso_utc(parsed));
-    }
-    Some(
-        parse_sqlite_timestamp(trimmed, "[year]-[month]-[day] [hour]:[minute]:[second]")
-            .or_else(|| {
-                parse_sqlite_timestamp(
-                    trimmed,
-                    "[year]-[month]-[day] [hour]:[minute]:[second].[subsecond]",
-                )
-            })
-            .or_else(|| {
-                parse_sqlite_timestamp(trimmed, "[year]-[month]-[day]T[hour]:[minute]:[second]")
-            })
-            .map_or_else(|| trimmed.to_string(), format_python_naive_iso_utc),
-    )
-}
-
-fn parse_sqlite_timestamp(timestamp: &str, format: &str) -> Option<PrimitiveDateTime> {
-    let description = time::format_description::parse_borrowed::<1>(format).ok()?;
-    PrimitiveDateTime::parse(timestamp, &description).ok()
-}
-
-fn format_python_aware_iso_utc(timestamp: OffsetDateTime) -> String {
-    let timestamp = timestamp.to_offset(UtcOffset::UTC);
-    let base = format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
-        timestamp.year(),
-        timestamp.month() as u8,
-        timestamp.day(),
-        timestamp.hour(),
-        timestamp.minute(),
-        timestamp.second(),
-    );
-    let nanosecond = timestamp.nanosecond();
-    if nanosecond == 0 {
-        return format!("{base}+00:00");
-    }
-    let microsecond = nanosecond / 1_000;
-    format!("{base}.{microsecond:06}+00:00")
-}
-
-fn format_python_naive_iso_utc(timestamp: PrimitiveDateTime) -> String {
-    let base = format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
-        timestamp.year(),
-        timestamp.month() as u8,
-        timestamp.day(),
-        timestamp.hour(),
-        timestamp.minute(),
-        timestamp.second(),
-    );
-    let nanosecond = timestamp.nanosecond();
-    if nanosecond == 0 {
-        return base;
-    }
-    let microsecond = nanosecond / 1_000;
-    format!("{base}.{microsecond:06}")
+    Some(canonicalize(timestamp).unwrap_or_else(|_| timestamp.trim().to_string()))
 }
 
 async fn ensure_active_admin_after_user_update_in_tx(

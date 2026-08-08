@@ -134,7 +134,7 @@ async fn set_archived_access(
         r"
         UPDATE documents
         SET
-            archived_at = CURRENT_TIMESTAMP,
+            archived_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'),
             archived_origin_path = ? || '/' || name,
             archived_access = ?
         WHERE id = ?
@@ -857,7 +857,7 @@ async fn archive_folder_favorite_excludes_inaccessible_document_metadata() {
     sqlx::query(
         r"
         UPDATE document_versions
-        SET committed_at = '2026-01-01T00:00:00Z', committed_by_name = 'Visible Author'
+        SET committed_at = '2026-01-01T00:00:00.000000Z', committed_by_name = 'Visible Author'
         WHERE document_id = ?
         ",
     )
@@ -868,7 +868,7 @@ async fn archive_folder_favorite_excludes_inaccessible_document_metadata() {
     sqlx::query(
         r"
         UPDATE document_versions
-        SET committed_at = '2030-01-01T00:00:00Z', committed_by_name = 'Secret Author'
+        SET committed_at = '2030-01-01T00:00:00.000000Z', committed_by_name = 'Secret Author'
         WHERE document_id = ?
         ",
     )
@@ -916,7 +916,7 @@ async fn archive_folder_favorite_excludes_inaccessible_document_metadata() {
     assert_eq!(favorite["path"], "Archive");
     assert_eq!(favorite["size_bytes"], 3);
     assert_eq!(favorite["latest_by"], "Visible Author");
-    assert_eq!(favorite["modified_at"], "2026-01-01T00:00:00+00:00");
+    assert_eq!(favorite["modified_at"], "2026-01-01T00:00:00.000000Z");
 }
 
 #[tokio::test]

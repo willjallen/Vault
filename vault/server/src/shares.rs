@@ -86,21 +86,14 @@ pub async fn create_share_link(
     let item_id = target.document_id.or(target.folder_id);
     sqlx::query(
         r"
-        INSERT INTO share_links
-            (
-                code,
-                target_type,
-                document_id,
-                folder_id,
-                access_mode,
-                created_by,
-                created_by_name,
-                created_by_user_id,
-                item_type,
-                item_id
-            )
-        VALUES
-            (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO share_links (
+            code, target_type, document_id, folder_id, access_mode, created_by, created_by_name,
+            created_by_user_id, item_type, item_id, created_at
+        )
+        VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+            strftime('%Y-%m-%dT%H:%M:%f000Z', 'now')
+        )
         ",
     )
     .bind(&code)
@@ -323,7 +316,7 @@ async fn share_link_expired(
         return Ok(false);
     };
     let expired = sqlx::query_scalar::<_, i64>(
-        "SELECT CASE WHEN datetime(?) <= CURRENT_TIMESTAMP THEN 1 ELSE 0 END",
+        "SELECT CASE WHEN datetime(?) <= datetime('now') THEN 1 ELSE 0 END",
     )
     .bind(expires_at)
     .fetch_one(pool)

@@ -101,7 +101,8 @@ async fn failed_preview_event_insert_is_retried() {
             id INTEGER PRIMARY KEY,
             event_type TEXT NOT NULL,
             resources TEXT NOT NULL,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            created_at TEXT NOT NULL
+                DEFAULT (strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'))
         )
         ",
     )

@@ -1,6 +1,7 @@
 mod v2_0_0;
 mod v2_1_0;
 mod v2_2_0;
+mod v2_2_1;
 
 use std::str::FromStr;
 use std::time::Duration;
@@ -15,6 +16,7 @@ use super::schema_validation::{
     SchemaMetadata, schema_incompatible, schema_metadata, user_schema_objects,
     validate_schema_metadata_exact,
 };
+use crate::timestamps::now_utc;
 
 pub type MigrationOperation =
     for<'borrow, 'connection> fn(
@@ -40,7 +42,8 @@ pub struct MigrationDefinition {
 }
 
 const BASELINE: BaselineDefinition = v2_0_0::BASELINE;
-pub const MIGRATIONS: [MigrationDefinition; 2] = [v2_1_0::MIGRATION, v2_2_0::MIGRATION];
+pub const MIGRATIONS: [MigrationDefinition; 3] =
+    [v2_1_0::MIGRATION, v2_2_0::MIGRATION, v2_2_1::MIGRATION];
 const CURRENT_MIGRATION_VERSION: i64 = MIGRATIONS[MIGRATIONS.len() - 1].version;
 const KNOWN_HISTORY_LENGTH: usize = MIGRATIONS.len() + 1;
 
@@ -150,9 +153,10 @@ async fn record_migration(
     tx: &mut Transaction<'_, Sqlite>,
     migration: MigrationDefinition,
 ) -> anyhow::Result<()> {
-    sqlx::query("INSERT INTO schema_migrations (version, name) VALUES (?, ?)")
+    sqlx::query("INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)")
         .bind(migration.version)
         .bind(migration.name)
+        .bind(now_utc())
         .execute(&mut **tx)
         .await?;
     Ok(())

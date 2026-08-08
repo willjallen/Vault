@@ -35,6 +35,7 @@ use vault_server::storage::{
     BlobByteStream, BlobReadRange, BlobStorageBackend, BlobWriteKind, LocalBlobStorage,
     SharedBlobStorage, StorageError, StoredBlob, multipart_manifest_key_for_hash,
 };
+use vault_server::timestamps::format_utc;
 use vault_server::transfers::recover_interrupted_transfers;
 use vault_server::uploads::{
     self, CreateUploadRequest, UploadPartHeaders, UploadPartIngest, UploadRuntimeSettings,
@@ -299,7 +300,7 @@ async fn mark_document_archived_for_writer(pool: &sqlx::SqlitePool, document_id:
     sqlx::query(
         r"
         UPDATE documents
-        SET archived_at = CURRENT_TIMESTAMP,
+        SET archived_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'),
             archived_origin_path = 'Project/' || name,
             archived_access = ?
         WHERE id = ?
@@ -2142,7 +2143,7 @@ async fn upload_session_creates_document_without_part_database_writes() {
             .as_str()
             .is_some_and(|token| token.contains('.'))
     );
-    let original_updated_at = "2001-02-03T04:05:06Z";
+    let original_updated_at = "2001-02-03T04:05:06.000000Z";
     sqlx::query("UPDATE upload_sessions SET updated_at = ? WHERE id = ?")
         .bind(original_updated_at)
         .bind(session_id)
@@ -2482,7 +2483,10 @@ async fn upload_tokens_use_domain_separation_and_bounded_key_rotation() {
 
     let mut upload_shaped_payload = Map::new();
     upload_shaped_payload.insert("exp".to_string(), json!(4_102_444_800_i64));
-    upload_shaped_payload.insert("expires_at".to_string(), json!("2100-01-01T00:00:00Z"));
+    upload_shaped_payload.insert(
+        "expires_at".to_string(),
+        json!("2100-01-01T00:00:00.000000Z"),
+    );
     upload_shaped_payload.insert("owner".to_string(), json!(user.id));
     upload_shaped_payload.insert("sid".to_string(), json!(session.id));
     upload_shaped_payload.insert("mode".to_string(), json!("create"));
@@ -2861,8 +2865,8 @@ async fn checkin_session_refreshes_delete_ttl_before_sweep() {
     sqlx::query(
         r"
         UPDATE documents
-        SET latest_modified_at = '2025-06-01 00:00:00',
-            expires_at = '2025-06-08 00:00:00',
+        SET latest_modified_at = '2025-06-01T00:00:00.000000Z',
+            expires_at = '2025-06-08T00:00:00.000000Z',
             expiry_action = 'delete'
         WHERE id = ?
         ",
@@ -3189,9 +3193,8 @@ async fn expired_upload_session_cleans_parts_and_is_not_resumable() {
     let session_dir = transfers_path.join("uploads").join(session_id);
     assert!(tokio::fs::metadata(&session_dir).await.is_ok());
 
-    let expired_at = (OffsetDateTime::now_utc() - Duration::seconds(1))
-        .format(&Rfc3339)
-        .expect("expired timestamp");
+    let expired_at =
+        format_utc(OffsetDateTime::now_utc() - Duration::seconds(1)).expect("expired timestamp");
     sqlx::query("UPDATE upload_sessions SET expires_at = ? WHERE id = ?")
         .bind(expired_at)
         .bind(session_id)

@@ -40,6 +40,7 @@ use crate::storage::{
     BlobByteStream, BlobLocation, BlobReadRange, BlobStorageBackend, BlobWriteKind,
     STORAGE_CHUNK_SIZE, SharedBlobStorage, StorageError, open_ranked_location_stream,
 };
+use crate::timestamps::{TimestampError, format_utc};
 
 const EXPORT_TTL_SECONDS: i64 = 86_400;
 const EXPORT_WORKERS: i64 = 1;
@@ -394,7 +395,7 @@ pub enum ExportError {
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
-    TimeFormat(#[from] time::error::Format),
+    Timestamp(#[from] TimestampError),
     #[error(transparent)]
     TimeParse(#[from] time::error::Parse),
     #[error(transparent)]
@@ -668,23 +669,8 @@ async fn create_export_job_inner(
     check_export_admission(pool, &user.id, &settings).await?;
     let job_id = Uuid::new_v4().simple().to_string();
     let filename = export_filename_for_items(pool, items).await?;
-    let (total_items, total_bytes) = match options.mode {
-        ExportJobCreateMode::Export => {
-            let resolved = resolve_downloads(pool, items, user).await?;
-            if resolved.selected_documents == 0 {
-                return Err(ExportError::ExportHasNoDownloadableFiles);
-            }
-            (
-                resolved.selected_documents,
-                export_total_bytes(&resolved.downloads)?,
-            )
-        }
-        ExportJobCreateMode::Download => {
-            validate_download_queue_selection(pool, items, user).await?;
-            (0, 0)
-        }
-    };
-    let expires_at = expires_at_rfc3339(settings.ttl_seconds)?;
+    let (total_items, total_bytes) = export_job_totals(pool, items, user, options.mode).await?;
+    let expires_at = expires_at_utc(settings.ttl_seconds)?;
     let request_payload = serde_json::to_string(&ExportRequestPayload {
         items: items.to_vec(),
     })?;
@@ -723,10 +709,25 @@ async fn create_export_job_inner(
                 created_by_name,
                 user_context,
                 request_payload,
-                expires_at
+                expires_at,
+                created_at,
+                updated_at
             )
         VALUES
-            (?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)
+            (
+                ?,
+                'queued',
+                ?,
+                ?,
+                ?,
+                ?,
+                ?,
+                ?,
+                ?,
+                ?,
+                strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'),
+                strftime('%Y-%m-%dT%H:%M:%f000Z', 'now')
+            )
         ",
     )
     .bind(&job_id)
@@ -765,6 +766,30 @@ async fn create_export_job_inner(
     Ok(payload)
 }
 
+async fn export_job_totals(
+    pool: &SqlitePool,
+    items: &[ExportSelectionItem],
+    user: &UserContext,
+    mode: ExportJobCreateMode,
+) -> Result<(i64, i64), ExportError> {
+    Ok(match mode {
+        ExportJobCreateMode::Export => {
+            let resolved = resolve_downloads(pool, items, user).await?;
+            if resolved.selected_documents == 0 {
+                return Err(ExportError::ExportHasNoDownloadableFiles);
+            }
+            (
+                resolved.selected_documents,
+                export_total_bytes(&resolved.downloads)?,
+            )
+        }
+        ExportJobCreateMode::Download => {
+            validate_download_queue_selection(pool, items, user).await?;
+            (0, 0)
+        }
+    })
+}
+
 async fn export_job_activity_timestamps(
     transaction: &mut Transaction<'_, Sqlite>,
     job_id: &str,
@@ -772,8 +797,8 @@ async fn export_job_activity_timestamps(
     Ok(sqlx::query_as(
         r"
         SELECT
-            strftime('%Y-%m-%dT%H:%M:%SZ', created_at),
-            strftime('%Y-%m-%dT%H:%M:%SZ', updated_at)
+            created_at,
+            updated_at
         FROM export_jobs
         WHERE id = ?
         ",
@@ -835,8 +860,8 @@ pub async fn cancel_export_job(
         r"
         UPDATE export_jobs
         SET status = 'cancelled',
-            cancelled_at = CURRENT_TIMESTAMP,
-            updated_at = CURRENT_TIMESTAMP
+            cancelled_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'),
+            updated_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now')
         WHERE id = ?
           AND status IN ('queued', 'running', 'finalizing')
         ",
@@ -1124,7 +1149,7 @@ async fn run_claimed_export_job(
             r"
             UPDATE export_jobs
             SET status = 'finalizing',
-                updated_at = CURRENT_TIMESTAMP
+                updated_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now')
             WHERE id = ?
               AND status = 'running'
             ",
@@ -1297,7 +1322,7 @@ async fn claim_oldest_export_job(pool: &SqlitePool) -> Result<Option<ExportWorkR
             processed_items = 0,
             processed_bytes = 0,
             error = NULL,
-            updated_at = CURRENT_TIMESTAMP
+            updated_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now')
         WHERE id = (
             SELECT id
             FROM export_jobs
@@ -1327,7 +1352,7 @@ async fn update_export_totals(
         UPDATE export_jobs
         SET total_items = ?,
             total_bytes = ?,
-            updated_at = CURRENT_TIMESTAMP
+            updated_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now')
         WHERE id = ?
           AND status = 'running'
         ",
@@ -1387,7 +1412,7 @@ async fn record_export_byte_progress(
                 WHEN processed_bytes + ? > total_bytes THEN total_bytes
                 ELSE processed_bytes + ?
             END,
-            updated_at = CURRENT_TIMESTAMP
+            updated_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now')
         WHERE id = ?
           AND status = 'running'
         ",
@@ -1409,7 +1434,7 @@ async fn record_export_item_complete(pool: &SqlitePool, job_id: &str) -> Result<
         r"
         UPDATE export_jobs
         SET processed_items = processed_items + 1,
-            updated_at = CURRENT_TIMESTAMP
+            updated_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now')
         WHERE id = ?
           AND status = 'running'
         ",
@@ -2103,19 +2128,14 @@ async fn persist_export_artifact(
         };
         sqlx::query(
             r"
-            INSERT INTO export_artifacts
-                (
-                    job_id,
-                    blob_id,
-                    filename,
-                    mime_type,
-                    size_bytes,
-                    hash_algo,
-                    hash,
-                    expires_at
-                )
-            VALUES
-                (?, ?, ?, 'application/zip', ?, 'sha256', ?, ?)
+            INSERT INTO export_artifacts (
+                job_id, blob_id, filename, mime_type, size_bytes, hash_algo, hash, expires_at,
+                created_at
+            )
+            VALUES (
+                ?1, ?2, ?3, 'application/zip', ?4, 'sha256', ?5, ?6,
+                strftime('%Y-%m-%dT%H:%M:%f000Z', 'now')
+            )
             ",
         )
         .bind(job_id)
@@ -2138,8 +2158,8 @@ async fn persist_export_artifact(
             SET status = 'complete',
                 processed_items = total_items,
                 processed_bytes = total_bytes,
-                completed_at = CURRENT_TIMESTAMP,
-                updated_at = CURRENT_TIMESTAMP
+                completed_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now'),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now')
             WHERE id = ?
               AND status = 'finalizing'
             ",
@@ -2188,9 +2208,17 @@ async fn record_export_events_in_tx(
         sqlx::query(
             r"
             INSERT INTO document_events
-                (document_id, event_type, actor, actor_name, message, result)
+                (document_id, event_type, actor, actor_name, message, result, created_at)
             VALUES
-                (?, 'download', ?, ?, ?, 'ok')
+                (
+                    ?,
+                    'download',
+                    ?,
+                    ?,
+                    ?,
+                    'ok',
+                    strftime('%Y-%m-%dT%H:%M:%f000Z', 'now')
+                )
             ",
         )
         .bind(download.document_id)
@@ -2213,7 +2241,7 @@ async fn mark_export_failed(
         UPDATE export_jobs
         SET status = 'failed',
             error = ?,
-            updated_at = CURRENT_TIMESTAMP
+            updated_at = strftime('%Y-%m-%dT%H:%M:%f000Z', 'now')
         WHERE id = ?
           AND status IN ('running', 'finalizing')
         ",
@@ -2239,8 +2267,8 @@ async fn export_job_row(
             j.processed_items,
             j.total_bytes,
             j.processed_bytes,
-            strftime('%Y-%m-%dT%H:%M:%SZ', j.created_at) AS created_at,
-            strftime('%Y-%m-%dT%H:%M:%SZ', j.updated_at) AS updated_at,
+            j.created_at,
+            j.updated_at,
             j.created_by,
             j.error,
             j.expires_at,
@@ -2761,8 +2789,10 @@ fn safe_download_name(name: &str) -> String {
         .to_string()
 }
 
-fn expires_at_rfc3339(ttl_seconds: i64) -> Result<String, ExportError> {
-    Ok((OffsetDateTime::now_utc() + Duration::seconds(ttl_seconds.max(60))).format(&Rfc3339)?)
+fn expires_at_utc(ttl_seconds: i64) -> Result<String, ExportError> {
+    Ok(format_utc(
+        OffsetDateTime::now_utc() + Duration::seconds(ttl_seconds.max(60)),
+    )?)
 }
 
 fn lower_hex(bytes: &[u8]) -> String {

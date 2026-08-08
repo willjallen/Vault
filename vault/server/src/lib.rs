@@ -19,6 +19,7 @@ pub mod shares;
 pub mod site_settings;
 pub mod state_events;
 pub mod storage;
+pub mod timestamps;
 pub mod transfers;
 pub mod uploads;
 pub mod version;

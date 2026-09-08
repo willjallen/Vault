@@ -1,5 +1,6 @@
 import { classNames, expiryStatusLabel, expiryStatusLabels, formatDate } from "../../lib/utils.js";
 import { selectFileRenamePrefix } from "../../lib/fileNames.js";
+import { filePreview } from "../../lib/filePreview.js";
 import { Icon } from "../common/Icon.js";
 import { RowSelectionIcon } from "./RowSelectionIcon.js";
 import { TtlStatusLabel } from "./TtlStatusLabel.js";
@@ -165,7 +166,14 @@ export function FileRow({
       role: "row",
       tabIndex: editing ? undefined : tabIndex,
       onClick: editing ? undefined : onSelect,
-      onDoubleClick: editing || !doubleClickDownload ? undefined : () => onOpen(doc),
+      onDoubleClick:
+        editing || (!filePreview(doc) && !doubleClickDownload)
+          ? undefined
+          : (e) => {
+              if (!e.target.closest(".row-action-button, .version-chip-button")) {
+                onOpen(doc);
+              }
+            },
       onDragStart: editing ? undefined : (e) => onDragStart(e, doc.id),
       onDragEnd: editing ? undefined : onDragEnd,
       onFocus,
@@ -182,7 +190,7 @@ export function FileRow({
       onKeyDown: editing
         ? undefined
         : (e) => {
-            if (e.key === "Enter") {
+            if (e.key === "Enter" && e.target === e.currentTarget) {
               e.preventDefault();
               onOpen(doc);
             }

@@ -4230,6 +4230,130 @@ input[type="file"]::file-selector-button:hover {
   color: var(--text-secondary);
 }
 
+.file-preview-window {
+  width: min(1200px, calc(100vw - 32px));
+  height: min(900px, calc(100dvh - 32px));
+  max-width: none;
+  max-height: none;
+  margin: auto;
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--border-subtle);
+  border-radius: 22px;
+  background: var(--surface-overlay);
+  color: var(--text);
+  box-shadow: var(--shadow-window);
+}
+
+.file-preview-window[open] {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+.file-preview-window::backdrop {
+  background: var(--backdrop-strong);
+  backdrop-filter: blur(10px);
+}
+
+.file-preview-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 16px;
+  border-bottom: 1px solid var(--border-extra-subtle);
+  background: var(--surface-overlay-muted);
+}
+
+.file-preview-title {
+  min-width: 0;
+}
+
+.file-preview-title h2 {
+  margin: 0;
+  overflow: hidden;
+  font-size: 1.1rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-preview-title p {
+  margin: 0;
+}
+
+.file-preview-actions {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 12px;
+}
+
+.file-preview-actions .btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.file-preview-body {
+  position: relative;
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  overflow: auto;
+}
+
+.file-preview-image {
+  display: block;
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+
+.file-preview-video {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.file-preview-body.media-audio {
+  flex-direction: column;
+  gap: 32px;
+}
+
+.file-preview-audio-art {
+  display: grid;
+  width: 160px;
+  height: 160px;
+  flex-shrink: 0;
+  place-items: center;
+  border: 1px solid var(--border-subtle);
+  border-radius: 24px;
+  background: var(--surface-overlay-muted);
+  color: var(--text-secondary);
+}
+
+.file-preview-audio {
+  width: min(540px, 100%);
+  flex-shrink: 0;
+}
+
+.file-preview-loading {
+  position: absolute;
+  top: 12px;
+  left: 16px;
+  margin: 0;
+}
+
+.file-preview-message {
+  max-width: 520px;
+  margin: auto;
+  text-align: center;
+}
+
 .folder-properties-layer,
 .file-details-layer {
   position: fixed;

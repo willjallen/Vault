@@ -686,6 +686,158 @@ async fn browser_range_probe_does_not_read_full_blob() {
 }
 
 #[tokio::test]
+async fn media_preview_streams_ranges_inline_without_recording_downloads() {
+    let full_read_called = Arc::new(AtomicBool::new(false));
+    let stream_calls = Arc::new(AtomicUsize::new(0));
+    let data = b"RIFF media fixture";
+    let storage = Arc::new(RangeOnlyStorage {
+        data: data.to_vec(),
+        full_read_called: Arc::clone(&full_read_called),
+        object_key: "media".to_string(),
+        stream_calls: Arc::clone(&stream_calls),
+    });
+    let (state, _temp_dir) = test_state(storage).await;
+    let project_id = grant_reader_project(&state).await;
+    let document_id = insert_downloadable_document(&state.db, project_id, "media", data).await;
+    sqlx::query("UPDATE documents SET name = 'sound.WAV' WHERE id = ?")
+        .bind(document_id)
+        .execute(&state.db)
+        .await
+        .expect("name");
+    sqlx::query("UPDATE document_versions SET mime_type = 'application/octet-stream'")
+        .execute(&state.db)
+        .await
+        .expect("mime");
+    let app = http::router(state.clone());
+    let uri = format!("/api/documents/{document_id}/versions/version-one/content");
+
+    for (range, expected, content_range) in [
+        ("bytes=0-3", &data[..4], "bytes 0-3/18"),
+        ("bytes=-7", &data[11..], "bytes 11-17/18"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(authed_get_with_range(&uri, range))
+            .await
+            .expect("preview");
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.headers()["content-type"], "audio/wav");
+        assert_eq!(response.headers()["content-disposition"], "inline");
+        assert_eq!(response.headers()["accept-ranges"], "bytes");
+        assert_eq!(response.headers()["content-range"], content_range);
+        assert_eq!(response.headers()["cache-control"], "private, no-store");
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+        assert_eq!(
+            response.headers()["content-security-policy"],
+            "sandbox; default-src 'none'; frame-ancestors 'none'"
+        );
+        assert_eq!(
+            to_bytes(response.into_body(), 1024).await.unwrap().as_ref(),
+            expected
+        );
+    }
+    let downloads: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM document_events WHERE event_type = 'download'")
+            .fetch_one(&state.db)
+            .await
+            .expect("download events");
+    assert_eq!(downloads, 0);
+    assert_eq!(stream_calls.load(Ordering::SeqCst), 2);
+    assert!(!full_read_called.load(Ordering::SeqCst));
+
+    let response = app
+        .oneshot(authed_get(&format!("/documents/{document_id}/download")))
+        .await
+        .expect("download");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response.headers()["content-disposition"]
+            .to_str()
+            .unwrap()
+            .starts_with("attachment;")
+    );
+}
+
+#[tokio::test]
+async fn media_preview_authorizes_each_request_and_rejects_active_content() {
+    let stream_calls = Arc::new(AtomicUsize::new(0));
+    let storage = Arc::new(RangeOnlyStorage {
+        data: b"<script>alert(1)</script>".to_vec(),
+        full_read_called: Arc::new(AtomicBool::new(false)),
+        object_key: "active-content".to_string(),
+        stream_calls: Arc::clone(&stream_calls),
+    });
+    let (state, _temp_dir) = test_state(storage).await;
+    let project_id = grant_reader_project(&state).await;
+    let document_id = insert_downloadable_document(
+        &state.db,
+        project_id,
+        "active-content",
+        b"<script>alert(1)</script>",
+    )
+    .await;
+    let uri = format!("/api/documents/{document_id}/versions/version-one/content");
+    let app = http::router(state.clone());
+    let response = app
+        .clone()
+        .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+        .await
+        .expect("unauthenticated");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    for mime_type in [
+        "text/html",
+        "application/xhtml+xml",
+        "application/javascript",
+    ] {
+        sqlx::query("UPDATE document_versions SET mime_type = ?")
+            .bind(mime_type)
+            .execute(&state.db)
+            .await
+            .expect("mime");
+        let response = app
+            .clone()
+            .oneshot(authed_get(&uri))
+            .await
+            .expect("unsupported");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    sqlx::query("UPDATE document_versions SET mime_type = 'image/svg+xml'")
+        .execute(&state.db)
+        .await
+        .expect("svg mime");
+    let response = app
+        .clone()
+        .oneshot(authed_get(&uri))
+        .await
+        .expect("sandboxed svg");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "image/svg+xml");
+    assert!(
+        response.headers()["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .contains("sandbox;")
+    );
+    drop(response);
+
+    let unknown_version = uri.replace("version-one", "another-doc-version");
+    let response = app
+        .clone()
+        .oneshot(authed_get(&unknown_version))
+        .await
+        .expect("version");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    sqlx::query("UPDATE folder_permissions SET can_read = 0, can_write = 0")
+        .execute(&state.db)
+        .await
+        .expect("revoke access");
+    let response = app.oneshot(authed_get(&uri)).await.expect("revoked access");
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(stream_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 #[allow(clippy::too_many_lines)] // The cases intentionally share one ETag and backend call counter.
 async fn download_range_contract_handles_suffix_if_range_and_malformed_headers() {
     /*

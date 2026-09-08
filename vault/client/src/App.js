@@ -8,6 +8,7 @@ import { TransferDock } from "./components/TransferDock.js";
 import { WhatsNew } from "./components/WhatsNewModal.js";
 import { ContextMenu } from "./components/browser/ContextMenu.js";
 import { FileDetailsModal } from "./components/browser/FileDetailsModal.js";
+import { FilePreviewModal } from "./components/browser/FilePreviewModal.js";
 import { MoveDialog } from "./components/browser/MoveDialog.js";
 import { UploadInputs } from "./components/browser/UploadInputs.js";
 import {
@@ -43,6 +44,7 @@ import { useAuthFetch } from "./lib/useAuthFetch.js";
 import { UploadFileScheduler } from "./lib/uploadActions.js";
 import { createUploadHandlers } from "./lib/uploadHandlers.js";
 import { useFolderNavigation } from "./lib/useFolderNavigation.js";
+import { useFileDialogs } from "./lib/useFileDialogs.js";
 import { useFavoritePreferenceActions } from "./lib/useFavoritePreferenceActions.js";
 import { useMoveDialog } from "./lib/useMoveDialog.js";
 import { noticesForState, useNotifications } from "./lib/useNotifications.js";
@@ -79,7 +81,6 @@ export function App({ initial }) {
   const [draggingFolderPath, setDraggingFolderPath] = useState(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [folderPropertiesTarget, setFolderPropertiesTarget] = useState(null);
-  const [fileDetailsTarget, setFileDetailsTarget] = useState(null);
   const [contentsSort, setContentsSort] = useState(DEFAULT_CONTENTS_SORT);
   const [confirmRequest, setConfirmRequest] = useState(null);
   const [siteSettings, setSiteSettings] = useState(() =>
@@ -137,19 +138,6 @@ export function App({ initial }) {
 
   const closeFolderProperties = useCallback(() => {
     setFolderPropertiesTarget(null);
-  }, []);
-
-  const openFileDetails = useCallback(
-    (doc) => {
-      setFileDetailsTarget(doc);
-      setSelectedId(doc.id);
-      closeContextMenu();
-    },
-    [closeContextMenu]
-  );
-
-  const closeFileDetails = useCallback(() => {
-    setFileDetailsTarget(null);
   }, []);
 
   const {
@@ -314,15 +302,6 @@ export function App({ initial }) {
     () => new Map(contentsItems.map((item) => [keyForItem(item), item])),
     [contentsItems]
   );
-  const activeFileDetailsDoc = useMemo(() => {
-    if (!fileDetailsTarget) {
-      return null;
-    }
-    if (selectedDoc?.id === fileDetailsTarget.id) {
-      return selectedDoc;
-    }
-    return docs.find((doc) => doc.id === fileDetailsTarget.id) || fileDetailsTarget;
-  }, [docs, fileDetailsTarget, selectedDoc]);
   const folderPaneItems = useMemo(() => {
     const childrenFor = (parentPath, predicate) =>
       // eslint-disable-next-line security/detect-object-injection
@@ -589,6 +568,14 @@ export function App({ initial }) {
     setError,
   });
 
+  const fileDialogs = useFileDialogs({
+    closeContextMenu,
+    docs,
+    onDownload: handleView,
+    selectedDoc,
+    setSelectedId,
+  });
+
   function handleVersionDownload(item) {
     if (!item.download_url) {
       return;
@@ -758,7 +745,8 @@ export function App({ initial }) {
       handleUploadClick,
       handleUploadFolderClick,
       openFolderProperties,
-      openFileDetails,
+      openFileDetails: fileDialogs.openFileDetails,
+      handleOpenFile: fileDialogs.handleOpenFile,
       handleView,
       handleVersionDownload,
       handleVersionUploadClick,
@@ -904,7 +892,7 @@ export function App({ initial }) {
       onContentsViewChange: handleContentsViewChange,
       onClearSelection: clearAllSelections,
       onContentsMarqueeSelectionChange: handleContentsMarqueeSelectionChange,
-      onOpenDoc: handleView,
+      onOpenDoc: fileDialogs.handleOpenFile,
       onDropOnFolder: handleDropOnFolder,
       onClearDropHint: clearDropState,
       onCanvasDrop: handleCanvasDrop,
@@ -988,11 +976,19 @@ export function App({ initial }) {
           onUpdated: () => refresh(folder, { invalidateContents: true, sidebar: true }),
         })
       : null,
-    activeFileDetailsDoc
+    fileDialogs.activeFileDetailsDoc
       ? h(FileDetailsModal, {
           actions: contextActions(),
-          doc: activeFileDetailsDoc,
-          onClose: closeFileDetails,
+          doc: fileDialogs.activeFileDetailsDoc,
+          onClose: fileDialogs.closeFileDetails,
+        })
+      : null,
+    fileDialogs.filePreviewTarget
+      ? h(FilePreviewModal, {
+          doc: fileDialogs.filePreviewTarget,
+          key: fileDialogs.filePreviewTarget.visual.media.url,
+          onClose: fileDialogs.closeFilePreview,
+          onDownload: handleView,
         })
       : null,
     h(WhatsNew, {

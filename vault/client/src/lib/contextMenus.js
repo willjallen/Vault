@@ -1,5 +1,6 @@
 import { isArchivedPath, isArchiveRootPath } from "./utils.js";
 import { canDeleteForeverItem } from "./siteSettings.js";
+import { filePreview } from "./filePreview.js";
 
 function compactMenuItems(items) {
   const compacted = items.filter(Boolean).reduce((acc, item) => {
@@ -36,6 +37,9 @@ export function buildFileMenuItems(actions) {
         disabled: busy || doc.archived,
       };
   return compactMenuItems([
+    filePreview(doc) && actions.handleOpenFile
+      ? { label: "Preview", action: () => actions.handleOpenFile(doc) }
+      : null,
     { label: "Download", action: () => actions.handleView(doc) },
     {
       label: "Replace",

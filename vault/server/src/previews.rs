@@ -116,6 +116,8 @@ pub struct VisualPayload {
     pub icon_key: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preview: Option<PreviewDescriptor>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media: Option<crate::media::MediaPreview>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -703,6 +705,21 @@ pub async fn visual_payloads(
             VisualPayload {
                 icon_key: semantic_icon_key(source.name, source.mime_type),
                 preview,
+                media: source
+                    .can_read
+                    .then_some(source.version_id)
+                    .flatten()
+                    .and_then(|version_id| {
+                        crate::media::MediaPreview::for_source(
+                            source.mime_type,
+                            source.name,
+                            format!(
+                                "/api/documents/{}/versions/{}/content",
+                                source.document_id,
+                                percent_encode_segment(version_id),
+                            ),
+                        )
+                    }),
             },
         );
     }

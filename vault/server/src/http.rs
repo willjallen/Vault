@@ -359,6 +359,10 @@ fn document_transfer_routes() -> Router<AppState> {
         .route("/api/documents/{doc_id}/detail", get(api_document_detail))
         .route("/api/previews/resolve", post(api_resolve_previews))
         .route(
+            "/api/documents/{doc_id}/versions/{version_id}/content",
+            get(preview_document_content),
+        )
+        .route(
             "/api/documents/{doc_id}/versions/{version_id}/previews/{recipe}/{variant}",
             get(download_document_preview),
         )
@@ -1874,6 +1878,43 @@ async fn api_resolve_previews(
             })
             .collect(),
     }))
+}
+
+async fn preview_document_content(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((doc_id, version_id)): Path<(i64, String)>,
+) -> Result<Response, ApiError> {
+    let user = current_user(&state, &headers).await?;
+    let download = version_download_by_id(&state.db, doc_id, &version_id, &user).await?;
+    let mime_type =
+        crate::media::preview_mime_type(download.mime_type.as_deref(), &download.document_path)
+            .ok_or_else(|| {
+                ApiError::BadRequest("This file type cannot be previewed".to_string())
+            })?;
+    let mut response = version_download_response(&state, &download, &headers).await?;
+    insert_header(response.headers_mut(), header::CONTENT_TYPE, mime_type);
+    insert_header(
+        response.headers_mut(),
+        header::CONTENT_DISPOSITION,
+        "inline",
+    );
+    insert_header(
+        response.headers_mut(),
+        header::CACHE_CONTROL,
+        "private, no-store",
+    );
+    insert_header(
+        response.headers_mut(),
+        header::CONTENT_SECURITY_POLICY,
+        "sandbox; default-src 'none'; frame-ancestors 'none'",
+    );
+    insert_header(
+        response.headers_mut(),
+        header::X_CONTENT_TYPE_OPTIONS,
+        "nosniff",
+    );
+    Ok(response)
 }
 
 async fn download_document_preview(

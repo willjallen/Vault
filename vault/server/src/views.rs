@@ -2736,6 +2736,7 @@ fn document_row_payload(
         visual: visual.cloned().unwrap_or_else(|| VisualPayload {
             icon_key: previews::semantic_icon_key(&doc.name, doc.mime_type.as_deref()),
             preview: None,
+            media: None,
         }),
     })
 }

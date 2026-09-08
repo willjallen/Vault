@@ -715,10 +715,10 @@ function SectionPanel({
           }),
         }),
         SettingsRow({
-          title: "Double click downloads files",
+          title: "Double click downloads other files",
           copy: doubleClickDownload
-            ? "Double clicking a file starts a download."
-            : "Double clicking a file is disabled. Use the row download action instead.",
+            ? "Images, audio, and video open a preview. Other files download on double click."
+            : "Images, audio, and video open a preview. Use Download for other files.",
           control: SettingsToggle({
             checked: doubleClickDownload,
             label: "Toggle double click file download",

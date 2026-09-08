@@ -2,19 +2,19 @@
 
 Unreleased
 
-fix: Canonicalize every stored and API timestamp as fixed-width UTC, migrate legacy values without losing microseconds, and render browser dates in local time.
+fix: Keep dates and times consistent across Vault, preserve existing timestamps, and display them in your local time zone.
 
 
 ========================================================================
 
 v2.2.0
 
-feat: Add an offline integrity check that validates SQLite metadata and stored object contents, reports findings, and exits without repairs.
-feat: Render responsive thumbnails for SVG files while blocking external resource access.
-fix: Preserve file and folder identity through archive and restore while keeping archived folders flat, browsable, downloadable, and restorable as one item.
-fix: Bind uploads to folder identity across renames and moves; in-flight create uploads from earlier versions must restart once after upgrading.
-fix: Apply guarded, ordered database migrations from the v2.0.0 baseline and normalize legacy Vault roots before folder mutations are served.
-fix: Make resumable uploads recover promptly from stalls and network interruptions while reporting only server-confirmed progress.
+feat: Administrators can check saved file information and contents for damage while Vault is stopped, without changing any data.
+feat: Show thumbnails for SVG images without allowing them to load content from outside Vault.
+fix: Keep files and folders correctly linked when archived or restored, and let you browse, download, or restore an archived folder as one item.
+fix: Keep uploads in the correct folder when it is renamed or moved; restart unfinished new-file uploads once after upgrading from an earlier version.
+fix: Safely update stored file and folder information when upgrading from v2.0.0 or later before allowing folder changes.
+fix: Recover uploads more quickly after stalls or connection interruptions, and show only progress that Vault has confirmed.
 
 
 ========================================================================
@@ -22,82 +22,82 @@ fix: Make resumable uploads recover promptly from stalls and network interruptio
 v2.1.0
 
 feat: Remember each folder's selected view and icon size across sessions and devices.
-feat: Add a changelog-backed What's New window that appears once per release.
+feat: Show a What's New window once per release so you can catch up on improvements.
 
 
 ========================================================================
 
 v2.0.0
 
-feat: Add Details, List, and resizable Icons views with compact sorting, marquee selection, and lock indicators.
-feat: Add durable, responsive thumbnails for JPEG, PNG, and WebP files.
-feat: Add cancellable progress popups for simultaneous uploads and downloads, including recursive folder uploads.
-feat: Add file Lock and Unlock actions with administrator overrides and lock-owner details.
-feat: Allow permanent deletion of empty writable folders.
-fix: Make local file storage power-loss durable and recover safely from missing or orphaned blob copies.
-fix: Make resumable uploads content-bound and restart-safe, including cancellation and abandoned-session cleanup.
-fix: Upload complete picker and drag-and-drop selections with bounded concurrency while preserving nested and empty folders.
-fix: Make bulk exports handle empty files and individual failures reliably, with clearer progress.
-fix: Harden proxy and OIDC trust, signing-key rotation, cross-site request protection, and authentication redirects.
-fix: Require HTTPS for S3-compatible storage except explicit loopback development endpoints.
+feat: Choose Details, List, or adjustable Icons views; sort files, drag to select several items, and see which files are locked.
+feat: Show thumbnails for JPEG, PNG, and WebP images that stay available after restarting Vault.
+feat: Track and cancel multiple uploads and downloads, including uploads of folders and everything inside them.
+feat: Lock and unlock files to prevent unwanted changes, see who locked them, and let administrators unlock files when needed.
+feat: Permanently delete empty folders when you have permission to change them.
+fix: Better protect locally stored files during power failures and recover safely when stored copies are missing or no longer linked to files.
+fix: Safely resume interrupted uploads after restarting Vault, prevent mismatched file contents, and clean up cancelled or abandoned uploads.
+fix: Upload every selected file and folder, including empty folders, whether you choose them or drag them into Vault.
+fix: Make downloads of multiple files handle empty files and individual errors reliably, with clearer progress.
+fix: Improve sign-in security, including protection against forged requests and unsafe redirects.
+fix: Require encrypted HTTPS connections for S3-compatible storage services, except for explicitly configured local development connections.
 fix: Prevent removal of the final administrator.
 fix: Hide folder paths users cannot access.
-fix: Make archive, permanent-delete, and retention changes atomic with their audit records and live updates.
-fix: Reject incompatible database schemas without mutation and separate process, database, and storage health checks.
-perf: Paginate large repositories and bound browser caches, background work, and server event history.
-perf: Stream large downloads and ZIP exports with bounded memory and concurrency.
-build: Patch vulnerable frontend development dependencies.
-ci: Enforce RustSec and OSV dependency audits.
-test: Add large-transfer and concurrent-user performance benchmarks.
+fix: Keep archiving, permanent deletion, and automatic cleanup consistent with activity records and updates shown to other users.
+fix: Stop safely when stored data uses an incompatible format, and help administrators distinguish server, database, and file storage problems.
+perf: Keep large collections responsive by loading files in smaller groups and limiting memory use and background activity.
+perf: Download large files and ZIP archives without holding the entire download in memory, while limiting simultaneous transfers.
+build: Fix security vulnerabilities in tools used to build Vault.
+ci: Automatically check third-party software for known security vulnerabilities before accepting changes.
+test: Add performance checks for large transfers and many people using Vault at once.
 
 
 ========================================================================
 
 v1.3.2
 
-fix: Enable File System Access downloads by default where supported, with automatic native fallback.
+fix: Ask where to save downloads by default when your browser supports it; otherwise, use its normal download behavior.
 
 
 ========================================================================
 
 v1.3.1
 
-fix: Use a save-location picker for downloads where configured and supported, with native download fallback.
-fix: Explain native download-location behavior until dismissed.
-perf: Stream downloads over one authenticated, backpressured connection.
+fix: Let you choose where to save downloads when enabled and supported; otherwise, use your browser’s normal download behavior.
+fix: Explain where your browser saves downloads, with an option to hide the guidance.
+perf: Download files through a single connection that checks your access and adjusts to how quickly your browser can save them.
 
 
 ========================================================================
 
 v1.3.0
 
-fix: Resume uploads only from committed parts and clearly show resumed transfers.
-fix: Refresh app shells after deployments while retaining long-lived content-addressed asset caching.
-build: Publish Docker images from semantic version tags and centralize version metadata in VERSION.
+fix: Resume uploads from the last successfully saved part and clearly show when an upload has resumed.
+fix: Show the latest version of Vault after an update while reusing unchanged files to keep loading fast.
+build: Publish Docker images for tagged releases and keep version numbers consistent across Vault.
 
 
 ========================================================================
 
 v1.2.0
 
-fix: Prevent stalled resumable uploads with browser-wide concurrency limits, per-part timeouts, and retries.
+fix: Prevent uploads from getting stuck by limiting simultaneous transfers and retrying parts that take too long.
 
 
 ========================================================================
 
 v1.1.0
 
-feat: Rewrite Vault's backend in Rust with Axum and SQLx while preserving its API, feature set, and single-container deployment.
-feat: Add Rust-native resumable transfers, ZIP64 exports, and local, S3, and R2 storage.
+feat: Rebuild the Vault server in Rust while keeping existing features, integrations, and installation in a single container.
+feat: Support resumable transfers, large ZIP downloads, and storage on your server, Amazon S3, or Cloudflare R2 in the rebuilt server.
 
 
 ========================================================================
 
 v1.0.1
 
-fix: Improve concurrent live updates with commit-driven SSE notifications and tuned SQLite connection handling.
+fix: Keep file changes up to date more reliably when several people use Vault at the same time.
 fix: Preserve file extensions during rename and prevent renaming archived files.
-fix: Show Remove from Favorites from the Favorites context menu.
+fix: Show Remove from Favorites when you right-click an item in Favorites.
 
 
 ========================================================================
@@ -111,12 +111,12 @@ Initial release
 
 feat:     A new feature.
 fix:      A bug fix.
-perf:     A performance improvement.
-docs:     Documentation changes.
-build:    Build system or dependency changes.
-ci:       Continuous integration changes.
-test:     Test coverage or infrastructure changes.
-refactor: Code refactoring that does not add a feature or fix a bug.
-style:    Code style changes.
+perf:     A speed or resource-use improvement.
+docs:     Help and documentation changes.
+build:    Changes to how Vault is built or the software it relies on.
+ci:       Changes to automated checks used during development.
+test:     Changes to tests that check Vault works correctly.
+refactor: Internal code improvements with no change to how Vault works.
+style:    Changes to how the code is formatted.
 chore:    Routine maintenance.
-revert:   Reverting a previous change.
+revert:   Undoing a previous change.

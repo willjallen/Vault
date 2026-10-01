@@ -8,9 +8,10 @@ version.workspace = true
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
-aws-config = "1"
+aws-config = "1.9.0"
 aws-credential-types = "1"
-aws-sdk-s3 = "1"
+# Use the current HTTPS client without also enabling its legacy HTTP/TLS stack.
+aws-sdk-s3 = { version = "1.144.0", default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
 axum = "0.8"
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }

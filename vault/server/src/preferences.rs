@@ -12,6 +12,7 @@ const MAX_SIDEBAR_SECTION_SIZE: i64 = 4000;
 const MIN_SIDEBAR_SECTION_SIZE_F64: f64 = 32.0;
 const MAX_SIDEBAR_SECTION_SIZE_F64: f64 = 4000.0;
 const CONTENTS_VIEW_VERSION: i64 = 1;
+const CONTENTS_COLUMN_KEYS: [&str; 4] = ["name", "modified", "user", "size"];
 const DEFAULT_CONTENTS_ICON_SIZE: i64 = 80;
 const MIN_CONTENTS_ICON_SIZE: i64 = 56;
 const MAX_CONTENTS_ICON_SIZE: i64 = 176;
@@ -141,6 +142,10 @@ pub fn normalize_user_preferences(raw: &Value) -> Value {
         "contentsViewByFolder".to_string(),
         clean_contents_view_by_folder(raw_object.get("contentsViewByFolder")),
     );
+    normalized.insert(
+        "contentsColumnOrderByFolder".to_string(),
+        clean_contents_column_order_by_folder(raw_object.get("contentsColumnOrderByFolder")),
+    );
 
     Value::Object(normalized)
 }
@@ -202,6 +207,12 @@ pub fn clean_user_preference_patch(raw: &Value) -> Result<Map<String, Value>, Pr
             "contentsViewByFolder" => {
                 cleaned.insert(key.clone(), clean_contents_view_by_folder_strict(value)?);
             }
+            "contentsColumnOrderByFolder" => {
+                cleaned.insert(
+                    key.clone(),
+                    clean_contents_column_order_by_folder_strict(value)?,
+                );
+            }
             _ => return Err(invalid_patch(format!("Unknown preference: {key}"))),
         }
     }
@@ -212,15 +223,18 @@ pub fn clean_user_preference_patch(raw: &Value) -> Result<Map<String, Value>, Pr
 pub fn merge_user_preferences(existing: &Value, patch: Map<String, Value>) -> Value {
     let mut merged = normalize_user_preferences(existing);
     let mut patch = patch;
-    let contents_view_patch = patch.remove("contentsViewByFolder");
+    let folder_patches =
+        ["contentsViewByFolder", "contentsColumnOrderByFolder"].map(|key| (key, patch.remove(key)));
     if let Some(object) = merged.as_object_mut() {
         object.extend(patch);
-        if let Some(Value::Object(entries)) = contents_view_patch {
-            let target = object
-                .entry("contentsViewByFolder".to_string())
-                .or_insert_with(|| Value::Object(Map::new()));
-            if let Some(target_entries) = target.as_object_mut() {
-                target_entries.extend(entries);
+        for (key, entries) in folder_patches {
+            if let Some(Value::Object(entries)) = entries {
+                let target = object
+                    .entry(key.to_string())
+                    .or_insert_with(|| Value::Object(Map::new()));
+                if let Some(target_entries) = target.as_object_mut() {
+                    target_entries.extend(entries);
+                }
             }
         }
     }
@@ -249,6 +263,7 @@ fn default_preferences() -> Map<String, Value> {
             clean_sidebar_section_collapsed(None),
         ),
         ("contentsViewByFolder".to_string(), json!({})),
+        ("contentsColumnOrderByFolder".to_string(), json!({})),
     ])
 }
 
@@ -261,6 +276,52 @@ fn is_valid_acknowledged_version(version: &str) -> bool {
         && version
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+'))
+}
+
+fn is_contents_column_order(raw: &Value) -> bool {
+    raw.as_array().is_some_and(|order| {
+        order.len() == CONTENTS_COLUMN_KEYS.len()
+            && CONTENTS_COLUMN_KEYS
+                .iter()
+                .all(|key| order.iter().any(|value| value.as_str() == Some(*key)))
+    })
+}
+
+fn clean_contents_column_order_by_folder(raw: Option<&Value>) -> Value {
+    let Some(entries) = raw.and_then(Value::as_object) else {
+        return json!({});
+    };
+    Value::Object(
+        entries
+            .iter()
+            .filter(|(path, order)| {
+                normalize_folder(Some(path)).is_ok_and(|normalized| normalized == **path)
+                    && is_contents_column_order(order)
+            })
+            .map(|(path, order)| (path.clone(), order.clone()))
+            .collect(),
+    )
+}
+
+fn clean_contents_column_order_by_folder_strict(raw: &Value) -> Result<Value, PreferenceError> {
+    let Some(entries) = raw.as_object() else {
+        return Err(invalid_patch(
+            "contentsColumnOrderByFolder must be an object",
+        ));
+    };
+    for (path, order) in entries {
+        let normalized = normalize_folder(Some(path))
+            .map_err(|_| invalid_patch("Column order folder path is invalid"))?;
+        if normalized != *path {
+            return Err(invalid_patch("Column order folder path must be canonical"));
+        }
+        if !is_contents_column_order(order) {
+            return Err(invalid_patch(
+                "Column order must contain name, modified, user, and size exactly once",
+            ));
+        }
+    }
+    Ok(raw.clone())
 }
 
 fn clean_contents_view_by_folder(raw: Option<&Value>) -> Value {

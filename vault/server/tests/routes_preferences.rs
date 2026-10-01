@@ -1125,3 +1125,149 @@ async fn preferences_patch_rejects_invalid_payloads_without_changing_existing_va
     assert_eq!(json["preferences"]["themePreference"], "light");
     assert!(json["preferences"].get("sidebarWidth").is_none());
 }
+
+#[tokio::test]
+async fn column_orders_are_persisted_and_merged_by_folder_for_each_user() {
+    /*
+     * Saving a second folder must preserve the root order, while updating a folder replaces
+     * only that folder's order. A fresh read returns the stored settings for the same user;
+     * other users start with no saved column orders.
+     */
+    let (state, _temp_dir) = test_state().await;
+    let pool = state.db.clone();
+    let app = http::router(state);
+    let root_order = json!(["size", "name", "modified", "user"]);
+    let alpha_order = json!(["user", "modified", "name", "size"]);
+    let beta_order = json!(["modified", "size", "user", "name"]);
+    for entries in [
+        json!({"": root_order, "Projects/Alpha": ["name", "modified", "user", "size"]}),
+        json!({"Projects/Beta": beta_order}),
+        json!({"Projects/Alpha": alpha_order}),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(authed_patch(
+                "/api/preferences",
+                "artist",
+                "artists",
+                &json!({"preferences": {"contentsColumnOrderByFolder": entries}}),
+            ))
+            .await
+            .expect("column order patch");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let expected =
+        json!({"": root_order, "Projects/Alpha": alpha_order, "Projects/Beta": beta_order});
+    let stored: String = sqlx::query_scalar(
+        "SELECT preferences FROM vault_users WHERE issuer = 'headers' AND subject = 'artist'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("stored preferences");
+    let stored: Value = serde_json::from_str(&stored).expect("stored preference JSON");
+    assert_eq!(stored["contentsColumnOrderByFolder"], expected);
+    let read = app
+        .clone()
+        .oneshot(authed_get("/api/preferences", "artist", "artists"))
+        .await
+        .expect("fresh preference read");
+    assert_eq!(
+        response_json(read).await["preferences"]["contentsColumnOrderByFolder"],
+        expected
+    );
+    let other = app
+        .oneshot(authed_get("/api/preferences", "another-user", "artists"))
+        .await
+        .expect("another user's preference read");
+    assert_eq!(
+        response_json(other).await["preferences"]["contentsColumnOrderByFolder"],
+        json!({})
+    );
+}
+
+#[test]
+fn malformed_stored_column_orders_are_ignored() {
+    /*
+     * Older or corrupt saved preferences must never hide, duplicate, or add columns. Valid
+     * canonical folder entries survive normalization; invalid paths and arrays are omitted.
+     */
+    let normalized = vault_server::preferences::normalize_user_preferences(&json!({
+        "contentsColumnOrderByFolder": {
+            "": ["size", "name", "modified", "user"],
+            "/Art": ["name", "modified", "user", "size"],
+            "Duplicate": ["name", "name", "user", "size"],
+            "Missing": ["name", "size"],
+            "Unknown": ["name", "modified", "user", "actions"],
+            "Invalid": null
+        }
+    }));
+    assert_eq!(
+        normalized["contentsColumnOrderByFolder"],
+        json!({
+            "": ["size", "name", "modified", "user"]
+        })
+    );
+}
+
+#[tokio::test]
+async fn invalid_column_orders_cannot_overwrite_saved_preferences() {
+    /*
+     * Noncanonical paths, repeated columns, missing columns, and fixed-column names must be
+     * rejected before any preferences are written. Valid saved folder orders survive each
+     * failed patch along with the unrelated theme preference.
+     */
+    let (state, _temp_dir) = test_state().await;
+    let app = http::router(state);
+    let order = json!(["size", "name", "modified", "user"]);
+    let initial = app.clone().oneshot(authed_patch(
+        "/api/preferences", "artist", "artists",
+        &json!({"preferences": {"contentsColumnOrderByFolder": {"Art": order}, "themePreference": "light"}}),
+    )).await.expect("initial preference patch");
+    assert_eq!(initial.status(), StatusCode::OK);
+    let invalid_cases = [
+        (
+            json!({"preferences": {"contentsColumnOrderByFolder": []}}),
+            "contentsColumnOrderByFolder must be an object",
+        ),
+        (
+            json!({"preferences": {"contentsColumnOrderByFolder": {"/Art": ["name", "modified", "user", "size"]}}}),
+            "Column order folder path must be canonical",
+        ),
+        (
+            json!({"preferences": {"contentsColumnOrderByFolder": {"Art": ["name", "name", "user", "size"]}}}),
+            "Column order must contain name, modified, user, and size exactly once",
+        ),
+        (
+            json!({"preferences": {"contentsColumnOrderByFolder": {"Art": ["name", "modified", "size"]}}}),
+            "Column order must contain name, modified, user, and size exactly once",
+        ),
+        (
+            json!({"preferences": {"contentsColumnOrderByFolder": {"Art": ["name", "modified", "user", "status"]}}}),
+            "Column order must contain name, modified, user, and size exactly once",
+        ),
+    ];
+    for (payload, detail) in invalid_cases {
+        let response = app
+            .clone()
+            .oneshot(authed_patch(
+                "/api/preferences",
+                "artist",
+                "artists",
+                &payload,
+            ))
+            .await
+            .expect("invalid column order patch");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response_json(response).await["detail"], detail);
+    }
+    let read = app
+        .oneshot(authed_get("/api/preferences", "artist", "artists"))
+        .await
+        .expect("saved preference read");
+    let preferences = response_json(read).await;
+    assert_eq!(
+        preferences["preferences"]["contentsColumnOrderByFolder"],
+        json!({"Art": order})
+    );
+    assert_eq!(preferences["preferences"]["themePreference"], "light");
+}

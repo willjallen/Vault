@@ -1,10 +1,12 @@
 import { CONTENTS_VIEW_MODES, contentsVisualSize } from "../../lib/contentsView.js";
+import { contentsColumnOrderForFolder } from "../../lib/contentsColumns.js";
 import { browserScopeClasses, canvasDropAttributes } from "../../lib/dropHandlers.js";
 import { writeLocalPreference } from "../../lib/localPreferences.js";
 import { classNames, formatBytes, isArchivedPath } from "../../lib/utils.js";
 import { Icon } from "../common/Icon.js";
 import {
   COLUMN_WIDTH_STORAGE_KEY,
+  columnOrderForContentsView,
   columnWidthsForResize,
   contentColumnStyle,
   measuredColumnWidths,
@@ -13,6 +15,7 @@ import {
 import { FolderRow } from "./FolderRow.js";
 import { FileRow } from "./FileRow.js";
 import { EmptyState } from "./EmptyState.js";
+import { ContentsLoadMore } from "./ContentsLoadMore.js";
 import { ContentsTableHeader } from "./ContentsTableHeader.js";
 import { ContentsViewToolbarControls, ViewModeControl } from "./ContentsViewControl.js";
 import {
@@ -24,6 +27,7 @@ import {
   rectsIntersect,
 } from "./marqueeSelection.js";
 import { useContentsView } from "./useContentsView.js";
+import { useColumnReorder } from "./useColumnReorder.js";
 
 const { useCallback, useEffect, useRef, useState } = React;
 const h = React.createElement;
@@ -79,33 +83,6 @@ function clearNativeSelection() {
   }
 }
 
-function ContentsLoadMore({ hasMore, loading, onLoadMore }) {
-  if (!hasMore && !loading) {
-    return null;
-  }
-  return h(
-    "div",
-    {
-      "aria-live": "polite",
-      className: "contents-load-more",
-      onClick: (e) => e.stopPropagation(),
-      onMouseDown: (e) => e.stopPropagation(),
-    },
-    h(
-      "button",
-      {
-        "aria-busy": loading ? "true" : undefined,
-        "aria-label": loading ? "Loading more contents" : "Load more contents",
-        className: "btn secondary contents-load-more-button",
-        disabled: loading,
-        onClick: onLoadMore,
-        type: "button",
-      },
-      loading ? "Loading more…" : "Load more"
-    )
-  );
-}
-
 function fileListState({
   contentsHasMore,
   contentsPending,
@@ -158,6 +135,7 @@ function fileListState({
 export function VaultFileList({
   folder,
   contentsViewByFolder,
+  contentsColumns = {},
   subfolders,
   files,
   currentUser,
@@ -251,6 +229,17 @@ export function VaultFileList({
   });
   const rovingFocusKey = rovingSelectionKey(orderedKeys, focusedSelectionKey);
   const visualSize = contentsVisualSize(contentsView);
+  const columnOrder = contentsColumnOrderForFolder(contentsColumns.orderByFolder, folder);
+  const rowColumnOrder = columnOrderForContentsView(contentsView.mode, columnOrder);
+  const { dragState: columnDragState, reorderHandlers } = useColumnReorder({
+    columnOrder,
+    folder,
+    headerRef,
+    locked: Boolean(
+      inlineFolderDraft || dragActive || contentsView.mode !== CONTENTS_VIEW_MODES.DETAILS
+    ),
+    onColumnOrderChange: contentsColumns.onOrderChange,
+  });
 
   const updateMarqueeSelection = useCallback(() => {
     marqueeFrameRef.current = null;
@@ -397,7 +386,7 @@ export function VaultFileList({
       startWidths: measuredColumnWidths(headerRef.current),
       startX: e.clientX,
     };
-    e.currentTarget.setPointerCapture?.(e.pointerId);
+    headerRef.current?.setPointerCapture?.(e.pointerId);
     document.body.classList.add("contents-column-resizing");
   }
 
@@ -692,6 +681,7 @@ export function VaultFileList({
     const selectionKey = itemSelectionKey(folderItem);
     const folderDropActive = isActiveFolderDropTarget(dropHint, activeDropTarget, folderItem.path);
     return h(FolderRow, {
+      columnOrder: rowColumnOrder,
       key: selectionKey,
       folder: folderItem,
       editing:
@@ -736,6 +726,7 @@ export function VaultFileList({
     const selectionKey = `document:${doc.id}`;
     const lockedByMe = doc.lock?.by === currentUser.id;
     return h(FileRow, {
+      columnOrder: rowColumnOrder,
       key: selectionKey,
       doc,
       currentUser,
@@ -793,7 +784,7 @@ export function VaultFileList({
         onCanvasDrop,
       }),
       onClick: handleBackgroundClick,
-      style: contentColumnStyle(columnWidths),
+      style: contentColumnStyle(columnWidths, columnOrder),
     },
     [
       h("div", { className: "browser-head" }, [
@@ -868,11 +859,14 @@ export function VaultFileList({
       ]),
       h(ContentsTableHeader, {
         allVisibleSelected,
+        columnOrder,
+        dragState: columnDragState,
         headerRef,
         key: "table-header",
         mode: contentsView.mode,
         onSelectAllChange: handleSelectAllChange,
         onSortChange,
+        reorderHandlers,
         resizeHandlers: {
           end: endColumnResize,
           move: moveColumnResize,
@@ -904,6 +898,7 @@ export function VaultFileList({
         [
           createDraft
             ? h(FolderRow, {
+                columnOrder: rowColumnOrder,
                 key: "inline-new-folder",
                 folder: {
                   path: "",

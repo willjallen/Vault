@@ -4,6 +4,7 @@ import { filePreview } from "../../lib/filePreview.js";
 import { Icon } from "../common/Icon.js";
 import { RowSelectionIcon } from "./RowSelectionIcon.js";
 import { TtlStatusLabel } from "./TtlStatusLabel.js";
+import { contentCellsInOrder } from "./contentColumns.js";
 
 const { useEffect, useRef } = React;
 const h = React.createElement;
@@ -54,6 +55,7 @@ function recursiveSearchPath(folder) {
 
 // eslint-disable-next-line complexity
 export function FileRow({
+  columnOrder,
   doc,
   currentUser,
   doubleClickDownload = false,
@@ -196,192 +198,199 @@ export function FileRow({
             }
           },
     },
-    [
-      h("div", { className: "file-cell icon", role: "gridcell" }, [
-        h(RowSelectionIcon, {
-          disabled: editing,
-          fileName: doc.name,
-          item: doc,
-          key: "visual",
-          kind: "file",
-          label: selected ? `Deselect ${doc.name}` : `Select ${doc.name}`,
-          onSelect: onToggleSelect,
-          selected,
-          size: visualSize,
-        }),
-        locked
-          ? h(
-              "span",
-              {
-                className: classNames(
-                  "compact-lock-indicator",
-                  lockedByMe ? "locked-self" : "locked-other"
-                ),
-                key: "lock",
-                title: `Checked out by ${lockHolderName}`,
-              },
-              h(Icon, {
-                icon: "lock",
-                label: `Checked out by ${lockHolderName}`,
-                size: 9,
+    contentCellsInOrder(
+      [
+        h("div", { className: "file-cell icon", role: "gridcell" }, [
+          h(RowSelectionIcon, {
+            disabled: editing,
+            fileName: doc.name,
+            item: doc,
+            key: "visual",
+            kind: "file",
+            label: selected ? `Deselect ${doc.name}` : `Select ${doc.name}`,
+            onSelect: onToggleSelect,
+            selected,
+            size: visualSize,
+          }),
+          locked
+            ? h(
+                "span",
+                {
+                  className: classNames(
+                    "compact-lock-indicator",
+                    lockedByMe ? "locked-self" : "locked-other"
+                  ),
+                  key: "lock",
+                  title: `Checked out by ${lockHolderName}`,
+                },
+                h(Icon, {
+                  icon: "lock",
+                  label: `Checked out by ${lockHolderName}`,
+                  size: 9,
+                })
+              )
+            : null,
+        ]),
+        h("div", { className: "file-cell main", role: "gridcell" }, [
+          editing
+            ? h("input", {
+                ref: inputRef,
+                className: "inline-name-editor",
+                type: "text",
+                value: editValue,
+                onClick: (e) => e.stopPropagation(),
+                onChange: (e) => onEditChange && onEditChange(e.target.value),
+                onBlur: commitEdit,
+                onKeyDown: (e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    commitEdit();
+                  }
+                  if (e.key === "Escape") {
+                    e.preventDefault();
+                    cancelEdit();
+                  }
+                },
               })
-            )
-          : null,
-      ]),
-      h("div", { className: "file-cell main", role: "gridcell" }, [
-        editing
-          ? h("input", {
-              ref: inputRef,
-              className: "inline-name-editor",
-              type: "text",
-              value: editValue,
-              onClick: (e) => e.stopPropagation(),
-              onChange: (e) => onEditChange && onEditChange(e.target.value),
-              onBlur: commitEdit,
-              onKeyDown: (e) => {
-                if (e.key === "Enter") {
-                  e.preventDefault();
-                  commitEdit();
-                }
-                if (e.key === "Escape") {
-                  e.preventDefault();
-                  cancelEdit();
-                }
-              },
-            })
-          : h("div", { className: "file-name-line" }, [
-              h(
-                "div",
-                { className: classNames("name", isArchived ? "archived-text" : "") },
-                highlightedFileName(doc.name, searchQuery)
+            : h("div", { className: "file-name-line" }, [
+                h(
+                  "div",
+                  { className: classNames("name", isArchived ? "archived-text" : "") },
+                  highlightedFileName(doc.name, searchQuery)
+                ),
+                searchPath
+                  ? h("span", { className: "file-search-path", key: "search-path" }, [
+                      h("span", { "aria-hidden": "true", key: "arrow" }, ">"),
+                      h("span", { key: "path" }, searchPath),
+                    ])
+                  : null,
+              ]),
+        ]),
+        h("div", { className: "file-cell meta", role: "gridcell" }, [
+          h(
+            "div",
+            { className: "muted tiny" },
+            formatDate(doc.modified_at, "No modifications yet")
+          ),
+        ]),
+        h(
+          "div",
+          { className: "file-cell user", role: "gridcell" },
+          h("span", { className: "muted tiny" }, doc.latest_by || "-")
+        ),
+        h(
+          "div",
+          { className: "file-cell size", role: "gridcell" },
+          h("span", { className: "muted tiny" }, doc.size_display || "-")
+        ),
+        h("div", { className: "file-cell status-col", role: "gridcell" }, [
+          onOpenDetails
+            ? h(
+                "button",
+                {
+                  "aria-label": `View version history for ${doc.name}`,
+                  className: "version-chip-button status-version",
+                  onClick: (e) => stopRowAction(e, () => onOpenDetails(doc)),
+                  title: `View version history: v${versionCount}`,
+                  type: "button",
+                },
+                h("span", { className: "version-chip" }, `v${versionCount}`)
+              )
+            : h(
+                "span",
+                {
+                  className: "version-chip status-version",
+                  title: `Current version: v${versionCount}`,
+                },
+                `v${versionCount}`
               ),
-              searchPath
-                ? h("span", { className: "file-search-path", key: "search-path" }, [
-                    h("span", { "aria-hidden": "true", key: "arrow" }, ">"),
-                    h("span", { key: "path" }, searchPath),
-                  ])
-                : null,
-            ]),
-      ]),
-      h("div", { className: "file-cell meta", role: "gridcell" }, [
-        h("div", { className: "muted tiny" }, formatDate(doc.modified_at, "No modifications yet")),
-      ]),
-      h(
-        "div",
-        { className: "file-cell user", role: "gridcell" },
-        h("span", { className: "muted tiny" }, doc.latest_by || "-")
-      ),
-      h(
-        "div",
-        { className: "file-cell size", role: "gridcell" },
-        h("span", { className: "muted tiny" }, doc.size_display || "-")
-      ),
-      h("div", { className: "file-cell status-col", role: "gridcell" }, [
-        onOpenDetails
-          ? h(
-              "button",
-              {
-                "aria-label": `View version history for ${doc.name}`,
-                className: "version-chip-button status-version",
-                onClick: (e) => stopRowAction(e, () => onOpenDetails(doc)),
-                title: `View version history: v${versionCount}`,
-                type: "button",
-              },
-              h("span", { className: "version-chip" }, `v${versionCount}`)
-            )
-          : h(
-              "span",
-              {
-                className: "version-chip status-version",
-                title: `Current version: v${versionCount}`,
-              },
-              `v${versionCount}`
-            ),
-        locked
-          ? h(
-              "span",
-              {
-                className: "file-lock-indicator status-lock",
-                title: `Checked out by ${lockHolderName}`,
-              },
-              [
-                h(Icon, { icon: "lock", key: "icon", size: 11 }),
-                h("span", { key: "label" }, lockHolderName),
-              ]
-            )
-          : h("span", { "aria-hidden": "true", className: "status-empty status-lock" }),
-        expiryLabels
-          ? h(TtlStatusLabel, {
-              className: "applied status-ttl",
-              labels: expiryLabels,
-              title: expiryTitle,
-            })
-          : h("span", { "aria-hidden": "true", className: "status-empty status-ttl" }),
-      ]),
-      h("div", { className: "file-cell row-actions", role: "gridcell" }, [
-        h(
-          "button",
-          {
-            "aria-label": `Download ${doc.name}`,
-            className: "row-action-button",
-            onClick: (e) => stopRowAction(e, onDownload),
-            title: "Download",
-            type: "button",
-          },
-          h(Icon, { icon: "download", size: 14 })
-        ),
-        h(
-          "button",
-          {
-            "aria-label": locked
-              ? `Upload checked-out version for ${doc.name}`
-              : `Upload replacement for ${doc.name}`,
-            className: classNames("row-action-button", lockedByMe ? "checked-out-upload" : ""),
-            disabled: busy || isArchived || lockedByOther,
-            onClick: (e) => stopRowAction(e, onUpload),
-            title: locked ? "Upload checked-out version" : "Upload replacement",
-            type: "button",
-          },
-          h(Icon, { icon: locked ? "file-upload" : "upload", size: 14 })
-        ),
-        locked
-          ? null
-          : h(
-              "button",
-              {
-                "aria-label": `Check out ${doc.name}`,
-                className: "row-action-button checkout",
-                disabled: busy || isArchived,
-                onClick: (e) => stopRowAction(e, onCheckout),
-                title: "Check out",
-                type: "button",
-              },
-              h(Icon, { icon: "file-download", size: 14 })
-            ),
-        h(
-          "button",
-          {
-            "aria-label": locked ? lockButtonTitle : `Lock ${doc.name}`,
-            className: classNames("row-action-button", "row-lock-button", locked ? "locked" : ""),
-            disabled: busy || isArchived || lockedByOther,
-            onClick: (e) => stopRowAction(e, onLock),
-            title: lockButtonTitle,
-            type: "button",
-          },
-          h(Icon, { icon: "lock", size: 14 })
-        ),
-        h(
-          "button",
-          {
-            "aria-label": `More actions for ${doc.name}`,
-            className: "row-action-button more",
-            onClick: (e) => stopRowAction(e, onMore),
-            title: "More actions",
-            type: "button",
-          },
-          h(Icon, { icon: "ellipsis", size: 14 })
-        ),
-      ]),
-    ]
+          locked
+            ? h(
+                "span",
+                {
+                  className: "file-lock-indicator status-lock",
+                  title: `Checked out by ${lockHolderName}`,
+                },
+                [
+                  h(Icon, { icon: "lock", key: "icon", size: 11 }),
+                  h("span", { key: "label" }, lockHolderName),
+                ]
+              )
+            : h("span", { "aria-hidden": "true", className: "status-empty status-lock" }),
+          expiryLabels
+            ? h(TtlStatusLabel, {
+                className: "applied status-ttl",
+                labels: expiryLabels,
+                title: expiryTitle,
+              })
+            : h("span", { "aria-hidden": "true", className: "status-empty status-ttl" }),
+        ]),
+        h("div", { className: "file-cell row-actions", role: "gridcell" }, [
+          h(
+            "button",
+            {
+              "aria-label": `Download ${doc.name}`,
+              className: "row-action-button",
+              onClick: (e) => stopRowAction(e, onDownload),
+              title: "Download",
+              type: "button",
+            },
+            h(Icon, { icon: "download", size: 14 })
+          ),
+          h(
+            "button",
+            {
+              "aria-label": locked
+                ? `Upload checked-out version for ${doc.name}`
+                : `Upload replacement for ${doc.name}`,
+              className: classNames("row-action-button", lockedByMe ? "checked-out-upload" : ""),
+              disabled: busy || isArchived || lockedByOther,
+              onClick: (e) => stopRowAction(e, onUpload),
+              title: locked ? "Upload checked-out version" : "Upload replacement",
+              type: "button",
+            },
+            h(Icon, { icon: locked ? "file-upload" : "upload", size: 14 })
+          ),
+          locked
+            ? null
+            : h(
+                "button",
+                {
+                  "aria-label": `Check out ${doc.name}`,
+                  className: "row-action-button checkout",
+                  disabled: busy || isArchived,
+                  onClick: (e) => stopRowAction(e, onCheckout),
+                  title: "Check out",
+                  type: "button",
+                },
+                h(Icon, { icon: "file-download", size: 14 })
+              ),
+          h(
+            "button",
+            {
+              "aria-label": locked ? lockButtonTitle : `Lock ${doc.name}`,
+              className: classNames("row-action-button", "row-lock-button", locked ? "locked" : ""),
+              disabled: busy || isArchived || lockedByOther,
+              onClick: (e) => stopRowAction(e, onLock),
+              title: lockButtonTitle,
+              type: "button",
+            },
+            h(Icon, { icon: "lock", size: 14 })
+          ),
+          h(
+            "button",
+            {
+              "aria-label": `More actions for ${doc.name}`,
+              className: "row-action-button more",
+              onClick: (e) => stopRowAction(e, onMore),
+              title: "More actions",
+              type: "button",
+            },
+            h(Icon, { icon: "ellipsis", size: 14 })
+          ),
+        ]),
+      ],
+      columnOrder
+    )
   );
 }

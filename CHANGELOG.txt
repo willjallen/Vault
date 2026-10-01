@@ -3,6 +3,7 @@
 Unreleased
 
 feat: Double-click images to see a larger preview, or play audio and video files supported by your browser directly in Vault.
+feat: Reorder Name, Modified, User, and Size columns, and remember each folder's order across your devices.
 fix: Keep dates and times consistent across Vault, preserve existing timestamps, and display them in your local time zone.
 
 

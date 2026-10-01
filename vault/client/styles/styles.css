@@ -975,9 +975,7 @@ body.sidebar-resizing {
   --contents-size-width: 96px;
   --contents-status-width: 236px;
   --contents-user-width: 126px;
-  --contents-grid-template: 32px minmax(196px, 1fr) minmax(128px, var(--contents-modified-width))
-    minmax(76px, var(--contents-user-width)) minmax(64px, var(--contents-size-width))
-    minmax(152px, var(--contents-status-width)) minmax(138px, var(--contents-actions-width));
+  --contents-grid-template: var(--contents-ordered-grid-template);
 
   background: var(--surface-panel);
   border: 1px solid var(--outline);
@@ -1077,6 +1075,35 @@ body.sidebar-resizing {
 
 .contents-head-actions {
   min-width: 0;
+}
+
+.contents-head-cell.column-dragging {
+  opacity: 0.5;
+}
+
+.contents-head-cell.column-drop-before::before,
+.contents-head-cell.column-drop-after::after {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  border-radius: 2px;
+  background: var(--accent-border);
+  content: "";
+  pointer-events: none;
+}
+
+.contents-head-cell.column-drop-before::before {
+  left: -6px;
+}
+
+.contents-head-cell.column-drop-after::after {
+  right: -6px;
+}
+
+.contents-sort-button.reorderable {
+  touch-action: none;
+  user-select: none;
 }
 
 .contents-column-resizer {

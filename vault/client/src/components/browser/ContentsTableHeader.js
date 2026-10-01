@@ -1,7 +1,8 @@
 import { CONTENTS_VIEW_MODES } from "../../lib/contentsView.js";
 import { classNames } from "../../lib/utils.js";
 import { Icon } from "../common/Icon.js";
-import { COLUMN_RESIZE_HANDLES } from "./contentColumns.js";
+import { normalizeContentsColumnOrder } from "../../lib/contentsColumns.js";
+import { columnResizeHandle } from "./contentColumns.js";
 
 const h = React.createElement;
 const NAME_COLUMN = { key: "name", label: "Name", className: "name", defaultDirection: "asc" };
@@ -12,7 +13,7 @@ const DETAIL_SORT_COLUMNS = [
   { key: "ttl", label: "Status", className: "status", defaultDirection: "asc" },
 ];
 
-function ContentsSortButton({ column, sort, onSortChange }) {
+function ContentsSortButton({ column, sort, onSortChange, reorderHandlers }) {
   const active = sort?.key === column.key;
   const direction = active ? sort.direction : column.defaultDirection;
   return h(
@@ -22,11 +23,22 @@ function ContentsSortButton({ column, sort, onSortChange }) {
       className: classNames(
         "contents-sort-button",
         `contents-sort-${column.className}`,
+        reorderHandlers ? "reorderable" : "",
         active ? "active" : ""
       ),
       "aria-sort": active ? (direction === "desc" ? "descending" : "ascending") : "none",
+      "aria-keyshortcuts": reorderHandlers ? "Alt+ArrowLeft Alt+ArrowRight" : undefined,
+      title: reorderHandlers ? "Drag to reorder; Alt+Left/Right also moves this column" : undefined,
+      onPointerDown: reorderHandlers ? (evt) => reorderHandlers.start(column.key, evt) : undefined,
+      onPointerMove: reorderHandlers?.move,
+      onPointerUp: reorderHandlers?.end,
+      onPointerCancel: reorderHandlers?.cancel,
+      onKeyDown: reorderHandlers ? (evt) => reorderHandlers.keyDown(column.key, evt) : undefined,
       onClick: (evt) => {
         evt.stopPropagation();
+        if (reorderHandlers?.suppressSort()) {
+          return;
+        }
         onSortChange?.(column.key);
       },
     },
@@ -42,7 +54,7 @@ function ContentsSortButton({ column, sort, onSortChange }) {
   );
 }
 
-function ContentsHeaderCell({ children, columnKey, resizeHandle, resizeHandlers }) {
+function ContentsHeaderCell({ children, columnKey, dragState, resizeHandle, resizeHandlers }) {
   return h(
     "div",
     {
@@ -50,7 +62,13 @@ function ContentsHeaderCell({ children, columnKey, resizeHandle, resizeHandlers 
         "contents-head-cell",
         columnKey === "name" ? "name-column" : "",
         columnKey === "actions" ? "actions-column" : "",
-        columnKey !== "name" && columnKey !== "actions" ? "detail-column" : ""
+        columnKey !== "name" && columnKey !== "actions" ? "detail-column" : "",
+        dragState?.key === columnKey ? "column-dragging" : "",
+        dragState?.target?.key === columnKey && dragState.key !== columnKey
+          ? dragState.target.after
+            ? "column-drop-after"
+            : "column-drop-before"
+          : ""
       ),
       "data-column-key": columnKey,
     },
@@ -76,11 +94,14 @@ function ContentsHeaderCell({ children, columnKey, resizeHandle, resizeHandlers 
 
 export function ContentsTableHeader({
   allVisibleSelected,
+  columnOrder,
+  dragState,
   headerRef,
   mode,
   onSelectAllChange,
   onSortChange,
   resizeHandlers,
+  reorderHandlers,
   sort,
   visibleCount,
 }) {
@@ -93,6 +114,9 @@ export function ContentsTableHeader({
       className: "contents-table-head",
       onClick: (evt) => evt.stopPropagation(),
       onMouseDown: (evt) => evt.stopPropagation(),
+      onPointerMove: resizeHandlers.move,
+      onPointerUp: resizeHandlers.end,
+      onPointerCancel: resizeHandlers.end,
       ref: headerRef,
     },
     [
@@ -110,26 +134,27 @@ export function ContentsTableHeader({
           type: "checkbox",
         })
       ),
-      h(
-        ContentsHeaderCell,
-        {
-          columnKey: NAME_COLUMN.key,
-          key: NAME_COLUMN.key,
-          resizeHandle: COLUMN_RESIZE_HANDLES.name,
-          resizeHandlers,
-        },
-        h(ContentsSortButton, { column: NAME_COLUMN, onSortChange, sort })
-      ),
-      ...DETAIL_SORT_COLUMNS.map((column) =>
+      ...[
+        ...normalizeContentsColumnOrder(columnOrder).map((key) =>
+          [NAME_COLUMN, ...DETAIL_SORT_COLUMNS].find((column) => column.key === key)
+        ),
+        DETAIL_SORT_COLUMNS.at(-1),
+      ].map((column) =>
         h(
           ContentsHeaderCell,
           {
             columnKey: column.className,
+            dragState,
             key: column.key,
-            resizeHandle: COLUMN_RESIZE_HANDLES[column.className],
+            resizeHandle: columnResizeHandle(columnOrder, column.className),
             resizeHandlers,
           },
-          h(ContentsSortButton, { column, onSortChange, sort })
+          h(ContentsSortButton, {
+            column,
+            onSortChange,
+            sort,
+            reorderHandlers: column.key === "ttl" ? undefined : reorderHandlers,
+          })
         )
       ),
       h("div", {

@@ -1,4 +1,8 @@
 import { normalizeContentsViewByFolder, setContentsViewForFolder } from "./contentsView.js";
+import {
+  normalizeContentsColumnOrderByFolder,
+  setContentsColumnOrderForFolder,
+} from "./contentsColumns.js";
 
 export const THEME_OPTIONS = ["system", "light", "dark"];
 export const PALETTE_OPTIONS = ["cozy", "winui"];
@@ -13,6 +17,7 @@ const USER_PREFERENCE_DEFAULTS = {
   downloadLocationGuidanceDismissed: false,
   whatsNewAcknowledgedVersion: "",
   contentsViewByFolder: {},
+  contentsColumnOrderByFolder: {},
   favoriteItems: [],
   sidebarSectionSizes: {
     folders: 180,
@@ -205,6 +210,9 @@ export function normalizeUserPreferences(value) {
     ),
     whatsNewAcknowledgedVersion: normalizeAcknowledgedVersion(source.whatsNewAcknowledgedVersion),
     contentsViewByFolder: normalizeContentsViewByFolder(source.contentsViewByFolder),
+    contentsColumnOrderByFolder: normalizeContentsColumnOrderByFolder(
+      source.contentsColumnOrderByFolder
+    ),
     favoriteItems: normalizeFavoriteItems(source.favoriteItems),
     sidebarSectionSizes: normalizeSidebarSectionSizes(source.sidebarSectionSizes),
     sidebarSectionCollapsed: normalizeSidebarSectionCollapsed(source.sidebarSectionCollapsed),
@@ -310,24 +318,37 @@ export function applyUserPreferences(preferences) {
   return normalized;
 }
 
-export function useAppearancePreferences({ apiFetch, initialPreferences } = {}) {
+function mergeFolderPreferenceEntries(preferences, field, entries) {
+  if (field === "contentsViewByFolder") {
+    return normalizeUserPreferences({
+      ...preferences,
+      contentsViewByFolder: { ...preferences.contentsViewByFolder, ...entries },
+    });
+  }
+  return normalizeUserPreferences({
+    ...preferences,
+    contentsColumnOrderByFolder: { ...preferences.contentsColumnOrderByFolder, ...entries },
+  });
+}
+
+export function useAppearancePreferences({
+  apiFetch,
+  initialPreferences,
+  onPreferenceSaveError,
+} = {}) {
   const [userPreferences, setUserPreferences] = useState(() =>
     resolveInitialUserPreferences(initialPreferences)
   );
-  const contentsViewPendingRef = useRef(new Map());
-  const contentsViewRevisionRef = useRef(0);
-  const contentsViewSaveChainRef = useRef(Promise.resolve(null));
+  const folderPreferencePendingRef = useRef(new Map());
+  const folderPreferenceRevisionRef = useRef(0);
+  const folderPreferenceSaveChainRef = useRef(Promise.resolve(null));
 
   const reconcileSavedPreferences = useCallback((savedPreferences) => {
-    let contentsViewByFolder = savedPreferences.contentsViewByFolder;
-    contentsViewPendingRef.current.forEach((pending) => {
-      contentsViewByFolder = setContentsViewForFolder(
-        contentsViewByFolder,
-        pending.folder,
-        pending.view
-      );
+    let reconciled = savedPreferences;
+    folderPreferencePendingRef.current.forEach((pending) => {
+      reconciled = mergeFolderPreferenceEntries(reconciled, pending.field, pending.entries);
     });
-    return normalizeUserPreferences({ ...savedPreferences, contentsViewByFolder });
+    return normalizeUserPreferences(reconciled);
   }, []);
 
   useEffect(() => {
@@ -406,49 +427,58 @@ export function useAppearancePreferences({ apiFetch, initialPreferences } = {}) 
     [updatePreference]
   );
 
-  const handleContentsViewChange = useCallback(
-    (folder, view) => {
-      const contentsViewPatch = setContentsViewForFolder({}, folder, view);
-      const [[folderPath, normalizedView]] = Object.entries(contentsViewPatch);
-      contentsViewRevisionRef.current += 1;
-      const revision = contentsViewRevisionRef.current;
-      contentsViewPendingRef.current.set(folderPath, {
-        folder: folderPath,
-        revision,
-        view: normalizedView,
-      });
-      setUserPreferences((current) =>
-        normalizeUserPreferences({
-          ...current,
-          contentsViewByFolder: setContentsViewForFolder(
-            current.contentsViewByFolder,
-            folder,
-            view
-          ),
-        })
-      );
-      const save = contentsViewSaveChainRef.current
+  const saveFolderPreference = useCallback(
+    (field, entries) => {
+      const [folderPath] = Object.keys(entries);
+      const pendingKey = JSON.stringify([field, folderPath]);
+      folderPreferenceRevisionRef.current += 1;
+      const revision = folderPreferenceRevisionRef.current;
+      folderPreferencePendingRef.current.set(pendingKey, { entries, field, revision });
+      setUserPreferences((current) => mergeFolderPreferenceEntries(current, field, entries));
+      const save = folderPreferenceSaveChainRef.current
         .catch(() => null)
-        .then(() => patchUserPreferences(apiFetch, { contentsViewByFolder: contentsViewPatch }));
-      contentsViewSaveChainRef.current = save;
-      save
+        .then(() => patchUserPreferences(apiFetch, { [field]: entries }));
+      folderPreferenceSaveChainRef.current = save;
+      return save
         .then((savedPreferences) => {
-          const pending = contentsViewPendingRef.current.get(folderPath);
-          if (pending?.revision === revision) {
-            contentsViewPendingRef.current.delete(folderPath);
+          if (folderPreferencePendingRef.current.get(pendingKey)?.revision === revision) {
+            folderPreferencePendingRef.current.delete(pendingKey);
           }
           if (savedPreferences) {
             setUserPreferences(reconcileSavedPreferences(savedPreferences));
           }
+          return savedPreferences;
         })
         .catch(() => {
-          const pending = contentsViewPendingRef.current.get(folderPath);
-          if (pending?.revision === revision) {
-            contentsViewPendingRef.current.delete(folderPath);
+          if (folderPreferencePendingRef.current.get(pendingKey)?.revision === revision) {
+            folderPreferencePendingRef.current.delete(pendingKey);
           }
+          if (field === "contentsColumnOrderByFolder") {
+            onPreferenceSaveError?.({
+              kind: "error",
+              title: "Could not save column order",
+              detail: "Try moving the column again to save it across your devices.",
+            });
+          }
+          return null;
         });
     },
-    [apiFetch, reconcileSavedPreferences]
+    [apiFetch, onPreferenceSaveError, reconcileSavedPreferences]
+  );
+
+  const handleContentsViewChange = useCallback(
+    (folder, view) =>
+      saveFolderPreference("contentsViewByFolder", setContentsViewForFolder({}, folder, view)),
+    [saveFolderPreference]
+  );
+
+  const handleContentsColumnOrderChange = useCallback(
+    (folder, order) =>
+      saveFolderPreference(
+        "contentsColumnOrderByFolder",
+        setContentsColumnOrderForFolder({}, folder, order)
+      ),
+    [saveFolderPreference]
   );
 
   const handleSidebarSectionSizesChange = useCallback(
@@ -468,6 +498,10 @@ export function useAppearancePreferences({ apiFetch, initialPreferences } = {}) 
   return {
     alternateRows: userPreferences.alternateRows,
     contentsViewByFolder: userPreferences.contentsViewByFolder,
+    contentsColumns: {
+      orderByFolder: userPreferences.contentsColumnOrderByFolder,
+      onOrderChange: handleContentsColumnOrderChange,
+    },
     doubleClickDownload: userPreferences.doubleClickDownload,
     favoriteItems: userPreferences.favoriteItems,
     handleAlternateRowsChange,

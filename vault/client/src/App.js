@@ -159,6 +159,7 @@ export function App({ initial }) {
   const {
     alternateRows,
     contentsViewByFolder,
+    contentsColumns,
     doubleClickDownload,
     favoriteItems,
     handleAlternateRowsChange,
@@ -181,6 +182,7 @@ export function App({ initial }) {
   } = useAppearancePreferences({
     apiFetch,
     initialPreferences: initialBootstrap.preferences,
+    onPreferenceSaveError: showNotice,
   });
 
   const currentUser = initialBootstrap.user || {};
@@ -851,6 +853,7 @@ export function App({ initial }) {
       contentsItems,
       contentsSort,
       contentsViewByFolder,
+      contentsColumns,
       contentsSelection,
       folderItems: folderPaneItems,
       folderSelection,

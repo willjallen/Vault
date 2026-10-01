@@ -1,13 +1,35 @@
 import { readLocalPreference } from "../../lib/localPreferences.js";
+import { normalizeContentsColumnOrder } from "../../lib/contentsColumns.js";
+import { CONTENTS_VIEW_MODES } from "../../lib/contentsView.js";
 
 export const COLUMN_WIDTH_STORAGE_KEY = "contentsColumnWidths";
-export const COLUMN_RESIZE_HANDLES = {
-  modified: { left: "modified", right: "user" },
-  name: { left: "name", right: "modified" },
-  size: { left: "size", right: "status" },
-  status: { left: "status", right: "actions" },
-  user: { left: "user", right: "size" },
-};
+export function columnOrderForContentsView(mode, order) {
+  return mode === CONTENTS_VIEW_MODES.DETAILS ? order : undefined;
+}
+
+export function columnResizeHandle(order, key) {
+  const columns = [...normalizeContentsColumnOrder(order), "status", "actions"];
+  const index = columns.indexOf(key);
+  return index < 0 || index === columns.length - 1
+    ? null
+    : { left: key, right: columns.at(index + 1) };
+}
+
+export function contentCellsInOrder(cells, order) {
+  const [selection, nameCell, modified, user, size, statusCell, actions] = cells;
+  const columns = new Map([
+    ["name", nameCell],
+    ["modified", modified],
+    ["user", user],
+    ["size", size],
+  ]);
+  return [
+    selection,
+    ...normalizeContentsColumnOrder(order).map((key) => columns.get(key)),
+    statusCell,
+    actions,
+  ];
+}
 
 const DEFAULT_COLUMN_WIDTHS = {
   actions: 162,
@@ -51,8 +73,20 @@ export function readStoredColumnWidths() {
   };
 }
 
-export function contentColumnStyle(widths) {
+export function contentColumnStyle(widths, order) {
+  const tracks = new Map([
+    ["name", "minmax(196px, 1fr)"],
+    ["modified", "minmax(128px, var(--contents-modified-width))"],
+    ["user", "minmax(76px, var(--contents-user-width))"],
+    ["size", "minmax(64px, var(--contents-size-width))"],
+  ]);
   return {
+    "--contents-ordered-grid-template": [
+      "32px",
+      ...normalizeContentsColumnOrder(order).map((key) => tracks.get(key)),
+      "minmax(152px, var(--contents-status-width))",
+      "minmax(138px, var(--contents-actions-width))",
+    ].join(" "),
     "--contents-actions-width": `${widths.actions}px`,
     "--contents-modified-width": `${widths.modified}px`,
     "--contents-size-width": `${widths.size}px`,

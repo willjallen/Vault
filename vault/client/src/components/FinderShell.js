@@ -37,6 +37,7 @@ export function FinderShell({
   folder,
   breadcrumbs,
   contentsViewByFolder,
+  contentsColumns,
   myEdits,
   folderChildren,
   favoriteItems,
@@ -293,6 +294,7 @@ export function FinderShell({
       h(VaultFileList, {
         folder,
         contentsViewByFolder,
+        contentsColumns,
         subfolders,
         files,
         currentUser,

@@ -8,6 +8,7 @@ import {
 import { Icon } from "../common/Icon.js";
 import { RowSelectionIcon } from "./RowSelectionIcon.js";
 import { TtlStatusLabel } from "./TtlStatusLabel.js";
+import { contentCellsInOrder } from "./contentColumns.js";
 
 const { useEffect, useRef } = React;
 const h = React.createElement;
@@ -203,6 +204,7 @@ function folderActionsCell({ folder, isDraft, onMore, stopRowAction }) {
 }
 
 export function FolderRow({
+  columnOrder,
   folder,
   editing,
   editValue,
@@ -292,49 +294,56 @@ export function FolderRow({
     }
   }
 
-  return h("div", rowAttributes, [
-    h(
-      "div",
-      { className: "file-cell icon", role: "gridcell" },
-      h(RowSelectionIcon, {
-        color: folder.color,
-        disabled: editing,
-        folderIcon: folder.icon,
-        item: folder,
-        interactive: !isDraft,
-        kind: "folder",
-        label: selected ? `Deselect ${folder.name}` : `Select ${folder.name}`,
-        onSelect: onToggleSelect,
-        selected,
-        size: visualSize,
-      })
-    ),
-    folderNameCell({
-      cancelEdit,
-      commitEdit,
-      editValue,
-      editing,
-      folder,
-      inputRef,
-      isArchived,
-      onEditChange,
-    }),
-    h(
-      "div",
-      { className: "file-cell meta", role: "gridcell" },
-      h("span", { className: "muted tiny" }, formatDate(folder.modified_at))
-    ),
-    h(
-      "div",
-      { className: "file-cell user", role: "gridcell" },
-      h("span", { className: "muted tiny" }, folder.latest_by || "-")
-    ),
-    h(
-      "div",
-      { className: "file-cell size", role: "gridcell" },
-      h("span", { className: "muted tiny" }, folder.size_display || "0 B")
-    ),
-    folderStatusCell(retention),
-    folderActionsCell({ folder, isDraft, onMore, stopRowAction }),
-  ]);
+  return h(
+    "div",
+    rowAttributes,
+    contentCellsInOrder(
+      [
+        h(
+          "div",
+          { className: "file-cell icon", role: "gridcell" },
+          h(RowSelectionIcon, {
+            color: folder.color,
+            disabled: editing,
+            folderIcon: folder.icon,
+            item: folder,
+            interactive: !isDraft,
+            kind: "folder",
+            label: selected ? `Deselect ${folder.name}` : `Select ${folder.name}`,
+            onSelect: onToggleSelect,
+            selected,
+            size: visualSize,
+          })
+        ),
+        folderNameCell({
+          cancelEdit,
+          commitEdit,
+          editValue,
+          editing,
+          folder,
+          inputRef,
+          isArchived,
+          onEditChange,
+        }),
+        h(
+          "div",
+          { className: "file-cell meta", role: "gridcell" },
+          h("span", { className: "muted tiny" }, formatDate(folder.modified_at))
+        ),
+        h(
+          "div",
+          { className: "file-cell user", role: "gridcell" },
+          h("span", { className: "muted tiny" }, folder.latest_by || "-")
+        ),
+        h(
+          "div",
+          { className: "file-cell size", role: "gridcell" },
+          h("span", { className: "muted tiny" }, folder.size_display || "0 B")
+        ),
+        folderStatusCell(retention),
+        folderActionsCell({ folder, isDraft, onMore, stopRowAction }),
+      ],
+      columnOrder
+    )
+  );
 }

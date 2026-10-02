@@ -578,6 +578,121 @@ async fn folder_share_stats_exclude_inaccessible_descendants_and_recheck_access(
 }
 
 #[tokio::test]
+async fn folder_share_ignores_unrelated_documents_but_validates_its_subtree() {
+    /*
+     * Resolving a folder link only enriches files in that folder's visible subtree.
+     * Broken metadata elsewhere cannot prevent navigation, while a broken current version
+     * inside the shared folder still reports the existing consistency error.
+     */
+    let (state, _temp_dir) = test_state(None).await;
+    let root = get_root_folder(&state.db, VAULT_ROOT_KEY)
+        .await
+        .expect("root");
+    let readers = create_group(&state.db, "readers").await;
+    grant_access(&state.db, root.id, readers).await;
+    let shared = get_or_create_folder_path(&state.db, Some("Shared"))
+        .await
+        .expect("shared folder");
+    let unrelated = get_or_create_folder_path(&state.db, Some("Unrelated"))
+        .await
+        .expect("unrelated folder");
+    insert_versioned_document(&state.db, shared.id, "visible.txt", b"ok").await;
+    let broken = insert_versioned_document(&state.db, unrelated.id, "broken.txt", b"broken").await;
+    sqlx::query("UPDATE documents SET current_version_id = 'missing-version' WHERE id = ?")
+        .bind(broken)
+        .execute(&state.db)
+        .await
+        .expect("break unrelated version");
+    let pool = state.db.clone();
+    let app = http::router(state);
+    let (status, share) = post_share(
+        &app,
+        json!({"target_type": "folder", "folder_id": shared.id}),
+        "reader",
+        "readers",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let code = share["code"].as_str().expect("code");
+    let (status, resolved) = resolve_share_code(&app, code, "reader", "readers").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(resolved["folder"], "Shared");
+    assert_eq!(resolved["folder_item"]["size_bytes"], 2);
+
+    sqlx::query("UPDATE documents SET folder_id = ? WHERE id = ?")
+        .bind(shared.id)
+        .bind(broken)
+        .execute(&pool)
+        .await
+        .expect("move broken document into scope");
+    let (status, resolved) = resolve_share_code(&app, code, "reader", "readers").await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        resolved["detail"],
+        "Current document version metadata is inconsistent"
+    );
+}
+
+#[tokio::test]
+async fn folder_share_totals_exclude_archived_files_and_subfolders() {
+    /*
+     * Folder links report the same active files as browsing the shared folder. Separately
+     * archived files and archived child folders retain their identities but must not inflate
+     * its size, including when resolving the link as an administrator.
+     */
+    let (state, _temp_dir) = test_state(None).await;
+    let shared = get_or_create_folder_path(&state.db, Some("Shared"))
+        .await
+        .expect("shared folder");
+    let child = get_or_create_folder_path(&state.db, Some("Shared/Child"))
+        .await
+        .expect("child folder");
+    insert_versioned_document(&state.db, shared.id, "active.txt", b"ok").await;
+    let archived = insert_versioned_document(&state.db, shared.id, "archived.txt", b"old").await;
+    insert_versioned_document(&state.db, child.id, "child.txt", b"old child").await;
+    let app = http::router(state);
+    let archived = app
+        .clone()
+        .oneshot(authed_json_request(
+            Method::POST,
+            "/api/archive",
+            &json!({"items": [
+                {"type": "document", "id": archived},
+                {"type": "folder", "id": child.id}
+            ]}),
+            "admin",
+            "vault-admin",
+        ))
+        .await
+        .expect("archive items");
+    assert_eq!(archived.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(archived).await["ok"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let (status, share) = post_share(
+        &app,
+        json!({"target_type": "folder", "folder_id": shared.id}),
+        "admin",
+        "vault-admin",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, resolved) = resolve_share_code(
+        &app,
+        share["code"].as_str().unwrap(),
+        "admin",
+        "vault-admin",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(resolved["folder_item"]["size_bytes"], 2);
+}
+
+#[tokio::test]
 async fn deleted_share_targets_cascade_links() {
     /*
      * Separate links are created for a document and its containing folder.

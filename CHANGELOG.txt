@@ -1,5 +1,12 @@
 ========================================================================
 
+Unreleased
+
+fix: Open folder share links quickly in large vaults.
+
+
+========================================================================
+
 v2.3.0
 
 feat: Double-click images to see a larger preview, or play audio and video files supported by your browser directly in Vault.

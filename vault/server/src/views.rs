@@ -2012,16 +2012,23 @@ pub async fn build_share_folder_payload(
     } else {
         folder_path_from_cache(folder, &path_cache)?
     };
-    let visible_docs = visible_document_rows(pool, user).await?;
-    let stats = if folder_is_archive(folder) {
-        archive_docs_stats_for_folder_payloads(&visible_docs, &folder_by_id)
-    } else if archived {
-        let scope = archive_entry_subtree_folder_ids_from_records(folder.id, &folders)
-            .into_iter()
-            .collect::<HashSet<_>>();
-        archived_folder_docs_stats(&visible_docs, &scope, &path)
+    let stats = if folder_is_archive(folder) || archived {
+        let visible_docs = visible_document_rows(pool, user).await?;
+        if folder_is_archive(folder) {
+            archive_docs_stats_for_folder_payloads(&visible_docs, &folder_by_id)
+        } else {
+            let scope = archive_entry_subtree_folder_ids_from_records(folder.id, &folders)
+                .into_iter()
+                .collect::<HashSet<_>>();
+            archived_folder_docs_stats(&visible_docs, &scope, &path)
+        }
     } else {
-        docs_stats_for_folder_payloads(&visible_docs, &folder_by_id, &path_cache)?
+        folder_page_stats(
+            pool,
+            &[FolderPageRow::from_record(folder, path.clone())],
+            user,
+        )
+        .await?
     };
     let delete_eligible = empty_folder_delete_eligible_ids(pool, &[(folder.id, path.clone())])
         .await?

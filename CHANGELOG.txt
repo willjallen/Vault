@@ -1,6 +1,6 @@
 ========================================================================
 
-Unreleased
+v2.3.1
 
 fix: Open folder share links quickly in large vaults.
 
